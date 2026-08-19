@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "openprx"
-version = "0.8.23"
+version = "0.8.24"
 edition = "2024"
 rust-version = "1.97.1"
 authors = ["g1e2x87"]
@@ -193,7 +193,7 @@ async-imap = { version = "0.11",features = ["runtime-tokio"], default-features =
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "tokio", "query", "ws", "macros", "multipart"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 tower = { version = "0.5", default-features = false }
-tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout"] }
+tower-http = { version = "0.6", default-features = false, features = ["limit"] }
 http-body-util = "0.1"
 rust-embed = "8.5"
 
@@ -285,6 +285,9 @@ rcgen = "0.14"
 # Serialize PTY tests that share controlling-tty resources, without forcing
 # `--test-threads=1` on the whole test binary.
 serial_test = "3"
+# `start_paused` test runtimes: scheduler tests simulate tool runs far longer
+# than any deadline the scheduler used to impose, without sleeping for real.
+tokio = { version = "1.42", features = ["test-util"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

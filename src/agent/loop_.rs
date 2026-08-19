@@ -24,9 +24,8 @@ use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
 use sha2::Digest;
-use std::collections::{BTreeSet, HashMap, hash_map::DefaultHasher};
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
-use std::hash::{Hash, Hasher};
 use std::io::Write as _;
 #[cfg(feature = "llm-router")]
 use std::path::Path;
@@ -337,34 +336,6 @@ impl DocumentIngestRuntime {
             sender: self.sender.clone(),
             owner_id: self.owner_id.clone(),
             legacy_session_key: self.legacy_session_key.clone(),
-        }
-    }
-}
-
-/// P2 concurrency governance controls used by the tool scheduler.
-#[derive(Debug, Clone)]
-pub struct ToolConcurrencyGovernanceConfig {
-    pub kill_switch_force_serial: bool,
-    pub rollout_stage: String,
-    pub rollout_sample_percent: u8,
-    pub rollout_channels: Vec<String>,
-    pub auto_rollback_enabled: bool,
-    pub rollback_timeout_rate_threshold: f64,
-    pub rollback_cancel_rate_threshold: f64,
-    pub rollback_error_rate_threshold: f64,
-}
-
-impl Default for ToolConcurrencyGovernanceConfig {
-    fn default() -> Self {
-        Self {
-            kill_switch_force_serial: false,
-            rollout_stage: "off".to_string(),
-            rollout_sample_percent: 0,
-            rollout_channels: Vec::new(),
-            auto_rollback_enabled: true,
-            rollback_timeout_rate_threshold: 0.2,
-            rollback_cancel_rate_threshold: 0.2,
-            rollback_error_rate_threshold: 0.2,
         }
     }
 }
@@ -3577,12 +3548,9 @@ pub(crate) async fn agent_turn(
     silent: bool,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
-    parallel_tools_enabled: bool,
     read_only_tool_concurrency_window: usize,
-    read_only_tool_timeout_secs: u64,
     priority_scheduling_enabled: bool,
     low_priority_tool_names: Vec<String>,
-    concurrency_governance: ToolConcurrencyGovernanceConfig,
     document_ingest: Option<DocumentIngestRuntime>,
 ) -> Result<(String, ToolLoopTrace)> {
     run_tool_call_loop_traced(
@@ -3599,12 +3567,9 @@ pub(crate) async fn agent_turn(
         "channel",
         multimodal_config,
         max_tool_iterations,
-        parallel_tools_enabled,
         read_only_tool_concurrency_window,
-        read_only_tool_timeout_secs,
         priority_scheduling_enabled,
         low_priority_tool_names,
-        concurrency_governance,
         None,
         None,
         None,
@@ -4154,141 +4119,18 @@ async fn execute_one_tool(
 /// Conservative scheduler policy:
 /// - only known read-only tools can run concurrently;
 /// - all stateful tools execute strictly serially;
-/// - read-only batches use a bounded concurrency window and timeout guard.
+/// - read-only batches use a bounded concurrency window.
+///
+/// Tool execution is never time-bounded. A long-running tool is normal agent
+/// business, so both the parallel read-only lane and the serial lane run tools
+/// without any deadline. Runaway work is surfaced and stopped through the
+/// runtime registry (`prx tasks list|kill`) and the cancellation token, never
+/// by silently killing a call that is still making progress.
 #[derive(Debug, Clone)]
 struct ReadOnlyToolScheduleConfig {
-    parallel_enabled: bool,
     concurrency_window: usize,
-    timeout_secs: u64,
     priority_enabled: bool,
     low_priority_tool_names: std::collections::HashSet<String>,
-    rollout_stage: String,
-    kill_switch_applied: bool,
-    auto_rollback_enabled: bool,
-    rollback_timeout_rate_threshold: f64,
-    rollback_cancel_rate_threshold: f64,
-    rollback_error_rate_threshold: f64,
-}
-
-#[derive(Debug, Clone)]
-struct RolloutDecision {
-    enabled: bool,
-    stage: String,
-    kill_switch_applied: bool,
-    reason: &'static str,
-}
-
-#[derive(Debug, Clone)]
-#[cfg(test)]
-struct BatchExecutionOutcome {
-    results: Vec<String>,
-    total_calls: usize,
-    timeout_count: usize,
-    cancel_count: usize,
-    error_count: usize,
-}
-
-fn rollout_stage_default_sample(stage: &str) -> u8 {
-    match stage {
-        "stage_a" => 5,
-        "stage_b" => 25,
-        "stage_c" => 50,
-        "full" => 100,
-        _ => 0,
-    }
-}
-
-fn rollout_effective_sample_percent(stage: &str, configured_percent: u8) -> u8 {
-    let stage_default = rollout_stage_default_sample(stage);
-    if configured_percent == 0 {
-        stage_default
-    } else {
-        configured_percent.min(stage_default.max(1))
-    }
-}
-
-fn rollout_sampling_key(channel_name: &str, scope_ctx: Option<&ScopeContext<'_>>) -> String {
-    scope_ctx.map_or_else(
-        || channel_name.to_string(),
-        |scope| format!("{}:{}:{}:{}", channel_name, scope.channel, scope.sender, scope.chat_id),
-    )
-}
-
-fn rollout_sample_selected(key: &str, sample_percent: u8) -> bool {
-    if sample_percent >= 100 {
-        return true;
-    }
-    if sample_percent == 0 {
-        return false;
-    }
-    let mut hasher = DefaultHasher::new();
-    key.hash(&mut hasher);
-    (hasher.finish() % 100) < u64::from(sample_percent)
-}
-
-fn resolve_rollout_decision(
-    parallel_tools_enabled: bool,
-    governance: &ToolConcurrencyGovernanceConfig,
-    channel_name: &str,
-    scope_ctx: Option<&ScopeContext<'_>>,
-) -> RolloutDecision {
-    if !parallel_tools_enabled {
-        return RolloutDecision {
-            enabled: false,
-            stage: "off".to_string(),
-            kill_switch_applied: false,
-            reason: "parallel_tools_disabled",
-        };
-    }
-    if governance.kill_switch_force_serial {
-        return RolloutDecision {
-            enabled: false,
-            stage: governance.rollout_stage.clone(),
-            kill_switch_applied: true,
-            reason: "kill_switch_force_serial",
-        };
-    }
-
-    let stage = governance.rollout_stage.trim().to_ascii_lowercase();
-    if stage == "off" {
-        return RolloutDecision {
-            enabled: false,
-            stage,
-            kill_switch_applied: false,
-            reason: "rollout_off",
-        };
-    }
-
-    if !governance.rollout_channels.is_empty() && !governance.rollout_channels.iter().any(|name| name == channel_name) {
-        return RolloutDecision {
-            enabled: false,
-            stage,
-            kill_switch_applied: false,
-            reason: "channel_not_in_rollout_allowlist",
-        };
-    }
-
-    if stage == "full" {
-        return RolloutDecision {
-            enabled: true,
-            stage,
-            kill_switch_applied: false,
-            reason: "full_rollout",
-        };
-    }
-
-    let sample_percent = rollout_effective_sample_percent(&stage, governance.rollout_sample_percent).min(100);
-    let selected = rollout_sample_selected(&rollout_sampling_key(channel_name, scope_ctx), sample_percent);
-    RolloutDecision {
-        enabled: selected,
-        stage,
-        kill_switch_applied: false,
-        reason: if selected {
-            "sample_selected"
-        } else {
-            "sample_not_selected"
-        },
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4497,11 +4339,9 @@ async fn execute_read_only_batch(
     cancellation_token: Option<&CancellationToken>,
     scope_ctx: Option<&ScopeContext<'_>>,
     chat_mode: ChatMode,
-) -> Result<BatchExecutionOutcome> {
+) -> Result<Vec<String>> {
     use futures::stream::{self, StreamExt};
-    use std::time::Duration;
 
-    let timeout = Duration::from_secs(schedule.timeout_secs);
     let batch_calls: Vec<ParsedToolCall> = calls.to_vec();
 
     let mut indexed_results: Vec<(usize, String)> = stream::iter(batch_calls.into_iter().enumerate())
@@ -4512,6 +4352,8 @@ async fn execute_read_only_batch(
                 return Ok((idx, scope_denial_message(&call)));
             }
 
+            // No deadline: the batch lane runs tools exactly as long as the
+            // serial lane does. Cancellation is the only way out.
             let execute_future = execute_one_tool(
                 &call.name,
                 call.arguments.clone(),
@@ -4523,52 +4365,28 @@ async fn execute_read_only_batch(
                 chat_mode,
             );
 
-            let bounded = async {
-                match tokio::time::timeout(timeout, execute_future).await {
-                    Ok(result) => result,
-                    Err(_) => Ok(format!(
-                        "Error: Tool '{}' timed out after {}s.",
-                        call.name, schedule.timeout_secs
-                    )),
-                }
-            };
-
             let result = if let Some(token) = cancellation_token {
                 tokio::select! {
                     () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                    bounded_result = bounded => bounded_result?,
+                    executed = execute_future => executed?,
                 }
             } else {
-                bounded.await?
+                execute_future.await?
             };
 
             Ok((idx, result))
         })
-        .buffer_unordered(schedule.concurrency_window)
+        .buffer_unordered(schedule.concurrency_window.max(1))
         .collect::<Vec<Result<(usize, String)>>>()
         .await
         .into_iter()
         .collect::<Result<Vec<(usize, String)>>>()?;
 
     indexed_results.sort_by_key(|(idx, _)| *idx);
-    let results = indexed_results
+    Ok(indexed_results
         .into_iter()
         .map(|(_, result)| result)
-        .collect::<Vec<String>>();
-    let timeout_count = results.iter().filter(|value| value.contains("timed out")).count();
-    let cancel_count = results
-        .iter()
-        .filter(|value| value.contains("cancelled") || value.contains("Cancelled"))
-        .count();
-    let error_count = results.iter().filter(|value| value.starts_with("Error")).count();
-
-    Ok(BatchExecutionOutcome {
-        total_calls: results.len(),
-        results,
-        timeout_count,
-        cancel_count,
-        error_count,
-    })
+        .collect::<Vec<String>>())
 }
 
 // SAFETY: All indexing in this function is guarded:
@@ -4603,7 +4421,6 @@ async fn execute_tools_with_policy(
 
     let mut results_by_original = vec![String::new(); tool_calls.len()];
     let mut cursor = 0;
-    let mut force_serial_for_remaining_turn = !schedule.parallel_enabled;
 
     while cursor < ordered_indices.len() {
         if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
@@ -4614,10 +4431,7 @@ async fn execute_tools_with_policy(
         let call = &tool_calls[index];
         let approval_required = requires_approval(call, scope_ctx);
 
-        if classify_tool_call(&call.name) == ToolSchedulingClass::ReadOnly
-            && !approval_required
-            && !force_serial_for_remaining_turn
-        {
+        if classify_tool_call(&call.name) == ToolSchedulingClass::ReadOnly && !approval_required {
             let batch_start = cursor;
             let mut batch_end = cursor + 1;
             while batch_end < ordered_indices.len() {
@@ -4634,7 +4448,7 @@ async fn execute_tools_with_policy(
                 .iter()
                 .map(|idx| tool_calls[*idx].clone())
                 .collect();
-            let batch_outcome = execute_read_only_batch(
+            let batch_results = execute_read_only_batch(
                 &batch_calls,
                 tools_registry,
                 observer,
@@ -4645,59 +4459,12 @@ async fn execute_tools_with_policy(
             )
             .await?;
 
-            let total = batch_outcome.total_calls.max(1);
-            let timeout_rate = batch_outcome.timeout_count as f64 / total as f64;
-            let cancel_rate = batch_outcome.cancel_count as f64 / total as f64;
-            let error_rate = batch_outcome.error_count as f64 / total as f64;
-            let mut rollback_reason: Option<String> = None;
-            let mut rollback_triggered = false;
-            if schedule.auto_rollback_enabled {
-                if timeout_rate > schedule.rollback_timeout_rate_threshold {
-                    rollback_reason = Some("timeout_rate".to_string());
-                    rollback_triggered = true;
-                } else if cancel_rate > schedule.rollback_cancel_rate_threshold {
-                    rollback_reason = Some("cancel_rate".to_string());
-                    rollback_triggered = true;
-                } else if error_rate > schedule.rollback_error_rate_threshold {
-                    rollback_reason = Some("error_rate".to_string());
-                    rollback_triggered = true;
-                }
-            }
-            if rollback_triggered {
-                force_serial_for_remaining_turn = true;
-            }
-
             observer.record_event(&ObserverEvent::ToolBatch {
-                rollout_stage: schedule.rollout_stage.clone(),
-                batch_size: batch_outcome.total_calls,
+                batch_size: batch_results.len(),
                 concurrency_window: schedule.concurrency_window,
-                timeout_count: batch_outcome.timeout_count,
-                cancel_count: batch_outcome.cancel_count,
-                error_count: batch_outcome.error_count,
-                degraded: force_serial_for_remaining_turn,
-                rollback: rollback_triggered,
-                rollback_reason: rollback_reason.clone(),
-                kill_switch_applied: schedule.kill_switch_applied,
             });
 
-            tracing::info!(
-                rollout_stage = %schedule.rollout_stage,
-                batch_size = batch_outcome.total_calls,
-                concurrency_window = schedule.concurrency_window,
-                timeout_count = batch_outcome.timeout_count,
-                cancel_count = batch_outcome.cancel_count,
-                error_count = batch_outcome.error_count,
-                timeout_rate = timeout_rate,
-                cancel_rate = cancel_rate,
-                error_rate = error_rate,
-                degraded = force_serial_for_remaining_turn,
-                rollback = rollback_triggered,
-                rollback_reason = ?rollback_reason,
-                kill_switch_applied = schedule.kill_switch_applied,
-                "tool batch execution"
-            );
-
-            for (offset, result) in batch_outcome.results.into_iter().enumerate() {
+            for (offset, result) in batch_results.into_iter().enumerate() {
                 let original_index = ordered_indices[batch_start + offset];
                 results_by_original[original_index] = result;
             }
@@ -5520,13 +5287,15 @@ async fn execute_tools_with_service(
     }
     let mut results = vec![String::new(); tool_calls.len()];
     let mut cursor = 0;
-    let mut force_serial = !schedule.parallel_enabled;
     while cursor < ordered_indices.len() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Err(ToolLoopCancelled.into());
         }
         let index = ordered_indices[cursor];
-        if !force_serial && classify_tool_call(&tool_calls[index].name) == ToolSchedulingClass::ReadOnly {
+        // Read-only calls always take the parallel lane; there is no switch that
+        // can force them back to serial. Both lanes hand `None` as the deadline,
+        // so a tool behaves identically whichever lane it runs in.
+        if classify_tool_call(&tool_calls[index].name) == ToolSchedulingClass::ReadOnly {
             let start = cursor;
             let mut end = cursor + 1;
             while end < ordered_indices.len()
@@ -5534,7 +5303,6 @@ async fn execute_tools_with_service(
             {
                 end += 1;
             }
-            let timeout = std::time::Duration::from_secs(schedule.timeout_secs);
             let batch = stream::iter(ordered_indices[start..end].iter().copied())
                 .map(|batch_index| async move {
                     let result = execute_one_with_service(
@@ -5544,7 +5312,7 @@ async fn execute_tools_with_service(
                         adapter,
                         cancellation,
                         chat_mode,
-                        Some(timeout),
+                        None,
                     )
                     .await?;
                     Ok::<_, anyhow::Error>((batch_index, result))
@@ -5554,38 +5322,9 @@ async fn execute_tools_with_service(
                 .await
                 .into_iter()
                 .collect::<Result<Vec<_>>>()?;
-            let total = batch.len().max(1);
-            let timeout_count = batch.iter().filter(|(_, value)| value.contains("timed out")).count();
-            let cancel_count = batch
-                .iter()
-                .filter(|(_, value)| value.to_ascii_lowercase().contains("cancelled"))
-                .count();
-            let error_count = batch.iter().filter(|(_, value)| value.starts_with("Error")).count();
-            let timeout_rate = timeout_count as f64 / total as f64;
-            let cancel_rate = cancel_count as f64 / total as f64;
-            let error_rate = error_count as f64 / total as f64;
-            let rollback_reason =
-                if schedule.auto_rollback_enabled && timeout_rate > schedule.rollback_timeout_rate_threshold {
-                    Some("timeout_rate")
-                } else if schedule.auto_rollback_enabled && cancel_rate > schedule.rollback_cancel_rate_threshold {
-                    Some("cancel_rate")
-                } else if schedule.auto_rollback_enabled && error_rate > schedule.rollback_error_rate_threshold {
-                    Some("error_rate")
-                } else {
-                    None
-                };
-            force_serial |= rollback_reason.is_some();
             observer.record_event(&ObserverEvent::ToolBatch {
-                rollout_stage: schedule.rollout_stage.clone(),
                 batch_size: batch.len(),
                 concurrency_window: schedule.concurrency_window,
-                timeout_count,
-                cancel_count,
-                error_count,
-                degraded: force_serial,
-                rollback: rollback_reason.is_some(),
-                rollback_reason: rollback_reason.map(str::to_string),
-                kill_switch_applied: schedule.kill_switch_applied,
             });
             for (batch_index, result) in batch {
                 results[batch_index] = result;
@@ -5651,12 +5390,9 @@ pub(crate) async fn run_tool_call_loop(
     channel_name: &str,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
-    parallel_tools_enabled: bool,
     read_only_tool_concurrency_window: usize,
-    read_only_tool_timeout_secs: u64,
     priority_scheduling_enabled: bool,
     low_priority_tool_names: Vec<String>,
-    concurrency_governance: ToolConcurrencyGovernanceConfig,
     compaction_config: Option<&crate::config::AgentCompactionConfig>,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
@@ -5680,12 +5416,9 @@ pub(crate) async fn run_tool_call_loop(
         channel_name,
         multimodal_config,
         max_tool_iterations,
-        parallel_tools_enabled,
         read_only_tool_concurrency_window,
-        read_only_tool_timeout_secs,
         priority_scheduling_enabled,
         low_priority_tool_names,
-        concurrency_governance,
         compaction_config,
         cancellation_token,
         on_delta,
@@ -5733,12 +5466,9 @@ pub(crate) async fn run_tool_call_loop_traced(
     channel_name: &str,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
-    parallel_tools_enabled: bool,
     read_only_tool_concurrency_window: usize,
-    read_only_tool_timeout_secs: u64,
     priority_scheduling_enabled: bool,
     low_priority_tool_names: Vec<String>,
-    concurrency_governance: ToolConcurrencyGovernanceConfig,
     compaction_config: Option<&crate::config::AgentCompactionConfig>,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
@@ -5762,12 +5492,9 @@ pub(crate) async fn run_tool_call_loop_traced(
         channel_name,
         multimodal_config,
         max_tool_iterations,
-        parallel_tools_enabled,
         read_only_tool_concurrency_window,
-        read_only_tool_timeout_secs,
         priority_scheduling_enabled,
         low_priority_tool_names,
-        concurrency_governance,
         compaction_config,
         cancellation_token,
         on_delta,
@@ -5809,12 +5536,9 @@ pub(crate) async fn run_tool_call_loop_outcome(
     channel_name: &str,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
-    parallel_tools_enabled: bool,
     read_only_tool_concurrency_window: usize,
-    read_only_tool_timeout_secs: u64,
     priority_scheduling_enabled: bool,
     low_priority_tool_names: Vec<String>,
-    concurrency_governance: ToolConcurrencyGovernanceConfig,
     compaction_config: Option<&crate::config::AgentCompactionConfig>,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
@@ -5902,27 +5626,10 @@ pub(crate) async fn run_tool_call_loop_outcome(
     // path applies the identical rule.
     let mut tool_specs = tool_specs;
     crate::tools::filter_tool_specs_for_exposure(&mut tool_specs, expose_stay_silent);
-    let rollout = resolve_rollout_decision(parallel_tools_enabled, &concurrency_governance, channel_name, scope_ctx);
-    tracing::info!(
-        channel = channel_name,
-        rollout_stage = %rollout.stage,
-        parallel_enabled = rollout.enabled,
-        kill_switch_applied = rollout.kill_switch_applied,
-        reason = rollout.reason,
-        "tool scheduler rollout decision"
-    );
     let read_only_schedule = ReadOnlyToolScheduleConfig {
-        parallel_enabled: rollout.enabled,
         concurrency_window: read_only_tool_concurrency_window.max(1),
-        timeout_secs: read_only_tool_timeout_secs.max(1),
         priority_enabled: priority_scheduling_enabled,
         low_priority_tool_names: low_priority_tool_names.into_iter().collect(),
-        rollout_stage: rollout.stage.clone(),
-        kill_switch_applied: rollout.kill_switch_applied,
-        auto_rollback_enabled: concurrency_governance.auto_rollback_enabled,
-        rollback_timeout_rate_threshold: concurrency_governance.rollback_timeout_rate_threshold.clamp(0.0, 1.0),
-        rollback_cancel_rate_threshold: concurrency_governance.rollback_cancel_rate_threshold.clamp(0.0, 1.0),
-        rollback_error_rate_threshold: concurrency_governance.rollback_error_rate_threshold.clamp(0.0, 1.0),
     };
     // The Chat streaming contract historically advertises the registry on
     // every `stream_chat_with_history` request. Some streaming-compatible test
@@ -7244,21 +6951,9 @@ pub(crate) async fn run_with_runtime_envelope(
                         "cli",
                         &config.multimodal,
                         config.agent.max_tool_iterations,
-                        config.agent.parallel_tools,
                         config.agent.read_only_tool_concurrency_window,
-                        config.agent.read_only_tool_timeout_secs,
                         config.agent.priority_scheduling_enabled,
                         config.agent.low_priority_tools.clone(),
-                        ToolConcurrencyGovernanceConfig {
-                            kill_switch_force_serial: config.agent.concurrency_kill_switch_force_serial,
-                            rollout_stage: config.agent.concurrency_rollout_stage.clone(),
-                            rollout_sample_percent: config.agent.concurrency_rollout_sample_percent,
-                            rollout_channels: config.agent.concurrency_rollout_channels.clone(),
-                            auto_rollback_enabled: config.agent.concurrency_auto_rollback_enabled,
-                            rollback_timeout_rate_threshold: config.agent.concurrency_rollback_timeout_rate_threshold,
-                            rollback_cancel_rate_threshold: config.agent.concurrency_rollback_cancel_rate_threshold,
-                            rollback_error_rate_threshold: config.agent.concurrency_rollback_error_rate_threshold,
-                        },
                         Some(&effective_compaction.config),
                         None,
                         None,
@@ -7663,21 +7358,9 @@ pub(crate) async fn run_with_runtime_envelope(
                         "cli",
                         &config.multimodal,
                         config.agent.max_tool_iterations,
-                        config.agent.parallel_tools,
                         config.agent.read_only_tool_concurrency_window,
-                        config.agent.read_only_tool_timeout_secs,
                         config.agent.priority_scheduling_enabled,
                         config.agent.low_priority_tools.clone(),
-                        ToolConcurrencyGovernanceConfig {
-                            kill_switch_force_serial: config.agent.concurrency_kill_switch_force_serial,
-                            rollout_stage: config.agent.concurrency_rollout_stage.clone(),
-                            rollout_sample_percent: config.agent.concurrency_rollout_sample_percent,
-                            rollout_channels: config.agent.concurrency_rollout_channels.clone(),
-                            auto_rollback_enabled: config.agent.concurrency_auto_rollback_enabled,
-                            rollback_timeout_rate_threshold: config.agent.concurrency_rollback_timeout_rate_threshold,
-                            rollback_cancel_rate_threshold: config.agent.concurrency_rollback_cancel_rate_threshold,
-                            rollback_error_rate_threshold: config.agent.concurrency_rollback_error_rate_threshold,
-                        },
                         Some(&effective_compaction.config),
                         None,
                         None,
@@ -8010,21 +7693,9 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         true,
         &config.multimodal,
         config.agent.max_tool_iterations,
-        config.agent.parallel_tools,
         config.agent.read_only_tool_concurrency_window,
-        config.agent.read_only_tool_timeout_secs,
         config.agent.priority_scheduling_enabled,
         config.agent.low_priority_tools.clone(),
-        ToolConcurrencyGovernanceConfig {
-            kill_switch_force_serial: config.agent.concurrency_kill_switch_force_serial,
-            rollout_stage: config.agent.concurrency_rollout_stage.clone(),
-            rollout_sample_percent: config.agent.concurrency_rollout_sample_percent,
-            rollout_channels: config.agent.concurrency_rollout_channels.clone(),
-            auto_rollback_enabled: config.agent.concurrency_auto_rollback_enabled,
-            rollback_timeout_rate_threshold: config.agent.concurrency_rollback_timeout_rate_threshold,
-            rollback_cancel_rate_threshold: config.agent.concurrency_rollback_cancel_rate_threshold,
-            rollback_error_rate_threshold: config.agent.concurrency_rollback_error_rate_threshold,
-        },
         Some(DocumentIngestRuntime::from_envelope(mem.clone(), &runtime_envelope)),
     )
     .await;
@@ -8879,12 +8550,9 @@ mod tests {
             "cli",
             &crate::config::MultimodalConfig::default(),
             4,
-            false,
             2,
-            30,
             false,
             Vec::new(),
-            ToolConcurrencyGovernanceConfig::default(),
             None,
             None,
             None,
@@ -9090,12 +8758,9 @@ mod tests {
             "cli",
             &crate::config::MultimodalConfig::default(),
             4,
-            false,
             2,
-            30,
             false,
             Vec::new(),
-            ToolConcurrencyGovernanceConfig::default(),
             None,
             None,
             None,
@@ -9193,12 +8858,9 @@ mod tests {
             "cli",
             &crate::config::MultimodalConfig::default(),
             3,
-            false,
             2,
-            30,
             false,
             Vec::new(),
-            ToolConcurrencyGovernanceConfig::default(),
             None,
             None,
             None,
@@ -9251,12 +8913,9 @@ mod tests {
             "cli",
             &multimodal,
             3,
-            false,
             2,
-            30,
             false,
             Vec::new(),
-            ToolConcurrencyGovernanceConfig::default(),
             None,
             None,
             None,
@@ -9301,12 +8960,9 @@ mod tests {
             "cli",
             &crate::config::MultimodalConfig::default(),
             3,
-            false,
             2,
-            30,
             false,
             Vec::new(),
-            ToolConcurrencyGovernanceConfig::default(),
             None,
             None,
             None,
@@ -9353,12 +9009,9 @@ mod tests {
             "cli",
             &crate::config::MultimodalConfig::default(),
             3,
-            false,
             2,
-            30,
             false,
             Vec::new(),
-            ToolConcurrencyGovernanceConfig::default(),
             None,
             None,
             None,
@@ -9458,36 +9111,6 @@ mod tests {
         assert_eq!(tool_barrier_key("memory_reindex"), Some("memory_write"));
     }
 
-    #[test]
-    fn resolve_rollout_decision_prioritizes_kill_switch() {
-        let decision = resolve_rollout_decision(
-            true,
-            &ToolConcurrencyGovernanceConfig {
-                kill_switch_force_serial: true,
-                rollout_stage: "full".to_string(),
-                ..ToolConcurrencyGovernanceConfig::default()
-            },
-            "telegram",
-            None,
-        );
-        assert!(!decision.enabled);
-        assert!(decision.kill_switch_applied);
-        assert_eq!(decision.reason, "kill_switch_force_serial");
-    }
-
-    #[test]
-    fn resolve_rollout_decision_stage_sampling_is_deterministic() {
-        let governance = ToolConcurrencyGovernanceConfig {
-            rollout_stage: "stage_a".to_string(),
-            rollout_sample_percent: 5,
-            ..ToolConcurrencyGovernanceConfig::default()
-        };
-        let first = resolve_rollout_decision(true, &governance, "telegram", None);
-        let second = resolve_rollout_decision(true, &governance, "telegram", None);
-        assert_eq!(first.enabled, second.enabled);
-        assert_eq!(first.stage, "stage_a");
-    }
-
     #[tokio::test]
     async fn run_tool_call_loop_executes_read_only_tools_with_bounded_parallelism() {
         let provider = ScriptedProvider::from_text_responses(vec![
@@ -9537,15 +9160,9 @@ mod tests {
             "telegram",
             &crate::config::MultimodalConfig::default(),
             4,
-            true,
             2,
-            30,
             false,
             Vec::new(),
-            ToolConcurrencyGovernanceConfig {
-                rollout_stage: "full".to_string(),
-                ..ToolConcurrencyGovernanceConfig::default()
-            },
             None,
             None,
             None,
@@ -9625,12 +9242,9 @@ mod tests {
             "cli",
             &crate::config::MultimodalConfig::default(),
             4,
-            false,
             2,
-            30,
             false,
             Vec::new(),
-            ToolConcurrencyGovernanceConfig::default(),
             None,
             None,
             None,
@@ -9717,15 +9331,9 @@ mod tests {
             "telegram",
             &crate::config::MultimodalConfig::default(),
             4,
-            true,
             2,
-            30,
             false,
             Vec::new(),
-            ToolConcurrencyGovernanceConfig {
-                rollout_stage: "full".to_string(),
-                ..ToolConcurrencyGovernanceConfig::default()
-            },
             None,
             None,
             None,
@@ -9783,17 +9391,9 @@ mod tests {
             None,
             "cli",
             ReadOnlyToolScheduleConfig {
-                parallel_enabled: true,
                 concurrency_window: 2,
-                timeout_secs: 30,
                 priority_enabled: true,
                 low_priority_tool_names: std::iter::once("sessions_spawn".to_string()).collect(),
-                rollout_stage: "full".to_string(),
-                kill_switch_applied: false,
-                auto_rollback_enabled: true,
-                rollback_timeout_rate_threshold: 0.2,
-                rollback_cancel_rate_threshold: 0.2,
-                rollback_error_rate_threshold: 0.2,
             },
             None,
             None,
@@ -10053,78 +9653,211 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn execute_tools_with_policy_triggers_rollback_and_forces_remaining_serial() {
-        let observer = SchedulerEventObserver::default();
-        let tools_registry: Vec<Box<dyn Tool>> = vec![
+    /// Builds the production tool-execution adapter used by
+    /// [`execute_tools_with_service`], so scheduler tests exercise the real
+    /// dispatch path rather than the `cfg(test)` mirror.
+    fn scheduler_test_adapter(tools: Vec<Box<dyn Tool>>, ledger_dir: &TempDir) -> ToolLoopRuntimeAdapter {
+        let (policy, tool_execution_context) = agent_tool_execution_context(None, "cli");
+        let approval_strategy = AgentToolApprovalStrategy {
+            manager: None,
+            resolver: None,
+            channel: "cli".to_string(),
+            policy: Arc::clone(&policy),
+            cancellation: None,
+        };
+        // Stateful tools refuse to run without a durable idempotency ledger, so
+        // the serial lane needs one before it can be compared with the parallel
+        // lane at all.
+        let ledger: Arc<dyn Memory> =
+            Arc::new(SqliteMemory::new(ledger_dir.path()).expect("test: sqlite ledger should open in a temp dir"));
+        let service = crate::tools::ToolExecutionService::from_shared_boxed_registry(
+            Arc::new(tools),
+            Arc::new(crate::tools::SecurityEffectPolicy::new(policy)),
+            Arc::new(approval_strategy),
+            Arc::new(crate::tools::AdapterOwnedPreparation),
+            Arc::new(crate::tools::TracingToolExecutionAudit),
+        )
+        .with_idempotency_memory(ledger);
+        ToolLoopRuntimeAdapter {
+            events: None,
+            stream_provider: false,
+            tool_execution_service: Some(Arc::new(service)),
+            tool_execution_context,
+        }
+    }
+
+    fn slow_tool_registry(delay_ms: u64) -> Vec<Box<dyn Tool>> {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        vec![
+            // `file_read` is read-only -> parallel batch lane.
             Box::new(DelayTool::new(
                 "file_read",
-                150,
-                Arc::new(AtomicUsize::new(0)),
-                Arc::new(AtomicUsize::new(0)),
+                delay_ms,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
             )),
-            Box::new(RecordingTool {
-                name: "shell".to_string(),
-                execution_order: Arc::new(std::sync::Mutex::new(Vec::new())),
-            }),
-        ];
+            // `shell` is stateful -> serial lane.
+            Box::new(DelayTool::new("shell", delay_ms, active, max_active)),
+        ]
+    }
+
+    fn unlimited_schedule(concurrency_window: usize) -> ReadOnlyToolScheduleConfig {
+        ReadOnlyToolScheduleConfig {
+            concurrency_window,
+            priority_enabled: false,
+            low_priority_tool_names: std::collections::HashSet::new(),
+        }
+    }
+
+    async fn run_single_tool_through_scheduler(
+        tool_name: &str,
+        schedule: ReadOnlyToolScheduleConfig,
+        observer: &dyn Observer,
+    ) -> String {
+        // 10 minutes of simulated tool work: far past every deadline the
+        // scheduler used to impose (the deleted default was 30s).
+        let ledger_dir = TempDir::new().expect("test: temp dir should be creatable");
+        let adapter = scheduler_test_adapter(slow_tool_registry(600_000), &ledger_dir);
+        let calls = vec![ParsedToolCall {
+            name: tool_name.to_string(),
+            arguments: serde_json::json!({"value": "x"}),
+        }];
+        let mut results =
+            execute_tools_with_service(&calls, &[], &adapter, schedule, None, ChatMode::default(), observer)
+                .await
+                .expect("scheduler should complete without error");
+        assert_eq!(results.len(), 1, "one call in, one result out");
+        results.remove(0)
+    }
+
+    /// Core evidence for the timeout/concurrency decoupling.
+    ///
+    /// Before the change the two lanes disagreed: the parallel read-only batch
+    /// wrapped every call in `tokio::time::timeout(read_only_tool_timeout_secs)`
+    /// while the serial lane passed `None`. Turning parallelism off therefore
+    /// also turned the timeout off — the timeout rode on the concurrency switch.
+    ///
+    /// Now both lanes hand `None` as the deadline, so a tool that runs for ten
+    /// simulated minutes returns its real output on either lane, and the two
+    /// lanes produce byte-identical results.
+    ///
+    /// Mutation check: restoring `Some(timeout)` on either lane in
+    /// `execute_tools_with_service` turns this test red.
+    #[tokio::test(start_paused = true)]
+    async fn parallel_and_serial_lanes_agree_that_tools_have_no_timeout() {
+        let observer = SchedulerEventObserver::default();
+
+        // `file_read` is read-only -> parallel batch lane.
+        let parallel_lane = run_single_tool_through_scheduler("file_read", unlimited_schedule(2), &observer).await;
+        // `shell` is stateful -> serial lane.
+        let serial_lane = run_single_tool_through_scheduler("shell", unlimited_schedule(2), &observer).await;
+
+        assert!(
+            !parallel_lane.contains("timed out"),
+            "parallel lane must not impose a deadline, got: {parallel_lane}"
+        );
+        assert!(
+            !serial_lane.contains("timed out"),
+            "serial lane must not impose a deadline, got: {serial_lane}"
+        );
+        assert_eq!(
+            parallel_lane, serial_lane,
+            "the two lanes must be indistinguishable: a tool's outcome cannot depend on which lane ran it"
+        );
+    }
+
+    /// No scheduler configuration can bring back a deadline, and none can push
+    /// read-only calls off the parallel lane. The schedule struct only carries
+    /// a window size and the priority ordering knobs; every combination of them
+    /// must still run both lanes deadline-free and identically.
+    #[tokio::test(start_paused = true)]
+    async fn no_schedule_config_can_reintroduce_a_timeout_or_a_serial_fallback() {
+        for window in [0_usize, 1, 2, 64] {
+            for priority_enabled in [false, true] {
+                let schedule = ReadOnlyToolScheduleConfig {
+                    concurrency_window: window,
+                    priority_enabled,
+                    low_priority_tool_names: ["file_read".to_string(), "shell".to_string()].into_iter().collect(),
+                };
+                let observer = SchedulerEventObserver::default();
+                let parallel_lane = run_single_tool_through_scheduler("file_read", schedule.clone(), &observer).await;
+                let serial_lane = run_single_tool_through_scheduler("shell", schedule, &observer).await;
+
+                assert!(
+                    !parallel_lane.contains("timed out") && !serial_lane.contains("timed out"),
+                    "window={window} priority={priority_enabled} must stay deadline-free"
+                );
+                assert_eq!(
+                    parallel_lane, serial_lane,
+                    "window={window} priority={priority_enabled} must keep both lanes identical"
+                );
+
+                // The read-only call always takes the batch lane: a ToolBatch
+                // event is proof the parallel path ran, and no configuration
+                // suppresses it.
+                let events = observer
+                    .batch_events
+                    .lock()
+                    .expect("batch events lock should be valid")
+                    .clone();
+                assert_eq!(
+                    events.len(),
+                    1,
+                    "window={window} priority={priority_enabled}: read-only calls must always batch"
+                );
+                assert!(matches!(
+                    events.first(),
+                    Some(ObserverEvent::ToolBatch { batch_size: 1, .. })
+                ));
+            }
+        }
+    }
+
+    /// Read-only calls in one iteration still overlap — deleting the rollout
+    /// gate removed the ability to *disable* concurrency, not concurrency
+    /// itself.
+    #[tokio::test]
+    async fn read_only_calls_still_run_concurrently_without_any_rollout_gate() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
+            "file_read",
+            120,
+            Arc::clone(&active),
+            Arc::clone(&max_active),
+        ))];
+        let ledger_dir = TempDir::new().expect("test: temp dir should be creatable");
+        let adapter = scheduler_test_adapter(tools, &ledger_dir);
         let calls = vec![
             ParsedToolCall {
                 name: "file_read".to_string(),
-                arguments: serde_json::json!({"value": "1"}),
+                arguments: serde_json::json!({"value": "a"}),
             },
             ParsedToolCall {
                 name: "file_read".to_string(),
-                arguments: serde_json::json!({"value": "2"}),
-            },
-            ParsedToolCall {
-                name: "shell".to_string(),
-                arguments: serde_json::json!({}),
-            },
-            ParsedToolCall {
-                name: "file_read".to_string(),
-                arguments: serde_json::json!({"value": "3"}),
+                arguments: serde_json::json!({"value": "b"}),
             },
         ];
-
-        let _ = execute_tools_with_policy(
+        let observer = SchedulerEventObserver::default();
+        let results = execute_tools_with_service(
             &calls,
-            &tools_registry,
-            &observer,
-            None,
-            "cli",
-            ReadOnlyToolScheduleConfig {
-                parallel_enabled: true,
-                concurrency_window: 2,
-                timeout_secs: 0,
-                priority_enabled: false,
-                low_priority_tool_names: std::collections::HashSet::new(),
-                rollout_stage: "stage_a".to_string(),
-                kill_switch_applied: false,
-                auto_rollback_enabled: true,
-                rollback_timeout_rate_threshold: 0.10,
-                rollback_cancel_rate_threshold: 1.0,
-                rollback_error_rate_threshold: 1.0,
-            },
-            None,
+            &[],
+            &adapter,
+            unlimited_schedule(2),
             None,
             ChatMode::default(),
-            None,
+            &observer,
         )
         .await
-        .expect("scheduler should complete with rollback");
+        .expect("scheduler should complete without error");
 
-        let events = observer
-            .batch_events
-            .lock()
-            .expect("batch events lock should be valid")
-            .clone();
+        assert_eq!(results.len(), 2);
         assert_eq!(
-            events.len(),
-            1,
-            "rollback should force subsequent read-only calls into serial lane"
+            max_active.load(Ordering::SeqCst),
+            2,
+            "both read-only calls must be in flight at the same time"
         );
-        assert!(matches!(events[0], ObserverEvent::ToolBatch { rollback: true, .. }));
     }
 
     #[tokio::test]
@@ -12649,12 +12382,9 @@ Let me check the result."#;
             "cli",
             &crate::config::MultimodalConfig::default(),
             4,
-            false,
             2,
-            30,
             false,
             Vec::new(),
-            ToolConcurrencyGovernanceConfig::default(),
             Some(&config),
             None,
             None,
@@ -12716,12 +12446,9 @@ Let me check the result."#;
             "cli",
             &crate::config::MultimodalConfig::default(),
             2,
-            false,
             2,
-            30,
             false,
             Vec::new(),
-            ToolConcurrencyGovernanceConfig::default(),
             Some(&config),
             None,
             None,
@@ -12793,12 +12520,9 @@ Let me check the result."#;
             "cli",
             &crate::config::MultimodalConfig::default(),
             4,
-            false,
             2,
-            30,
             false,
             Vec::new(),
-            ToolConcurrencyGovernanceConfig::default(),
             Some(&config),
             None,
             None,
@@ -13488,12 +13212,9 @@ Let me check the result."#;
                 "terminal",
                 &crate::config::MultimodalConfig::default(),
                 4,
-                false,
                 2,
-                30,
                 false,
                 Vec::new(),
-                ToolConcurrencyGovernanceConfig::default(),
                 None,
                 None,
                 None,
@@ -13591,12 +13312,9 @@ Let me check the result."#;
                 "telegram",
                 &crate::config::MultimodalConfig::default(),
                 4,
-                false,
                 2,
-                30,
                 false,
                 Vec::new(),
-                ToolConcurrencyGovernanceConfig::default(),
                 None,
                 None,
                 None,
@@ -13670,12 +13388,9 @@ Let me check the result."#;
                 "telegram",
                 &crate::config::MultimodalConfig::default(),
                 4,
-                false,
                 2,
-                30,
                 false,
                 Vec::new(),
-                ToolConcurrencyGovernanceConfig::default(),
                 None,
                 None,
                 None,

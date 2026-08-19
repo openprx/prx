@@ -374,10 +374,10 @@ struct TestAppStateOverrides {
 
 /// Build a minimal gateway router suitable for integration tests.
 /// This mirrors the structure from `run_gateway` but only includes the routes
-/// relevant to our tests (/health, /webhook, /api/*).
+/// relevant to our tests (/health, /webhook, /api/*). Like production, it has no
+/// request timeout: gateway requests may legitimately run for hours.
 fn build_test_router(state: AppState) -> Router {
     use axum::middleware;
-    use tower_http::timeout::TimeoutLayer;
 
     // Public routes with body limit (same as production)
     let limited_public_routes = Router::new()
@@ -395,10 +395,6 @@ fn build_test_router(state: AppState) -> Router {
         .merge(limited_public_routes)
         .nest("/api", api_routes)
         .with_state(state)
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(30),
-        ))
 }
 
 /// Minimal health handler for tests.

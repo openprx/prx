@@ -464,15 +464,11 @@ impl Agent {
         }
     }
 
+    /// Tool calls of a single iteration always run concurrently. There is no
+    /// switch that forces them back to serial: unbounded concurrency is the
+    /// runtime contract, and serialization used to be the only lane that also
+    /// dropped the execution deadline.
     async fn execute_tools(&self, calls: &[ParsedToolCall]) -> Vec<ToolExecutionResult> {
-        if !self.config.parallel_tools {
-            let mut results = Vec::with_capacity(calls.len());
-            for call in calls {
-                results.push(self.execute_tool_call(call).await);
-            }
-            return results;
-        }
-
         let futs: Vec<_> = calls.iter().map(|call| self.execute_tool_call(call)).collect();
         futures::future::join_all(futs).await
     }
@@ -1332,8 +1328,8 @@ mod tests {
                 .expect("memory creation should succeed with valid config"),
         );
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        // execute_tool_call is invoked directly below, so parallel_tools/config
-        // does not matter; mirror the minimal builder used by other unit tests.
+        // execute_tool_call is invoked directly below, so scheduling config does
+        // not matter; mirror the minimal builder used by other unit tests.
         let agent = Agent::builder()
             .provider(provider)
             .tools(vec![Box::new(ScopeEchoTool)])

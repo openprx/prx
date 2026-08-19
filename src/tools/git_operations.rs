@@ -646,15 +646,6 @@ impl Tool for GitOperationsTool {
             }
         }
 
-        // Record action for rate limiting
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: rate limit exceeded".into()),
-            });
-        }
-
         // Execute the requested operation
         match operation {
             "status" => self.git_status(args).await,

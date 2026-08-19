@@ -170,7 +170,7 @@ fn migrate_toml_key(root: &mut toml::Value, old: &[&str], new: &[&str]) {
     }
 }
 
-fn migrate_legacy_config_keys(root: &mut toml::Value) -> Result<()> {
+fn migrate_legacy_config_keys(root: &mut toml::Value, config_path: Option<&Path>) -> Result<()> {
     migrate_toml_key(
         root,
         &["http_request", "max_response_bytes"],
@@ -197,6 +197,12 @@ fn migrate_legacy_config_keys(root: &mut toml::Value) -> Result<()> {
             tracing::warn!(path = %path.join("."), "Ignoring removed module gate; capability availability is no longer switch-controlled");
         }
     }
+    // Retired keys are dropped *here*, before the unknown-path check below, so
+    // that a config written against an older prx keeps loading with a warning
+    // instead of failing to start. Only the paths on the published list are
+    // absorbed; every other unrecognised key still stops the load, because a
+    // typo must not inherit the leniency built for deliberate removals.
+    crate::config::deprecations::strip_deprecated_keys(root, config_path);
     prune_empty_toml_tables(root);
     Ok(())
 }
@@ -935,9 +941,6 @@ pub struct AgentConfig {
     /// Maximum conversation history messages retained per session. Default: `300`.
     #[serde(default = "default_agent_max_history_messages")]
     pub max_history_messages: usize,
-    /// Enable parallel tool execution within a single iteration. Default: `false`.
-    #[serde(default)]
-    pub parallel_tools: bool,
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
@@ -945,10 +948,6 @@ pub struct AgentConfig {
     /// Defaults to 2 to preserve existing scheduler behavior.
     #[serde(default = "default_read_only_tool_concurrency_window")]
     pub read_only_tool_concurrency_window: usize,
-    /// Timeout in seconds for each read-only tool call in a parallel batch.
-    /// Defaults to 30s to preserve existing scheduler behavior.
-    #[serde(default = "default_read_only_tool_timeout_secs")]
-    pub read_only_tool_timeout_secs: u64,
     /// Enables priority scheduling so foreground tool calls run before background batches.
     /// Defaults to false to preserve existing scheduler behavior.
     #[serde(default)]
@@ -956,31 +955,6 @@ pub struct AgentConfig {
     /// Tool names treated as low-priority when `priority_scheduling_enabled = true`.
     #[serde(default = "default_agent_low_priority_tools")]
     pub low_priority_tools: Vec<String>,
-    /// Global kill switch. When enabled, forces tool scheduling to serial mode.
-    #[serde(default)]
-    pub concurrency_kill_switch_force_serial: bool,
-    /// Rollout stage for read-only parallel scheduling.
-    /// Allowed values: `off`, `stage_a`, `stage_b`, `stage_c`, `full`.
-    #[serde(default = "default_concurrency_rollout_stage")]
-    pub concurrency_rollout_stage: String,
-    /// Optional rollout sample percentage (0-100). When zero, stage defaults apply.
-    #[serde(default)]
-    pub concurrency_rollout_sample_percent: u8,
-    /// Optional channel allowlist for concurrency rollout. Empty means all channels.
-    #[serde(default)]
-    pub concurrency_rollout_channels: Vec<String>,
-    /// Enable automatic fallback to serial mode when rollback thresholds are exceeded.
-    #[serde(default = "default_true")]
-    pub concurrency_auto_rollback_enabled: bool,
-    /// Timeout rate threshold (0.0-1.0) for triggering serial fallback.
-    #[serde(default = "default_concurrency_rollback_threshold")]
-    pub concurrency_rollback_timeout_rate_threshold: f64,
-    /// Cancellation rate threshold (0.0-1.0) for triggering serial fallback.
-    #[serde(default = "default_concurrency_rollback_threshold")]
-    pub concurrency_rollback_cancel_rate_threshold: f64,
-    /// Error rate threshold (0.0-1.0) for triggering serial fallback.
-    #[serde(default = "default_concurrency_rollback_threshold")]
-    pub concurrency_rollback_error_rate_threshold: f64,
     /// Context compaction controls (`[agent.compaction]`).
     #[serde(default)]
     pub compaction: AgentCompactionConfig,
@@ -1134,15 +1108,6 @@ pub struct SessionsSpawnConfig {
     /// Remove worker workspace directory after process-mode completion.
     #[serde(default = "default_sessions_spawn_cleanup_on_complete")]
     pub cleanup_on_complete: bool,
-    /// Maximum concurrent running sub-agent processes/tasks globally.
-    #[serde(default = "default_sessions_spawn_max_concurrent")]
-    pub max_concurrent: usize,
-    /// Maximum nested spawn depth (`sessions_spawn` from a spawned sub-agent).
-    #[serde(default = "default_sessions_spawn_max_spawn_depth")]
-    pub max_spawn_depth: usize,
-    /// Maximum concurrent child runs allowed per parent session.
-    #[serde(default = "default_sessions_spawn_max_children_per_agent")]
-    pub max_children_per_agent: usize,
 }
 
 pub const HYBRID_PROCESS_MEMORY_UNAVAILABLE: &str = "sessions_spawn.process_memory_strategy='hybrid' is unavailable: the production merge consumer and merge/reject/ack/cleanup protocol do not exist; use 'shared_fabric' or 'isolated_private'";
@@ -1166,9 +1131,6 @@ impl Default for SessionsSpawnConfig {
             process_memory_strategy: default_sessions_spawn_process_memory_strategy(),
             worker_workspace_root: None,
             cleanup_on_complete: default_sessions_spawn_cleanup_on_complete(),
-            max_concurrent: default_sessions_spawn_max_concurrent(),
-            max_spawn_depth: default_sessions_spawn_max_spawn_depth(),
-            max_children_per_agent: default_sessions_spawn_max_children_per_agent(),
         }
     }
 }
@@ -1183,22 +1145,6 @@ fn default_sessions_spawn_process_memory_strategy() -> String {
 
 const fn default_sessions_spawn_cleanup_on_complete() -> bool {
     true
-}
-
-const fn default_sessions_spawn_max_concurrent() -> usize {
-    // 🔴 Anti fork-bomb safeguard (NOT removed). Behavior-limits Phase 1 raises
-    // 4 -> 64 to a high position. Never set to 0 (0 blocks all spawns).
-    64
-}
-
-const fn default_sessions_spawn_max_spawn_depth() -> usize {
-    // 🔴 Anti fork-bomb safeguard (NOT removed). Raised 2 -> 8. Never 0.
-    8
-}
-
-const fn default_sessions_spawn_max_children_per_agent() -> usize {
-    // 🔴 Anti fork-bomb safeguard (NOT removed). Raised 5 -> 32. Never 0.
-    32
 }
 
 /// Self-system experimental automation config (`[self_system]`).
@@ -1262,10 +1208,6 @@ const fn default_read_only_tool_concurrency_window() -> usize {
     2
 }
 
-const fn default_read_only_tool_timeout_secs() -> u64 {
-    30
-}
-
 fn default_agent_low_priority_tools() -> Vec<String> {
     // NOTE: `cron` is intentionally NOT in this list. Low-priority classification
     // is matched by tool NAME only (it cannot see the `action` argument), so
@@ -1276,14 +1218,6 @@ fn default_agent_low_priority_tools() -> Vec<String> {
         .into_iter()
         .map(str::to_string)
         .collect()
-}
-
-fn default_concurrency_rollout_stage() -> String {
-    "off".to_string()
-}
-
-const fn default_concurrency_rollback_threshold() -> f64 {
-    0.20
 }
 
 const fn default_agent_compaction_reserve_tokens() -> usize {
@@ -1304,20 +1238,10 @@ impl Default for AgentConfig {
             compact_context: false,
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
-            parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
             read_only_tool_concurrency_window: default_read_only_tool_concurrency_window(),
-            read_only_tool_timeout_secs: default_read_only_tool_timeout_secs(),
             priority_scheduling_enabled: false,
             low_priority_tools: default_agent_low_priority_tools(),
-            concurrency_kill_switch_force_serial: false,
-            concurrency_rollout_stage: default_concurrency_rollout_stage(),
-            concurrency_rollout_sample_percent: 0,
-            concurrency_rollout_channels: Vec::new(),
-            concurrency_auto_rollback_enabled: true,
-            concurrency_rollback_timeout_rate_threshold: default_concurrency_rollback_threshold(),
-            concurrency_rollback_cancel_rate_threshold: default_concurrency_rollback_threshold(),
-            concurrency_rollback_error_rate_threshold: default_concurrency_rollback_threshold(),
             compaction: AgentCompactionConfig::default(),
         }
     }
@@ -1812,9 +1736,6 @@ pub struct GatewayConfig {
     /// Maximum distinct idempotency keys retained in memory.
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
-    /// Request timeout in seconds for gateway HTTP handlers.
-    #[serde(default = "default_gateway_request_timeout_secs")]
-    pub request_timeout_secs: u64,
 }
 
 const fn default_gateway_port() -> u16 {
@@ -1849,10 +1770,6 @@ const fn default_gateway_idempotency_max_keys() -> usize {
     10_000
 }
 
-const fn default_gateway_request_timeout_secs() -> u64 {
-    60
-}
-
 const fn default_true() -> bool {
     true
 }
@@ -1872,7 +1789,6 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
-            request_timeout_secs: default_gateway_request_timeout_secs(),
         }
     }
 }
@@ -3021,9 +2937,6 @@ pub struct MemoryEventsConfig {
     /// Record tool/event payloads by default.
     #[serde(default)]
     pub record_tool_events: bool,
-    /// Retention hint for event cleanup. Enforcement is handled by hygiene.
-    #[serde(default = "default_memory_event_retention_days")]
-    pub retention_days: u32,
 }
 
 /// Semantic memory promotion configuration (`[memory.semantic]`).
@@ -3072,9 +2985,6 @@ const fn default_min_relevance_score() -> f64 {
 }
 const fn default_cache_size() -> usize {
     10_000
-}
-const fn default_memory_event_retention_days() -> u32 {
-    14
 }
 const fn default_semantic_auto_promote_min_chars() -> usize {
     30
@@ -3131,7 +3041,6 @@ impl Default for MemoryEventsConfig {
             record_user_messages: true,
             record_assistant_messages: true,
             record_tool_events: false,
-            retention_days: default_memory_event_retention_days(),
         }
     }
 }
@@ -3395,7 +3304,6 @@ impl Default for ScopeConfig {
 /// pipeline and the per-tool `auto_approve` / `always_ask` / `allowed_commands`
 /// lists have been removed; coarse risk presets are governed entirely by
 /// `level`. Fine-grained per-risk classification is deferred to Phase 2.
-pub const DEFAULT_AUTONOMY_MAX_ACTIONS_PER_HOUR: u32 = 20;
 pub const DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS: u32 = 500;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3406,10 +3314,6 @@ pub struct AutonomyConfig {
     pub workspace_only: bool,
     /// Explicit path denylist. Default includes system-critical paths.
     pub forbidden_paths: Vec<String>,
-    /// Maximum actions allowed per hour per policy. Default: `20`.
-    /// Note: `0` means "blocked", NOT "unlimited" — use `u32::MAX` only as an
-    /// explicit unrestricted operator choice.
-    pub max_actions_per_hour: u32,
     /// Maximum cost per day in cents per policy. Default: `500`.
     pub max_cost_per_day_cents: u32,
 
@@ -3448,7 +3352,6 @@ impl Default for AutonomyConfig {
                 "~/.aws".into(),
                 "~/.config".into(),
             ],
-            max_actions_per_hour: DEFAULT_AUTONOMY_MAX_ACTIONS_PER_HOUR,
             max_cost_per_day_cents: DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS,
             acknowledge_unrestricted_profile: false,
             scopes: ScopeConfig::default(),
@@ -5100,17 +5003,16 @@ fn default_interaction_notice_text() -> String {
         .to_string()
 }
 
-/// Security configuration for resource limits and audit logging.
+/// Security configuration for audit logging.
 ///
-/// The host-shell sandbox configuration and the former
-/// `[security.tool_policy]` pipeline were removed. Non-shell tool authorization
-/// remains driven by `[autonomy]`.
+/// The host-shell sandbox configuration, the former `[security.tool_policy]`
+/// pipeline and the `[security.resources]` command limits were removed: the
+/// first two had no pipeline behind them, and the limits named a per-command
+/// memory/CPU/subprocess ceiling this runtime never enforced and, being an
+/// unbounded runtime, will not. Non-shell tool authorization remains driven by
+/// `[autonomy]`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub struct SecurityConfig {
-    /// Resource limits
-    #[serde(default)]
-    pub resources: ResourceLimitsConfig,
-
     /// Audit logging configuration
     #[serde(default)]
     pub audit: AuditConfig,
@@ -5134,53 +5036,6 @@ impl Default for ToolTieringConfig {
         Self {
             always_include: Vec::new(),
             always_exclude: Vec::new(),
-        }
-    }
-}
-
-/// Resource limits for command execution
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ResourceLimitsConfig {
-    /// Maximum memory in MB per command
-    #[serde(default = "default_max_memory_mb")]
-    pub max_memory_mb: u32,
-
-    /// Maximum CPU time in seconds per command
-    #[serde(default = "default_max_cpu_time_seconds")]
-    pub max_cpu_time_seconds: u64,
-
-    /// Maximum number of subprocesses
-    #[serde(default = "default_max_subprocesses")]
-    pub max_subprocesses: u32,
-
-    /// Enable memory monitoring
-    #[serde(default = "default_memory_monitoring_enabled")]
-    pub memory_monitoring: bool,
-}
-
-const fn default_max_memory_mb() -> u32 {
-    512
-}
-
-const fn default_max_cpu_time_seconds() -> u64 {
-    60
-}
-
-const fn default_max_subprocesses() -> u32 {
-    10
-}
-
-const fn default_memory_monitoring_enabled() -> bool {
-    true
-}
-
-impl Default for ResourceLimitsConfig {
-    fn default() -> Self {
-        Self {
-            max_memory_mb: default_max_memory_mb(),
-            max_cpu_time_seconds: default_max_cpu_time_seconds(),
-            max_subprocesses: default_max_subprocesses(),
-            memory_monitoring: default_memory_monitoring_enabled(),
         }
     }
 }
@@ -5822,8 +5677,12 @@ pub(crate) async fn migrate_config_legacy_secrets(config: &Config) -> Result<()>
 }
 
 impl Config {
-    fn deserialize_merged(mut merged: toml::Value) -> Result<Self> {
-        migrate_legacy_config_keys(&mut merged)?;
+    /// Turn a merged TOML tree into a `Config`.
+    ///
+    /// `config_path` is only used to tell an operator which file and line a
+    /// retired key sits on; deserialization itself does not depend on it.
+    fn deserialize_merged(mut merged: toml::Value, config_path: Option<&Path>) -> Result<Self> {
+        migrate_legacy_config_keys(&mut merged, config_path)?;
 
         let mut unknown_paths = Vec::new();
         let config = serde_ignored::deserialize(merged.into_deserializer(), |path| {
@@ -5834,8 +5693,14 @@ impl Config {
         unknown_paths.sort();
         unknown_paths.dedup();
         if !unknown_paths.is_empty() {
+            // Deliberately removed keys were already absorbed with a warning
+            // above, so anything still here is a name this build has never
+            // known — almost always a typo. Say so, rather than implying the
+            // operator may have configured something that used to exist.
             anyhow::bail!(
-                "Unknown configuration path(s): {}. Remove misspelled or obsolete keys; configuration is never silently ignored.",
+                "Unknown configuration path(s): {}. These names are not recognised by this build \
+                 (keys removed by a prx upgrade are ignored with a warning instead, so this is most \
+                 likely a typo); configuration is never silently ignored.",
                 unknown_paths.join(", ")
             );
         }
@@ -5859,7 +5724,7 @@ impl Config {
 
     fn validate_stored_merged(merged: toml::Value, config_path: &Path, workspace_dir: PathBuf) -> Result<()> {
         let compaction_max_context_explicit = agent_compaction_max_context_tokens_present(&merged);
-        let mut config = Self::deserialize_merged(merged)?;
+        let mut config = Self::deserialize_merged(merged, Some(config_path))?;
         config.config_path = config_path.to_path_buf();
         config.workspace_dir = workspace_dir;
         config.agent.compaction.max_context_tokens_explicit = compaction_max_context_explicit;
@@ -5869,7 +5734,7 @@ impl Config {
     pub(crate) fn load_from_path(config_path: &Path, workspace_dir: PathBuf) -> Result<Self> {
         let merged = read_merged_toml_with_gate(config_path)?;
         let compaction_max_context_explicit = agent_compaction_max_context_tokens_present(&merged);
-        let mut config = Self::deserialize_merged(merged)?;
+        let mut config = Self::deserialize_merged(merged, Some(config_path))?;
         config.config_path = config_path.to_path_buf();
         config.workspace_dir = workspace_dir;
         config.agent.compaction.max_context_tokens_explicit = compaction_max_context_explicit;
@@ -6074,11 +5939,6 @@ impl Config {
             }
         }
 
-        // Autonomy
-        if self.autonomy.max_actions_per_hour == 0 {
-            anyhow::bail!("autonomy.max_actions_per_hour must be greater than 0");
-        }
-
         // Runtime. A zero-sized blocking pool cannot run any blocking work, so
         // every `spawn_blocking` would queue forever instead of failing fast.
         if let Some(max_blocking_threads) = self.runtime.max_blocking_threads {
@@ -6108,21 +5968,6 @@ impl Config {
         }
         if self.scheduler.claim_lease_secs < 3 {
             anyhow::bail!("scheduler.claim_lease_secs must be at least 3");
-        }
-        if !matches!(
-            self.agent.concurrency_rollout_stage.as_str(),
-            "off" | "stage_a" | "stage_b" | "stage_c" | "full"
-        ) {
-            anyhow::bail!("agent.concurrency_rollout_stage must be one of: off|stage_a|stage_b|stage_c|full");
-        }
-        if !(0.0..=1.0).contains(&self.agent.concurrency_rollback_timeout_rate_threshold) {
-            anyhow::bail!("agent.concurrency_rollback_timeout_rate_threshold must be in [0,1]");
-        }
-        if !(0.0..=1.0).contains(&self.agent.concurrency_rollback_cancel_rate_threshold) {
-            anyhow::bail!("agent.concurrency_rollback_cancel_rate_threshold must be in [0,1]");
-        }
-        if !(0.0..=1.0).contains(&self.agent.concurrency_rollback_error_rate_threshold) {
-            anyhow::bail!("agent.concurrency_rollback_error_rate_threshold must be in [0,1]");
         }
 
         // Model routes
@@ -6531,7 +6376,6 @@ mod tests {
         assert_eq!(a.level, AutonomyLevel::Full);
         assert!(a.workspace_only);
         assert!(a.forbidden_paths.contains(&"/etc".to_string()));
-        assert_eq!(a.max_actions_per_hour, DEFAULT_AUTONOMY_MAX_ACTIONS_PER_HOUR);
         assert_eq!(a.max_cost_per_day_cents, DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS);
     }
 
@@ -6542,7 +6386,6 @@ mod tests {
 level = "full"
 workspace_only = false
 forbidden_paths = []
-max_actions_per_hour = 100
 max_cost_per_day_cents = 500
 
 [sandbox]
@@ -6608,7 +6451,6 @@ default_temperature = 0.7
         assert!(m.events.record_user_messages);
         assert!(m.events.record_assistant_messages);
         assert!(!m.events.record_tool_events);
-        assert_eq!(m.events.retention_days, 14);
         assert!(m.semantic.auto_promote_user_messages);
         assert!(!m.semantic.auto_promote_assistant_messages);
         assert_eq!(m.semantic.min_chars, 30);
@@ -6632,7 +6474,6 @@ auto_save = true
 record_user_messages = true
 record_assistant_messages = false
 record_tool_events = true
-retention_days = 3
 
 [semantic]
 auto_promote_user_messages = false
@@ -6645,7 +6486,6 @@ min_chars = 12
         assert!(parsed.should_record_user_message_event());
         assert!(!parsed.should_record_assistant_message_event());
         assert!(parsed.events.record_tool_events);
-        assert_eq!(parsed.events.retention_days, 3);
         assert!(
             !parsed.should_auto_promote_user_message(
                 "this user message is long enough but semantic promotion is disabled"
@@ -6765,7 +6605,6 @@ min_chars = 12
                 level: AutonomyLevel::Full,
                 workspace_only: false,
                 forbidden_paths: vec!["/secret".into()],
-                max_actions_per_hour: 50,
                 max_cost_per_day_cents: 1000,
                 scopes: ScopeConfig::default(),
                 ..AutonomyConfig::default()
@@ -6988,20 +6827,10 @@ reasoning_enabled = false
         // Behavior-limits Phase 1: raised defaults (200 / 300).
         assert_eq!(cfg.max_tool_iterations, 200);
         assert_eq!(cfg.max_history_messages, 300);
-        assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
         assert_eq!(cfg.read_only_tool_concurrency_window, 2);
-        assert_eq!(cfg.read_only_tool_timeout_secs, 30);
         assert!(!cfg.priority_scheduling_enabled);
         assert_eq!(cfg.low_priority_tools, default_agent_low_priority_tools());
-        assert!(!cfg.concurrency_kill_switch_force_serial);
-        assert_eq!(cfg.concurrency_rollout_stage, "off");
-        assert_eq!(cfg.concurrency_rollout_sample_percent, 0);
-        assert!(cfg.concurrency_rollout_channels.is_empty());
-        assert!(cfg.concurrency_auto_rollback_enabled);
-        assert!((cfg.concurrency_rollback_timeout_rate_threshold - 0.2).abs() < f64::EPSILON);
-        assert!((cfg.concurrency_rollback_cancel_rate_threshold - 0.2).abs() < f64::EPSILON);
-        assert!((cfg.concurrency_rollback_error_rate_threshold - 0.2).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -7084,39 +6913,19 @@ default_temperature = 0.7
 compact_context = true
 max_tool_iterations = 20
 max_history_messages = 80
-parallel_tools = true
 tool_dispatcher = "xml"
 read_only_tool_concurrency_window = 4
-read_only_tool_timeout_secs = 45
 priority_scheduling_enabled = true
 low_priority_tools = ["sessions_spawn", "delegate"]
-concurrency_kill_switch_force_serial = false
-concurrency_rollout_stage = "stage_b"
-concurrency_rollout_sample_percent = 25
-concurrency_rollout_channels = ["telegram", "discord"]
-concurrency_auto_rollback_enabled = true
-concurrency_rollback_timeout_rate_threshold = 0.21
-concurrency_rollback_cancel_rate_threshold = 0.22
-concurrency_rollback_error_rate_threshold = 0.23
 "#;
         let parsed: Config = toml::from_str(raw).unwrap();
         assert!(parsed.agent.compact_context);
         assert_eq!(parsed.agent.max_tool_iterations, 20);
         assert_eq!(parsed.agent.max_history_messages, 80);
-        assert!(parsed.agent.parallel_tools);
         assert_eq!(parsed.agent.tool_dispatcher, "xml");
         assert_eq!(parsed.agent.read_only_tool_concurrency_window, 4);
-        assert_eq!(parsed.agent.read_only_tool_timeout_secs, 45);
         assert!(parsed.agent.priority_scheduling_enabled);
         assert_eq!(parsed.agent.low_priority_tools, vec!["sessions_spawn", "delegate"]);
-        assert!(!parsed.agent.concurrency_kill_switch_force_serial);
-        assert_eq!(parsed.agent.concurrency_rollout_stage, "stage_b");
-        assert_eq!(parsed.agent.concurrency_rollout_sample_percent, 25);
-        assert_eq!(parsed.agent.concurrency_rollout_channels, vec!["telegram", "discord"]);
-        assert!(parsed.agent.concurrency_auto_rollback_enabled);
-        assert!((parsed.agent.concurrency_rollback_timeout_rate_threshold - 0.21).abs() < f64::EPSILON);
-        assert!((parsed.agent.concurrency_rollback_cancel_rate_threshold - 0.22).abs() < f64::EPSILON);
-        assert!((parsed.agent.concurrency_rollback_error_rate_threshold - 0.23).abs() < f64::EPSILON);
     }
 
     #[tokio::test]
@@ -7238,6 +7047,240 @@ default_model = "single-file"
         let _ = fs::remove_dir_all(&dir).await;
     }
 
+    /// Every path on the retired list must genuinely be gone from the schema.
+    ///
+    /// This is the dangerous direction of the migration layer: listing a key
+    /// that still exists would make the loader silently discard a setting the
+    /// operator is relying on, which is exactly the "configuration is never
+    /// silently ignored" promise the strict loader exists to keep. So each
+    /// listed path is planted into an otherwise-valid document and must come
+    /// back as unrecognised.
+    #[tokio::test]
+    async fn every_retired_key_is_actually_absent_from_the_schema() {
+        use crate::config::deprecations::{DEPRECATED_CONFIG_KEYS, DeprecatedShape};
+
+        for key in DEPRECATED_CONFIG_KEYS {
+            let mut document = toml::Value::try_from(Config::default()).expect("test: serialize default config");
+            let planted = match key.shape {
+                DeprecatedShape::Field => toml::Value::Integer(1),
+                DeprecatedShape::Section => {
+                    let mut table = toml::map::Map::new();
+                    table.insert("planted".to_string(), toml::Value::Integer(1));
+                    toml::Value::Table(table)
+                }
+            };
+            // The default document already has the parent tables, so an
+            // "if absent" insert is enough to plant the retired leaf.
+            assert!(
+                insert_toml_path_if_absent(&mut document, key.path, planted),
+                "test: could not plant {}",
+                key.path.join(".")
+            );
+
+            let mut unknown = Vec::new();
+            let _ignored: Result<Config, _> = serde_ignored::deserialize(document.into_deserializer(), |path| {
+                unknown.push(path.to_string());
+            });
+
+            let dotted = key.path.join(".");
+            assert!(
+                unknown.iter().any(|found| found.starts_with(&dotted)),
+                "{dotted} is on the retired list but the schema still accepts it; stripping it would silently \
+                 discard a live setting. Reported unknown paths: {unknown:?}"
+            );
+        }
+    }
+
+    /// A config written against an older prx must keep loading. Every key the
+    /// unbounded-runtime work removed is absorbed with a warning, and the
+    /// surviving keys in the same tables must still take effect — a migration
+    /// layer that quietly dropped its neighbours would be worse than the bail.
+    #[tokio::test]
+    async fn config_load_ignores_removed_keys_and_keeps_the_rest() {
+        let dir = std::env::temp_dir().join(format!("openprx_test_deprecated_keys_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let config_path = dir.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+default_temperature = 0.7
+default_model = "kept"
+
+[agent]
+max_tool_iterations = 150
+parallel_tools = true
+read_only_tool_timeout_secs = 30
+concurrency_rollout_stage = "stage_a"
+concurrency_rollout_channels = ["telegram"]
+concurrency_rollback_timeout_rate_threshold = 0.2
+
+[sessions_spawn]
+max_concurrent = 64
+max_spawn_depth = 8
+max_children_per_agent = 32
+process_memory_strategy = "isolated_private"
+
+[autonomy]
+level = "full"
+workspace_only = false
+forbidden_paths = []
+max_actions_per_hour = 4294967295
+max_cost_per_day_cents = 4294967295
+
+[gateway]
+port = 3120
+request_timeout_secs = 60
+
+[memory]
+backend = "sqlite"
+auto_save = true
+
+[memory.events]
+record_tool_events = true
+retention_days = 14
+
+[security.resources]
+max_memory_mb = 512
+max_cpu_time_seconds = 300
+max_subprocesses = 10
+
+[security.audit]
+max_size_mb = 42
+"#,
+        )
+        .await
+        .unwrap();
+
+        let loaded = Config::load_from_path(&config_path, dir.join("workspace"))
+            .expect("a config carrying removed keys must still load");
+
+        // Neighbouring keys in every touched table survived the strip.
+        assert_eq!(loaded.default_model.as_deref(), Some("kept"));
+        assert_eq!(loaded.agent.max_tool_iterations, 150);
+        assert_eq!(loaded.sessions_spawn.process_memory_strategy, "isolated_private");
+        assert_eq!(loaded.autonomy.max_cost_per_day_cents, 4_294_967_295);
+        assert_eq!(loaded.gateway.port, 3120);
+        assert!(loaded.memory.events.record_tool_events);
+        assert_eq!(loaded.security.audit.max_size_mb, 42);
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    /// A whole retired table, not just a leaf, must be absorbed — including the
+    /// case where stripping it leaves its parent empty.
+    #[tokio::test]
+    async fn config_load_ignores_a_removed_section_on_its_own() {
+        let dir = std::env::temp_dir().join(format!("openprx_test_deprecated_section_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let config_path = dir.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+default_temperature = 0.7
+default_model = "section-only"
+
+[security]
+[security.resources]
+max_memory_mb = 512
+max_cpu_time_seconds = 300
+max_subprocesses = 10
+memory_monitoring = true
+"#,
+        )
+        .await
+        .unwrap();
+
+        let loaded = Config::load_from_path(&config_path, dir.join("workspace"))
+            .expect("a lone removed section must not stop the load");
+        assert_eq!(loaded.default_model.as_deref(), Some("section-only"));
+        assert_eq!(loaded.security.audit.log_path, default_audit_log_path());
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    /// The leniency above is scoped to the published list. A misspelling that
+    /// merely *resembles* a retired key must still stop the load, or the
+    /// migration layer would have thrown away the strictness it was added to
+    /// protect.
+    #[tokio::test]
+    async fn config_load_still_rejects_a_misspelled_key() {
+        let dir = std::env::temp_dir().join(format!("openprx_test_typo_key_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let config_path = dir.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+default_temperature = 0.7
+
+[autonomy]
+level = "full"
+workspace_only = false
+forbidden_paths = []
+max_cost_per_day_cents = 500
+max_actions_per_hourr = 20
+"#,
+        )
+        .await
+        .unwrap();
+
+        let error =
+            Config::load_from_path(&config_path, dir.join("workspace")).expect_err("a typo must still be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("Unknown configuration path"),
+            "a typo must be reported as unknown, got: {message}"
+        );
+        assert!(
+            message.contains("autonomy.max_actions_per_hourr"),
+            "the message must name the offending path, got: {message}"
+        );
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    /// A retired key in a `config.d` fragment is the shape real deployments
+    /// actually have, and the fragment merge must not reintroduce it after the
+    /// main file has been cleaned.
+    #[tokio::test]
+    async fn config_load_ignores_removed_keys_inside_config_d_fragments() {
+        let dir = std::env::temp_dir().join(format!("openprx_test_deprecated_fragment_{}", uuid::Uuid::new_v4()));
+        let config_dir = dir.join("config.d");
+        fs::create_dir_all(&config_dir).await.unwrap();
+
+        fs::write(
+            dir.join("config.toml"),
+            "default_temperature = 0.7\ndefault_model = \"base\"\n",
+        )
+        .await
+        .unwrap();
+        fs::write(
+            config_dir.join("security.toml"),
+            r#"
+[autonomy]
+level = "full"
+workspace_only = false
+forbidden_paths = []
+max_actions_per_hour = 4294967295
+max_cost_per_day_cents = 4294967295
+
+[security]
+[security.resources]
+max_memory_mb = 512
+"#,
+        )
+        .await
+        .unwrap();
+
+        let loaded = Config::load_from_path(&dir.join("config.toml"), dir.join("workspace"))
+            .expect("a fragment carrying removed keys must still load");
+        assert_eq!(loaded.autonomy.max_cost_per_day_cents, 4_294_967_295);
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
     #[tokio::test]
     async fn config_load_from_path_merges_config_dir_and_replaces_arrays() {
         let dir = std::env::temp_dir().join(format!("openprx_test_config_merge_{}", uuid::Uuid::new_v4()));
@@ -7332,8 +7375,8 @@ model = "override-beta"
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
         // Keep test deterministic even if process env mutates proxy defaults elsewhere.
         config.proxy = ProxyConfig::default();
-        config.security.resources.max_cpu_time_seconds = 120;
-        config.autonomy.max_actions_per_hour = 42;
+        config.security.audit.max_size_mb = 120;
+        config.autonomy.max_cost_per_day_cents = 42;
         config.agents.insert(
             "worker".into(),
             DelegateAgentConfig {
@@ -8118,7 +8161,6 @@ channel_id = "C123"
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
-            request_timeout_secs: 45,
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
@@ -8132,7 +8174,6 @@ channel_id = "C123"
         assert_eq!(parsed.rate_limit_max_keys, 2048);
         assert_eq!(parsed.idempotency_ttl_secs, 600);
         assert_eq!(parsed.idempotency_max_keys, 4096);
-        assert_eq!(parsed.request_timeout_secs, 45);
     }
 
     #[test]
@@ -8704,7 +8745,6 @@ default_model = "legacy-model"
         assert!(!g.trust_forwarded_headers);
         assert_eq!(g.rate_limit_max_keys, 10_000);
         assert_eq!(g.idempotency_max_keys, 10_000);
-        assert_eq!(g.request_timeout_secs, 60);
     }
 
     #[test]

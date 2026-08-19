@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
-use crate::agent::loop_::{DocumentIngestRuntime, ScopeContext, ToolConcurrencyGovernanceConfig};
+use crate::agent::loop_::{DocumentIngestRuntime, ScopeContext};
 use crate::config::DelegateAgentConfig;
 use crate::hooks::HookManager;
 use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MessageEventScope};
@@ -1060,15 +1060,9 @@ impl DelegateTool {
                 "delegate",
                 &self.multimodal_config,
                 agent_config.max_iterations,
-                true,
                 2,
-                30,
                 false,
                 vec!["sessions_spawn".to_string(), "delegate".to_string(), "cron".to_string()],
-                ToolConcurrencyGovernanceConfig {
-                    rollout_stage: "full".to_string(),
-                    ..ToolConcurrencyGovernanceConfig::default()
-                },
                 Some(&resolved_compaction.config),
                 None,
                 None,
@@ -1557,21 +1551,6 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("read-only mode"));
-    }
-
-    #[tokio::test]
-    async fn delegation_blocked_when_rate_limited() {
-        let limited = Arc::new(SecurityPolicy {
-            max_actions_per_hour: 0,
-            ..SecurityPolicy::default()
-        });
-        let tool = DelegateTool::new(sample_agents(), None, limited);
-        let result = tool
-            .execute(json!({"agent": "researcher", "prompt": "test"}))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("Rate limit exceeded"));
     }
 
     #[tokio::test]

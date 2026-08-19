@@ -858,14 +858,6 @@ impl Tool for McpTool {
             });
         }
 
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: rate limit exceeded".into()),
-            });
-        }
-
         self.refresh_runtime_state().await;
 
         let (server_name, tool_name, arguments) = if name == MCP_ROOT_NAME {
@@ -1296,7 +1288,6 @@ mod tests {
     async fn readonly_blocks_execute() {
         let security = Arc::new(SecurityPolicy {
             autonomy: crate::security::AutonomyLevel::ReadOnly,
-            max_actions_per_hour: 1000,
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });

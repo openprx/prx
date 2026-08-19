@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Digest;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 pub const PERSISTED_APPROVAL_GRANT_TTL_SECS: i64 = 24 * 60 * 60;
 
@@ -1109,51 +1108,6 @@ pub fn resource_operation_hash(tool_name: &str, operation_name: &str) -> u64 {
     command_operation_hash(tool_name, operation_name)
 }
 
-/// Sliding-window action tracker for rate limiting.
-#[derive(Debug)]
-pub struct ActionTracker {
-    /// Timestamps of recent actions (kept within the last hour).
-    actions: Mutex<Vec<Instant>>,
-}
-
-impl ActionTracker {
-    pub const fn new() -> Self {
-        Self {
-            actions: Mutex::new(Vec::new()),
-        }
-    }
-
-    /// Record an action and return the current count within the window.
-    pub fn record(&self) -> usize {
-        let mut actions = self.actions.lock();
-        let cutoff = Instant::now()
-            .checked_sub(std::time::Duration::from_hours(1))
-            .unwrap_or_else(Instant::now);
-        actions.retain(|t| *t > cutoff);
-        actions.push(Instant::now());
-        actions.len()
-    }
-
-    /// Count of actions in the current window without recording.
-    pub fn count(&self) -> usize {
-        let mut actions = self.actions.lock();
-        let cutoff = Instant::now()
-            .checked_sub(std::time::Duration::from_hours(1))
-            .unwrap_or_else(Instant::now);
-        actions.retain(|t| *t > cutoff);
-        actions.len()
-    }
-}
-
-impl Clone for ActionTracker {
-    fn clone(&self) -> Self {
-        let actions = self.actions.lock();
-        Self {
-            actions: Mutex::new(actions.clone()),
-        }
-    }
-}
-
 /// Security policy enforced on all tool executions
 #[derive(Debug, Clone)]
 pub struct SecurityPolicy {
@@ -1161,9 +1115,7 @@ pub struct SecurityPolicy {
     pub workspace_dir: PathBuf,
     pub workspace_only: bool,
     pub forbidden_paths: Vec<String>,
-    pub max_actions_per_hour: u32,
     pub max_cost_per_day_cents: u32,
-    pub tracker: ActionTracker,
     /// Scope-based per-user/channel/chat_type tool access rules.
     pub scope_rules: Vec<crate::config::ScopeRule>,
     /// Default action when no scope rule matches: true = allow, false = deny.
@@ -1835,14 +1787,15 @@ impl SecurityPolicy {
     }
 
     // ── Tool Operation Gating ──────────────────────────────────────────────
-    // Read operations bypass autonomy and rate checks because they have
-    // no side effects. Act operations must pass both the autonomy gate
-    // (not read-only) and the sliding-window rate limiter.
+    // Read operations bypass the autonomy check because they have no side
+    // effects. Act operations must pass the autonomy gate (not read-only).
+    // There is no action budget: this runtime does not ration how much work an
+    // agent may do per unit of time.
 
     /// Enforce policy for a tool operation.
     ///
-    /// Read operations are always allowed by autonomy/rate gates.
-    /// Act operations require non-readonly autonomy and available action budget.
+    /// Read operations are always allowed. Act operations require non-readonly
+    /// autonomy.
     pub fn enforce_tool_operation(&self, operation: ToolOperation, operation_name: &str) -> Result<(), String> {
         match operation {
             ToolOperation::Read => Ok(()),
@@ -1856,25 +1809,9 @@ impl SecurityPolicy {
                     ));
                 }
 
-                if !self.record_action() {
-                    return Err("Rate limit exceeded: action budget exhausted".to_string());
-                }
-
                 Ok(())
             }
         }
-    }
-
-    /// Record an action and check if the rate limit has been exceeded.
-    /// Returns `true` if the action is allowed, `false` if rate-limited.
-    pub fn record_action(&self) -> bool {
-        let count = self.tracker.record();
-        count <= self.max_actions_per_hour as usize
-    }
-
-    /// Check if the rate limit would be exceeded without recording.
-    pub fn is_rate_limited(&self) -> bool {
-        self.tracker.count() >= self.max_actions_per_hour as usize
     }
 
     /// Build from config sections
@@ -1884,9 +1821,7 @@ impl SecurityPolicy {
             workspace_dir: workspace_dir.to_path_buf(),
             workspace_only: autonomy_config.workspace_only,
             forbidden_paths: autonomy_config.forbidden_paths.clone(),
-            max_actions_per_hour: autonomy_config.max_actions_per_hour,
             max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
-            tracker: ActionTracker::new(),
             scope_rules: autonomy_config.scopes.rules.clone(),
             scope_default_allow: autonomy_config.scopes.default.to_lowercase() != "deny",
             // Default audit config; callers that have the real `security.audit`
@@ -2144,16 +2079,16 @@ mod tests {
         assert!(err.contains("[REDACTED]"));
     }
 
+    /// Autonomy is the only gate on an Act operation. Nothing rations how many
+    /// of them may run per unit of time, so a policy that permits acting at all
+    /// permits acting repeatedly.
     #[test]
-    fn enforce_tool_operation_act_uses_rate_budget() {
-        let p = SecurityPolicy {
-            max_actions_per_hour: 0,
-            ..default_policy()
-        };
-        let err = p
-            .enforce_tool_operation(ToolOperation::Act, "memory_store")
-            .unwrap_err();
-        assert!(err.contains("Rate limit exceeded"));
+    fn enforce_tool_operation_act_is_not_rationed() {
+        let p = default_policy();
+        for _ in 0..64 {
+            p.enforce_tool_operation(ToolOperation::Act, "memory_store")
+                .expect("test: an Act operation must never be refused for volume");
+        }
     }
 
     #[test]
@@ -3508,7 +3443,6 @@ mod tests {
             level: AutonomyLevel::Full,
             workspace_only: false,
             forbidden_paths: vec!["/secret".into()],
-            max_actions_per_hour: 100,
             max_cost_per_day_cents: 1000,
             ..crate::config::AutonomyConfig::default()
         };
@@ -3520,7 +3454,6 @@ mod tests {
         assert_eq!(policy.autonomy, AutonomyLevel::Full);
         assert!(!policy.workspace_only);
         assert_eq!(policy.forbidden_paths, vec!["/secret"]);
-        assert_eq!(policy.max_actions_per_hour, 100);
         assert_eq!(policy.max_cost_per_day_cents, 1000);
         assert_eq!(policy.workspace_dir, PathBuf::from("/tmp/test-workspace"));
     }
@@ -3536,73 +3469,7 @@ mod tests {
         assert!(!p.forbidden_paths.is_empty());
         assert_eq!(p.workspace_only, autonomy.workspace_only);
         assert_eq!(p.forbidden_paths, autonomy.forbidden_paths);
-        assert_eq!(p.max_actions_per_hour, autonomy.max_actions_per_hour);
         assert_eq!(p.max_cost_per_day_cents, autonomy.max_cost_per_day_cents);
-    }
-
-    // ── ActionTracker / rate limiting ───────────────────────
-
-    #[test]
-    fn action_tracker_starts_at_zero() {
-        let tracker = ActionTracker::new();
-        assert_eq!(tracker.count(), 0);
-    }
-
-    #[test]
-    fn action_tracker_records_actions() {
-        let tracker = ActionTracker::new();
-        assert_eq!(tracker.record(), 1);
-        assert_eq!(tracker.record(), 2);
-        assert_eq!(tracker.record(), 3);
-        assert_eq!(tracker.count(), 3);
-    }
-
-    #[test]
-    fn record_action_allows_within_limit() {
-        let p = SecurityPolicy {
-            max_actions_per_hour: 5,
-            ..SecurityPolicy::default()
-        };
-        for _ in 0..5 {
-            assert!(p.record_action(), "should allow actions within limit");
-        }
-    }
-
-    #[test]
-    fn record_action_blocks_over_limit() {
-        let p = SecurityPolicy {
-            max_actions_per_hour: 3,
-            ..SecurityPolicy::default()
-        };
-        assert!(p.record_action()); // 1
-        assert!(p.record_action()); // 2
-        assert!(p.record_action()); // 3
-        assert!(!p.record_action()); // 4 — over limit
-    }
-
-    #[test]
-    fn is_rate_limited_reflects_count() {
-        let p = SecurityPolicy {
-            max_actions_per_hour: 2,
-            ..SecurityPolicy::default()
-        };
-        assert!(!p.is_rate_limited());
-        p.record_action();
-        assert!(!p.is_rate_limited());
-        p.record_action();
-        assert!(p.is_rate_limited());
-    }
-
-    #[test]
-    fn action_tracker_clone_is_independent() {
-        let tracker = ActionTracker::new();
-        tracker.record();
-        tracker.record();
-        let cloned = tracker.clone();
-        assert_eq!(cloned.count(), 2);
-        tracker.record();
-        assert_eq!(tracker.count(), 3);
-        assert_eq!(cloned.count(), 2); // clone is independent
     }
 
     // ── Edge cases: command injection ────────────────────────
@@ -3825,39 +3692,6 @@ mod tests {
         assert!(!p.is_path_allowed("/var/run/docker.sock"));
     }
 
-    // ── Edge cases: rate limiter boundary ────────────────────
-
-    #[test]
-    fn rate_limit_exactly_at_boundary() {
-        let p = SecurityPolicy {
-            max_actions_per_hour: 1,
-            ..SecurityPolicy::default()
-        };
-        assert!(p.record_action()); // 1 — exactly at limit
-        assert!(!p.record_action()); // 2 — over
-        assert!(!p.record_action()); // 3 — still over
-    }
-
-    #[test]
-    fn rate_limit_zero_blocks_everything() {
-        let p = SecurityPolicy {
-            max_actions_per_hour: 0,
-            ..SecurityPolicy::default()
-        };
-        assert!(!p.record_action());
-    }
-
-    #[test]
-    fn rate_limit_high_allows_many() {
-        let p = SecurityPolicy {
-            max_actions_per_hour: 10000,
-            ..SecurityPolicy::default()
-        };
-        for _ in 0..100 {
-            assert!(p.record_action());
-        }
-    }
-
     // ── Edge cases: autonomy + command combos ────────────────
 
     #[test]
@@ -4048,24 +3882,6 @@ mod tests {
         assert!(!policy.is_tool_allowed("shell", "uuid:alice", "signal", "group"));
         // shell allowed in direct
         assert!(policy.is_tool_allowed("shell", "uuid:alice", "signal", "direct"));
-    }
-
-    // ── Edge cases: from_config preserves tracker ────────────
-
-    #[test]
-    fn from_config_creates_fresh_tracker() {
-        let autonomy_config = crate::config::AutonomyConfig {
-            level: AutonomyLevel::Full,
-            workspace_only: false,
-            forbidden_paths: vec![],
-            max_actions_per_hour: 10,
-            max_cost_per_day_cents: 100,
-            ..crate::config::AutonomyConfig::default()
-        };
-        let workspace = PathBuf::from("/tmp/test");
-        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
-        assert_eq!(policy.tracker.count(), 0);
-        assert!(!policy.is_rate_limited());
     }
 
     // ══════════════════════════════════════════════════════════

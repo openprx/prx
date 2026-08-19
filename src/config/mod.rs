@@ -1,3 +1,4 @@
+pub(crate) mod deprecations;
 pub mod files;
 pub mod generation;
 pub mod hotreload;
@@ -23,11 +24,11 @@ pub use schema::{
     MemoryEventsConfig, MemorySemanticConfig, MemoryWebhookConfig, ModelRouteConfig, MultimodalConfig,
     NextcloudTalkConfig, NodeServerConfig, NodesConfig, ObservabilityConfig, OllamaProviderConfig, OsPagingConfig,
     ProvidersConfig, ProxyConfig, ProxyScope, QueryClassificationConfig, ReliabilityConfig, RemoteNodeConfig,
-    ResourceLimitsConfig, RetrievalInjectionRole, RouterConfig, RouterModelConfig, RuntimeConfig, SchedulerConfig,
-    ScopeConfig, ScopeRule, SecretsConfig, SecurityConfig, SelfSystemConfig, SessionsSpawnConfig, SkillsConfig,
-    SlackConfig, SmartGroupConfig, StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode,
-    TaskRoutingConfig, TaskRoutingIntentConfig, TaskRoutingRule, TelegramConfig, ToolTieringConfig, TunnelConfig,
-    UserPolicyConfig, WacliConfig, WebSearchConfig, WebhookConfig, WhatsAppConfig, apply_runtime_proxy_to_builder,
+    RetrievalInjectionRole, RouterConfig, RouterModelConfig, RuntimeConfig, SchedulerConfig, ScopeConfig, ScopeRule,
+    SecretsConfig, SecurityConfig, SelfSystemConfig, SessionsSpawnConfig, SkillsConfig, SlackConfig, SmartGroupConfig,
+    StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode, TaskRoutingConfig,
+    TaskRoutingIntentConfig, TaskRoutingRule, TelegramConfig, ToolTieringConfig, TunnelConfig, UserPolicyConfig,
+    WacliConfig, WebSearchConfig, WebhookConfig, WhatsAppConfig, apply_runtime_proxy_to_builder,
     bootstrap_max_blocking_threads, build_runtime_proxy_client, build_runtime_proxy_client_with_timeouts,
     runtime_proxy_config,
 };

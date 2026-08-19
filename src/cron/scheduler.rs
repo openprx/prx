@@ -427,14 +427,6 @@ async fn run_agent_job(
     if !security.can_act() {
         return (false, "blocked by security policy: autonomy is read-only".to_string());
     }
-
-    if security.is_rate_limited() {
-        return (false, "blocked by security policy: rate limit exceeded".to_string());
-    }
-
-    if !security.record_action() {
-        return (false, "blocked by security policy: action budget exhausted".to_string());
-    }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
@@ -1167,10 +1159,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_job_command_does_not_reapply_rate_limit() {
+    async fn run_job_command_executes_a_shell_job() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.autonomy.max_actions_per_hour = 0;
+        let config = test_config(&tmp).await;
         let job = test_job("echo should-run");
 
         let (success, output) = run_job_command(&config, &job).await;
@@ -1242,22 +1233,6 @@ mod tests {
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("read-only"));
-    }
-
-    #[tokio::test]
-    async fn run_agent_job_blocks_rate_limited() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.autonomy.max_actions_per_hour = 0;
-        let mut job = test_job("");
-        job.job_type = JobType::Agent;
-        job.prompt = Some("Say hello".into());
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-
-        let (success, output) = run_agent_job(&config, &security, &job, None).await;
-        assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("rate limit exceeded"));
     }
 
     #[tokio::test]

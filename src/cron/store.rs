@@ -1962,8 +1962,11 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&mut Connection) -> Result
     let mut conn =
         Connection::open(&db_path).with_context(|| format!("Failed to open cron DB: {}", db_path.display()))?;
 
-    // Avoid SQLITE_BUSY under concurrent scheduler + CLI access
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    // Concurrent scheduler + CLI access must queue behind the database lock,
+    // never be turned into an error by it: the busy *handler* retries for as
+    // long as the lock is held (warning periodically) where a `busy_timeout`
+    // would surface `SQLITE_BUSY` the moment it expired.
+    crate::runtime::sqlite_pool::install_busy_handler(&conn)?;
 
     conn.execute_batch(
         "PRAGMA foreign_keys = ON;
@@ -2598,7 +2601,6 @@ mod tests {
         .unwrap()
         .unwrap();
         with_connection(&config, |blocker| {
-            blocker.busy_timeout(std::time::Duration::from_secs(5))?;
             let blocker_tx = blocker.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let worker_config = config.clone();
             let worker_job = job.clone();
@@ -2626,6 +2628,71 @@ mod tests {
         })
         .unwrap();
         assert!(list_runs(&config, &job.id, 10).unwrap().is_empty());
+    }
+
+    /// A cron write that finds the database locked must wait for the lock, not
+    /// give up on it. The lock is held here for longer than the 5 s
+    /// `busy_timeout` this store used to carry, so the old behaviour would have
+    /// surfaced `SQLITE_BUSY` well before the holder let go.
+    ///
+    /// Waiting without end is only defensible while it is visible, so the
+    /// periodic warning is asserted too: without it this would be an invisible
+    /// hang rather than an observable queue.
+    #[test]
+    fn cron_write_waits_past_the_old_five_second_deadline_and_warns() {
+        /// How long the competing connection keeps the write lock. Comfortably
+        /// past the 5 s deadline the store used to give up at.
+        const HELD_FOR: std::time::Duration = std::time::Duration::from_secs(7);
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        // Creates the schema, so the blocked write below contends for the write
+        // lock rather than for table creation.
+        add_job(&config, "*/5 * * * *", "echo seed").unwrap();
+
+        let db_path = config.workspace_dir.join("cron").join("jobs.db");
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            // No busy handler: this connection stands in for the other process
+            // and takes the lock immediately.
+            let conn = Connection::open(&db_path).expect("test: holder connection");
+            conn.execute_batch("BEGIN IMMEDIATE; UPDATE cron_jobs SET last_output = 'held';")
+                .expect("test: hold the write lock");
+            locked_tx.send(()).expect("test: report lock held");
+            std::thread::sleep(HELD_FOR);
+            conn.execute_batch("COMMIT").expect("test: release the write lock");
+        });
+        locked_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("test: the holder must take the lock");
+
+        // Runs on this thread so the busy handler's warnings land in this
+        // thread's captured subscriber.
+        let started = std::time::Instant::now();
+        let (added, logs) = crate::runtime::sqlite_pool::log_capture::capturing_logs(|| {
+            add_job(&config, "*/7 * * * *", "echo blocked")
+        });
+        let waited = started.elapsed();
+        holder.join().expect("test: holder thread");
+
+        assert!(
+            added.is_ok(),
+            "a held lock must delay the cron write, never fail it: {:?}",
+            added.err()
+        );
+        assert!(
+            waited >= std::time::Duration::from_secs(6),
+            "the write must have waited past the old 5 s deadline, waited {waited:?}"
+        );
+        assert!(
+            logs.contains("locked by another process"),
+            "an unbounded wait must announce itself; no warning was emitted: {logs}"
+        );
+        assert_eq!(
+            list_jobs(&config).unwrap().len(),
+            2,
+            "the delayed write must land once the lock is released"
+        );
     }
 
     #[test]

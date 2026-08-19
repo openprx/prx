@@ -388,7 +388,6 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             println!("Security:");
             println!("  Autonomy level:    {:?}", config.autonomy.level);
             println!("  Workspace only:    {}", config.autonomy.workspace_only);
-            println!("  Max actions/hour:  {}", config.autonomy.max_actions_per_hour);
             println!(
                 "  Max cost/day:      ${:.2}",
                 f64::from(config.autonomy.max_cost_per_day_cents) / 100.0

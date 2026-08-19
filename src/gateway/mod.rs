@@ -1,21 +1,35 @@
-//! Axum-based HTTP gateway with proper HTTP/1.1 compliance, body limits, and timeouts.
+//! Axum-based HTTP gateway with proper HTTP/1.1 compliance and body limits.
 //!
 //! This module replaces the raw TCP implementation with axum for:
 //! - Proper HTTP/1.1 parsing and compliance
 //! - Content-Length validation (handled by hyper)
 //! - Request body size limits (64KB max)
-//! - Request timeouts (configurable) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
+//!
+//! There is deliberately **no request timeout**. A gateway request can start an
+//! agent turn, and an agent turn has no legitimate upper bound — research runs,
+//! builds, and multi-hour tool chains are ordinary work here, not pathology. A
+//! wall-clock cap on the outer request could only ever cut such a turn off
+//! mid-flight, and it did: the former 60s `TimeoutLayer` sat *below* every inner
+//! bound it was supposed to contain (single LLM call, compaction, sub-agent), so
+//! it fired first and made failover and retry unreachable dead configuration.
+//!
+//! Work that can run long is therefore submitted as a detached job (see
+//! [`jobs`]) rather than executed inside the request future, which decouples its
+//! lifetime from the connection: a closed tab or a proxy hang-up no longer
+//! destroys a turn halfway through its side effects. Visibility and termination
+//! move to the operator instead of the clock — `prx tasks list` /
+//! `prx tasks kill`, `GET /api/runtime/tasks`, and `GET /api/jobs`.
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 mod api;
 mod compat;
+mod jobs;
 mod ui;
 
 use crate::agent::loop_::{
-    DocumentIngestRuntime, ToolConcurrencyGovernanceConfig, build_context_with_shared_events_and_scope,
-    run_tool_call_loop_traced,
+    DocumentIngestRuntime, build_context_with_shared_events_and_scope, run_tool_call_loop_traced,
 };
 use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, SignalChannel, WhatsAppChannel};
 use crate::config::Config;
@@ -48,7 +62,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tower_http::limit::RequestBodyLimitLayer;
-use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
@@ -380,9 +393,32 @@ struct IdempotencyClaim {
     key_digest: String,
     generation: u64,
     armed: bool,
+    /// Whether this attempt reached work that can produce observable side
+    /// effects — memory writes, tool calls, outbound messages.
+    ///
+    /// This is the only thing that decides whether a redelivery of the same key
+    /// is allowed to run again. Before dispatch a failed attempt is provably a
+    /// no-op, so re-running it is free. After dispatch nothing here knows how
+    /// far the attempt got, so re-running it could write the file, send the
+    /// message, or call the external API a second time. "Not known to be safe"
+    /// is therefore treated as "not retryable", never the other way round.
+    dispatched: bool,
 }
 
 impl IdempotencyClaim {
+    /// Record that the attempt is about to start doing observable work.
+    ///
+    /// Call this immediately before the first side effect, not at claim
+    /// acquisition: everything up to that point is what makes a retry safe.
+    const fn mark_dispatched(&mut self) {
+        self.dispatched = true;
+    }
+
+    /// Whether a redelivery of this key may re-execute the request.
+    const fn retry_eligible(&self) -> bool {
+        !self.dispatched
+    }
+
     fn succeed(mut self, replay: IdempotencyReplay, result_hash: String) -> bool {
         let transitioned = self
             .store
@@ -393,7 +429,8 @@ impl IdempotencyClaim {
         transitioned
     }
 
-    fn fail(mut self, retry_eligible: bool) -> bool {
+    fn fail(mut self) -> bool {
+        let retry_eligible = self.retry_eligible();
         let transitioned = self
             .store
             .fail_if_owner(&self.key_digest, self.generation, retry_eligible);
@@ -405,9 +442,22 @@ impl IdempotencyClaim {
 }
 
 impl Drop for IdempotencyClaim {
+    /// A claim that reaches `Drop` still armed was abandoned without anyone
+    /// deciding how the attempt ended: the task was cancelled or killed, a
+    /// caller took an early return path, or a panic unwound through it.
+    ///
+    /// This used to release the key as `retry_eligible = true`, which turned
+    /// every abandoned attempt into an invitation to run the whole request
+    /// again — while the original may still have been mid-flight, and after it
+    /// may already have written half its side effects. Abandonment carries no
+    /// information about how far the work got, so it resolves the same way any
+    /// other unknown does: dispatched work is not retryable.
     fn drop(&mut self) {
         if self.armed {
-            let _ = self.store.fail_if_owner(&self.key_digest, self.generation, true);
+            let retry_eligible = self.retry_eligible();
+            let _ = self
+                .store
+                .fail_if_owner(&self.key_digest, self.generation, retry_eligible);
         }
     }
 }
@@ -475,6 +525,7 @@ impl IdempotencyStore {
             key_digest,
             generation,
             armed: true,
+            dispatched: false,
         })
     }
 
@@ -1570,11 +1621,7 @@ pub async fn run_gateway(
         .merge(limited_public_routes)
         .nest("/api", api_routes)
         .merge(ui::router())
-        .with_state(state)
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(config.gateway.request_timeout_secs.max(1)),
-        ));
+        .with_state(state);
 
     // The listener is bound and every route/state dependency is now constructed.
     // This explicit acknowledgement, rather than supervisor task survival, is the
@@ -1977,21 +2024,9 @@ async fn run_gateway_chat_with_multimodal(
         "webhook",
         &multimodal_config,
         max_tool_iterations,
-        config_snapshot.agent.parallel_tools,
         config_snapshot.agent.read_only_tool_concurrency_window,
-        config_snapshot.agent.read_only_tool_timeout_secs,
         config_snapshot.agent.priority_scheduling_enabled,
         config_snapshot.agent.low_priority_tools.clone(),
-        ToolConcurrencyGovernanceConfig {
-            kill_switch_force_serial: config_snapshot.agent.concurrency_kill_switch_force_serial,
-            rollout_stage: config_snapshot.agent.concurrency_rollout_stage.clone(),
-            rollout_sample_percent: config_snapshot.agent.concurrency_rollout_sample_percent,
-            rollout_channels: config_snapshot.agent.concurrency_rollout_channels.clone(),
-            auto_rollback_enabled: config_snapshot.agent.concurrency_auto_rollback_enabled,
-            rollback_timeout_rate_threshold: config_snapshot.agent.concurrency_rollback_timeout_rate_threshold,
-            rollback_cancel_rate_threshold: config_snapshot.agent.concurrency_rollback_cancel_rate_threshold,
-            rollback_error_rate_threshold: config_snapshot.agent.concurrency_rollback_error_rate_threshold,
-        },
         None,
         None,                     // no cancellation token
         None,                     // no streaming delta sender
@@ -2125,9 +2160,11 @@ pub struct WebhookBody {
 async fn handle_webhook(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: axum::http::Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    let async_mode = jobs::wants_async(uri.query(), &headers);
     let bearer_token = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -2317,13 +2354,55 @@ async fn handle_webhook(
         }
     }
 
-    let message = &webhook_body.message;
+    // From here on the request may run for as long as the agent turn behind it
+    // needs, so it becomes a detached job rather than staying inside this
+    // handler's future. Two things follow from that. The turn survives a client
+    // that hangs up — a webhook sender's read timeout no longer destroys work
+    // that had already started writing memory and calling tools. And the
+    // idempotency claim travels *with* the work instead of with the connection,
+    // so a dropped connection can no longer release the claim underneath a run
+    // that is still going.
+    let job = jobs::submit(
+        jobs::KIND_WEBHOOK,
+        format!("gateway:webhook:{}", fabric_channel_label(&webhook_body)),
+        run_webhook_job(state, webhook_body, idempotency_digest, idempotency_claim),
+    );
+
+    if async_mode {
+        return (StatusCode::ACCEPTED, Json(job.accepted_body()));
+    }
+    job.wait().await.into_parts()
+}
+
+/// Label for the registry row of a webhook job, so `prx tasks list` shows which
+/// delivery target the run belongs to rather than a bare route name.
+fn fabric_channel_label(body: &WebhookBody) -> &str {
+    body.reply_target.as_deref().unwrap_or("anonymous")
+}
+
+/// The unbounded half of `POST /webhook`, run as a job.
+///
+/// Owns the idempotency claim for the whole run: the claim is only resolved by
+/// code that knows how the run ended, never by the request future going away.
+async fn run_webhook_job(
+    state: AppState,
+    webhook_body: WebhookBody,
+    idempotency_digest: Option<String>,
+    idempotency_claim: Option<IdempotencyClaim>,
+) -> Result<jobs::JobOutput, String> {
+    let mut idempotency_claim = idempotency_claim;
+    let message = webhook_body.message.as_str();
 
     if state.auto_save && should_autosave_gateway_message(webhook_body.reply_target.as_deref(), message) {
-        if let Err(error) =
+        if let Err((status, body)) =
             authorize_gateway_resource_mutation(&state, "gateway:webhook:autosave", ResourceRiskLevel::Low)
         {
-            return error;
+            return Ok(jobs::JobOutput::new(status, body.0));
+        }
+        // First observable side effect of the attempt: past this point a
+        // redelivery of the same key would duplicate it.
+        if let Some(claim) = idempotency_claim.as_mut() {
+            claim.mark_dispatched();
         }
         let key = webhook_memory_key(idempotency_digest.as_deref());
         let _ = state.mem.store(&key, message, MemoryCategory::Conversation, None).await;
@@ -2358,6 +2437,11 @@ async fn handle_webhook(
             .as_deref()
             .map(|digest| format!("gateway:webhook:{digest}")),
     );
+    // The turn records the inbound message and may call tools, so from here the
+    // attempt is not replayable by re-execution — only by the stored result.
+    if let Some(claim) = idempotency_claim.as_mut() {
+        claim.mark_dispatched();
+    }
     match run_gateway_chat_with_multimodal(&state, &provider_label, message, &fabric_ctx).await {
         Ok(response) => {
             let response_id = Uuid::new_v4();
@@ -2373,7 +2457,7 @@ async fn handle_webhook(
                     let err = serde_json::json!({
                         "error": "Request completed but its idempotency result could not be committed"
                     });
-                    return (StatusCode::SERVICE_UNAVAILABLE, Json(err));
+                    return Ok(jobs::JobOutput::new(StatusCode::SERVICE_UNAVAILABLE, err));
                 }
             }
             let duration = started_at.elapsed();
@@ -2404,11 +2488,11 @@ async fn handle_webhook(
                 "model": state.model,
                 "response_id": response_id.to_string(),
             });
-            (StatusCode::OK, Json(body))
+            Ok(jobs::JobOutput::new(StatusCode::OK, body))
         }
         Err(e) => {
             if let Some(claim) = idempotency_claim.take() {
-                let _ = claim.fail(true);
+                let _ = claim.fail();
             }
             let duration = started_at.elapsed();
             let sanitized = providers::sanitize_api_error(&e.to_string());
@@ -2443,7 +2527,7 @@ async fn handle_webhook(
 
             tracing::error!("Webhook provider error: {}", sanitized);
             let err = serde_json::json!({"error": "LLM request failed"});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+            Ok(jobs::JobOutput::new(StatusCode::INTERNAL_SERVER_ERROR, err))
         }
     }
 }
@@ -3016,20 +3100,6 @@ mod tests {
         assert!(after.fresh);
         assert_eq!(after.state, crate::health::ComponentState::Ready);
         assert_ne!(after.updated_at, before);
-    }
-
-    #[test]
-    fn security_timeout_uses_gateway_config_default() {
-        assert_eq!(crate::config::GatewayConfig::default().request_timeout_secs, 60);
-    }
-
-    #[test]
-    fn security_timeout_config_allows_override() {
-        let cfg = crate::config::GatewayConfig {
-            request_timeout_secs: 12,
-            ..crate::config::GatewayConfig::default()
-        };
-        assert_eq!(cfg.request_timeout_secs, 12);
     }
 
     #[test]
@@ -3782,6 +3852,12 @@ mod tests {
         }
     }
 
+    /// Webhook requests in these tests use the default synchronous mode; async
+    /// submission is opted into with `?mode=async`.
+    fn test_uri() -> axum::http::Uri {
+        axum::http::Uri::from_static("/webhook")
+    }
+
     fn test_connect_info() -> ConnectInfo<SocketAddr> {
         ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 30_300)))
     }
@@ -3832,6 +3908,7 @@ mod tests {
         let first = handle_webhook(
             State(state.clone()),
             test_connect_info(),
+            test_uri(),
             headers.clone(),
             Bytes::from_static(br#"{"message":"hello"}"#),
         )
@@ -3848,6 +3925,7 @@ mod tests {
         let second = handle_webhook(
             State(state),
             test_connect_info(),
+            test_uri(),
             headers,
             Bytes::from_static(br#"{"message":"hello"}"#),
         )
@@ -3865,8 +3943,16 @@ mod tests {
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
     }
 
+    /// A failed attempt is not handed back for re-execution.
+    ///
+    /// The turn behind a webhook can call tools before the provider error that
+    /// ends it, and nothing here can tell whether it did. `RetryUnavailable`
+    /// existed for exactly this case but was unreachable while every release
+    /// path set `retry_eligible = true`; refusing the redelivery is what makes
+    /// it reachable, and it is the only answer that cannot duplicate a side
+    /// effect the first attempt already committed.
     #[tokio::test]
-    async fn webhook_idempotency_failed_attempt_can_retry() {
+    async fn webhook_idempotency_failed_attempt_is_not_reexecuted() {
         let provider_impl = Arc::new(FailFirstProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let state = webhook_test_state(provider);
@@ -3876,6 +3962,7 @@ mod tests {
         let first = handle_webhook(
             State(state.clone()),
             test_connect_info(),
+            test_uri(),
             headers.clone(),
             Bytes::from_static(br#"{"message":"hello"}"#),
         )
@@ -3886,20 +3973,30 @@ mod tests {
         let retry = handle_webhook(
             State(state),
             test_connect_info(),
+            test_uri(),
             headers,
             Bytes::from_static(br#"{"message":"hello"}"#),
         )
         .await
         .into_response();
-        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(retry.status(), StatusCode::CONFLICT);
         let payload = retry.into_body().collect().await.unwrap().to_bytes();
         let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(parsed["response"], "retry-ok");
-        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(parsed["status"], "retry_unavailable");
+        assert_eq!(
+            provider_impl.calls.load(Ordering::SeqCst),
+            1,
+            "a refused redelivery must not reach the provider again"
+        );
     }
 
+    /// The autosave key is derived from the idempotency digest, so it neither
+    /// leaks the caller's raw key nor changes between deliveries of the same
+    /// request. (Stability across digests is asserted directly in
+    /// `webhook_memory_key_is_stable_for_idempotent_retry`; this covers the key
+    /// actually written by the webhook path.)
     #[tokio::test]
-    async fn webhook_idempotency_retry_reuses_autosave_key() {
+    async fn webhook_idempotency_autosave_key_is_derived_not_leaked() {
         let provider_impl = Arc::new(FailFirstProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let tracking_impl = Arc::new(TrackingMemory::default());
@@ -3910,35 +4007,31 @@ mod tests {
         headers.insert("X-Idempotency-Key", HeaderValue::from_static("stable-autosave"));
 
         let first = handle_webhook(
-            State(state.clone()),
+            State(state),
             test_connect_info(),
-            headers.clone(),
+            test_uri(),
+            headers,
             Bytes::from_static(br#"{"message":"remember this stable autosave payload across the retry attempt"}"#),
         )
         .await
         .into_response();
         assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
-        let retry = handle_webhook(
-            State(state),
-            test_connect_info(),
-            headers,
-            Bytes::from_static(br#"{"message":"remember this stable autosave payload across the retry attempt"}"#),
-        )
-        .await
-        .into_response();
-        assert_eq!(retry.status(), StatusCode::OK);
-
         let keys = tracking_impl.keys.lock();
-        assert_eq!(keys.len(), 2);
-        assert_eq!(keys[0], keys[1]);
-        assert!(keys[0].starts_with("webhook_msg_"));
-        assert!(!keys[0].contains("stable-autosave"));
-        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(keys.len(), 1);
+        let key = keys.first().expect("autosave key recorded");
+        assert!(key.starts_with("webhook_msg_"));
+        assert!(!key.contains("stable-autosave"));
     }
 
+    /// A cancelled *caller* is not a cancelled *run*. The turn lives in a
+    /// detached job, so aborting the handler task leaves the work going — and
+    /// the idempotency key must stay claimed while it does. Releasing it on
+    /// abandonment, as `IdempotencyClaim::drop` used to, would let the redelivery
+    /// re-execute a request that was still running and had already begun
+    /// committing side effects.
     #[tokio::test]
-    async fn webhook_idempotency_cancelled_attempt_can_retry() {
+    async fn webhook_idempotency_cancelled_attempt_does_not_reexecute() {
         let provider_impl = Arc::new(BlockFirstProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let state = webhook_test_state(provider);
@@ -3952,6 +4045,7 @@ mod tests {
             handle_webhook(
                 State(first_state),
                 test_connect_info(),
+                test_uri(),
                 first_headers,
                 Bytes::from_static(br#"{"message":"hello"}"#),
             )
@@ -3962,19 +4056,48 @@ mod tests {
         first.abort();
         assert!(first.await.unwrap_err().is_cancelled());
 
+        // The abandoned caller must not have handed the key back for re-execution.
         let retry = handle_webhook(
-            State(state),
+            State(state.clone()),
             test_connect_info(),
-            headers,
+            test_uri(),
+            headers.clone(),
             Bytes::from_static(br#"{"message":"hello"}"#),
         )
         .await
         .into_response();
-        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(retry.status(), StatusCode::CONFLICT);
         let payload = retry.into_body().collect().await.unwrap().to_bytes();
         let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["status"], "processing");
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+
+        // Once the detached run finishes, the redelivery is answered from the
+        // stored result instead of by running the request a second time.
+        provider_impl.release_first.notify_one();
+        let mut duplicate = None;
+        for _ in 0..200_u32 {
+            let response = handle_webhook(
+                State(state.clone()),
+                test_connect_info(),
+                test_uri(),
+                headers.clone(),
+                Bytes::from_static(br#"{"message":"hello"}"#),
+            )
+            .await
+            .into_response();
+            if response.status() == StatusCode::OK {
+                duplicate = Some(response);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let duplicate = duplicate.expect("detached run should commit its idempotent result");
+        let payload = duplicate.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["status"], "duplicate");
         assert_eq!(parsed["response"], "released");
-        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -3992,6 +4115,7 @@ mod tests {
             handle_webhook(
                 State(first_state),
                 test_connect_info(),
+                test_uri(),
                 first_headers,
                 Bytes::from_static(br#"{"message":"hello"}"#),
             )
@@ -4003,6 +4127,7 @@ mod tests {
         let concurrent = handle_webhook(
             State(state.clone()),
             test_connect_info(),
+            test_uri(),
             headers.clone(),
             Bytes::from_static(br#"{"message":"hello"}"#),
         )
@@ -4036,6 +4161,7 @@ mod tests {
             handle_webhook(
                 State(first_state),
                 test_connect_info(),
+                test_uri(),
                 first_headers,
                 Bytes::from_static(br#"{"message":"first"}"#),
             )
@@ -4049,6 +4175,7 @@ mod tests {
         let at_capacity = handle_webhook(
             State(state),
             test_connect_info(),
+            test_uri(),
             second_headers,
             Bytes::from_static(br#"{"message":"second"}"#),
         )
@@ -4075,6 +4202,7 @@ mod tests {
         let first = handle_webhook(
             State(state.clone()),
             test_connect_info(),
+            test_uri(),
             headers.clone(),
             Bytes::from_static(br#"{"message":"first"}"#),
         )
@@ -4085,6 +4213,7 @@ mod tests {
         let conflict = handle_webhook(
             State(state),
             test_connect_info(),
+            test_uri(),
             headers,
             Bytes::from_static(br#"{"message":"second"}"#),
         )
@@ -4109,6 +4238,7 @@ mod tests {
         let response = handle_webhook(
             State(state),
             test_connect_info(),
+            test_uri(),
             headers,
             Bytes::from_static(br#"{"message":"hello"}"#),
         )
@@ -4129,6 +4259,7 @@ mod tests {
         let first = handle_webhook(
             State(state.clone()),
             test_connect_info(),
+            test_uri(),
             headers.clone(),
             Bytes::from_static(br#"{"message":"hello"}"#),
         )
@@ -4139,6 +4270,7 @@ mod tests {
         let duplicate = handle_webhook(
             State(state),
             test_connect_info(),
+            test_uri(),
             headers,
             Bytes::from_static(br#"{"message":"hello"}"#),
         )
@@ -4199,6 +4331,7 @@ mod tests {
         let response = handle_webhook(
             State(state),
             test_connect_info(),
+            test_uri(),
             headers,
             Bytes::from_static(br#"{"message":"hello gateway","reply_target":"client-a"}"#),
         )
@@ -4341,6 +4474,7 @@ mod tests {
         let first = handle_webhook(
             State(state.clone()),
             test_connect_info(),
+            test_uri(),
             headers.clone(),
             Bytes::from_static(br#"{"message":"hello one"}"#),
         )
@@ -4351,6 +4485,7 @@ mod tests {
         let second = handle_webhook(
             State(state),
             test_connect_info(),
+            test_uri(),
             headers,
             Bytes::from_static(br#"{"message":"hello two"}"#),
         )
@@ -4409,6 +4544,7 @@ mod tests {
         let response = handle_webhook(
             State(state),
             test_connect_info(),
+            test_uri(),
             HeaderMap::new(),
             Bytes::from_static(br#"{"message":"hello group","reply_target":"group:team-1"}"#),
         )
@@ -4475,6 +4611,7 @@ mod tests {
         let response = handle_webhook(
             State(state),
             test_connect_info(),
+            test_uri(),
             HeaderMap::new(),
             Bytes::from_static(br#"{"message":"hello"}"#),
         )
@@ -4531,6 +4668,7 @@ mod tests {
         let response = handle_webhook(
             State(state),
             test_connect_info(),
+            test_uri(),
             headers,
             Bytes::from_static(br#"{"message":"hello"}"#),
         )
@@ -4586,6 +4724,7 @@ mod tests {
         let response = handle_webhook(
             State(state),
             test_connect_info(),
+            test_uri(),
             headers,
             Bytes::from_static(br#"{"message":"hello"}"#),
         )
@@ -4638,6 +4777,7 @@ mod tests {
         let response = handle_webhook(
             State(state),
             test_connect_info(),
+            test_uri(),
             HeaderMap::new(),
             Bytes::from_static(br#"{"message":"hello"}"#),
         )
@@ -4694,9 +4834,15 @@ mod tests {
             HeaderValue::from_str(&format!("sha256={}", compute_whatsapp_signature_hex(&secret, body))).unwrap(),
         );
 
-        let response = handle_webhook(State(state), test_connect_info(), headers, Bytes::from_static(body))
-            .await
-            .into_response();
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            test_uri(),
+            headers,
+            Bytes::from_static(body),
+        )
+        .await
+        .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
@@ -5075,9 +5221,54 @@ mod tests {
             IdempotencyClaimOutcome::Processing
         ));
 
-        assert!(claim.fail(true));
+        assert!(claim.fail());
         std::thread::sleep(Duration::from_millis(10));
         let _retry = acquire_idempotency_claim(&store, "ttl-key", test_fingerprint(1));
+    }
+
+    /// A claim abandoned *after* the attempt began doing observable work leaves
+    /// the key non-retryable: nothing here knows how far the run got, and a
+    /// redelivery that re-executed it would duplicate whatever it did commit.
+    #[test]
+    fn idempotency_abandoned_claim_is_not_retryable_once_dispatched() {
+        let store = Arc::new(IdempotencyStore::new(Duration::from_mins(5), 100));
+        let mut claim = acquire_idempotency_claim(&store, "dispatched", test_fingerprint(1));
+        claim.mark_dispatched();
+        drop(claim);
+
+        assert!(matches!(
+            store.claim("dispatched".to_string(), test_fingerprint(1)),
+            IdempotencyClaimOutcome::RetryUnavailable
+        ));
+    }
+
+    /// The same abandonment *before* dispatch is provably a no-op, so the key
+    /// stays retryable — the tightened rule blocks unknown side effects, it does
+    /// not block every retry.
+    #[test]
+    fn idempotency_abandoned_claim_stays_retryable_before_dispatch() {
+        let store = Arc::new(IdempotencyStore::new(Duration::from_mins(5), 100));
+        drop(acquire_idempotency_claim(&store, "undispatched", test_fingerprint(1)));
+
+        assert!(matches!(
+            store.claim("undispatched".to_string(), test_fingerprint(1)),
+            IdempotencyClaimOutcome::Acquired(_)
+        ));
+    }
+
+    /// Explicit failure follows the same rule as abandonment: a run that had
+    /// started working is not offered back for re-execution.
+    #[test]
+    fn idempotency_explicit_failure_after_dispatch_is_not_retryable() {
+        let store = Arc::new(IdempotencyStore::new(Duration::from_mins(5), 100));
+        let mut claim = acquire_idempotency_claim(&store, "failed", test_fingerprint(1));
+        claim.mark_dispatched();
+        assert!(claim.fail());
+
+        assert!(matches!(
+            store.claim("failed".to_string(), test_fingerprint(1)),
+            IdempotencyClaimOutcome::RetryUnavailable
+        ));
     }
 
     #[test]
@@ -5100,7 +5291,7 @@ mod tests {
         let store = Arc::new(IdempotencyStore::new(Duration::from_mins(1), 1));
         let first = acquire_idempotency_claim(&store, "key", test_fingerprint(1));
         let first_generation = first.generation;
-        assert!(first.fail(true));
+        assert!(first.fail());
         let second = acquire_idempotency_claim(&store, "key", test_fingerprint(1));
 
         assert!(!store.complete_if_owner(
@@ -5127,7 +5318,7 @@ mod tests {
             IdempotencyClaimOutcome::AtCapacity
         ));
 
-        assert!(claims.pop().expect("one claim").fail(true));
+        assert!(claims.pop().expect("one claim").fail());
         let _replacement = acquire_idempotency_claim(&store, "replacement", test_fingerprint(251));
     }
 

@@ -418,7 +418,6 @@ pub fn all_tools_with_runtime_ext(
         root_config.web_search.timeout_secs,
     )));
     tool_arcs.push(Arc::new(WebFetchTool::new(
-        security.clone(),
         browser_config.allowed_domains.clone(),
         root_config.web_search.fetch_max_chars,
         root_config.web_search.timeout_secs,

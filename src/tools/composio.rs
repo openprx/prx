@@ -1255,24 +1255,6 @@ mod tests {
         assert!(result.error.as_deref().unwrap_or("").contains("read-only mode"));
     }
 
-    #[tokio::test]
-    async fn execute_blocked_when_rate_limited() {
-        let limited = Arc::new(SecurityPolicy {
-            max_actions_per_hour: 0,
-            ..SecurityPolicy::default()
-        });
-        let tool = ComposioTool::new("test-key", None, limited);
-        let result = tool
-            .execute(json!({
-                "action": "execute",
-                "action_name": "GITHUB_LIST_REPOS"
-            }))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("Rate limit exceeded"));
-    }
-
     // ── API response parsing ──────────────────────────────────
 
     #[test]

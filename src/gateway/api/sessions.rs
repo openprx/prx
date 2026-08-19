@@ -1,8 +1,9 @@
 use super::{AppState, extract_resource_auth_token};
 use crate::agent::loop_::{
-    DocumentIngestRuntime, ScopeContext, ToolConcurrencyGovernanceConfig, build_context_with_shared_events_and_scope,
-    build_runtime_system_prompt, run_tool_call_loop_traced, select_prompt_skills,
+    DocumentIngestRuntime, ScopeContext, build_context_with_shared_events_and_scope, build_runtime_system_prompt,
+    run_tool_call_loop_traced, select_prompt_skills,
 };
+use crate::gateway::jobs;
 use crate::memory::MemoryFabric;
 use crate::observability::NoopObserver;
 use crate::providers::ChatMessage;
@@ -354,21 +355,9 @@ async fn run_console_runtime_turn(
         "console",
         &config_snapshot.multimodal,
         config_snapshot.agent.max_tool_iterations,
-        config_snapshot.agent.parallel_tools,
         config_snapshot.agent.read_only_tool_concurrency_window,
-        config_snapshot.agent.read_only_tool_timeout_secs,
         config_snapshot.agent.priority_scheduling_enabled,
         config_snapshot.agent.low_priority_tools.clone(),
-        ToolConcurrencyGovernanceConfig {
-            kill_switch_force_serial: config_snapshot.agent.concurrency_kill_switch_force_serial,
-            rollout_stage: config_snapshot.agent.concurrency_rollout_stage.clone(),
-            rollout_sample_percent: config_snapshot.agent.concurrency_rollout_sample_percent,
-            rollout_channels: config_snapshot.agent.concurrency_rollout_channels.clone(),
-            auto_rollback_enabled: config_snapshot.agent.concurrency_auto_rollback_enabled,
-            rollback_timeout_rate_threshold: config_snapshot.agent.concurrency_rollback_timeout_rate_threshold,
-            rollback_cancel_rate_threshold: config_snapshot.agent.concurrency_rollback_cancel_rate_threshold,
-            rollback_error_rate_threshold: config_snapshot.agent.concurrency_rollback_error_rate_threshold,
-        },
         Some(&config_snapshot.agent.compaction),
         None,
         None,
@@ -776,6 +765,8 @@ pub async fn post_session_message(
     Path(session_id): Path<String>,
     request: Request,
 ) -> impl IntoResponse {
+    let headers = request.headers().clone();
+    let async_mode = jobs::wants_async(request.uri().query(), &headers);
     let message = match parse_message_from_request(&state, request).await {
         Ok(message) => message,
         Err(error_response) => return error_response,
@@ -835,25 +826,49 @@ pub async fn post_session_message(
         }
     };
 
+    // Everything up to here is bounded bookkeeping. What follows is the agent
+    // turn itself, which has no upper bound — tool chains, sub-agents, and
+    // compaction can legitimately run for hours, and PRX no longer cuts them off
+    // on a clock. Awaiting it inside this handler would tie the turn's lifetime
+    // to the HTTP connection, so a closed tab or a proxy hang-up would destroy a
+    // turn mid-flight, after its side effects had already begun. It therefore
+    // runs as a detached job: visible in `prx tasks list`, killable by id, and
+    // still there when the client comes back.
+    let job = jobs::submit(
+        jobs::KIND_SESSION_MESSAGE,
+        format!("gateway:session_message:{session_id}"),
+        run_console_message_job(state, runtime_envelope, message, turns, user_message_event_id),
+    );
+
+    if async_mode {
+        return (StatusCode::ACCEPTED, Json(job.accepted_body())).into_response();
+    }
+    job.wait().await.into_response()
+}
+
+/// The unbounded half of `POST /sessions/{id}/message`, run as a job.
+///
+/// Returns the exact `(status, body)` the synchronous handler used to produce,
+/// so waiting clients see no contract change and polling clients see the same
+/// payload under `result`.
+async fn run_console_message_job(
+    state: AppState,
+    runtime_envelope: RuntimeEnvelope,
+    message: String,
+    turns: Vec<crate::memory::ConversationTurn>,
+    user_message_event_id: String,
+) -> Result<jobs::JobOutput, String> {
     let turn =
         match run_console_runtime_turn(&state, &runtime_envelope, &message, turns, Some(user_message_event_id)).await {
             Ok(turn) => turn,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": crate::providers::sanitize_api_error(&error.to_string())
-                    })),
-                )
-                    .into_response();
-            }
+            Err(error) => return Err(crate::providers::sanitize_api_error(&error.to_string())),
         };
     let reply = turn.reply.clone();
 
-    if let Err(error) =
+    if let Err((status, body)) =
         super::authorize_resource_mutation(&state, "gateway_api:sessions:assistant_message", ResourceRiskLevel::Low)
     {
-        return error.into_response();
+        return Ok(jobs::JobOutput::new(status, body.0));
     }
 
     let provider_outcome =
@@ -901,21 +916,15 @@ pub async fn post_session_message(
 
     if let Err(error) = append_console_turn(&state, &turn.envelope, "assistant", &reply, !terminal_committed).await {
         tracing::error!("Failed to persist assistant session turn: {error}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "Failed to persist assistant response" })),
-        )
-            .into_response();
+        return Err("Failed to persist assistant response".to_string());
     }
 
-    (
-        StatusCode::OK,
-        Json(SendMessageResponse {
-            status: "ok".to_string(),
-            reply,
-        }),
-    )
-        .into_response()
+    let body = serde_json::to_value(SendMessageResponse {
+        status: "ok".to_string(),
+        reply,
+    })
+    .map_err(|error| format!("Failed to encode session reply: {error}"))?;
+    Ok(jobs::JobOutput::new(StatusCode::OK, body))
 }
 
 pub async fn get_session_media(

@@ -69,8 +69,7 @@ pub use whatsapp::WhatsAppChannel;
 pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{
-    DocumentIngestRuntime, ScopeContext, ToolConcurrencyGovernanceConfig, build_context_with_shared_events_and_scope,
-    build_tool_instructions,
+    DocumentIngestRuntime, ScopeContext, build_context_with_shared_events_and_scope, build_tool_instructions,
 };
 use crate::config::Config;
 use crate::hooks::HookManager;
@@ -198,7 +197,6 @@ struct ChannelMessageRuntimeSnapshot {
     multimodal: crate::config::MultimodalConfig,
     max_tool_iterations: usize,
     read_only_tool_concurrency_window: usize,
-    read_only_tool_timeout_secs: u64,
     priority_scheduling_enabled: bool,
     low_priority_tools: Vec<String>,
     min_relevance_score: f64,
@@ -241,8 +239,6 @@ struct ChannelRuntimeContext {
     max_tool_iterations: usize,
     #[cfg(test)]
     read_only_tool_concurrency_window: usize,
-    #[cfg(test)]
-    read_only_tool_timeout_secs: u64,
     #[cfg(test)]
     priority_scheduling_enabled: bool,
     #[cfg(test)]
@@ -1141,7 +1137,6 @@ fn message_runtime_snapshot(
             multimodal: ctx.multimodal.clone(),
             max_tool_iterations: ctx.max_tool_iterations,
             read_only_tool_concurrency_window: ctx.read_only_tool_concurrency_window,
-            read_only_tool_timeout_secs: ctx.read_only_tool_timeout_secs,
             priority_scheduling_enabled: ctx.priority_scheduling_enabled,
             low_priority_tools: ctx.low_priority_tools.clone(),
             min_relevance_score: ctx.min_relevance_score,
@@ -1157,7 +1152,6 @@ fn message_runtime_snapshot(
         multimodal: config.multimodal.clone(),
         max_tool_iterations: config.agent.max_tool_iterations,
         read_only_tool_concurrency_window: config.agent.read_only_tool_concurrency_window,
-        read_only_tool_timeout_secs: config.agent.read_only_tool_timeout_secs,
         priority_scheduling_enabled: config.agent.priority_scheduling_enabled,
         low_priority_tools: config.agent.low_priority_tools.clone(),
         min_relevance_score: config.memory.min_relevance_score,
@@ -3251,8 +3245,8 @@ async fn process_channel_message(
     // D8-4: seed a turn-root spawn execution context so any sub-agent spawned
     // directly from this channel turn inherits parent_run_id = the per-turn
     // run_id (top-level lineage was previously None). spawn_depth starts at 0 and
-    // is_turn_root keeps the first child's depth at 0 (no max_spawn_depth
-    // tightening). The session scope key mirrors the spawn scope convention
+    // is_turn_root keeps the first child's reported depth at 0 (a turn is not
+    // itself a spawn). The session scope key mirrors the spawn scope convention
     // (channel:chat_id:sender) so children share the turn's session scope.
     let turn_spawn_session_scope_key = format!("{}:{}:{}", msg.channel, msg.reply_target, msg.sender);
     let turn_spawn_ctx = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
@@ -3290,12 +3284,9 @@ async fn process_channel_message(
                     msg.channel.as_str(),
                     &message_runtime.multimodal,
                     message_runtime.max_tool_iterations,
-                    true,
                     message_runtime.read_only_tool_concurrency_window,
-                    message_runtime.read_only_tool_timeout_secs,
                     message_runtime.priority_scheduling_enabled,
                     message_runtime.low_priority_tools.clone(),
-                    ToolConcurrencyGovernanceConfig::default(),
                     Some(&message_runtime.agent_compaction),
                     Some(cancellation_token.clone()),
                     delta_tx.clone(),
@@ -5615,8 +5606,6 @@ pub async fn start_channels_with_config(
         #[cfg(test)]
         read_only_tool_concurrency_window: config.agent.read_only_tool_concurrency_window,
         #[cfg(test)]
-        read_only_tool_timeout_secs: config.agent.read_only_tool_timeout_secs,
-        #[cfg(test)]
         priority_scheduling_enabled: config.agent.priority_scheduling_enabled,
         #[cfg(test)]
         low_priority_tools: config.agent.low_priority_tools.clone(),
@@ -6262,7 +6251,6 @@ mod tests {
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -6335,7 +6323,6 @@ mod tests {
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -6744,7 +6731,6 @@ mod tests {
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -7525,7 +7511,6 @@ BTC is currently around $65,000 based on latest tool output."#
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -7635,7 +7620,6 @@ BTC is currently around $65,000 based on latest tool output."#
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -7725,7 +7709,6 @@ BTC is currently around $65,000 based on latest tool output."#
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -7817,7 +7800,6 @@ BTC is currently around $65,000 based on latest tool output."#
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -7908,7 +7890,6 @@ BTC is currently around $65,000 based on latest tool output."#
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -8004,7 +7985,6 @@ BTC is currently around $65,000 based on latest tool output."#
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -8127,7 +8107,6 @@ BTC is currently around $65,000 based on latest tool output."#
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -8223,7 +8202,6 @@ BTC is currently around $65,000 based on latest tool output."#
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -8320,7 +8298,6 @@ BTC is currently around $65,000 based on latest tool output."#
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -8412,7 +8389,6 @@ BTC is currently around $65,000 based on latest tool output."#
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 12,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -8503,7 +8479,6 @@ BTC is currently around $65,000 based on latest tool output."#
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 3,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -8714,12 +8689,11 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     /// Tunable knobs for the inbound-gate test contexts. Defaults reproduce the
-    /// original `gate_test_ctx` behavior (autosave off, generous action budget,
-    /// production gate authorizer).
+    /// original `gate_test_ctx` behavior (autosave off, production gate
+    /// authorizer).
     struct GateTestOpts {
         autonomy: crate::security::AutonomyLevel,
         auto_save_memory: bool,
-        max_actions_per_hour: u32,
         test_inbound_authorizer: Option<Arc<dyn crate::security::inbound_gate::InboundAuthorizer + Send + Sync>>,
     }
 
@@ -8728,7 +8702,6 @@ BTC is currently around $65,000 based on latest tool output."#
             Self {
                 autonomy,
                 auto_save_memory: false,
-                max_actions_per_hour: 20,
                 test_inbound_authorizer: None,
             }
         }
@@ -8761,7 +8734,6 @@ BTC is currently around $65,000 based on latest tool output."#
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -8789,7 +8761,6 @@ BTC is currently around $65,000 based on latest tool output."#
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
                 security: Arc::new(crate::security::SecurityPolicy {
                     autonomy: opts.autonomy,
-                    max_actions_per_hour: opts.max_actions_per_hour,
                     ..crate::security::SecurityPolicy::default()
                 }),
             })),
@@ -8928,34 +8899,6 @@ BTC is currently around $65,000 based on latest tool output."#
                 Ok(())
             }
         }
-    }
-
-    /// D6-3 (outbound deny, budget path): with `max_actions_per_hour=2` and
-    /// Supervised autonomy, the inbound gate (action #1) and autosave gate
-    /// (action #2) pass, but the outbound gate (action #3) is rate-denied. The
-    /// inbound user turn must still be persisted (it ran before the budget was
-    /// exhausted) while no reply is sent. Uses a dedicated policy + tracker so
-    /// the budget starts fresh (no flaky pre-consumption).
-    #[tokio::test]
-    async fn process_channel_message_outbound_gate_denied_by_budget() {
-        let memory = Arc::new(CountingMemory::default());
-        let channel_impl = Arc::new(RecordingChannel::default());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-        let mut opts = GateTestOpts::new(crate::security::AutonomyLevel::Supervised);
-        opts.auto_save_memory = true;
-        opts.max_actions_per_hour = 2;
-        let ctx = gate_test_ctx_with(opts, Arc::clone(&memory), channel);
-
-        process_channel_message(ctx, gate_test_dm_message(), CancellationToken::new()).await;
-
-        assert!(
-            memory.append_calls.load(Ordering::SeqCst) >= 1,
-            "inbound turn must persist (gated before the budget was exhausted)"
-        );
-        assert!(
-            channel_impl.sent_messages.lock().await.is_empty(),
-            "outbound must be suppressed once the action budget is exhausted"
-        );
     }
 
     /// Test seam: deny only the `:outbound` operation, allowing inbound + autosave.
@@ -9171,7 +9114,6 @@ BTC is currently around $65,000 based on latest tool output."#
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -9565,7 +9507,6 @@ BTC is currently around $65,000 based on latest tool output."#
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -9681,7 +9622,6 @@ BTC is currently around $65,000 based on latest tool output."#
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -9812,7 +9752,6 @@ BTC is currently around $65,000 based on latest tool output."#
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -9925,7 +9864,6 @@ BTC is currently around $65,000 based on latest tool output."#
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -10587,7 +10525,6 @@ BTC is currently around $65,000 based on latest tool output."#
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -10705,7 +10642,6 @@ BTC is currently around $65,000 based on latest tool output."#
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -10813,7 +10749,6 @@ BTC is currently around $65,000 based on latest tool output."#
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
             min_relevance_score: 0.0,
@@ -11390,6 +11325,50 @@ After"#;
             component["last_error"].as_str().unwrap_or("").contains("stalled"),
             "expected an operator-facing stall summary, got {:?}",
             component["last_error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_listener_stays_visible_without_blocking_readiness() {
+        // The stall must be loud in the detailed status and silent in the
+        // readiness boolean. A false readiness makes /health answer 503, which
+        // makes an orchestrator restart the process and kill every long-running
+        // task in flight — automatic termination sneaking back in through the
+        // probe after the timeouts were removed.
+        let channel_name = format!("test-readiness-{}", uuid::Uuid::new_v4());
+        let component_name = format!("channel:{channel_name}");
+        let channel: Arc<dyn Channel> = Arc::new(WedgedChannel {
+            name: channel_name,
+            expectation: Duration::from_millis(50),
+        });
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(1);
+        let shutdown = CancellationToken::new();
+        let handle = spawn_supervised_listener_with_health_interval(
+            channel,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            shutdown.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let component = component_json(&component_name);
+        let readiness = crate::health::readiness();
+        drain_supervisor(&shutdown, handle).await;
+
+        // Visible.
+        assert_eq!(component["status"], "degraded");
+        assert_eq!(component["activity"]["stalled"], true);
+        assert!(component["activity"]["idle_seconds"].as_u64().is_some());
+        assert!(component["last_error"].as_str().unwrap_or("").contains("stalled"));
+
+        // Inert.
+        assert!(
+            !readiness.issues.iter().any(|issue| issue.component == component_name),
+            "a stalled listener must not be raised as a readiness issue: {:?}",
+            readiness.issues
         );
     }
 

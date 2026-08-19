@@ -64,14 +64,6 @@ impl NodesTool {
             });
         }
 
-        if !self.security.record_action() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: rate limit exceeded".into()),
-            });
-        }
-
         None
     }
 
@@ -507,7 +499,6 @@ mod tests {
         config.nodes.nodes = nodes;
         let security = Arc::new(SecurityPolicy {
             autonomy: level,
-            max_actions_per_hour: 1000,
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
@@ -729,7 +720,6 @@ mod tests {
         config.workspace_dir = tmp.path().to_path_buf();
         let security = Arc::new(SecurityPolicy {
             workspace_dir: tmp.path().to_path_buf(),
-            max_actions_per_hour: 1000,
             ..SecurityPolicy::default()
         });
         let tool = NodesTool::new(new_shared(config), security).with_shared_memory(memory.clone());

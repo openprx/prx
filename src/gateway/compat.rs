@@ -4,7 +4,7 @@
 //! MCP server enable flag, caller identity, exposed tool allowlist, trusted
 //! scope injection, and the target tool's own SideEffectGate checks.
 
-use super::AppState;
+use super::{AppState, jobs};
 use axum::{
     Json,
     extract::State,
@@ -224,9 +224,11 @@ pub async fn mcp_tools_list(State(state): State<AppState>) -> Json<Vec<McpExpose
 
 pub async fn mcp_tools_call(
     State(state): State<AppState>,
+    uri: axum::http::Uri,
     headers: HeaderMap,
     Json(request): Json<McpToolCallRequest>,
-) -> Result<Json<McpToolCallResponse>, (StatusCode, Json<Value>)> {
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let async_mode = jobs::wants_async(uri.query(), &headers);
     let config = state.config.load_full().clone();
     // When a remote JWKS endpoint is configured, refresh its cache off the
     // async runtime before the synchronous identity-derivation path verifies
@@ -257,21 +259,54 @@ pub async fn mcp_tools_call(
         tracing::warn!(error = %error, "mcp agent identity binding upsert skipped");
     }
 
-    let Some(tool) = state
+    // Admission check only: the tool is resolved again inside the job, which is
+    // where it actually runs.
+    if !state
         .tools_registry
         .iter()
-        .find(|tool| tool.supports_name(&request.name))
-    else {
+        .any(|tool| tool.supports_name(&request.name))
+    {
         return Err(json_error(StatusCode::NOT_FOUND, "exposed tool is not available"));
-    };
+    }
 
     let args = inject_trusted_scope(request.arguments, &identity);
-    let result = tool
-        .execute_named(&request.name, args)
-        .await
-        .map_err(|error| json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
 
-    Ok(Json(McpToolCallResponse {
+    // An exposed tool can be a shell command, a build, or a sub-agent run —
+    // none of which has a bound. Running it inside this handler would tie it to
+    // the MCP client's connection; as a job it keeps going if the client drops,
+    // and it shows up in `prx tasks list` with a kill path while it runs.
+    let tool_name = request.name.clone();
+    let job = jobs::submit(
+        jobs::KIND_MCP_TOOL_CALL,
+        format!("gateway:mcp_tool_call:{tool_name}"),
+        run_mcp_tool_call_job(Arc::clone(&state.tools_registry), request.name, args, identity),
+    );
+
+    if async_mode {
+        return Ok((StatusCode::ACCEPTED, Json(job.accepted_body())));
+    }
+    Ok(job.wait().await.into_parts())
+}
+
+/// The unbounded half of `POST /mcp/v1/tools/call`, run as a job.
+///
+/// Resolves the tool again inside the job because the registry is shared by
+/// `Arc` and the borrow taken during admission cannot outlive the handler.
+async fn run_mcp_tool_call_job(
+    tools: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+    tool_name: String,
+    args: Value,
+    identity: ExternalAgentIdentity,
+) -> Result<jobs::JobOutput, String> {
+    let Some(tool) = tools.iter().find(|tool| tool.supports_name(&tool_name)) else {
+        return Err("exposed tool is not available".to_string());
+    };
+    let result = tool
+        .execute_named(&tool_name, args)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let body = serde_json::to_value(McpToolCallResponse {
         content: vec![McpToolContent {
             kind: "text",
             text: if result.success {
@@ -281,9 +316,11 @@ pub async fn mcp_tools_call(
             },
         }],
         is_error: !result.success,
-        tool_name: request.name,
+        tool_name,
         caller: identity,
-    }))
+    })
+    .map_err(|error| format!("failed to encode mcp tool result: {error}"))?;
+    Ok(jobs::JobOutput::new(StatusCode::OK, body))
 }
 
 pub async fn a2a_identity(
@@ -840,6 +877,10 @@ fn upsert_agent_identity_binding(
         std::fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(db_path)?;
+    // This writes the same brain.db the pooled memory store owns, so it must
+    // agree with the pool on what a held lock means: wait for it (warning
+    // periodically), never fail the binding upsert with `SQLITE_BUSY`.
+    crate::runtime::sqlite_pool::install_busy_handler(&conn)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS agent_identity_bindings (
             binding_id        TEXT PRIMARY KEY,

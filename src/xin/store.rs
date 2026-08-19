@@ -2382,8 +2382,11 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
 
     let conn = Connection::open(&db_path).with_context(|| format!("Failed to open xin DB: {}", db_path.display()))?;
 
-    // Avoid SQLITE_BUSY under concurrent task execution
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    // Concurrent task execution must queue behind the database lock, never be
+    // turned into an error by it: the busy *handler* retries for as long as the
+    // lock is held (warning periodically) where a `busy_timeout` would surface
+    // `SQLITE_BUSY` the moment it expired.
+    crate::runtime::sqlite_pool::install_busy_handler(&conn)?;
 
     conn.execute_batch(
         "PRAGMA foreign_keys = ON;
@@ -2607,7 +2610,7 @@ mod tests {
     fn open_xin_test_connection(config: &Config) -> Connection {
         let db_path = config.workspace_dir.join("xin").join("tasks.db");
         let conn = Connection::open(&db_path).unwrap();
-        conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+        crate::runtime::sqlite_pool::install_busy_handler(&conn).unwrap();
         conn
     }
 
@@ -3628,6 +3631,10 @@ mod tests {
         assert!(mark_step_running_with_lease(&config, &step.id, &new_lease).unwrap());
     }
 
+    /// A renewal that had to queue for the write lock must re-decide expiry
+    /// once it holds the lock, not act on what was true when it started
+    /// waiting. The lock is released only after the lease has genuinely
+    /// expired, so the renewal must come back empty-handed.
     #[test]
     fn renewal_waiting_on_write_lock_rechecks_authoritative_expiry() {
         let tmp = TempDir::new().unwrap();
@@ -3641,16 +3648,32 @@ mod tests {
         let lock = open_xin_test_connection(&config);
         lock.execute_batch("BEGIN IMMEDIATE").unwrap();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let renewal_config = config;
+        let renewal_config = config.clone();
         let step_id = step.id;
         let renewal = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
             renew_step_lease_with_expiry(&renewal_config, &step_id, worker, 60).unwrap()
         });
         started_rx.recv().unwrap();
-        while Utc::now() <= expiry {
+
+        // Wait on the *database's* clock, not this process's.
+        //
+        // Both the stored `lease_expires_at` and the predicate that renewal
+        // evaluates come from `authoritative_now`, which is SQLite's `now`
+        // truncated to whole milliseconds. `Utc::now()` is finer than that and
+        // measurably ahead of it — up to ~1 ms on this code path — so a wall
+        // clock instant just past `expiry` can still sit inside the millisecond
+        // the database is reporting, where the lease is correctly still current.
+        // Spinning on the wall clock therefore released the lock during a window
+        // in which renewing was the right answer, and the test failed for being
+        // early rather than for the behaviour it names. Polling the same clock
+        // the code under test consults removes the window entirely instead of
+        // papering over it with a sleep or a slacker assertion.
+        let db_clock = open_xin_test_connection(&config);
+        while authoritative_now(&db_clock).unwrap() <= expiry {
             std::thread::yield_now();
         }
+        drop(db_clock);
         lock.execute_batch("COMMIT").unwrap();
 
         assert!(

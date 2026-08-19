@@ -188,8 +188,10 @@ impl SqliteWebhookRepository {
         ensure_memory_schema(&db_path)?;
         let conn = Connection::open(&db_path)
             .with_context(|| format!("failed to open webhook repository {}", db_path.display()))?;
-        conn.busy_timeout(Duration::from_secs(5))
-            .context("failed to configure webhook repository busy_timeout")?;
+        // Same policy as the pooled connections onto this file: a lock held by
+        // another writer makes this call wait (and warn), never fail.
+        crate::runtime::sqlite_pool::install_busy_handler(&conn)
+            .context("failed to install webhook repository busy handler")?;
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS webhook_ingestions (

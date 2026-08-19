@@ -4,7 +4,7 @@
 //! `FileReadTool`, `HttpRequestTool`, and `SecurityPolicy` contracts.
 
 use openprx::runtime::NativeRuntime;
-use openprx::security::policy::{ActionTracker, AutonomyLevel, CommandRiskLevel, SecurityPolicy};
+use openprx::security::policy::{AutonomyLevel, CommandRiskLevel, SecurityPolicy};
 use openprx::tools::traits::Tool;
 use openprx::tools::{FileReadTool, HttpRequestTool, ShellTool};
 use serde_json::json;
@@ -151,48 +151,32 @@ async fn int_ts_02_risk_classification_high_blocked() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// INT-TS-03: Shell tool rate limiting via ActionTracker
+// INT-TS-03: the shell tool runs as often as it is asked to
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Nothing rations how many commands an agent may run. This drives the shell
+/// tool far past the ceiling the removed `[autonomy] max_actions_per_hour`
+/// default (20) would have imposed and requires every one of them to succeed.
 #[tokio::test]
-async fn int_ts_03_direct_shell_does_not_reapply_action_budget() {
+async fn int_ts_03_shell_is_not_rationed_per_hour() {
     let security = make_security(|p| {
         p.autonomy = AutonomyLevel::Full;
         p.workspace_dir = std::env::temp_dir();
-        p.max_actions_per_hour = 10;
     });
 
     let tool = shell_tool(&security);
 
-    // Execute 10 commands — all should succeed
-    for i in 0..10 {
+    for i in 0..64 {
         let result = tool
             .execute(json!({"command": format!("echo iteration_{i}")}))
             .await
-            .expect("test: command within rate limit should return ToolResult");
+            .expect("test: a repeated command should return ToolResult");
         assert!(
             result.success,
-            "test: command {i} within limit should succeed, error: {:?}",
+            "test: command {i} must not be refused for volume, error: {:?}",
             result.error
         );
     }
-
-    // Execution accounting belongs to the orchestration boundary, not here.
-    let result = tool
-        .execute(json!({"command": "echo overflow"}))
-        .await
-        .expect("test: rate-limited command should return ToolResult");
-    assert!(result.success, "direct executor must not consume policy budget");
-}
-
-#[test]
-fn int_ts_03_action_tracker_sliding_window() {
-    let tracker = ActionTracker::new();
-    assert_eq!(tracker.count(), 0, "test: fresh tracker should be at 0");
-    tracker.record();
-    tracker.record();
-    tracker.record();
-    assert_eq!(tracker.count(), 3, "test: tracker should count 3 after 3 records");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -636,24 +620,6 @@ fn int_ts_02_pip_install_passes_command_gate() {
     );
 }
 
-#[test]
-fn int_ts_03_rate_limit_boundary() {
-    let policy = SecurityPolicy {
-        max_actions_per_hour: 10,
-        ..SecurityPolicy::default()
-    };
-
-    for i in 0..10 {
-        assert!(policy.record_action(), "test: action {i} should be within limit");
-    }
-
-    assert!(!policy.record_action(), "test: 11th action should be rate-limited");
-    assert!(
-        policy.is_rate_limited(),
-        "test: is_rate_limited should return true after exhaustion"
-    );
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // INT-TS-06: FileRead tool blocks protected memory markdown
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -744,12 +710,7 @@ async fn int_ts_06_file_read_allows_memory_without_acl() {
 async fn int_ts_09_web_fetch_blocks_private_with_empty_allowlist() {
     use openprx::tools::WebFetchTool;
 
-    let security = make_security(|p| {
-        p.autonomy = AutonomyLevel::Supervised;
-    });
-
     let tool = WebFetchTool::new(
-        security,
         vec![], // empty allowed_domains
         10_000,
         10,
@@ -775,12 +736,7 @@ async fn int_ts_09_web_fetch_blocks_private_with_empty_allowlist() {
 async fn int_ts_09_web_fetch_rejects_unlisted_domain() {
     use openprx::tools::WebFetchTool;
 
-    let security = make_security(|p| {
-        p.autonomy = AutonomyLevel::Full;
-    });
-
     let tool = WebFetchTool::new(
-        security,
         vec!["docs.example.com".into()], // only this domain allowed
         10_000,
         10,

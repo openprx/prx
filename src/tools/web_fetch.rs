@@ -1,9 +1,8 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
-use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 #[allow(clippy::expect_used)]
@@ -26,21 +25,14 @@ static RE_TAGS: LazyLock<Regex> =
 
 /// Web fetch tool — fetches a URL and returns clean readable text.
 pub struct WebFetchTool {
-    security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
     max_chars: usize,
     timeout_secs: u64,
 }
 
 impl WebFetchTool {
-    pub fn new(
-        security: Arc<SecurityPolicy>,
-        allowed_domains: Vec<String>,
-        max_chars: usize,
-        timeout_secs: u64,
-    ) -> Self {
+    pub fn new(allowed_domains: Vec<String>, max_chars: usize, timeout_secs: u64) -> Self {
         Self {
-            security,
             allowed_domains: normalize_allowed_domains(allowed_domains),
             max_chars: max_chars.max(100),
             timeout_secs: timeout_secs.max(1),
@@ -146,21 +138,6 @@ impl Tool for WebFetchTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded".to_string()),
-            });
-        }
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action budget exhausted".to_string()),
-            });
-        }
-
         let url = args
             .get("url")
             .and_then(|v| v.as_str())
@@ -458,12 +435,6 @@ fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::SecurityPolicy;
-
-    fn test_security() -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy::default())
-    }
-
     #[test]
     fn test_html_to_text_basic() {
         let html = "<html><body><h1>Hello</h1><p>World</p></body></html>";
@@ -509,19 +480,19 @@ mod tests {
 
     #[test]
     fn test_tool_name() {
-        let tool = WebFetchTool::new(test_security(), vec!["example.com".into()], 10000, 15);
+        let tool = WebFetchTool::new(vec!["example.com".into()], 10000, 15);
         assert_eq!(tool.name(), "web_fetch");
     }
 
     #[test]
     fn test_tool_description_contains_fetch() {
-        let tool = WebFetchTool::new(test_security(), vec!["example.com".into()], 10000, 15);
+        let tool = WebFetchTool::new(vec!["example.com".into()], 10000, 15);
         assert!(tool.description().to_lowercase().contains("fetch"));
     }
 
     #[test]
     fn test_parameters_schema() {
-        let tool = WebFetchTool::new(test_security(), vec!["example.com".into()], 10000, 15);
+        let tool = WebFetchTool::new(vec!["example.com".into()], 10000, 15);
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["url"].is_object());
@@ -530,7 +501,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_missing_url() {
-        let tool = WebFetchTool::new(test_security(), vec!["example.com".into()], 10000, 15);
+        let tool = WebFetchTool::new(vec!["example.com".into()], 10000, 15);
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("url"));
@@ -538,14 +509,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_empty_url() {
-        let tool = WebFetchTool::new(test_security(), vec!["example.com".into()], 10000, 15);
+        let tool = WebFetchTool::new(vec!["example.com".into()], 10000, 15);
         let result = tool.execute(json!({"url": ""})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_execute_invalid_scheme() {
-        let tool = WebFetchTool::new(test_security(), vec!["example.com".into()], 10000, 15);
+        let tool = WebFetchTool::new(vec!["example.com".into()], 10000, 15);
         let result = tool.execute(json!({"url": "ftp://example.com"})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("http://") || true); // scheme check
@@ -553,7 +524,7 @@ mod tests {
 
     #[test]
     fn validate_url_blocks_private_hosts() {
-        let tool = WebFetchTool::new(test_security(), vec!["example.com".into()], 10000, 15);
+        let tool = WebFetchTool::new(vec!["example.com".into()], 10000, 15);
         let err = tool
             .validate_url("http://127.0.0.1/internal")
             .expect_err("private host should be rejected");
@@ -562,7 +533,7 @@ mod tests {
 
     #[test]
     fn validate_url_enforces_allowlist() {
-        let tool = WebFetchTool::new(test_security(), vec!["example.com".into()], 10000, 15);
+        let tool = WebFetchTool::new(vec!["example.com".into()], 10000, 15);
         let err = tool
             .validate_url("https://evil.com/")
             .expect_err("unexpected allowlist bypass");
@@ -571,7 +542,7 @@ mod tests {
 
     #[test]
     fn validate_url_allows_public_host_when_allowlist_empty() {
-        let tool = WebFetchTool::new(test_security(), vec![], 10000, 15);
+        let tool = WebFetchTool::new(vec![], 10000, 15);
         let ok = tool
             .validate_url("https://example.com/docs")
             .expect("public host should be allowed when allowlist is empty");

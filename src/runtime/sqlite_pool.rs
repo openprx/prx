@@ -662,16 +662,25 @@ impl Drop for SqliteWriteGuard<'_> {
     }
 }
 
+/// Test-only `tracing` capture, shared by every store that must prove an
+/// unbounded wait stayed observable.
+///
+/// The busy handler's promise is "wait forever, but say so": a test that asserts
+/// only the wait would let the warning rot away silently, so the assertion needs
+/// the log text. It lives here rather than in each store's test module because
+/// the policy it verifies is defined here.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod log_capture {
     use std::io::Write;
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
     use tracing_subscriber::fmt::writer::MakeWriter;
 
     /// Collects formatted `tracing` output so a test can assert that a log line
     /// was actually emitted rather than assuming it was.
     #[derive(Clone, Default)]
-    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+    pub(crate) struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
 
     impl CapturedLogs {
         fn text(&self) -> String {
@@ -699,7 +708,7 @@ mod tests {
     }
 
     /// Run `f` with every `tracing` event on this thread captured.
-    fn capturing_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+    pub(crate) fn capturing_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(logs.clone())
@@ -710,6 +719,12 @@ mod tests {
         let text = logs.text();
         (value, text)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::log_capture::capturing_logs;
+    use super::*;
 
     fn temp_pool(dir: &tempfile::TempDir, max_readers: usize) -> SqliteConnectionPool {
         let pool = SqliteConnectionPool::builder(dir.path().join("pool-test.db"))

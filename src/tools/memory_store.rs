@@ -363,21 +363,4 @@ mod tests {
         assert!(result.error.as_deref().unwrap_or("").contains("read-only mode"));
         assert!(mem.get("lang").await.unwrap().is_none());
     }
-
-    #[tokio::test]
-    async fn store_blocked_when_rate_limited() {
-        let (_tmp, mem) = test_mem();
-        let limited = Arc::new(SecurityPolicy {
-            max_actions_per_hour: 0,
-            ..SecurityPolicy::default()
-        });
-        let tool = MemoryStoreTool::new(mem.clone(), limited);
-        let result = tool
-            .execute(json!({"key": "lang", "content": "Prefers Rust"}))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("Rate limit exceeded"));
-        assert!(mem.get("lang").await.unwrap().is_none());
-    }
 }

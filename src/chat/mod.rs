@@ -74,10 +74,10 @@ pub mod renderer;
 pub mod tui;
 
 use crate::agent::loop_::{
-    DocumentIngestRuntime, ScopeContext, ToolCallNotification, ToolConcurrencyGovernanceConfig,
-    apply_compaction_patch_exact, build_configurable_compaction_patch_with_source_history,
-    build_context_with_shared_events_and_scope, build_runtime_system_prompt, increment_recalled_useful_counts,
-    is_tool_loop_cancelled, measure_history_tokens, run_tool_call_loop_traced, select_prompt_skills,
+    DocumentIngestRuntime, ScopeContext, ToolCallNotification, apply_compaction_patch_exact,
+    build_configurable_compaction_patch_with_source_history, build_context_with_shared_events_and_scope,
+    build_runtime_system_prompt, increment_recalled_useful_counts, is_tool_loop_cancelled, measure_history_tokens,
+    run_tool_call_loop_traced, select_prompt_skills,
 };
 use crate::approval::ApprovalManager;
 use crate::channels::traits::extract_outgoing_media;
@@ -7732,7 +7732,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // D8-4: seed a turn-root spawn execution context so a sub-agent spawned
         // directly from this chat turn inherits parent_run_id = the per-turn
         // run_id. spawn_depth starts at 0 and is_turn_root keeps the first child's
-        // depth at 0 (no max_spawn_depth tightening). The chat session key is the
+        // reported depth at 0 (a turn is not itself a spawn). The chat session key is the
         // turn's spawn session scope.
         let turn_spawn_ctx = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
             turn_run_id.clone(),
@@ -7769,23 +7769,9 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             "terminal",
                             &config.multimodal,
                             config.agent.max_tool_iterations,
-                            config.agent.parallel_tools,
                             config.agent.read_only_tool_concurrency_window,
-                            config.agent.read_only_tool_timeout_secs,
                             config.agent.priority_scheduling_enabled,
                             config.agent.low_priority_tools.clone(),
-                            ToolConcurrencyGovernanceConfig {
-                                kill_switch_force_serial: config.agent.concurrency_kill_switch_force_serial,
-                                rollout_stage: config.agent.concurrency_rollout_stage.clone(),
-                                rollout_sample_percent: config.agent.concurrency_rollout_sample_percent,
-                                rollout_channels: config.agent.concurrency_rollout_channels.clone(),
-                                auto_rollback_enabled: config.agent.concurrency_auto_rollback_enabled,
-                                rollback_timeout_rate_threshold: config
-                                    .agent
-                                    .concurrency_rollback_timeout_rate_threshold,
-                                rollback_cancel_rate_threshold: config.agent.concurrency_rollback_cancel_rate_threshold,
-                                rollback_error_rate_threshold: config.agent.concurrency_rollback_error_rate_threshold,
-                            },
                             Some(&effective_compaction.config),
                             Some(cancellation.clone()),
                             Some(delta_tx.clone()),
@@ -15053,7 +15039,6 @@ mod file_mention_tests {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: workspace.to_path_buf(),
-            max_actions_per_hour: 100,
             ..SecurityPolicy::default()
         });
         vec![Box::new(FileReadTool::new(security, acl_enabled))]

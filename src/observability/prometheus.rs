@@ -1,5 +1,7 @@
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
-use prometheus::{Encoder, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounterVec, Registry, TextEncoder};
+use prometheus::{
+    Encoder, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, Registry, TextEncoder,
+};
 
 /// Prometheus-backed observer — exposes metrics for scraping via `/metrics`.
 pub struct PrometheusObserver {
@@ -8,11 +10,8 @@ pub struct PrometheusObserver {
     // Counters
     agent_starts: IntCounterVec,
     tool_calls: IntCounterVec,
-    tool_batches: IntCounterVec,
-    tool_timeouts: IntCounterVec,
-    tool_cancellations: IntCounterVec,
-    tool_degrades: IntCounterVec,
-    tool_rollbacks: IntCounterVec,
+    tool_batches: IntCounter,
+    tool_batch_size: Histogram,
     channel_messages: IntCounterVec,
     heartbeat_ticks: prometheus::IntCounter,
     errors: IntCounterVec,
@@ -47,31 +46,13 @@ impl PrometheusObserver {
             &["tool", "success"],
         )
         .map_err(|e| anyhow::anyhow!("failed to create tool_calls metric: {e}"))?;
-        let tool_batches = IntCounterVec::new(
-            prometheus::Opts::new("prx_tool_batches_total", "Total read-only tool batches"),
-            &["rollout_stage"],
+        let tool_batches = IntCounter::new("prx_tool_batches_total", "Total read-only tool batches")
+            .map_err(|e| anyhow::anyhow!("failed to create tool_batches metric: {e}"))?;
+        let tool_batch_size = Histogram::with_opts(
+            prometheus::HistogramOpts::new("prx_tool_batch_size", "Read-only tool batch size")
+                .buckets(vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0]),
         )
-        .map_err(|e| anyhow::anyhow!("failed to create tool_batches metric: {e}"))?;
-        let tool_timeouts = IntCounterVec::new(
-            prometheus::Opts::new("prx_tool_timeouts_total", "Total tool timeouts"),
-            &["rollout_stage"],
-        )
-        .map_err(|e| anyhow::anyhow!("failed to create tool_timeouts metric: {e}"))?;
-        let tool_cancellations = IntCounterVec::new(
-            prometheus::Opts::new("prx_tool_cancellations_total", "Total tool cancellations"),
-            &["rollout_stage"],
-        )
-        .map_err(|e| anyhow::anyhow!("failed to create tool_cancellations metric: {e}"))?;
-        let tool_degrades = IntCounterVec::new(
-            prometheus::Opts::new("prx_tool_degrades_total", "Total scheduler degradations"),
-            &["rollout_stage"],
-        )
-        .map_err(|e| anyhow::anyhow!("failed to create tool_degrades metric: {e}"))?;
-        let tool_rollbacks = IntCounterVec::new(
-            prometheus::Opts::new("prx_tool_rollbacks_total", "Total scheduler rollbacks"),
-            &["rollout_stage"],
-        )
-        .map_err(|e| anyhow::anyhow!("failed to create tool_rollbacks metric: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to create tool_batch_size metric: {e}"))?;
 
         let channel_messages = IntCounterVec::new(
             prometheus::Opts::new("prx_channel_messages_total", "Total channel messages"),
@@ -141,10 +122,7 @@ impl PrometheusObserver {
         registry.register(Box::new(agent_starts.clone())).ok();
         registry.register(Box::new(tool_calls.clone())).ok();
         registry.register(Box::new(tool_batches.clone())).ok();
-        registry.register(Box::new(tool_timeouts.clone())).ok();
-        registry.register(Box::new(tool_cancellations.clone())).ok();
-        registry.register(Box::new(tool_degrades.clone())).ok();
-        registry.register(Box::new(tool_rollbacks.clone())).ok();
+        registry.register(Box::new(tool_batch_size.clone())).ok();
         registry.register(Box::new(channel_messages.clone())).ok();
         registry.register(Box::new(heartbeat_ticks.clone())).ok();
         registry.register(Box::new(errors.clone())).ok();
@@ -160,10 +138,7 @@ impl PrometheusObserver {
             agent_starts,
             tool_calls,
             tool_batches,
-            tool_timeouts,
-            tool_cancellations,
-            tool_degrades,
-            tool_rollbacks,
+            tool_batch_size,
             channel_messages,
             heartbeat_ticks,
             errors,
@@ -258,26 +233,12 @@ impl Observer for PrometheusObserver {
                     .observe(duration.as_secs_f64());
             }
             ObserverEvent::ToolBatch {
-                rollout_stage,
-                timeout_count,
-                cancel_count,
-                degraded,
-                rollback,
-                ..
+                batch_size,
+                concurrency_window: _,
             } => {
-                self.tool_batches.with_label_values(&[rollout_stage.as_str()]).inc();
-                self.tool_timeouts
-                    .with_label_values(&[rollout_stage.as_str()])
-                    .inc_by(u64::try_from(*timeout_count).unwrap_or(u64::MAX));
-                self.tool_cancellations
-                    .with_label_values(&[rollout_stage.as_str()])
-                    .inc_by(u64::try_from(*cancel_count).unwrap_or(u64::MAX));
-                if *degraded {
-                    self.tool_degrades.with_label_values(&[rollout_stage.as_str()]).inc();
-                }
-                if *rollback {
-                    self.tool_rollbacks.with_label_values(&[rollout_stage.as_str()]).inc();
-                }
+                self.tool_batches.inc();
+                #[allow(clippy::cast_precision_loss)]
+                self.tool_batch_size.observe(*batch_size as f64);
             }
             ObserverEvent::ChannelMessage { channel, direction } => {
                 self.channel_messages.with_label_values(&[channel, direction]).inc();
@@ -373,16 +334,8 @@ mod tests {
             success: false,
         });
         obs.record_event(&ObserverEvent::ToolBatch {
-            rollout_stage: "stage_b".into(),
             batch_size: 2,
             concurrency_window: 2,
-            timeout_count: 1,
-            cancel_count: 0,
-            error_count: 1,
-            degraded: true,
-            rollback: true,
-            rollback_reason: Some("timeout_rate".into()),
-            kill_switch_applied: false,
         });
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "telegram".into(),

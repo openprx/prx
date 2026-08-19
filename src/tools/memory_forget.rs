@@ -317,21 +317,4 @@ mod tests {
         assert!(result.error.as_deref().unwrap_or("").contains("read-only mode"));
         assert!(mem.get("temp").await.unwrap().is_some());
     }
-
-    #[tokio::test]
-    async fn forget_blocked_when_rate_limited() {
-        let (_tmp, mem) = test_mem();
-        mem.store("temp", "temporary", MemoryCategory::Conversation, None)
-            .await
-            .unwrap();
-        let limited = Arc::new(SecurityPolicy {
-            max_actions_per_hour: 0,
-            ..SecurityPolicy::default()
-        });
-        let tool = MemoryForgetTool::new(mem.clone(), limited);
-        let result = tool.execute(json!({"key": "temp"})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("Rate limit exceeded"));
-        assert!(mem.get("temp").await.unwrap().is_some());
-    }
 }

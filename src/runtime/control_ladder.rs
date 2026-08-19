@@ -490,25 +490,18 @@ fn self_system_layer(_config: &Config) -> ControlLayerTrace {
 }
 
 fn task_pool_layer(config: &Config) -> ControlLayerTrace {
-    let enabled = config.sessions_spawn.max_concurrent > 0
-        && config.sessions_spawn.max_spawn_depth > 0
-        && config.sessions_spawn.max_children_per_agent > 0;
+    // Sub-agent spawning has no capacity ceiling to report: the runtime caps
+    // neither concurrent runs, nesting depth nor children per session, so this
+    // rung is always available and only describes how a spawn is shaped.
     ControlLayerTrace {
         level: 5,
         name: "task_pool".to_string(),
-        enabled,
-        status: if enabled { "configured" } else { "fallback" }.to_string(),
-        reason: if enabled {
-            Some("sessions_spawn_enabled".to_string())
-        } else {
-            Some("capacity_disabled".to_string())
-        },
+        enabled: true,
+        status: "configured".to_string(),
+        reason: Some("sessions_spawn_enabled".to_string()),
         detail: json!({
             "default_mode": config.sessions_spawn.default_mode,
             "memory_strategy": config.sessions_spawn.process_memory_strategy,
-            "max_concurrent": config.sessions_spawn.max_concurrent,
-            "max_spawn_depth": config.sessions_spawn.max_spawn_depth,
-            "max_children_per_agent": config.sessions_spawn.max_children_per_agent,
         }),
     }
 }

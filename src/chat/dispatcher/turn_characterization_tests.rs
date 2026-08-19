@@ -1,5 +1,5 @@
 use super::*;
-use crate::agent::loop_::{ToolConcurrencyGovernanceConfig, ToolLoopOutcome, ToolLoopTrace};
+use crate::agent::loop_::{ToolLoopOutcome, ToolLoopTrace};
 use crate::hooks::HookManager;
 use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, TokenUsage, TokenUsageSource};
 use crate::observability::NoopObserver;
@@ -366,12 +366,9 @@ async fn run_agent_fixture(
         "terminal",
         &crate::config::MultimodalConfig::default(),
         4,
-        false,
         2,
-        30,
         false,
         Vec::new(),
-        ToolConcurrencyGovernanceConfig::default(),
         None,
         Some(cancellation),
         on_delta,

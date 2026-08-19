@@ -84,7 +84,6 @@ pub struct EvolutionRuntimeConfig {
     pub mode: EvolutionMode,
     pub storage_dir: String,
     pub batch_size: usize,
-    pub poll_interval_secs: u64,
     pub retention: EvolutionRetentionConfig,
     pub data_thresholds: DataThresholds,
 }
@@ -95,7 +94,6 @@ impl Default for EvolutionRuntimeConfig {
             mode: EvolutionMode::default(),
             storage_dir: "self/evolution".to_string(),
             batch_size: 64,
-            poll_interval_secs: 3,
             retention: EvolutionRetentionConfig::default(),
             data_thresholds: DataThresholds::default(),
         }

@@ -54,14 +54,9 @@ impl CronTool {
         None
     }
 
-    /// Mutation pre-checks WITHOUT consuming the action budget: module enabled,
-    /// read-only mode, and the hourly rate-limit window. Callers that defer the
-    /// budget charge until after parameter validation (e.g. `add`/`schedule`,
-    /// which validate params + run the shell approval gate before touching the
-    /// DB) use this and then call [`Self::consume_action_budget`] right before
-    /// the DB write — matching the legacy `cron_add` semantics where invalid
-    /// requests never burned a budget slot.
-    fn enforce_mutation_no_budget(&self, action: &str, cfg: &Config) -> Option<ToolResult> {
+    /// Mutation pre-checks: module enabled and not read-only. Nothing rations
+    /// how many mutations may run, so this is the whole gate.
+    fn enforce_mutation(&self, action: &str, cfg: &Config) -> Option<ToolResult> {
         if let Some(r) = self.check_enabled(cfg) {
             return Some(r);
         }
@@ -72,38 +67,7 @@ impl CronTool {
                 error: Some(format!("Security policy: read-only mode, cannot perform '{action}'")),
             });
         }
-        if self.security.is_rate_limited() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
-            });
-        }
         None
-    }
-
-    /// Consume one action from the security budget. Returns an error `ToolResult`
-    /// when the budget is exhausted, otherwise `None`.
-    fn consume_action_budget(&self) -> Option<ToolResult> {
-        if self.security.record_action() {
-            None
-        } else {
-            Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".to_string()),
-            })
-        }
-    }
-
-    /// Full mutation pre-check: [`Self::enforce_mutation_no_budget`] plus an
-    /// immediate budget charge. Used by mutating actions that don't have
-    /// significant post-validation gating before the DB write.
-    fn enforce_mutation(&self, action: &str, cfg: &Config) -> Option<ToolResult> {
-        if let Some(r) = self.enforce_mutation_no_budget(action, cfg) {
-            return Some(r);
-        }
-        self.consume_action_budget()
     }
 
     /// Create a recurring (or `at`/`every`) job from the `add`/`schedule` action.
@@ -205,11 +169,6 @@ impl CronTool {
                         });
                     }
                 };
-                // All shell-job validation + approval passed: charge the budget now,
-                // immediately before the DB write (legacy cron_add parity).
-                if let Some(r) = self.consume_action_budget() {
-                    return Ok(r);
-                }
                 let persisted_grant = ApprovalGrant::persisted_runner_grant(
                     "cron_scheduler",
                     command,
@@ -287,12 +246,6 @@ impl CronTool {
                     },
                     None => None,
                 };
-                // All agent-job validation passed (prompt/session/model/delivery):
-                // charge the budget now, immediately before the DB write (legacy
-                // cron_add parity — invalid requests never burn a budget slot).
-                if let Some(r) = self.consume_action_budget() {
-                    return Ok(r);
-                }
                 cron::add_agent_job_with_lineage(
                     cfg,
                     name,
@@ -707,10 +660,7 @@ impl Tool for CronTool {
 
             // ── Mutating ───────────────────────────────────────────────────────────
             "add" | "schedule" => {
-                // Budget is NOT charged here: handle_add validates all params and
-                // runs the shell approval gate first, and only consumes the action
-                // budget immediately before the DB write (legacy cron_add parity).
-                if let Some(r) = self.enforce_mutation_no_budget(action, &cfg) {
+                if let Some(r) = self.enforce_mutation(action, &cfg) {
                     return Ok(r);
                 }
                 self.handle_add(&cfg, &args)
@@ -919,13 +869,6 @@ impl Tool for CronTool {
                         error: Some("Security policy: read-only mode, cannot perform 'cron run'".into()),
                     });
                 }
-                if self.security.is_rate_limited() {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-                    });
-                }
                 let job = match cron::get_job(&cfg, job_id) {
                     Ok(j) => j,
                     Err(e) => {
@@ -962,24 +905,6 @@ impl Tool for CronTool {
                         error: Some(format!("cron job '{}' changed or is already running", job.id)),
                     });
                 };
-                if !self.security.record_action() {
-                    let reason = "Rate limit exceeded: action budget exhausted";
-                    let release_error =
-                        match cron::abandon_job_claim(&cfg, &job.id, &manual_claim, job.last_status.as_deref(), reason)
-                        {
-                            Ok(true) => None,
-                            Ok(false) => Some("claim ownership changed before release".to_string()),
-                            Err(error) => Some(error.to_string()),
-                        };
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(release_error.map_or_else(
-                            || reason.to_string(),
-                            |error| format!("{reason}; failed to release cron claim: {error}"),
-                        )),
-                    });
-                }
                 let started_at = Utc::now();
                 let (success, output) =
                     cron::scheduler::execute_claimed_job_preauthorized_for_tool(&cfg, &job, manual_claim, self.name())
@@ -1732,7 +1657,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_run_claim_conflict_does_not_consume_action_budget() {
+    async fn manual_run_claim_conflict_leaves_the_job_runnable_after_release() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config {
             workspace_dir: tmp.path().join("workspace"),
@@ -1740,7 +1665,6 @@ mod tests {
             ..Config::default()
         };
         config.autonomy.level = AutonomyLevel::Full;
-        config.autonomy.max_actions_per_hour = 1;
         tokio::fs::create_dir_all(&config.workspace_dir).await.unwrap();
         let cfg_snap = Arc::new(config.clone());
         let cfg = new_shared(config);
@@ -1773,7 +1697,7 @@ mod tests {
         let retry = tool.execute(json!({"action": "run", "job_id": job.id})).await.unwrap();
         assert!(
             retry.success,
-            "claim conflict consumed the only action budget: {:?}",
+            "releasing the blocking claim must make the job runnable again: {:?}",
             retry.error
         );
     }
@@ -1841,12 +1765,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_shell_run_needs_no_grant_and_consumes_action_exactly_once() {
+    async fn manual_shell_run_needs_no_grant() {
         let tmp = TempDir::new().unwrap();
         let base = test_config(&tmp).await;
-        let mut config = (*base.load_full()).clone();
-        config.autonomy.max_actions_per_hour = 1;
-        let cfg = new_shared(config);
+        let cfg = new_shared((*base.load_full()).clone());
         let cfg_snap = cfg.load_full();
         let command = "touch single-use-marker";
         let job = cron::add_job(&cfg_snap, "*/5 * * * *", command).unwrap();
@@ -1857,10 +1779,6 @@ mod tests {
 
         assert!(result.success, "{:?}", result.error);
         assert!(cfg_snap.workspace_dir.join("single-use-marker").exists());
-        assert!(
-            security.is_rate_limited(),
-            "exactly one action should exhaust the one-action budget"
-        );
         assert!(!cfg_snap.workspace_dir.join("audit.log").exists());
     }
 

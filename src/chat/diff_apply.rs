@@ -443,9 +443,6 @@ pub(crate) async fn execute_plan(plan: &DiffApplyPlan, security: &SecurityPolicy
     if !security.can_act() {
         return Err(DiffApplyError::RejectedPath("autonomy is read-only".to_string()));
     }
-    if security.is_rate_limited() {
-        return Err(DiffApplyError::RejectedPath("action rate limit exceeded".to_string()));
-    }
 
     let mut prepared = Vec::with_capacity(plan.files.len());
     for file in &plan.files {
@@ -461,9 +458,6 @@ pub(crate) async fn execute_plan(plan: &DiffApplyPlan, security: &SecurityPolicy
 
     for item in &prepared {
         authorize_write(&item.target, security)?;
-    }
-    if !security.record_action() {
-        return Err(DiffApplyError::RejectedPath("action budget exhausted".to_string()));
     }
     for item in prepared {
         write_target(&item.target, item.content, item.create_new).await?;
@@ -709,15 +703,6 @@ mod tests {
         }
     }
 
-    fn policy_with_action_limit(workspace: &Path, max_actions_per_hour: u32) -> SecurityPolicy {
-        SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: workspace.to_path_buf(),
-            max_actions_per_hour,
-            ..SecurityPolicy::default()
-        }
-    }
-
     fn diff_for(path: &str, old: &str, new: &str) -> String {
         format!("--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-{old}\n+{new}\n")
     }
@@ -893,33 +878,6 @@ mod tests {
         .expect("plan");
         let err = execute_plan(&plan, &policy(temp.path())).await.expect_err("stale");
         assert!(matches!(err, DiffApplyError::Stale(_)));
-        assert_eq!(
-            tokio::fs::read_to_string(temp.path().join("a.txt")).await.unwrap(),
-            "old\n"
-        );
-        assert_eq!(
-            tokio::fs::read_to_string(temp.path().join("b.txt")).await.unwrap(),
-            "keep\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn budget_exhausted_before_write_leaves_all_targets_unchanged() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        tokio::fs::write(temp.path().join("a.txt"), "old\n")
-            .await
-            .expect("seed a");
-        tokio::fs::write(temp.path().join("b.txt"), "keep\n")
-            .await
-            .expect("seed b");
-        let plan = parse_unified_diff(
-            "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-keep\n+changed\n",
-        )
-        .expect("plan");
-        let err = execute_plan(&plan, &policy_with_action_limit(temp.path(), 2))
-            .await
-            .expect_err("budget exhausted");
-        assert!(matches!(err, DiffApplyError::RejectedPath(message) if message == "action budget exhausted"));
         assert_eq!(
             tokio::fs::read_to_string(temp.path().join("a.txt")).await.unwrap(),
             "old\n"

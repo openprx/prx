@@ -259,14 +259,6 @@ impl Tool for MessageSendTool {
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: rate limit exceeded".into()),
-            });
-        }
-
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("send");
 
         let turn_context = current_message_send_execution_context();
@@ -650,7 +642,6 @@ mod tests {
     fn test_security(level: AutonomyLevel) -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
             autonomy: level,
-            max_actions_per_hour: 100,
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         })
@@ -853,30 +844,6 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap().contains("read-only"));
-    }
-
-    #[tokio::test]
-    async fn execute_blocks_rate_limit() {
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Full,
-            max_actions_per_hour: 0,
-            workspace_dir: std::env::temp_dir(),
-            ..SecurityPolicy::default()
-        });
-        let (ch, _) = DummyChannel::new();
-        let tool = MessageSendTool::new(ch, security);
-
-        let result = tool
-            .execute(json!({
-                "action": "send",
-                "target": "+15551234567",
-                "message": "rate limited"
-            }))
-            .await
-            .unwrap();
-
-        assert!(!result.success);
-        assert!(result.error.unwrap().contains("rate limit"));
     }
 
     #[tokio::test]

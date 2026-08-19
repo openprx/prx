@@ -44,14 +44,6 @@ impl ProxyConfigTool {
             });
         }
 
-        if !self.security.record_action() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: rate limit exceeded".into()),
-            });
-        }
-
         None
     }
 

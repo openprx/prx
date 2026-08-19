@@ -114,14 +114,6 @@ impl Tool for FileEditTool {
             });
         }
 
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
-
         // Security check: validate path is within workspace (same policy as file_write).
         if !self.security.is_path_allowed(path) {
             return Ok(ToolResult {
@@ -289,13 +281,8 @@ impl Tool for FileEditTool {
         })
         .await;
 
-        // Only count the action against the rate budget once the write succeeds —
-        // error paths above are pure reads / no-ops on disk.
         match write_result {
             Ok(Ok(())) => {
-                if !self.security.record_action() {
-                    tracing::warn!("file_edit succeeded for {path} but action budget was already exhausted");
-                }
                 let suffix = if replacements == 1 { "" } else { "s" };
                 Ok(ToolResult {
                     success: true,
@@ -339,15 +326,10 @@ mod tests {
         })
     }
 
-    fn test_security_with(
-        workspace: std::path::PathBuf,
-        autonomy: AutonomyLevel,
-        max_actions_per_hour: u32,
-    ) -> Arc<SecurityPolicy> {
+    fn test_security_with(workspace: std::path::PathBuf, autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
             autonomy,
             workspace_dir: workspace,
-            max_actions_per_hour,
             ..SecurityPolicy::default()
         })
     }
@@ -582,7 +564,7 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(dir.join("f.txt"), "hello").await.unwrap();
 
-        let tool = FileEditTool::new(test_security_with(dir.clone(), AutonomyLevel::ReadOnly, 20));
+        let tool = FileEditTool::new(test_security_with(dir.clone(), AutonomyLevel::ReadOnly));
         let result = tool
             .execute(json!({"path": "f.txt", "old_string": "hello", "new_string": "bye"}))
             .await

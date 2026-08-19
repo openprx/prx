@@ -81,8 +81,11 @@ default_model = "claude-opus-4-6"
 temperature = 0.3
 max_history = 200
 
-[gateway]
-request_timeout_secs = 180
+# [gateway] has no request timeout. An HTTP request that starts an agent turn
+# is allowed to take as long as the turn takes; the gateway runs such work as a
+# detached job instead of holding it inside the request future, so a disconnect
+# never destroys it. Use `prx tasks list` / `prx tasks kill <id>` (or
+# `GET /api/jobs`) to see and end long work.
 
 [runtime]
 # Hard cap on the tokio blocking-thread pool (optional).
@@ -125,7 +128,6 @@ auto_save = true
 record_user_messages = true
 record_assistant_messages = true
 record_tool_events = false
-retention_days = 14
 
 [memory.semantic]
 auto_promote_user_messages = true
@@ -156,36 +158,18 @@ interval_minutes = 30
 active_hours = [8, 23]
 
 [agent]
-# Master switch for parallel read-only scheduling (default: false).
-parallel_tools = false
+# Read-only tool calls in one model iteration always run in parallel; there is
+# no switch that turns that off. Tool execution is never time-bounded either —
+# a long-running tool is normal agent business. Use `prx tasks list|kill` to see
+# and stop work that is actually running away.
 # Max concurrent read-only tools in one batch (default: 2)
 read_only_tool_concurrency_window = 2
-# Per read-only tool timeout in seconds (default: 30)
-read_only_tool_timeout_secs = 30
 # Enable priority scheduling so foreground tools run before background batches.
 priority_scheduling_enabled = false
 # Optional list of low-priority/background tools.
 # NOTE: priority is matched by tool name only (not by action), so `cron` is not
 # listed here — adding it would demote every cron action, not just background runs.
 low_priority_tools = ["sessions_spawn", "delegate"]
-# Rollout stage: off | stage_a | stage_b | stage_c | full
-concurrency_rollout_stage = "off"
-# Optional sample percent (0 means stage default)
-concurrency_rollout_sample_percent = 0
-# Optional channel allowlist for rollout
-concurrency_rollout_channels = ["telegram", "discord"]
-# Emergency kill switch (highest priority) to force serial scheduling
-concurrency_kill_switch_force_serial = false
-# Auto rollback thresholds
-concurrency_auto_rollback_enabled = true
-concurrency_rollback_timeout_rate_threshold = 0.20
-concurrency_rollback_cancel_rate_threshold = 0.20
-concurrency_rollback_error_rate_threshold = 0.20
-
-[subagent_governance]
-max_concurrent_subagents = 4
-max_spawn_depth = 2
-max_children_per_agent = 5
 
 # Secure autonomous defaults. `full` skips confirmation prompts but remains
 # workspace-scoped and bounded unless the operator explicitly widens it.
@@ -193,7 +177,6 @@ max_children_per_agent = 5
 level = "full"
 workspace_only = true
 forbidden_paths = ["/etc", "/root", "/home", "/opt", "/tmp", "~/.ssh"]
-max_actions_per_hour = 20
 max_cost_per_day_cents = 500
 
 # Multi-agent setup
@@ -265,19 +248,39 @@ pending/committed/failed state and atomically commits the topic, participant,
 eligible memory, and memory-fabric outbox row. Failed or expired pending attempts
 can be retried with the same idempotency identity.
 
-## Agent Concurrency Env Overrides
+## Removed Configuration Keys
 
-- `ZEROCLAW_READ_ONLY_TOOL_CONCURRENCY_WINDOW`
-- `ZEROCLAW_READ_ONLY_TOOL_TIMEOUT_SECS`
-- `ZEROCLAW_PRIORITY_SCHEDULING_ENABLED`
-- `ZEROCLAW_CONCURRENCY_KILL_SWITCH_FORCE_SERIAL`
-- `ZEROCLAW_CONCURRENCY_ROLLOUT_STAGE`
-- `ZEROCLAW_CONCURRENCY_ROLLOUT_SAMPLE_PERCENT`
-- `ZEROCLAW_CONCURRENCY_ROLLOUT_CHANNELS` (comma-separated)
-- `ZEROCLAW_CONCURRENCY_AUTO_ROLLBACK_ENABLED`
-- `ZEROCLAW_CONCURRENCY_ROLLBACK_TIMEOUT_RATE_THRESHOLD`
-- `ZEROCLAW_CONCURRENCY_ROLLBACK_CANCEL_RATE_THRESHOLD`
-- `ZEROCLAW_CONCURRENCY_ROLLBACK_ERROR_RATE_THRESHOLD`
+prx does not cap how much work runs at once and does not impose timeouts on
+agent work, so the keys that expressed those ceilings are gone. A few others
+named limits no code path ever applied.
+
+A config that still contains one of these keys **keeps loading**: the key is
+dropped and a `WARN` names the file and line so you can delete it when
+convenient. Nothing rewrites your config files.
+
+| Removed key | Why |
+|---|---|
+| `agent.parallel_tools` | no concurrency ceiling to switch |
+| `agent.read_only_tool_timeout_secs` | no timeouts on agent work |
+| `agent.concurrency_kill_switch_force_serial` | staged rollout retired |
+| `agent.concurrency_rollout_stage` | staged rollout retired |
+| `agent.concurrency_rollout_sample_percent` | staged rollout retired |
+| `agent.concurrency_rollout_channels` | staged rollout retired |
+| `agent.concurrency_auto_rollback_enabled` | staged rollout retired |
+| `agent.concurrency_rollback_timeout_rate_threshold` | staged rollout retired |
+| `agent.concurrency_rollback_cancel_rate_threshold` | staged rollout retired |
+| `agent.concurrency_rollback_error_rate_threshold` | staged rollout retired |
+| `sessions_spawn.max_concurrent` | sub-agent fan-out is uncapped; use `prx tasks` to see and end runs |
+| `sessions_spawn.max_spawn_depth` | nesting is uncapped; depth is still reported |
+| `sessions_spawn.max_children_per_agent` | per-session fan-out is uncapped |
+| `autonomy.max_actions_per_hour` | no hourly action budget |
+| `gateway.request_timeout_secs` | no request deadline on gateway handlers |
+| `[security.resources]` (whole table) | never enforced by any code path |
+| `memory.events.retention_days` | never read by the hygiene pass |
+
+A key that is merely **misspelled** is still a hard error. Only the exact paths
+above are absorbed, so `max_actions_per_hourr` still stops the load with
+`Unknown configuration path(s)`.
 
 ## Workspace Files
 

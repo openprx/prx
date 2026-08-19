@@ -67,14 +67,6 @@ impl Tool for FileWriteTool {
             });
         }
 
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
-
         // Security check: validate path is within workspace
         if !self.security.is_path_allowed(path) {
             return Ok(ToolResult {
@@ -141,14 +133,6 @@ impl Tool for FileWriteTool {
                 success: false,
                 output: String::new(),
                 error: Some(error),
-            });
-        }
-
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
             });
         }
 
@@ -271,15 +255,10 @@ mod tests {
         })
     }
 
-    fn test_security_with(
-        workspace: std::path::PathBuf,
-        autonomy: AutonomyLevel,
-        max_actions_per_hour: u32,
-    ) -> Arc<SecurityPolicy> {
+    fn test_security_with(workspace: std::path::PathBuf, autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
             autonomy,
             workspace_dir: workspace,
-            max_actions_per_hour,
             ..SecurityPolicy::default()
         })
     }
@@ -511,7 +490,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileWriteTool::new(test_security_with(dir.clone(), AutonomyLevel::ReadOnly, 20));
+        let tool = FileWriteTool::new(test_security_with(dir.clone(), AutonomyLevel::ReadOnly));
         let result = tool
             .execute(json!({"path": "out.txt", "content": "should-block"}))
             .await
@@ -519,25 +498,6 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("read-only"));
-        assert!(!dir.join("out.txt").exists());
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
-    #[tokio::test]
-    async fn file_write_blocks_when_rate_limited() {
-        let dir = std::env::temp_dir().join("openprx_test_file_write_rate_limited");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-
-        let tool = FileWriteTool::new(test_security_with(dir.clone(), AutonomyLevel::Supervised, 0));
-        let result = tool
-            .execute(json!({"path": "out.txt", "content": "should-block"}))
-            .await
-            .unwrap();
-
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("Rate limit exceeded"));
         assert!(!dir.join("out.txt").exists());
 
         let _ = tokio::fs::remove_dir_all(&dir).await;

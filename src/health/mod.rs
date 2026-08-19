@@ -309,6 +309,41 @@ pub fn readiness_from_snapshot(snapshot: &HealthSnapshot) -> ReadinessReport {
             continue;
         }
 
+        // A stall is reported, never acted upon — and this boolean is where that
+        // rule would otherwise be broken.
+        //
+        // prx is a runtime for long-running agent work with no execution
+        // timeouts: nothing may terminate a task automatically. Letting a stalled
+        // listener flip readiness to false would not keep that power out of the
+        // system, it would hand it to the orchestrator instead — `/health`
+        // answers 503 when readiness is false, and Kubernetes (or any equivalent
+        // liveness/readiness probe) responds by restarting the whole process,
+        // killing every long task in flight. That is strictly more destructive
+        // than the timeouts this design removed: a timeout ends one operation, a
+        // restart ends all of them. So a stall lives in the detailed status only,
+        // the same way `long_task_warn_secs` warns without terminating.
+        //
+        // Observability is untouched: the component keeps its `Degraded` state,
+        // its stall summary in `last_error`, and its full `activity` detail in
+        // every snapshot, state file and `prx doctor` run. Only the readiness
+        // boolean declines to act on it.
+        //
+        // Scope is deliberately narrow. `Failed` still blocks readiness — that is
+        // a deterministic fault, not a quiet channel — and so does a component
+        // whose readiness signal merely went stale. Only an explicit stall
+        // verdict is excluded. Do not widen this to all `Degraded` components,
+        // and do not remove it: either change puts process restarts back on a
+        // path that only meant to describe a channel. The state gate carries its
+        // own weight here — a listener that errored out is `Failed` while still
+        // carrying its last (stalled) activity reading, so matching on the
+        // reading alone would quietly exempt real faults too.
+        if component.state == ComponentState::Degraded && component.activity.is_some_and(|activity| activity.stalled) {
+            if component.required {
+                ready_components += 1;
+            }
+            continue;
+        }
+
         let summary = component.last_error.clone().unwrap_or_else(|| match component.state {
             ComponentState::Starting => "component has not acknowledged readiness".to_string(),
             ComponentState::Disabled => "required component is disabled".to_string(),
@@ -498,6 +533,113 @@ mod tests {
         assert_eq!(report.ready_components, 1);
         assert_eq!(report.issues.len(), 1);
         assert_eq!(report.issues[0].component, "optional-failed");
+    }
+
+    fn stalled_channel_component(required: bool) -> ComponentHealth {
+        let mut component = test_component(ComponentState::Degraded, required, true);
+        component.owner = "channels".to_string();
+        component.last_error = Some("listener stalled: no receive activity for 240s".to_string());
+        component.activity = Some(ComponentActivity {
+            liveness: "bounded",
+            idle_seconds: 240,
+            stall_threshold_seconds: Some(135),
+            stalled: true,
+            last_inbound_seconds_ago: Some(1802),
+            last_outbound_seconds_ago: Some(1801),
+            last_upstream_seconds_ago: Some(240),
+        });
+        component
+    }
+
+    #[test]
+    fn stalled_component_is_reported_without_blocking_readiness() {
+        // A stall must stay visible and stay inert. If it flipped readiness to
+        // false, /health would answer 503 and an orchestrator would restart the
+        // process, killing every long-running task — the automatic termination
+        // this runtime exists to avoid.
+        let mut components = BTreeMap::new();
+        components.insert(
+            "required-ready".to_string(),
+            test_component(ComponentState::Ready, true, true),
+        );
+        components.insert("channel:telegram".to_string(), stalled_channel_component(false));
+        let snapshot = HealthSnapshot {
+            pid: 1,
+            updated_at: now_rfc3339(),
+            uptime_seconds: 1,
+            components,
+        };
+
+        let report = readiness_from_snapshot(&snapshot);
+
+        assert!(report.ready, "a stalled listener must not take the daemon out of ready");
+        assert_eq!(report.status, "ready");
+        assert!(
+            !report.issues.iter().any(|issue| issue.component == "channel:telegram"),
+            "a stall must not be raised as a readiness issue"
+        );
+
+        // Same snapshot, undiminished detail: the stall is fully observable.
+        let component = &snapshot.components["channel:telegram"];
+        assert_eq!(component.state, ComponentState::Degraded);
+        assert_eq!(component.status, "degraded");
+        assert!(
+            component
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("stalled"))
+        );
+        let activity = component.activity.expect("stalled component must publish its activity");
+        assert!(activity.stalled);
+        assert_eq!(activity.idle_seconds, 240);
+        assert_eq!(activity.stall_threshold_seconds, Some(135));
+        assert_eq!(activity.liveness, "bounded");
+    }
+
+    #[test]
+    fn required_stalled_component_still_counts_as_ready() {
+        let mut components = BTreeMap::new();
+        components.insert("channel:telegram".to_string(), stalled_channel_component(true));
+        let snapshot = HealthSnapshot {
+            pid: 1,
+            updated_at: now_rfc3339(),
+            uptime_seconds: 1,
+            components,
+        };
+
+        let report = readiness_from_snapshot(&snapshot);
+
+        assert!(report.ready);
+        assert_eq!(report.required_components, 1);
+        assert_eq!(report.ready_components, 1);
+    }
+
+    #[test]
+    fn failed_component_keeps_blocking_readiness_even_while_stalled() {
+        // Narrow scope guard: a listener that errored out is `Failed` while still
+        // carrying its last stalled reading. That is a deterministic fault and
+        // must keep blocking readiness — only the stall verdict is exempt.
+        let mut failed = stalled_channel_component(false);
+        failed.state = ComponentState::Failed;
+        failed.status = ComponentState::Failed.legacy_status().to_string();
+        let mut components = BTreeMap::new();
+        components.insert(
+            "required-ready".to_string(),
+            test_component(ComponentState::Ready, true, true),
+        );
+        components.insert("channel:telegram".to_string(), failed);
+        let snapshot = HealthSnapshot {
+            pid: 1,
+            updated_at: now_rfc3339(),
+            uptime_seconds: 1,
+            components,
+        };
+
+        let report = readiness_from_snapshot(&snapshot);
+
+        assert!(!report.ready);
+        assert_eq!(report.issues.len(), 1);
+        assert_eq!(report.issues[0].component, "channel:telegram");
     }
 
     #[test]

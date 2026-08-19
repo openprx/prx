@@ -45,17 +45,10 @@ impl Observer for VerboseObserver {
                 eprintln!("< Tool {tool} (success={success}, duration_ms={ms})");
             }
             ObserverEvent::ToolBatch {
-                rollout_stage,
                 batch_size,
-                timeout_count,
-                cancel_count,
-                error_count,
-                rollback,
-                ..
+                concurrency_window,
             } => {
-                eprintln!(
-                    "< ToolBatch stage={rollout_stage} size={batch_size} timeout={timeout_count} cancel={cancel_count} error={error_count} rollback={rollback}"
-                );
+                eprintln!("< ToolBatch size={batch_size} window={concurrency_window}");
             }
             ObserverEvent::TurnComplete => {
                 eprintln!("< Complete");

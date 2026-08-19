@@ -11,7 +11,7 @@
 use super::sessions_list::format_run_usage;
 use super::sessions_read_model;
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
-use crate::agent::loop_::{DocumentIngestRuntime, ScopeContext, SpawnEventSink, ToolConcurrencyGovernanceConfig};
+use crate::agent::loop_::{DocumentIngestRuntime, ScopeContext, SpawnEventSink};
 use crate::channels::build_identity_prompt;
 use crate::channels::traits::{Channel, SendMessage};
 use crate::config::{AgentCompactionConfig, DelegateAgentConfig, MultimodalConfig, SessionsSpawnConfig};
@@ -286,9 +286,9 @@ pub(crate) struct SpawnExecutionContext {
     /// channel/chat/agent turn so its directly-spawned children inherit
     /// `parent_run_id`) from a *spawn run* context (a sub-agent run that may
     /// itself spawn). The turn root represents "the turn itself, before any
-    /// spawn nesting": its first child must compute `spawn_depth` 0 — exactly as
-    /// if no context were seeded — so seeding does not tighten the
-    /// `max_spawn_depth` boundary. A spawn run's child computes `+1` as before.
+    /// spawn nesting": its first child reports `spawn_depth` 0 — exactly as if
+    /// no context were seeded — so seeding a turn does not inflate the reported
+    /// nesting of its children. A spawn run's child reports `+1`.
     pub(crate) is_turn_root: bool,
 }
 
@@ -296,8 +296,8 @@ impl SpawnExecutionContext {
     /// Seed a *turn root* context for a top-level channel/chat/agent turn. The
     /// per-turn `run_id` becomes the `parent_run_id` of any task this turn spawns
     /// directly, while `spawn_depth` starts at 0 and — because `is_turn_root` is
-    /// true — the first child still computes depth 0 (no boundary tightening; see
-    /// `spawn_depth` computation in `execute`).
+    /// true — the first child still reports depth 0 (see the `spawn_depth`
+    /// computation in `execute`).
     pub(crate) const fn seed_turn_context(run_id: String, session_scope_key: String) -> Self {
         Self {
             run_id,
@@ -451,10 +451,15 @@ fn spawn_lineage(
     }
 }
 
+/// Count the runs that are still live, for the spawn-time visibility log.
+///
+/// Nothing rejects a spawn on this number; it exists so an operator reading the
+/// log can watch fan-out grow, the same way the runtime registry lets them see
+/// and kill it.
 fn running_run_count(runs: &[SubAgentRun]) -> usize {
     runs.iter()
-        // A suspended (AwaitingInput) run is still live — it holds a concurrency
-        // slot until it resumes or is killed/times out — so it counts here.
+        // A suspended (AwaitingInput) run is still live — it has not released
+        // its process or its history — so it counts here.
         .filter(|run| {
             matches!(
                 run.status,
@@ -1237,10 +1242,10 @@ impl Tool for SessionsSpawnTool {
             .filter(|s| !s.is_empty());
         let spawn_scope = parse_spawn_scope(&args);
         let parent_exec_ctx = current_spawn_execution_context();
-        // D8-4: a turn-root context represents the turn itself (zero spawn nesting
-        // so far); its first child must compute depth 0 — identical to the
-        // no-context case — so seeding a turn root never tightens the
-        // max_spawn_depth boundary. A real spawn-run context's child computes +1.
+        // D8-4: a turn-root context represents the turn itself (zero spawn
+        // nesting so far), so its first child reports depth 0 — identical to the
+        // no-context case. A real spawn-run context's child reports +1. The depth
+        // is lineage only: nothing rejects a spawn for being deeply nested.
         let spawn_depth = parent_exec_ctx.as_ref().map_or(0, |ctx| {
             if ctx.is_turn_root {
                 ctx.spawn_depth
@@ -1251,64 +1256,19 @@ impl Tool for SessionsSpawnTool {
         let parent_run_id = parent_exec_ctx.as_ref().map(|ctx| ctx.run_id.clone());
         let session_scope_key = spawn_session_scope_key(parent_exec_ctx.as_ref(), spawn_scope.as_ref());
 
-        {
-            let runs = self.active_runs.read().await;
-            let active_count = running_run_count(&runs);
-            if active_count >= self.spawn_config.max_concurrent {
-                tracing::warn!(
-                    active_count,
-                    max_concurrent = self.spawn_config.max_concurrent,
-                    "sessions_spawn rejected: max concurrent runs reached"
-                );
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "sessions_spawn rejected: max_concurrent={} reached",
-                        self.spawn_config.max_concurrent
-                    )),
-                });
-            }
-
-            if spawn_depth > self.spawn_config.max_spawn_depth {
-                tracing::warn!(
-                    spawn_depth,
-                    max_spawn_depth = self.spawn_config.max_spawn_depth,
-                    "sessions_spawn rejected: max spawn depth exceeded"
-                );
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "sessions_spawn rejected: spawn depth {} exceeds max_spawn_depth={}",
-                        spawn_depth, self.spawn_config.max_spawn_depth
-                    )),
-                });
-            }
-
-            let same_session_children = runs
-                .iter()
-                .filter(|run| {
-                    matches!(run.status, SubAgentStatus::Running) && run.session_scope_key == session_scope_key
-                })
-                .count();
-            if same_session_children >= self.spawn_config.max_children_per_agent {
-                tracing::warn!(
-                    same_session_children,
-                    max_children_per_agent = self.spawn_config.max_children_per_agent,
-                    session_scope_key = %session_scope_key,
-                    "sessions_spawn rejected: max children per session reached"
-                );
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "sessions_spawn rejected: max_children_per_agent={} reached",
-                        self.spawn_config.max_children_per_agent
-                    )),
-                });
-            }
-        }
+        // This runtime caps neither how many sub-agents run at once, how deeply
+        // they nest, nor how many one session may own: an operator sees every
+        // live run in the runtime registry and ends it with `prx tasks kill`,
+        // which is what makes an uncapped fan-out answerable rather than
+        // unstoppable. Counting the live runs on the way in keeps that fan-out
+        // visible in the log while it grows, instead of only after it hurts.
+        let live_runs = running_run_count(&self.active_runs.read().await);
+        tracing::debug!(
+            live_runs,
+            spawn_depth,
+            session_scope_key = %session_scope_key,
+            "sessions_spawn accepted"
+        );
 
         // FIX-P0-37: spawning a child session creates a new process that
         // consumes resources and carries a potential sandbox-escape surface,
@@ -3106,15 +3066,9 @@ async fn run_sub_agent_task(
                 "sessions_spawn",
                 &multimodal_config_owned,
                 max_iterations,
-                true,
                 2,
-                30,
                 false,
                 vec!["sessions_spawn".to_string(), "delegate".to_string(), "cron".to_string()],
-                ToolConcurrencyGovernanceConfig {
-                    rollout_stage: "full".to_string(),
-                    ..ToolConcurrencyGovernanceConfig::default()
-                },
                 Some(&compaction_config_owned),
                 Some(cancel_token_owned),
                 on_delta_iter, // chat event bridge: incremental loop output (v1.1a)
@@ -4159,6 +4113,81 @@ mod tests {
                     error_message: None,
                 }],
                 final_provider: "echo".to_string(),
+                final_model: model.to_string(),
+                tokens_used: crate::llm::route_decision::TokenUsage::default(),
+            })
+        }
+    }
+
+    /// A provider that parks until the test hands out permits, so every run it
+    /// serves stays `Running` at the same time. That is what lets a fan-out test
+    /// observe many simultaneously live runs rather than a fast serial trickle.
+    struct GatedProvider {
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl GatedProvider {
+        /// Park until the test releases this run.
+        async fn wait_for_release(&self) {
+            if let Ok(permit) = self.gate.acquire().await {
+                drop(permit);
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::Provider for GatedProvider {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.wait_for_release().await;
+            Ok("gated".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: crate::providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<crate::providers::ChatResponse> {
+            self.wait_for_release().await;
+            Ok(crate::providers::ChatResponse {
+                text: Some("gated".to_string()),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            })
+        }
+
+        async fn chat_traced(
+            &self,
+            _request: crate::providers::ChatRequest<'_>,
+            model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<crate::providers::traits::ChatTrace> {
+            self.wait_for_release().await;
+            let started_at = chrono::Utc::now();
+            let finished_at = chrono::Utc::now();
+            Ok(crate::providers::traits::ChatTrace {
+                response: crate::providers::ChatResponse {
+                    text: Some("gated".to_string()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                },
+                attempts: vec![crate::llm::route_decision::ProviderAttempt {
+                    seq: 1,
+                    provider: "gated".to_string(),
+                    model: model.to_string(),
+                    started_at,
+                    finished_at,
+                    status: crate::llm::route_decision::AttemptStatus::Success,
+                    error_class: None,
+                    error_message: None,
+                }],
+                final_provider: "gated".to_string(),
                 final_model: model.to_string(),
                 tokens_used: crate::llm::route_decision::TokenUsage::default(),
             })
@@ -5229,70 +5258,138 @@ mod tests {
         assert_eq!(messages.len(), 1);
     }
 
-    #[tokio::test]
-    async fn spawn_rejected_when_max_concurrent_reached() {
+    /// The runtime places no ceiling on how many sub-agents run at once, how
+    /// deeply they nest, or how many one session owns. This fans out past every
+    /// ceiling that used to exist — `max_concurrent` = 64 and, because all 100
+    /// runs share one session scope key, `max_children_per_agent` = 32 — and
+    /// requires that every single spawn is accepted and stays live.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn spawn_fan_out_is_uncapped_by_concurrency_or_children() {
+        /// Comfortably past both removed ceilings (64 global, 32 per session).
+        const FAN_OUT: usize = 100;
+
         let (ch, _) = RecordingChannel::new();
-        let mut spawn_cfg = crate::config::SessionsSpawnConfig::default();
-        spawn_cfg.max_concurrent = 0;
-        let tool = make_tool_with_spawn_config(
+        // Every run parks inside the provider, so all FAN_OUT of them are
+        // simultaneously Running when the assertions below look at the registry.
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        // No workaround of any kind: the default policy is what a real spawn
+        // runs under, and nothing in it rations how many spawns may happen.
+        let tool = make_tool(
             Arc::new(ch),
-            Arc::new(EchoProvider { response: "ok".into() }),
-            spawn_cfg,
+            Arc::new(GatedProvider {
+                gate: Arc::clone(&gate),
+            }),
+        );
+        tool.set_default_recipient(Some("test-recipient".to_string())).await;
+
+        for index in 0..FAN_OUT {
+            let result = tool
+                .execute(with_spawn_grant(json!({
+                    "task": format!("fan-out child {index}"),
+                    "_zc_scope_trusted": true,
+                    "_zc_scope": {
+                        "sender": "openprx_user",
+                        "channel": "signal",
+                        "chat_type": "direct",
+                        "chat_id": "+15551234567"
+                    }
+                })))
+                .await
+                .unwrap();
+            assert!(
+                result.success,
+                "spawn {index} of {FAN_OUT} must be accepted, got error: {:?}",
+                result.error
+            );
+        }
+
+        let runs = tool.active_runs_snapshot().await;
+        assert_eq!(
+            running_run_count(&runs),
+            FAN_OUT,
+            "all {FAN_OUT} runs must be live at once; none may be capped away"
+        );
+        let scope_keys: std::collections::HashSet<&str> =
+            runs.iter().map(|run| run.session_scope_key.as_str()).collect();
+        assert_eq!(
+            scope_keys.len(),
+            1,
+            "the fan-out must share one session scope, which is what the removed \
+             per-session ceiling counted"
         );
 
-        let result = tool.execute(json!({"task": "blocked"})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("max_concurrent"));
+        // Let the parked runs finish so nothing is left blocked on the gate.
+        gate.add_permits(FAN_OUT * 4);
     }
 
+    /// Nesting has no ceiling either: a chain of spawn-run contexts, each one
+    /// deeper than the last, is accepted well past the depth the removed
+    /// `max_spawn_depth` = 8 allowed. The depth is still reported, because a
+    /// fan-out is only acceptable while an operator can see its shape.
     #[tokio::test]
-    async fn spawn_rejected_when_depth_exceeded() {
+    async fn spawn_nesting_is_uncapped_and_still_reports_depth() {
+        /// Comfortably past the removed depth ceiling of 8.
+        const DEEPEST: usize = 40;
+
         let (ch, _) = RecordingChannel::new();
-        let mut spawn_cfg = crate::config::SessionsSpawnConfig::default();
-        spawn_cfg.max_spawn_depth = 0;
-        let tool = make_tool_with_spawn_config(
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        // No workaround of any kind: the default policy is what a real spawn
+        // runs under, and nothing in it rations how many spawns may happen.
+        let tool = make_tool(
             Arc::new(ch),
-            Arc::new(EchoProvider { response: "ok".into() }),
-            spawn_cfg,
+            Arc::new(GatedProvider {
+                gate: Arc::clone(&gate),
+            }),
+        );
+        tool.set_default_recipient(Some("test-recipient".to_string())).await;
+
+        for parent_depth in 0..DEEPEST {
+            let result = SPAWN_EXECUTION_CONTEXT
+                .scope(
+                    SpawnExecutionContext {
+                        run_id: format!("spawn-run-{parent_depth}"),
+                        session_scope_key: format!("signal:direct:+1555000{parent_depth}"),
+                        spawn_depth: parent_depth,
+                        owner_id: None,
+                        topic_id: None,
+                        source_message_event_id: None,
+                        is_turn_root: false,
+                    },
+                    async { tool.execute(with_spawn_grant(json!({"task": "nested"}))).await },
+                )
+                .await
+                .unwrap();
+            assert!(
+                result.success,
+                "a child at depth {} must be accepted, got error: {:?}",
+                parent_depth + 1,
+                result.error
+            );
+        }
+
+        let runs = tool.active_runs_snapshot().await;
+        let deepest = runs
+            .iter()
+            .map(|run| run.spawn_depth)
+            .max()
+            .expect("test: the nested runs must be registered");
+        assert_eq!(
+            deepest, DEEPEST,
+            "the deepest child must still report its nesting depth"
         );
 
-        let result = SPAWN_EXECUTION_CONTEXT
-            .scope(
-                SpawnExecutionContext {
-                    run_id: "parent-run".to_string(),
-                    session_scope_key: "signal:group:test".to_string(),
-                    spawn_depth: 0,
-                    owner_id: Some("owner-a".to_string()),
-                    topic_id: Some("topic-a".to_string()),
-                    source_message_event_id: Some("msg-a".to_string()),
-                    // A real spawn-run parent (not a turn root): the next hop is
-                    // depth 1, which exceeds max_spawn_depth=0 and is rejected.
-                    is_turn_root: false,
-                },
-                async { tool.execute(json!({"task": "nested"})).await },
-            )
-            .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("max_spawn_depth"));
+        gate.add_permits(DEEPEST * 4);
     }
 
-    /// D8-4: a turn-root context (is_turn_root = true, spawn_depth = 0) must NOT
-    /// tighten the max_spawn_depth boundary. With max_spawn_depth = 0, a spawn
-    /// directly from a turn root computes the child's depth as 0 (identical to the
-    /// no-context case), so it is allowed — unlike a real spawn-run parent at
-    /// depth 0, which would compute depth 1 and be rejected (see
-    /// spawn_rejected_when_depth_exceeded above).
+    /// D8-4: a turn-root context (is_turn_root = true, spawn_depth = 0)
+    /// represents the turn itself, so its first child reports depth 0 — exactly
+    /// as if no context had been seeded. Seeding a turn must not inflate the
+    /// nesting its children report (the complement is
+    /// spawn_run_parent_reports_child_at_depth_one).
     #[tokio::test]
-    async fn turn_root_seed_does_not_tighten_max_spawn_depth() {
+    async fn turn_root_seed_reports_first_child_at_depth_zero() {
         let (ch, _) = RecordingChannel::new();
-        let mut spawn_cfg = crate::config::SessionsSpawnConfig::default();
-        spawn_cfg.max_spawn_depth = 0;
-        let tool = make_tool_with_spawn_config(
-            Arc::new(ch),
-            Arc::new(EchoProvider { response: "ok".into() }),
-            spawn_cfg,
-        );
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
         tool.set_default_recipient(Some("test-recipient".to_string())).await;
 
         let result = SPAWN_EXECUTION_CONTEXT
@@ -5306,14 +5403,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            result.success,
-            "a turn-root seed must not tighten max_spawn_depth=0 (first child depth is 0)"
-        );
+        assert!(result.success, "a turn-root seed must not block its first child");
 
         let runs = tool.active_runs_snapshot().await;
         let child = runs.first().expect("the spawned child run must be registered");
-        assert_eq!(child.spawn_depth, 0, "turn-root first child must compute spawn_depth 0");
+        assert_eq!(child.spawn_depth, 0, "turn-root first child must report spawn_depth 0");
         assert_eq!(
             child.parent_run_id.as_deref(),
             Some("turn-root-run"),
@@ -5322,20 +5416,13 @@ mod tests {
     }
 
     /// D8-4: a real spawn-run parent at depth 0 (is_turn_root = false) is the
-    /// boundary the turn-root case must NOT mimic: its first child computes depth
-    /// 1, which exceeds max_spawn_depth = 0 and is rejected. This is the
-    /// complement of turn_root_seed_does_not_tighten_max_spawn_depth (same
-    /// spawn_depth = 0 seed, opposite is_turn_root, opposite outcome).
+    /// case the turn root must not mimic — its child reports depth 1, one hop
+    /// deeper. Same spawn_depth = 0 seed, opposite is_turn_root, opposite
+    /// reported depth.
     #[tokio::test]
-    async fn spawn_run_parent_at_depth_zero_still_rejects_next_hop() {
+    async fn spawn_run_parent_reports_child_at_depth_one() {
         let (ch, _) = RecordingChannel::new();
-        let mut spawn_cfg = crate::config::SessionsSpawnConfig::default();
-        spawn_cfg.max_spawn_depth = 0;
-        let tool = make_tool_with_spawn_config(
-            Arc::new(ch),
-            Arc::new(EchoProvider { response: "ok".into() }),
-            spawn_cfg,
-        );
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
         tool.set_default_recipient(Some("test-recipient".to_string())).await;
 
         let result = SPAWN_EXECUTION_CONTEXT
@@ -5354,36 +5441,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("max_spawn_depth"));
-    }
+        assert!(result.success, "a nested spawn must not be blocked by its depth");
 
-    #[tokio::test]
-    async fn spawn_rejected_when_max_children_per_session_reached() {
-        let (ch, _) = RecordingChannel::new();
-        let mut spawn_cfg = crate::config::SessionsSpawnConfig::default();
-        spawn_cfg.max_children_per_agent = 0;
-        let tool = make_tool_with_spawn_config(
-            Arc::new(ch),
-            Arc::new(EchoProvider { response: "ok".into() }),
-            spawn_cfg,
-        );
-
-        let result = tool
-            .execute(json!({
-                "task": "child",
-                "_zc_scope_trusted": true,
-                "_zc_scope": {
-                    "sender": "openprx_user",
-                    "channel": "signal",
-                    "chat_type": "direct",
-                    "chat_id": "+15551234567"
-                }
-            }))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("max_children_per_agent"));
+        let runs = tool.active_runs_snapshot().await;
+        let child = runs.first().expect("the spawned child run must be registered");
+        assert_eq!(child.spawn_depth, 1, "a spawn-run parent's child is one hop deeper");
     }
 
     #[tokio::test]

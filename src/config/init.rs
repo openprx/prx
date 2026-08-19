@@ -447,7 +447,6 @@ auto_save = true
 record_user_messages = true
 record_assistant_messages = true
 record_tool_events = false
-retention_days = 14
 
 [memory.semantic]
 auto_promote_user_messages = true
@@ -467,7 +466,6 @@ auto_save = true
 record_user_messages = true
 record_assistant_messages = true
 record_tool_events = false
-retention_days = 14
 
 [memory.semantic]
 auto_promote_user_messages = true
@@ -498,7 +496,6 @@ auto_save = true
 record_user_messages = true
 record_assistant_messages = true
 record_tool_events = false
-retention_days = 14
 
 # Semantic memory promotion controls long-term durable memory extraction.
 [memory.semantic]
@@ -652,7 +649,6 @@ fn security_template(spec: Spec) -> String {
 level = "full"
 workspace_only = true
 # Secure autonomous defaults. Operators may explicitly widen these values.
-max_actions_per_hour = 20
 max_cost_per_day_cents = 500
 # Set true only when host-wide unrestricted operation is intentional and
 # reviewed. This suppresses doctor noise; it is not a capability gate.
@@ -665,12 +661,6 @@ forbidden_paths = [
 
 [secrets]
 encrypt = true
-
-[security]
-[security.resources]
-max_memory_mb = 512
-max_cpu_time_seconds = 300
-max_subprocesses = 10
 
 # Direct natural-person adapters emit this notice before the first AI response.
 [compliance.interaction_notice]
@@ -692,7 +682,6 @@ status = "unclassified"               # unclassified | high_risk | not_high_risk
 level = "full"                         # read_only | supervised | full
 workspace_only = false
 forbidden_paths = []                   # no extra path denylist
-max_actions_per_hour = 4294967295
 max_cost_per_day_cents = 4294967295
 # Set true only when host-wide unrestricted operation is intentional and
 # reviewed. This suppresses doctor noise; it is not a capability gate.
@@ -700,12 +689,6 @@ acknowledge_unrestricted_profile = false
 
 [secrets]
 encrypt = true
-
-[security]
-[security.resources]
-max_memory_mb = 512
-max_cpu_time_seconds = 300
-max_subprocesses = 10
 
 [security.audit]
 log_path = "audit.log"
@@ -813,10 +796,6 @@ max_recalled_pages = 10
 
 [sessions_spawn]
 # process_memory_strategy = "shared_fabric" # shared_fabric | isolated_private
-# 🔴 fork-bomb safeguards (high-position; never set to 0):
-# max_concurrent = 64
-# max_spawn_depth = 8
-# max_children_per_agent = 32
 
 [self_system]
 "#
@@ -838,14 +817,11 @@ mode = "safeguard"                    # off | safeguard | aggressive
 [agent.compaction.os_paging]
 max_recalled_pages = 10
 
-# Session spawning for parallel task execution.
-# 🔴 fork-bomb safeguards kept at high positions (never 0).
+# Session spawning for parallel task execution. Concurrency, nesting depth and
+# children per session are uncapped; live runs are listed and ended with
+# `prx tasks`.
 [sessions_spawn]
-max_concurrent = 64
-max_spawn_depth = 8
-max_children_per_agent = 32
 process_memory_strategy = "shared_fabric"
-# timeout_secs = 300
 
 # Self-system for autonomous behavior
 [self_system]
@@ -893,7 +869,6 @@ fn identity_template(spec: Spec) -> String {
 # User policy records
 # [[user_policies]]
 # user_id = "user-uuid"
-# max_actions_per_hour = 50
 # allowed_tools = ["web_search", "read_file"]
 "#
         .into(),
@@ -1452,7 +1427,6 @@ mod tests {
         let content = security_template(Spec::Server);
         assert!(content.contains("level = \"full\""));
         assert!(content.contains("workspace_only = true"));
-        assert!(content.contains("max_actions_per_hour = 20"));
         assert!(content.contains("max_cost_per_day_cents = 500"));
         assert!(content.contains("\"/etc\""));
         assert!(!content.contains("level = \"supervised\""));

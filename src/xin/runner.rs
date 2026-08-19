@@ -833,14 +833,6 @@ async fn run_agent(
         return (false, "blocked by security policy: autonomy is read-only".into());
     }
 
-    if security.is_rate_limited() {
-        return (false, "blocked by security policy: rate limit exceeded".into());
-    }
-
-    if !security.record_action() {
-        return (false, "blocked by security policy: action budget exhausted".into());
-    }
-
     let prompt = format!("[xin:task:{}] {}", task.id, task.payload);
 
     let mut agent_config = config.clone();

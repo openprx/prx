@@ -240,8 +240,11 @@ fn wait_for_local_media_path(
     let db_path = store_root.join("wacli.db");
     let conn = rusqlite::Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("open wacli metadata database read-only: {}", db_path.display()))?;
-    conn.busy_timeout(Duration::from_millis(100))
-        .context("configure wacli media lookup busy timeout")?;
+    // The wacli helper process writes this database while we read it. A lock it
+    // holds means "come back in a moment", not "this media does not exist", so
+    // the lookup waits for the lock (warning periodically) instead of the 100 ms
+    // deadline it used to give up after.
+    crate::runtime::sqlite_pool::install_busy_handler(&conn).context("install wacli media lookup busy handler")?;
 
     let deadline = Instant::now() + timeout;
     loop {
