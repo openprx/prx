@@ -4,9 +4,11 @@ pub mod control_ladder;
 pub mod docker;
 pub mod envelope;
 pub mod native;
+pub mod registry;
 pub mod shell_process;
 pub mod shutdown;
 pub mod sqlite_pool;
+pub mod tasks_cli;
 pub mod traits;
 
 pub use docker::DockerRuntime;

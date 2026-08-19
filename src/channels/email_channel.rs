@@ -35,6 +35,10 @@ use uuid::Uuid;
 
 use super::traits::{Channel, ChannelMessage, SendMessage};
 
+/// Slack added to the IMAP IDLE window before a missing round-trip is reported
+/// (not acted upon) as a stall; covers reconnect backoff after a dropped session.
+const EMAIL_LIVENESS_GRACE_SECS: u64 = 300;
+
 /// Email channel configuration
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EmailConfig {
@@ -406,6 +410,10 @@ impl EmailChannel {
     /// Fetch unseen messages and send to channel
     async fn process_unseen(&self, session: &mut ImapSession, tx: &mpsc::Sender<ChannelMessage>) -> Result<()> {
         let messages = self.fetch_unseen(session).await?;
+        // The IMAP SEARCH/FETCH round-trip came back, with or without mail. This
+        // runs after every IDLE wake-up (new mail *and* the periodic IDLE
+        // timeout), so a quiet mailbox still proves the session is alive.
+        crate::channels::activity::record_upstream(self.name());
 
         for email in messages {
             // Check allowlist
@@ -485,6 +493,19 @@ enum IdleWaitResult {
 impl Channel for EmailChannel {
     fn name(&self) -> &str {
         "email"
+    }
+
+    /// IMAP IDLE is re-armed at most every `idle_timeout_secs` (RFC 2177 caps it
+    /// at 29 minutes), and each re-arm performs a SEARCH/FETCH round-trip.
+    ///
+    /// Report-only (see `channels::activity`): never a timeout.
+    fn liveness_expectation(&self) -> crate::channels::activity::LivenessModel {
+        crate::channels::activity::LivenessModel::Bounded(std::time::Duration::from_secs(
+            self.config
+                .idle_timeout_secs
+                .saturating_add(EMAIL_LIVENESS_GRACE_SECS)
+                .max(EMAIL_LIVENESS_GRACE_SECS),
+        ))
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {

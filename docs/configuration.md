@@ -102,6 +102,20 @@ request_timeout_secs = 180
 # effect only on restart: hot reload cannot resize a live pool.
 # max_blocking_threads = 8192
 
+# Seconds after which a still-running work item is reported in the log.
+#
+# NOTIFICATION ONLY — nothing is ever terminated because of this threshold.
+# PRX does not cut work off on a clock: a research run, a build, or a long
+# agent turn can legitimately take hours, and ending one on a timer is a worse
+# outcome than letting it finish. The warning exists so a task that is
+# genuinely wedged becomes visible, leaving the decision to an operator
+# (`prx tasks list`, then `prx tasks kill <id>` if it really is stuck).
+#
+# Unset uses the 900s default. Set 0 to silence the warning entirely. Enabled
+# values must be at least 10 seconds; below that the sweeper would warn about
+# ordinary tool calls and bury the signal it exists to raise.
+# long_task_warn_secs = 900
+
 [memory]
 backend = "sqlite"
 # Compatibility gate for semantic promotion. Message events are controlled below.

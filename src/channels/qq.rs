@@ -8,6 +8,12 @@ use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 use uuid::Uuid;
 
+/// Longest gap between two gateway frames that is still considered normal.
+///
+/// The server-supplied heartbeat interval defaults to 41.25s and each beat is
+/// ACKed, so this budget covers several missed beats. Reporting only.
+const QQ_GATEWAY_SILENCE_BUDGET_SECS: u64 = 180;
+
 const QQ_API_BASE: &str = "https://api.sgroup.qq.com";
 const QQ_AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 
@@ -176,6 +182,16 @@ impl Channel for QQChannel {
         "qq"
     }
 
+    /// The gateway announces a heartbeat interval (41.25s by default) and ACKs
+    /// every beat, so frames keep arriving with no user traffic at all.
+    ///
+    /// Report-only (see `channels::activity`): never a timeout.
+    fn liveness_expectation(&self) -> crate::channels::activity::LivenessModel {
+        crate::channels::activity::LivenessModel::Bounded(std::time::Duration::from_secs(
+            QQ_GATEWAY_SILENCE_BUDGET_SECS,
+        ))
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let token = self.get_token().await?;
 
@@ -297,6 +313,10 @@ impl Channel for QQChannel {
                     }
                 }
                 msg = read.next() => {
+                    // Every gateway frame counts, heartbeat ACKs included, so an
+                    // idle guild still proves the socket is alive.
+                    crate::channels::activity::record_upstream(self.name());
+
                     let msg = match msg {
                         Some(Ok(Message::Text(t))) => t,
                         Some(Ok(Message::Close(_))) | None => break,

@@ -38,3 +38,60 @@ download completes, so OpenPRX briefly waits for the matching `local_path`,
 copies the image into its workspace-owned media store with the configured
 `[multimodal].max_image_size_mb` limit, and then sends it through the normal
 multimodal provider path. Source paths outside `store_dir` are rejected.
+
+## Listener Liveness Reporting
+
+Channel health is derived from what a listener has actually been observed doing,
+not from a heartbeat timer. Each listener records three signals:
+
+- **inbound** — a message was received and handed to the pipeline
+- **outbound** — a reply was sent successfully
+- **upstream** — one receive round-trip completed, *including one that returned
+  nothing* (a long poll the server answered, a gateway heartbeat frame, one poll
+  interval, one IMAP IDLE re-arm)
+
+The upstream signal is what separates "idle" from "wedged": it keeps arriving
+while nobody is talking. Channels with a bounded cadence declare the longest
+normal gap between two round-trips; silence beyond three times that gap is
+reported as a stall, together with how long the channel has been silent.
+
+Channels that are purely push-driven with no keepalive of their own (webhook
+receivers, the Signal SSE stream, local CLI/terminal input) declare no cadence.
+They are reported as `passive`: their idle time is published, but no stall
+verdict is claimed, because silence there is genuinely indistinguishable from a
+wedge.
+
+**A stall is a report, never an action.** prx does not impose execution timeouts,
+and a listener blocking for a long time is a legitimate state — only an operator
+can tell a wedged channel from a deliberately quiet one. Nothing restarts,
+aborts, reconnects or cancels a channel because of a stall report.
+
+### Where to see it
+
+`GET /health` on the gateway exposes every `channel:<name>` component, each with
+an `activity` object:
+
+```json
+"channel:telegram": {
+  "state": "degraded",
+  "status": "degraded",
+  "last_error": "listener stalled: no receive activity for 240s (expected at least one every 135s)",
+  "activity": {
+    "liveness": "bounded",
+    "idle_seconds": 240,
+    "stall_threshold_seconds": 135,
+    "stalled": true,
+    "last_inbound_seconds_ago": 1802,
+    "last_outbound_seconds_ago": 1801,
+    "last_upstream_seconds_ago": 240
+  }
+}
+```
+
+`prx doctor` renders the same data per channel:
+
+```
+✅ channel:slack fresh (12s ago, idle 4s)
+✅ channel:linq fresh (18s ago, push-only, idle 903s)
+❌ channel:telegram listener stalled (no receive activity for 240s)
+```

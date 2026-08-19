@@ -3498,6 +3498,21 @@ pub struct RuntimeConfig {
     /// effect only on restart — config hot-reload cannot resize a live pool.
     #[serde(default)]
     pub max_blocking_threads: Option<usize>,
+
+    /// Seconds after which a still-running work item is reported in the log.
+    ///
+    /// **Notification only — nothing is ever terminated because of it.** PRX
+    /// treats long tasks as normal business: a research run or a build can
+    /// legitimately take hours, and ending one on a timer is a worse outcome
+    /// than letting it finish. This threshold exists so that a task which is
+    /// genuinely wedged becomes *visible*, leaving the decision to an operator
+    /// (`prx tasks list` / `prx tasks kill`).
+    ///
+    /// Leave unset for the 900s default; set `0` to silence the warning
+    /// entirely. Enabled values must be at least 10 seconds, below which the
+    /// sweeper would warn about ordinary tool calls.
+    #[serde(default)]
+    pub long_task_warn_secs: Option<u64>,
 }
 
 /// Docker runtime configuration (`[runtime.docker]` section).
@@ -3575,6 +3590,7 @@ impl Default for RuntimeConfig {
             codex_stream_idle_timeout_secs: None,
             codex_reasoning_effort: None,
             max_blocking_threads: None,
+            long_task_warn_secs: None,
         }
     }
 }
@@ -6068,6 +6084,18 @@ impl Config {
         if let Some(max_blocking_threads) = self.runtime.max_blocking_threads {
             if max_blocking_threads == 0 {
                 anyhow::bail!("runtime.max_blocking_threads must be greater than 0");
+            }
+        }
+        // The long-task warning is a notification, never a timeout, so any
+        // positive threshold is legitimate. The only rejected range is a
+        // non-zero value too small to distinguish a wedged task from an
+        // ordinary tool call, which would bury the signal it exists to raise.
+        if let Some(long_task_warn_secs) = self.runtime.long_task_warn_secs {
+            if long_task_warn_secs > 0 && long_task_warn_secs < crate::runtime::registry::MIN_LONG_TASK_WARN_SECS {
+                anyhow::bail!(
+                    "runtime.long_task_warn_secs must be 0 (disabled) or at least {} seconds",
+                    crate::runtime::registry::MIN_LONG_TASK_WARN_SECS
+                );
             }
         }
 

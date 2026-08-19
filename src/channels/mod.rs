@@ -16,6 +16,7 @@
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+pub mod activity;
 pub mod cli;
 pub mod dingtalk;
 pub mod discord;
@@ -1779,9 +1780,11 @@ async fn handle_runtime_command_if_needed(
         }
     };
 
-    if let Err(err) = channel
-        .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
-        .await
+    if let Err(err) = send_recording_activity(
+        channel.as_ref(),
+        &SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()),
+    )
+    .await
     {
         tracing::warn!("Failed to send runtime command response on {}: {err}", channel.name());
     }
@@ -2393,6 +2396,10 @@ fn spawn_supervised_listener_with_health_interval(
         let mut consecutive_failures = 0_u32;
 
         loop {
+            // Declare how this incarnation of the listener proves liveness and
+            // reset its activity baseline, so a restarted listener is not judged
+            // on the silence of the one it replaced.
+            activity::register(ch.name(), ch.liveness_expectation());
             crate::health::mark_component_ok(&component);
             let mut health = tokio::time::interval(health_interval);
             health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2404,7 +2411,7 @@ fn spawn_supervised_listener_with_health_interval(
                     tokio::select! {
                         () = shutdown.cancelled() => break ListenerOutcome::Shutdown,
                         _ = health.tick() => {
-                            crate::health::mark_component_ok(&component);
+                            publish_listener_health(ch.name(), &component);
                         }
                         result = &mut listen_future => break ListenerOutcome::Listen(result),
                     }
@@ -2457,6 +2464,66 @@ fn spawn_supervised_listener_with_health_interval(
             backoff = backoff.saturating_mul(2).min(max_backoff);
         }
     })
+}
+
+/// Publish what the listener has actually been observed doing.
+///
+/// This replaces an unconditional `mark_component_ok` on every heartbeat tick.
+/// That older signal only proved the heartbeat timer was still scheduled, so a
+/// listener wedged forever inside `listen()` — a long poll that never returns, a
+/// socket that never errors — kept publishing perfect health while receiving
+/// nothing. Health is now derived from `channels::activity`, which records real
+/// traffic and completed upstream round-trips.
+///
+/// The stall verdict is a *report*, and must stay one. The listener is left
+/// running untouched and returns to `Ready` on its own the moment activity
+/// resumes. Never wire a restart, an abort, a reconnect or a cancellation to it:
+/// prx imposes no execution timeouts, and only an operator can tell a wedged
+/// channel from a deliberately quiet one.
+fn publish_listener_health(channel: &str, component: &str) {
+    let Some(status) = activity::status(channel) else {
+        // Nothing has ever been recorded for this channel, so there is no
+        // evidence to publish. Refresh freshness without claiming readiness
+        // rather than asserting a health we cannot back up.
+        crate::health::touch_component(component);
+        return;
+    };
+
+    crate::health::set_component_activity(component, Some(status.to_component_activity()));
+    if status.stalled {
+        crate::health::mark_component_degraded(component, status.stall_summary());
+    } else {
+        crate::health::mark_component_ok(component);
+    }
+}
+
+/// Deliver a reply and record the outbound activity when it succeeds.
+///
+/// A successful send proves the credentials, the network and the remote API are
+/// still working. It is tracked separately from the receive path and is
+/// deliberately excluded from the stall verdict in `channels::activity`: a
+/// channel can keep answering perfectly while its listener is deaf, and masking
+/// that with outbound traffic is exactly the false-health this design removes.
+async fn send_recording_activity(channel: &dyn Channel, message: &SendMessage) -> anyhow::Result<()> {
+    let result = channel.send(message).await;
+    if result.is_ok() {
+        activity::record_outbound(channel.name());
+    }
+    result
+}
+
+/// Finalize a streamed draft and record the outbound activity when it succeeds.
+async fn finalize_draft_recording_activity(
+    channel: &dyn Channel,
+    recipient: &str,
+    message_id: &str,
+    text: &str,
+) -> anyhow::Result<()> {
+    let result = channel.finalize_draft(recipient, message_id, text).await;
+    if result.is_ok() {
+        activity::record_outbound(channel.name());
+    }
+    result
 }
 
 fn channel_supervisor_sleep_duration(consecutive_failures: u32, backoff: u64, max_backoff: u64) -> Duration {
@@ -2703,9 +2770,11 @@ async fn process_channel_message(
                 route.provider
             );
             if let Some(channel) = target_channel.as_ref() {
-                let _ = channel
-                    .send(&SendMessage::new(message, &msg.reply_target).in_thread(msg.thread_ts.clone()))
-                    .await;
+                let _ = send_recording_activity(
+                    channel.as_ref(),
+                    &SendMessage::new(message, &msg.reply_target).in_thread(msg.thread_ts.clone()),
+                )
+                .await;
             }
             return;
         }
@@ -2857,9 +2926,11 @@ async fn process_channel_message(
                 truncate_with_ellipsis(&fallback, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
-                if let Err(e) = channel
-                    .send(&SendMessage::new(fallback, &msg.reply_target).in_thread(msg.thread_ts.clone()))
-                    .await
+                if let Err(e) = send_recording_activity(
+                    channel.as_ref(),
+                    &SendMessage::new(fallback, &msg.reply_target).in_thread(msg.thread_ts.clone()),
+                )
+                .await
                 {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
                 }
@@ -3449,21 +3520,26 @@ async fn process_channel_message(
             );
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
-                    if let Err(e) = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
-                        .await
+                    if let Err(e) = finalize_draft_recording_activity(
+                        channel.as_ref(),
+                        &msg.reply_target,
+                        draft_id,
+                        &delivered_response,
+                    )
+                    .await
                     {
                         tracing::warn!("Failed to finalize draft: {e}; sending as new message");
-                        let _ = channel
-                            .send(
-                                &SendMessage::new(&delivered_response, &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
-                            )
-                            .await;
+                        let _ = send_recording_activity(
+                            channel.as_ref(),
+                            &SendMessage::new(&delivered_response, &msg.reply_target).in_thread(msg.thread_ts.clone()),
+                        )
+                        .await;
                     }
-                } else if let Err(e) = channel
-                    .send(&SendMessage::new(delivered_response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
-                    .await
+                } else if let Err(e) = send_recording_activity(
+                    channel.as_ref(),
+                    &SendMessage::new(delivered_response, &msg.reply_target).in_thread(msg.thread_ts.clone()),
+                )
+                .await
                 {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
                 }
@@ -3559,20 +3635,20 @@ async fn process_channel_message(
             eprintln!("  ❌ LLM error after {}ms: {e}", started_at.elapsed().as_millis());
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
-                    let _ = channel
-                        .finalize_draft(
-                            &msg.reply_target,
-                            draft_id,
-                            "⚠️ Something went wrong. Please try again later.",
-                        )
-                        .await;
+                    let _ = finalize_draft_recording_activity(
+                        channel.as_ref(),
+                        &msg.reply_target,
+                        draft_id,
+                        "⚠️ Something went wrong. Please try again later.",
+                    )
+                    .await;
                 } else {
-                    let _ = channel
-                        .send(
-                            &SendMessage::new("⚠️ Something went wrong. Please try again later.", &msg.reply_target)
-                                .in_thread(msg.thread_ts.clone()),
-                        )
-                        .await;
+                    let _ = send_recording_activity(
+                        channel.as_ref(),
+                        &SendMessage::new("⚠️ Something went wrong. Please try again later.", &msg.reply_target)
+                            .in_thread(msg.thread_ts.clone()),
+                    )
+                    .await;
                 }
             }
         }
@@ -3616,11 +3692,15 @@ async fn process_channel_message(
             if let Some(channel) = target_channel.as_ref() {
                 let error_text = "⚠️ Request timed out. Please try again shortly.";
                 if let Some(ref draft_id) = draft_message_id {
-                    let _ = channel.finalize_draft(&msg.reply_target, draft_id, error_text).await;
+                    let _ =
+                        finalize_draft_recording_activity(channel.as_ref(), &msg.reply_target, draft_id, error_text)
+                            .await;
                 } else {
-                    let _ = channel
-                        .send(&SendMessage::new(error_text, &msg.reply_target).in_thread(msg.thread_ts.clone()))
-                        .await;
+                    let _ = send_recording_activity(
+                        channel.as_ref(),
+                        &SendMessage::new(error_text, &msg.reply_target).in_thread(msg.thread_ts.clone()),
+                    )
+                    .await;
                 }
             }
         }
@@ -3660,11 +3740,15 @@ async fn process_channel_message(
             if let Some(channel) = target_channel.as_ref() {
                 let error_text = "Session context was too long and has been reset. Please resend your message.";
                 if let Some(ref draft_id) = draft_message_id {
-                    let _ = channel.finalize_draft(&msg.reply_target, draft_id, error_text).await;
+                    let _ =
+                        finalize_draft_recording_activity(channel.as_ref(), &msg.reply_target, draft_id, error_text)
+                            .await;
                 } else {
-                    let _ = channel
-                        .send(&SendMessage::new(error_text, &msg.reply_target).in_thread(msg.thread_ts.clone()))
-                        .await;
+                    let _ = send_recording_activity(
+                        channel.as_ref(),
+                        &SendMessage::new(error_text, &msg.reply_target).in_thread(msg.thread_ts.clone()),
+                    )
+                    .await;
                 }
             }
         }
@@ -3912,7 +3996,12 @@ async fn run_message_dispatch_loop(
                 continue;
             }
             maybe_msg = rx.recv() => match maybe_msg {
-                Some(msg) => msg,
+                Some(msg) => {
+                    // The single point every channel's inbound traffic passes
+                    // through, webhook-delivered messages included.
+                    activity::record_inbound(&msg.channel);
+                    msg
+                }
                 None => break,
             },
         };
@@ -11181,6 +11270,215 @@ After"#;
             1,
             "shutdown must not trigger a listener restart"
         );
+    }
+
+    /// A listener wedged forever inside `listen()`: the receive future never
+    /// resolves, exactly like a long poll that will never come back or a socket
+    /// that will never error. It declares a bounded liveness expectation, so the
+    /// silence is real evidence rather than an unknown.
+    struct WedgedChannel {
+        name: String,
+        expectation: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for WedgedChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn liveness_expectation(&self) -> activity::LivenessModel {
+            activity::LivenessModel::Bounded(self.expectation)
+        }
+
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>) -> anyhow::Result<()> {
+            // Never returns, never errors, never receives — the failure mode the
+            // old timer-based heartbeat reported as perfectly healthy.
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    /// A listener that keeps completing upstream round-trips without ever
+    /// delivering a message — the "healthy but nobody is talking" case that must
+    /// NOT be reported as stalled.
+    struct QuietButLiveChannel {
+        name: String,
+        expectation: Duration,
+        round_trip: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for QuietButLiveChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn liveness_expectation(&self) -> activity::LivenessModel {
+            activity::LivenessModel::Bounded(self.expectation)
+        }
+
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>) -> anyhow::Result<()> {
+            loop {
+                activity::record_upstream(self.name());
+                tokio::time::sleep(self.round_trip).await;
+            }
+        }
+    }
+
+    fn component_json(component: &str) -> serde_json::Value {
+        crate::health::snapshot_json()["components"][component].clone()
+    }
+
+    async fn drain_supervisor(shutdown: &CancellationToken, handle: tokio::task::JoinHandle<()>) {
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    }
+
+    #[tokio::test]
+    async fn wedged_listener_is_reported_stalled_instead_of_healthy() {
+        // P0-1 regression: the heartbeat used to call mark_component_ok() on every
+        // tick regardless of what the listener was doing, so a channel that could
+        // never receive again still published "ok". Health must now follow the
+        // recorded activity, not the timer.
+        let channel_name = format!("test-wedged-{}", uuid::Uuid::new_v4());
+        let component_name = format!("channel:{channel_name}");
+        let channel: Arc<dyn Channel> = Arc::new(WedgedChannel {
+            name: channel_name,
+            expectation: Duration::from_millis(50),
+        });
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(1);
+        let shutdown = CancellationToken::new();
+        let handle = spawn_supervised_listener_with_health_interval(
+            channel,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            shutdown.clone(),
+        );
+
+        // Well past the 3x tolerance on a 50ms expectation.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let component = component_json(&component_name);
+        drain_supervisor(&shutdown, handle).await;
+
+        assert_eq!(
+            component["status"], "degraded",
+            "a listener that can never receive again must not be published as healthy"
+        );
+        assert_eq!(component["state"], "degraded");
+        assert_eq!(
+            component["activity"]["stalled"], true,
+            "the stall must be visible as measured activity, not only as a status word"
+        );
+        assert_eq!(component["activity"]["liveness"], "bounded");
+        assert!(
+            component["activity"]["idle_seconds"].as_u64().is_some(),
+            "operators need the stall duration, not just a boolean"
+        );
+        assert!(
+            component["last_error"].as_str().unwrap_or("").contains("stalled"),
+            "expected an operator-facing stall summary, got {:?}",
+            component["last_error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn quiet_but_live_listener_stays_healthy() {
+        // The counterpart to the regression above: a channel whose upstream keeps
+        // answering with zero messages is perfectly healthy and must never be
+        // reported as stalled just because nobody is talking to it.
+        let channel_name = format!("test-quiet-live-{}", uuid::Uuid::new_v4());
+        let component_name = format!("channel:{channel_name}");
+        let channel: Arc<dyn Channel> = Arc::new(QuietButLiveChannel {
+            name: channel_name,
+            expectation: Duration::from_millis(200),
+            round_trip: Duration::from_millis(10),
+        });
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(1);
+        let shutdown = CancellationToken::new();
+        let handle = spawn_supervised_listener_with_health_interval(
+            channel,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            shutdown.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let component = component_json(&component_name);
+        drain_supervisor(&shutdown, handle).await;
+
+        assert_eq!(component["status"], "ok");
+        assert_eq!(component["activity"]["stalled"], false);
+        assert!(
+            component["activity"]["last_upstream_seconds_ago"].as_u64().is_some(),
+            "completed round-trips must be recorded even with no inbound messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn passive_listener_publishes_idle_time_without_a_stall_verdict() {
+        // Push-only channels have no cadence to measure against, so claiming a
+        // stall would be a guess. They stay "ok" but advertise `passive`, which is
+        // how an operator knows the green is not evidence-based.
+        let channel_name = format!("test-passive-{}", uuid::Uuid::new_v4());
+        let component_name = format!("channel:{channel_name}");
+        let channel: Arc<dyn Channel> = Arc::new(BlockUntilClosedChannel {
+            name: channel_name,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(1);
+        let shutdown = CancellationToken::new();
+        let handle = spawn_supervised_listener_with_health_interval(
+            channel,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            shutdown.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let component = component_json(&component_name);
+        drain_supervisor(&shutdown, handle).await;
+
+        assert_eq!(component["status"], "ok");
+        assert_eq!(component["activity"]["liveness"], "passive");
+        assert_eq!(component["activity"]["stalled"], false);
+        assert!(component["activity"]["stall_threshold_seconds"].is_null());
+    }
+
+    #[test]
+    fn stalled_status_publishes_a_degraded_component() {
+        // Unit-level guard on the mapping itself, so a refactor cannot quietly
+        // turn a stalled listener back into a green one.
+        let channel_name = format!("test-publish-{}", uuid::Uuid::new_v4());
+        let component_name = format!("channel:{channel_name}");
+
+        activity::register(
+            &channel_name,
+            activity::LivenessModel::Bounded(Duration::from_millis(1)),
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        publish_listener_health(&channel_name, &component_name);
+
+        let component = component_json(&component_name);
+        assert_eq!(component["status"], "degraded");
+        assert_eq!(component["activity"]["stalled"], true);
     }
 
     #[test]

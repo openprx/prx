@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 
 const SLACK_POLL_INTERVAL_SECS: u64 = 3;
 const SLACK_MAX_BACKOFF_SECS: u64 = 60;
+/// Slack added on top of the worst-case poll spacing before a missing round-trip
+/// is reported (not acted upon) as a stall.
+const SLACK_LIVENESS_GRACE_SECS: u64 = 15;
 
 /// Slack channel — polls conversations.history via Web API
 pub struct SlackChannel {
@@ -143,6 +146,16 @@ impl Channel for SlackChannel {
         "slack"
     }
 
+    /// One successful poll per interval, stretched by the error backoff ladder.
+    ///
+    /// Report-only (see `channels::activity`): a poll that keeps failing shows up
+    /// as stalled, it is never cancelled or restarted because of this value.
+    fn liveness_expectation(&self) -> crate::channels::activity::LivenessModel {
+        crate::channels::activity::LivenessModel::Bounded(std::time::Duration::from_secs(
+            SLACK_POLL_INTERVAL_SECS + SLACK_MAX_BACKOFF_SECS + SLACK_LIVENESS_GRACE_SECS,
+        ))
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let mut body = serde_json::json!({
             "channel": message.recipient,
@@ -242,6 +255,9 @@ impl Channel for SlackChannel {
             }
 
             consecutive_errors = 0;
+            // One `conversations.history` round-trip returned, even with zero
+            // messages: that is the receive path proving itself while nobody talks.
+            crate::channels::activity::record_upstream(self.name());
 
             if let Some(messages) = data.get("messages").and_then(|m| m.as_array()) {
                 // Messages come newest-first, reverse to process oldest first

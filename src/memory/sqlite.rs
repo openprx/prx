@@ -459,8 +459,11 @@ impl SqliteMemory {
 
         Self::init_schema(&pool.write())?;
 
+        let pool = Arc::new(pool);
+        SqliteConnectionPool::publish_metrics(&pool);
+
         Ok(Self {
-            pool: Arc::new(pool),
+            pool,
             db_path,
             acl_enabled,
             embedder,

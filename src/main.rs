@@ -660,6 +660,30 @@ Examples:
     /// Show system status (full details)
     Status,
 
+    /// Inspect and terminate work running inside a live PRX process
+    #[command(long_about = "\
+Inspect and terminate work running inside a live PRX process.
+
+PRX does not cut work off on a clock: a long agent run is normal business, so
+nothing expires by itself. That makes this command the operator's backstop —
+it lists every tool call, sub-agent run and child process the runtime is
+currently holding, together with parent/child lineage and elapsed time, and
+ends any of them on request.
+
+The registry lives inside the process that owns the work, so these subcommands
+talk to a running gateway over HTTP rather than inspecting this invocation.
+
+Examples:
+  prx tasks list                      # what is running right now
+  prx tasks list --json               # machine-readable, includes unreaped children
+  prx tasks kill w42                  # kill w42 and everything it started
+  prx tasks kill w42 --no-cascade     # kill only w42
+  prx tasks pools                     # connection-pool saturation")]
+    Tasks {
+        #[command(subcommand)]
+        tasks_command: TasksCommands,
+    },
+
     /// Manage memory indexes and maintenance operations
     Memory {
         #[command(subcommand)]
@@ -815,6 +839,53 @@ Examples:
         /// Target shell
         #[arg(value_enum)]
         shell: CompletionShell,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TasksCommands {
+    /// List work items the running process is currently holding
+    List {
+        /// Output machine-readable JSON
+        #[arg(long)]
+        json: bool,
+        /// Gateway base URL (default: the configured gateway bind address)
+        #[arg(long)]
+        url: Option<String>,
+        /// Bearer token, when the gateway requires pairing
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Terminate one work item by id
+    Kill {
+        /// Work item id as printed by `prx tasks list` (`w42` or `42`)
+        id: String,
+        /// Kill only this item, leaving the tools and processes it started
+        /// running. Cascading is the default because nothing else will clean
+        /// those up.
+        #[arg(long)]
+        no_cascade: bool,
+        /// Output machine-readable JSON
+        #[arg(long)]
+        json: bool,
+        /// Gateway base URL (default: the configured gateway bind address)
+        #[arg(long)]
+        url: Option<String>,
+        /// Bearer token, when the gateway requires pairing
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Show connection-pool occupancy and saturation counters
+    Pools {
+        /// Output machine-readable JSON
+        #[arg(long)]
+        json: bool,
+        /// Gateway base URL (default: the configured gateway bind address)
+        #[arg(long)]
+        url: Option<String>,
+        /// Bearer token, when the gateway requires pairing
+        #[arg(long)]
+        token: Option<String>,
     },
 }
 
@@ -1243,7 +1314,7 @@ async fn async_main() -> Result<()> {
                 | MigrateCommands::Plan { .. }
                 | MigrateCommands::Baseline
         }
-    ) || matches!(&cli.command, Commands::Doctor { .. });
+    ) || matches!(&cli.command, Commands::Doctor { .. } | Commands::Tasks { .. });
     let config = if read_only_config_command {
         Config::load_existing_read_only_with_config_dir(cli.config_dir.as_deref()).await?
     } else {
@@ -1251,6 +1322,129 @@ async fn async_main() -> Result<()> {
     };
 
     mode::dispatch(cli.command, config).await
+}
+
+/// `prx tasks` — talks to a running process's gateway rather than inspecting
+/// this one, because the work registry is per-process state.
+async fn handle_tasks_command(command: TasksCommands, config: &Config) -> anyhow::Result<()> {
+    use openprx::runtime::tasks_cli::{self, TasksEndpoint};
+
+    match command {
+        TasksCommands::List { json, url, token } => {
+            let endpoint = TasksEndpoint::resolve(config, url, token);
+            let listing = tasks_cli::fetch_tasks(&endpoint).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&listing)?);
+                return Ok(());
+            }
+            if listing.running.is_empty() {
+                println!("No work items are currently running.");
+            } else {
+                println!("Running work items ({}):", listing.running.len());
+                print_work_items(&listing.running);
+            }
+            if !listing.unreaped.is_empty() {
+                println!();
+                println!(
+                    "Spawned but not reaped ({}) — children that outlived their owner:",
+                    listing.unreaped.len()
+                );
+                print_work_items(&listing.unreaped);
+            }
+            Ok(())
+        }
+        TasksCommands::Kill {
+            id,
+            no_cascade,
+            json,
+            url,
+            token,
+        } => {
+            let endpoint = TasksEndpoint::resolve(config, url, token);
+            let report = tasks_cli::request_kill(&endpoint, &id, !no_cascade).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "Killed {} (cascade: {}) — {} target(s):",
+                    report.requested,
+                    if report.cascade { "on" } else { "off" },
+                    report.targets.len()
+                );
+                for target in &report.targets {
+                    println!(
+                        "  {:<8} {:<10} {:<14} {}",
+                        target.id, target.kind, target.outcome, target.name
+                    );
+                }
+                if report.targets.iter().any(|target| target.outcome == "requested") {
+                    println!();
+                    println!(
+                        "Some targets had not gone away yet when this report was produced. Nothing \
+                         was abandoned — re-run `prx tasks list` to see the current state."
+                    );
+                }
+            }
+            // A target with no termination handle is a partial result, not a success.
+            if report.targets.iter().any(|target| target.outcome == "not_killable") {
+                bail!("one or more targets had no termination handle and could not be killed");
+            }
+            Ok(())
+        }
+        TasksCommands::Pools { json, url, token } => {
+            let endpoint = TasksEndpoint::resolve(config, url, token);
+            let report = tasks_cli::fetch_pools(&endpoint).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                return Ok(());
+            }
+            for pool in &report.pools {
+                println!("[{}] {}", pool.kind, pool.name);
+                if let Some(metrics) = pool.metrics.as_object() {
+                    let mut keys: Vec<&String> = metrics.keys().collect();
+                    keys.sort();
+                    for key in keys {
+                        if let Some(value) = metrics.get(key) {
+                            println!("    {key:<32} {value}");
+                        }
+                    }
+                }
+                println!();
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Render one work-item table, shared by the running and unreaped sections.
+fn print_work_items(items: &[openprx::runtime::tasks_cli::WorkItem]) {
+    println!(
+        "{:<8} {:<10} {:>10}  {:<14} {:<}",
+        "ID", "KIND", "ELAPSED", "STATE", "NAME"
+    );
+    for item in items {
+        let mut name = item.name.clone();
+        if let Some(parent) = &item.parent {
+            name.push_str(&format!("  (parent {parent})"));
+        }
+        if let Some(run_id) = &item.run_id {
+            name.push_str(&format!("  (run {run_id})"));
+        }
+        if let Some(pid) = item.pid {
+            name.push_str(&format!("  (pid {pid}"));
+            match item.pgid {
+                Some(pgid) => name.push_str(&format!(", pgid {pgid})")),
+                None => name.push(')'),
+            }
+        }
+        println!(
+            "{:<8} {:<10} {:>10}  {:<14} {name}",
+            item.id,
+            item.kind,
+            openprx::runtime::tasks_cli::format_elapsed(item.elapsed_secs),
+            item.state
+        );
+    }
 }
 
 async fn handle_memory_command(command: MemoryCommands, config: &Config) -> anyhow::Result<()> {

@@ -35,6 +35,30 @@ impl ComponentState {
     }
 }
 
+/// Evidence-based activity detail for a component whose liveness is measured
+/// rather than assumed (currently the channel listeners).
+///
+/// Published so operators can see *why* a component is reported the way it is:
+/// how long it has been silent, how long it is allowed to stay silent, and when
+/// each direction of traffic last worked. Every field is descriptive — nothing
+/// in this struct may be used to trigger a restart, an abort or a reconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ComponentActivity {
+    /// How liveness is judged: `bounded` (the component proves itself on a known
+    /// cadence) or `passive` (no cadence exists, so no stall verdict is claimed).
+    pub liveness: &'static str,
+    /// Seconds since the component last proved its receive path works.
+    pub idle_seconds: u64,
+    /// Silence beyond which the component is *reported* stalled. `None` for
+    /// passive components.
+    pub stall_threshold_seconds: Option<u64>,
+    /// Whether the component is currently reported as stalled.
+    pub stalled: bool,
+    pub last_inbound_seconds_ago: Option<u64>,
+    pub last_outbound_seconds_ago: Option<u64>,
+    pub last_upstream_seconds_ago: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ComponentHealth {
     pub state: ComponentState,
@@ -48,6 +72,10 @@ pub struct ComponentHealth {
     pub last_ok: Option<String>,
     pub last_error: Option<String>,
     pub restart_count: u64,
+    /// Measured activity, when the component reports evidence instead of a bare
+    /// heartbeat. `None` means the component only publishes coarse states.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<ComponentActivity>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,6 +136,7 @@ fn new_component(owner: &str, required: bool, freshness_ttl: Duration, state: Co
         last_ok: (state == ComponentState::Ready).then_some(now),
         last_error: None,
         restart_count: 0,
+        activity: None,
     }
 }
 
@@ -175,6 +204,23 @@ pub fn mark_component_ok(component: &str) {
 #[allow(clippy::needless_pass_by_value)]
 pub fn mark_component_error(component: &str, error: impl ToString) {
     set_component_state(component, ComponentState::Failed, Some(error.to_string()));
+}
+
+/// Report a component as degraded with an operator-facing reason.
+///
+/// Used by the channel supervisor to publish a listener that has gone silent for
+/// longer than its own declared cadence allows. This is a *report*: the
+/// component keeps running untouched, and it recovers on its own the moment real
+/// activity resumes. Nothing in prx may turn a degraded report into a restart,
+/// an abort or a timeout.
+#[allow(clippy::needless_pass_by_value)]
+pub fn mark_component_degraded(component: &str, reason: impl ToString) {
+    set_component_state(component, ComponentState::Degraded, Some(reason.to_string()));
+}
+
+/// Attach (or clear) measured activity detail for a component.
+pub fn set_component_activity(component: &str, activity: Option<ComponentActivity>) {
+    upsert_component(component, move |entry| entry.activity = activity);
 }
 
 pub fn mark_component_stopping(component: &str) {

@@ -207,6 +207,35 @@ struct ReaderPoolState {
     waiters: usize,
 }
 
+impl crate::runtime::registry::PoolStatsSource for SqliteConnectionPool {
+    fn pool_kind(&self) -> &'static str {
+        "sqlite"
+    }
+
+    fn pool_name(&self) -> String {
+        self.db_path.display().to_string()
+    }
+
+    fn pool_metrics(&self) -> serde_json::Value {
+        let stats = self.stats();
+        serde_json::json!({
+            "max_readers": stats.max_readers,
+            "readers_in_use": stats.readers_in_use,
+            "readers_idle": stats.readers_idle,
+            "reader_waiters": stats.reader_waiters,
+            "reader_acquisitions": stats.reader_acquisitions,
+            "saturated_reader_acquisitions": stats.saturated_reader_acquisitions,
+            "total_reader_wait_ms": stats.total_reader_wait.as_millis(),
+            "reader_connects": stats.reader_connects,
+            "reader_discards": stats.reader_discards,
+            "write_acquisitions": stats.write_acquisitions,
+            "contended_write_acquisitions": stats.contended_write_acquisitions,
+            "write_waiters": stats.write_waiters,
+            "total_write_wait_ms": stats.total_write_wait.as_millis(),
+        })
+    }
+}
+
 /// Builder for [`SqliteConnectionPool`].
 ///
 /// Everything the two stores disagree about is a knob here rather than a branch
@@ -444,6 +473,17 @@ impl SqliteConnectionPool {
             write_waiters: self.metrics.write_waiters.load(Ordering::Relaxed),
             total_write_wait: Duration::from_nanos(self.metrics.write_wait_nanos.load(Ordering::Relaxed)),
         }
+    }
+
+    /// Publish this pool's counters to the runtime pool report.
+    ///
+    /// Called once per pool, right after it is placed in an `Arc`: the registry
+    /// keeps only a `Weak`, so a pool that is dropped disappears from the report
+    /// without any deregistration step.
+    pub fn publish_metrics(pool: &Arc<Self>) {
+        let concrete = Arc::clone(pool);
+        let source: Arc<dyn crate::runtime::registry::PoolStatsSource> = concrete;
+        crate::runtime::registry::register_pool(&source);
     }
 
     /// Open one reader connection.

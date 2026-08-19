@@ -16,6 +16,7 @@ mod hooks;
 mod logs;
 mod mcp;
 mod plugins;
+mod runtime;
 mod sessions;
 mod skills;
 mod status;
@@ -82,6 +83,11 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/hooks/{id}", put(hooks::update_hook))
         .route("/hooks/{id}", delete(hooks::delete_hook))
         .route("/skills/{id}/toggle", patch(skills::toggle_skill))
+        // Runtime observability: what is running, and the manual kill path that
+        // replaces the timeouts PRX deliberately does not have.
+        .route("/runtime/tasks", get(runtime::get_tasks))
+        .route("/runtime/tasks/{id}/kill", post(runtime::post_task_kill))
+        .route("/runtime/pools", get(runtime::get_pools))
         // Phase 4: WASM plugins
         .route("/plugins", get(plugins::list_plugins))
         .route("/plugins/{name}/reload", post(plugins::reload_plugin))

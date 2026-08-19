@@ -1533,8 +1533,41 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
                 .and_then(parse_rfc3339)
                 .map_or(i64::MAX, |dt| Utc::now().signed_duration_since(dt).num_seconds());
 
-            if status_ok && age <= CHANNEL_STALE_SECONDS {
-                items.push(DiagItem::ok(cat, format!("{name} fresh ({age}s ago)")));
+            // Measured listener activity, when the channel publishes it. The
+            // supervisor derives health from real traffic rather than from its own
+            // heartbeat timer, so a wedged listener shows up here as a stall with
+            // the silence duration attached. Purely informational: `prx doctor`
+            // reports, it never restarts anything.
+            let activity = component.get("activity");
+            let stalled = activity
+                .and_then(|activity| activity.get("stalled"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let idle_seconds = activity
+                .and_then(|activity| activity.get("idle_seconds"))
+                .and_then(serde_json::Value::as_u64);
+            let liveness = activity
+                .and_then(|activity| activity.get("liveness"))
+                .and_then(serde_json::Value::as_str);
+
+            if stalled {
+                stale += 1;
+                let idle = idle_seconds.unwrap_or_default();
+                items.push(DiagItem::error(
+                    cat,
+                    format!("{name} listener stalled (no receive activity for {idle}s)"),
+                ));
+            } else if status_ok && age <= CHANNEL_STALE_SECONDS {
+                let detail = match (liveness, idle_seconds) {
+                    (Some("passive"), Some(idle)) => {
+                        // No cadence to measure against, so "fresh" here means the
+                        // supervisor is alive, not that the channel proved itself.
+                        format!("{name} fresh ({age}s ago, push-only, idle {idle}s)")
+                    }
+                    (_, Some(idle)) => format!("{name} fresh ({age}s ago, idle {idle}s)"),
+                    (_, None) => format!("{name} fresh ({age}s ago)"),
+                };
+                items.push(DiagItem::ok(cat, detail));
             } else {
                 stale += 1;
                 items.push(DiagItem::error(

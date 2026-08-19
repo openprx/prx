@@ -377,6 +377,10 @@ pub(crate) struct ManagedShellChild {
     pgid: Option<i32>,
     leader_reaped: bool,
     complete: bool,
+    /// Registry row for this child. Dropped with the struct, so a child whose
+    /// owner disappears without reaping stays visible as an orphan instead of
+    /// silently vanishing from the ledger.
+    registration: crate::runtime::registry::WorkGuard,
 }
 
 impl ManagedShellChild {
@@ -431,6 +435,9 @@ impl ManagedShellChild {
 
     pub(crate) const fn mark_complete(&mut self) {
         self.complete = true;
+        // The leader was waited on and the group torn down, so the ledger row
+        // is retired rather than reported as an unreaped child.
+        self.registration.mark_reaped();
         #[cfg(unix)]
         {
             self.pgid = None;
@@ -459,17 +466,44 @@ impl Drop for ManagedShellChild {
     }
 }
 
+/// Human-readable label for a command, used as the registry row's name.
+///
+/// Borrowed from the `Command` itself rather than passed in by callers, so
+/// every managed spawn is labelled without any call site having to remember.
+fn command_label(cmd: &tokio::process::Command) -> String {
+    let std_cmd = cmd.as_std();
+    let mut label = std_cmd.get_program().to_string_lossy().into_owned();
+    for arg in std_cmd.get_args() {
+        label.push(' ');
+        label.push_str(&arg.to_string_lossy());
+    }
+    // Shell one-liners can be arbitrarily long; the registry is a listing, not
+    // an audit log, so a bounded label keeps `prx tasks list` readable.
+    const MAX_LABEL_BYTES: usize = 200;
+    if label.len() > MAX_LABEL_BYTES {
+        label.truncate(label.floor_char_boundary(MAX_LABEL_BYTES));
+        label.push('…');
+    }
+    label
+}
+
 pub(crate) fn spawn_managed_shell_child(mut cmd: tokio::process::Command) -> io::Result<ManagedShellChild> {
     cmd.kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
 
+    let label = command_label(&cmd);
     let child = cmd.spawn()?;
     #[cfg(unix)]
     let pgid = child
         .id()
         .and_then(|pid| i32::try_from(pid).ok())
         .filter(|pid| *pid > 0);
+    #[cfg(not(unix))]
+    let pgid: Option<i32> = None;
+    // Registered with the group id, not just the pid: a child that forks its
+    // own workers can only be ended as a whole through `killpg`.
+    let registration = crate::runtime::registry::register_process(&label, child.id(), pgid);
 
     Ok(ManagedShellChild {
         child: Some(child),
@@ -477,6 +511,7 @@ pub(crate) fn spawn_managed_shell_child(mut cmd: tokio::process::Command) -> io:
         pgid,
         leader_reaped: false,
         complete: false,
+        registration,
     })
 }
 

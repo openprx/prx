@@ -16,6 +16,16 @@ use tokio::fs;
 
 /// Telegram's maximum message length for text messages
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
+/// Server-side long-poll window requested from `getUpdates`.
+///
+/// Telegram answers a long poll within this window *even when it has nothing to
+/// deliver*. That promise is what lets a normal long wait be told apart from a
+/// wedged one without imposing any client-side timeout: waiting is expected up
+/// to this window, and silence far beyond it means the call will never return.
+const TELEGRAM_LONG_POLL_TIMEOUT_SECS: u64 = 30;
+/// Slack added to the long-poll window before a round-trip is considered late,
+/// covering request latency and the fixed sleeps taken on transport/API errors.
+const TELEGRAM_LONG_POLL_GRACE_SECS: u64 = 15;
 const TELEGRAM_BIND_COMMAND: &str = "/bind";
 
 /// Split a message into chunks that respect Telegram's 4096 character limit.
@@ -1460,6 +1470,16 @@ impl Channel for TelegramChannel {
         "telegram"
     }
 
+    /// One `getUpdates` round-trip per long-poll window, plus slack.
+    ///
+    /// Report-only (see `channels::activity`): exceeding it must never abort or
+    /// restart the poll, it only makes a wedged listener visible.
+    fn liveness_expectation(&self) -> crate::channels::activity::LivenessModel {
+        crate::channels::activity::LivenessModel::Bounded(std::time::Duration::from_secs(
+            TELEGRAM_LONG_POLL_TIMEOUT_SECS + TELEGRAM_LONG_POLL_GRACE_SECS,
+        ))
+    }
+
     fn bot_identity(&self) -> Option<String> {
         self.bot_username
             .lock()
@@ -1751,7 +1771,7 @@ impl Channel for TelegramChannel {
             let url = self.api_url("getUpdates");
             let body = serde_json::json!({
                 "offset": offset,
-                "timeout": 30,
+                "timeout": TELEGRAM_LONG_POLL_TIMEOUT_SECS,
                 "allowed_updates": ["message"]
             });
 
@@ -1772,6 +1792,10 @@ impl Channel for TelegramChannel {
                     continue;
                 }
             };
+
+            // The long poll came back — with or without updates. This, not the
+            // arrival of a message, is the proof that the receive path lives.
+            crate::channels::activity::record_upstream(self.name());
 
             let ok = data.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(true);
             if !ok {

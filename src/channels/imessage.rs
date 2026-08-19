@@ -6,6 +6,10 @@ use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 use tokio::sync::mpsc;
 
+/// Slack added to the configured poll spacing before a missing chat.db read is
+/// reported (not acted upon) as a stall.
+const IMESSAGE_LIVENESS_GRACE_SECS: u64 = 30;
+
 /// iMessage channel using macOS `AppleScript` bridge.
 /// Polls the Messages database for new messages and sends replies via `osascript`.
 #[derive(Clone)]
@@ -87,6 +91,17 @@ fn is_valid_imessage_target(target: &str) -> bool {
 impl Channel for IMessageChannel {
     fn name(&self) -> &str {
         "imessage"
+    }
+
+    /// One chat.db poll per configured interval.
+    ///
+    /// Report-only (see `channels::activity`): never a timeout.
+    fn liveness_expectation(&self) -> crate::channels::activity::LivenessModel {
+        crate::channels::activity::LivenessModel::Bounded(std::time::Duration::from_secs(
+            self.poll_interval_secs
+                .saturating_add(IMESSAGE_LIVENESS_GRACE_SECS)
+                .max(IMESSAGE_LIVENESS_GRACE_SECS),
+        ))
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -197,6 +212,8 @@ end tell"#
             .await
             .map_err(|e| anyhow::anyhow!("iMessage poll worker join error: {e}"))?;
             conn = returned_conn;
+            // The blocking read of chat.db came back, with or without rows.
+            crate::channels::activity::record_upstream(self.name());
 
             match poll_result {
                 Ok(messages) => {

@@ -3,6 +3,12 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 
+/// Spacing between two `channels/{id}/posts` polls.
+const MATTERMOST_POLL_INTERVAL_SECS: u64 = 3;
+/// Slack added to the poll spacing before a missing round-trip is reported (not
+/// acted upon) as a stall.
+const MATTERMOST_LIVENESS_GRACE_SECS: u64 = 30;
+
 /// Mattermost channel — polls channel posts via REST API v4.
 /// Mattermost is API-compatible with many Slack patterns but uses a dedicated v4 structure.
 pub struct MattermostChannel {
@@ -94,6 +100,15 @@ impl Channel for MattermostChannel {
         "mattermost"
     }
 
+    /// One `channels/{id}/posts` poll per interval.
+    ///
+    /// Report-only (see `channels::activity`): never a timeout.
+    fn liveness_expectation(&self) -> crate::channels::activity::LivenessModel {
+        crate::channels::activity::LivenessModel::Bounded(std::time::Duration::from_secs(
+            MATTERMOST_POLL_INTERVAL_SECS + MATTERMOST_LIVENESS_GRACE_SECS,
+        ))
+    }
+
     async fn send(&self, message: &SendMessage) -> Result<()> {
         // Mattermost supports threading via 'root_id'.
         // We pack 'channel_id:root_id' into recipient if it's a thread.
@@ -150,7 +165,7 @@ impl Channel for MattermostChannel {
         tracing::info!("Mattermost channel listening on {}...", channel_id);
 
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(MATTERMOST_POLL_INTERVAL_SECS)).await;
 
             let resp = match self
                 .http_client()
@@ -174,6 +189,11 @@ impl Channel for MattermostChannel {
                     continue;
                 }
             };
+
+            // The poll returned and parsed — an empty `posts` object still counts.
+            // Without this the listener could spin forever on a dead upstream
+            // (transport and parse errors both `continue`) and look perfectly fine.
+            crate::channels::activity::record_upstream(self.name());
 
             if let Some(posts) = data.get("posts").and_then(|p| p.as_object()) {
                 // Process in chronological order

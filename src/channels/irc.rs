@@ -344,6 +344,15 @@ impl Channel for IrcChannel {
         "irc"
     }
 
+    /// Any server line — including the periodic PING — resets the clock, and the
+    /// socket read already bails after `READ_TIMEOUT` of complete silence.
+    ///
+    /// Report-only (see `channels::activity`): this value adds no timeout of its
+    /// own, it only decides when silence becomes visible to operators.
+    fn liveness_expectation(&self) -> crate::channels::activity::LivenessModel {
+        crate::channels::activity::LivenessModel::Bounded(READ_TIMEOUT)
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let mut guard = self.writer.lock().await;
         let writer = guard.as_mut().ok_or_else(|| anyhow::anyhow!("IRC not connected"))?;
@@ -406,6 +415,9 @@ impl Channel for IrcChannel {
             if n == 0 {
                 anyhow::bail!("IRC connection closed by server");
             }
+            // A full line arrived from the server. Server PINGs alone keep this
+            // ticking on a channel where nobody is talking.
+            crate::channels::activity::record_upstream(self.name());
 
             let Some(msg) = IrcMessage::parse(&line) else {
                 continue;

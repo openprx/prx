@@ -2567,6 +2567,11 @@ async fn handle_whatsapp_message(State(state): State<AppState>, headers: HeaderM
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
+    // Webhook-delivered channels never pass through the channel dispatch loop,
+    // so their inbound activity is recorded here instead (see
+    // `channels::activity`). Reporting only — nothing acts on it.
+    crate::channels::activity::record_inbound(wa.name());
+
     // Process each message
     let provider_label = state
         .config
@@ -2695,6 +2700,11 @@ async fn handle_linq_webhook(State(state): State<AppState>, headers: HeaderMap, 
         // Acknowledge the webhook even if no messages (could be status/delivery events)
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
+
+    // Webhook-delivered channels never pass through the channel dispatch loop,
+    // so their inbound activity is recorded here instead (see
+    // `channels::activity`). Reporting only — nothing acts on it.
+    crate::channels::activity::record_inbound(linq.name());
 
     // Process each message
     let provider_label = state
@@ -2833,6 +2843,11 @@ async fn handle_nextcloud_talk_webhook(
         // Acknowledge webhook even if payload does not contain actionable user messages.
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
+
+    // Webhook-delivered channels never pass through the channel dispatch loop,
+    // so their inbound activity is recorded here instead (see
+    // `channels::activity`). Reporting only — nothing acts on it.
+    crate::channels::activity::record_inbound(nextcloud_talk.name());
 
     let provider_label = state
         .config

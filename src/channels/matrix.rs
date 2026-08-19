@@ -14,6 +14,17 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell, RwLock, mpsc};
 
+/// Channel name, shared by `name()` and the liveness bookkeeping inside the sync
+/// callback (where `self` is not in scope).
+const MATRIX_CHANNEL_NAME: &str = "matrix";
+/// Server-side timeout of one `/sync` long poll. The homeserver answers within
+/// this window even when nothing changed, which is what makes a normal wait
+/// distinguishable from a wedged one.
+const MATRIX_SYNC_TIMEOUT_SECS: u64 = 30;
+/// Slack added to the sync window before a missing round-trip is reported (not
+/// acted upon) as a stall; covers the 5s sleep taken after a sync error.
+const MATRIX_LIVENESS_GRACE_SECS: u64 = 30;
+
 /// Matrix channel for Matrix Client-Server API.
 /// Uses matrix-sdk for reliable sync and encrypted-room decryption.
 #[derive(Clone)]
@@ -479,7 +490,16 @@ impl MatrixChannel {
 #[async_trait]
 impl Channel for MatrixChannel {
     fn name(&self) -> &str {
-        "matrix"
+        MATRIX_CHANNEL_NAME
+    }
+
+    /// One `/sync` round-trip per long-poll window.
+    ///
+    /// Report-only (see `channels::activity`): never a timeout.
+    fn liveness_expectation(&self) -> crate::channels::activity::LivenessModel {
+        crate::channels::activity::LivenessModel::Bounded(std::time::Duration::from_secs(
+            MATRIX_SYNC_TIMEOUT_SECS + MATRIX_LIVENESS_GRACE_SECS,
+        ))
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -612,7 +632,7 @@ impl Channel for MatrixChannel {
             }
         });
 
-        let sync_settings = SyncSettings::new().timeout(std::time::Duration::from_secs(30));
+        let sync_settings = SyncSettings::new().timeout(std::time::Duration::from_secs(MATRIX_SYNC_TIMEOUT_SECS));
         client
             .sync_with_result_callback(sync_settings, |sync_result| {
                 let tx = tx.clone();
@@ -624,6 +644,10 @@ impl Channel for MatrixChannel {
                     if let Err(error) = sync_result {
                         tracing::warn!("Matrix sync error: {error}, retrying...");
                         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    } else {
+                        // One sync round-trip returned, empty or not: the receive
+                        // path is alive even while the room is silent.
+                        crate::channels::activity::record_upstream(MATRIX_CHANNEL_NAME);
                     }
 
                     Ok::<LoopCtrl, matrix_sdk::Error>(LoopCtrl::Continue)

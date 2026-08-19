@@ -90,6 +90,9 @@ const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
     "src/tools/sessions_spawn.rs::process_mode_parent_timeout_kills_stuck_process::let mut child = command.spawn().unwrap();",
     "src/tools/sessions_spawn.rs::run_sub_agent_process::let mut child = command.spawn()?;",
     "src/tools/sessions_spawn.rs::termination_after_leader_exit_does_not_wait_forever_on_inherited_pipe::let mut child = command.spawn().expect(\"test leader should spawn\");",
+    // Test-only: the orphan-reclaim test must create a child that deliberately
+    // bypasses the managed path, otherwise there is no orphan to detect.
+    "src/runtime/registry.rs::unreaped_child_is_reported_as_an_orphan_then_reclaimed::let mut child = command.spawn().expect(\"test: spawn detached child\");",
     "src/runtime/shell_process.rs::spawn_managed_shell_child::let child = cmd.spawn()?;",
     "src/tunnel/cloudflare.rs::start::.spawn()?;",
     "src/tunnel/custom.rs::start::.spawn()?;",

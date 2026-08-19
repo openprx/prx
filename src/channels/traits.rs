@@ -1,3 +1,4 @@
+use crate::channels::activity::LivenessModel;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
@@ -164,6 +165,24 @@ pub trait Channel: Send + Sync {
     /// Check if channel is healthy
     async fn health_check(&self) -> bool {
         true
+    }
+
+    /// How this channel proves that its receive path is still alive.
+    ///
+    /// Read by the listener supervisor when `listen()` starts, so a wedged
+    /// listener can be told apart from a merely quiet one. Channels that complete
+    /// an upstream round-trip on a bounded cadence — a long poll the server is
+    /// obliged to answer, a gateway heartbeat, a fixed poll interval — return
+    /// [`LivenessModel::Bounded`] with the longest gap that is still normal, and
+    /// call [`crate::channels::activity::record_upstream`] once per round-trip.
+    /// Channels driven purely by push with no keepalive of their own return
+    /// [`LivenessModel::Passive`]: silence is genuinely indistinguishable from a
+    /// wedge there, so no stall verdict is claimed.
+    ///
+    /// Report-only. The returned duration describes the channel; it must never be
+    /// used as a timeout, a restart trigger or a cancellation deadline.
+    fn liveness_expectation(&self) -> LivenessModel {
+        LivenessModel::Passive
     }
 
     /// Signal that the bot is processing a response (e.g. "typing" indicator).

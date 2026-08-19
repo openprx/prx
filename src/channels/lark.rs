@@ -400,6 +400,11 @@ impl LarkChannel {
                 msg = read.next() => {
                     let raw = match msg {
                         Some(Ok(ws_msg)) => {
+                            // Any frame proves the long connection still carries
+                            // traffic — including the pings that keep an idle
+                            // tenant alive.
+                            crate::channels::activity::record_upstream(self.name());
+
                             if should_refresh_last_recv(&ws_msg) {
                                 last_recv = Instant::now();
                             }
@@ -767,6 +772,20 @@ impl LarkChannel {
 impl Channel for LarkChannel {
     fn name(&self) -> &str {
         "lark"
+    }
+
+    /// Websocket mode reconnects itself once no frame has arrived for
+    /// [`WS_HEARTBEAT_TIMEOUT`], so that window is exactly the gap that is still
+    /// normal. Webhook mode is push-only with no cadence of its own, so no stall
+    /// verdict can honestly be claimed for it.
+    ///
+    /// Report-only (see `channels::activity`): never a timeout.
+    fn liveness_expectation(&self) -> crate::channels::activity::LivenessModel {
+        use crate::config::schema::LarkReceiveMode;
+        match self.receive_mode {
+            LarkReceiveMode::Websocket => crate::channels::activity::LivenessModel::Bounded(WS_HEARTBEAT_TIMEOUT),
+            LarkReceiveMode::Webhook => crate::channels::activity::LivenessModel::Passive,
+        }
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {

@@ -1569,150 +1569,166 @@ impl Tool for SessionsSpawnTool {
             let process_cost_config = self.cost_config.clone();
             let monitor_process_control = process_control.clone();
 
-            let jh = tokio::spawn(SPAWN_EXECUTION_CONTEXT.scope(process_execution_ctx, async move {
-                let failure_active_runs = active_runs.clone();
-                let failure_run_id = rid.clone();
-                let monitor_result = std::panic::AssertUnwindSafe(async {
-                    tracing::info!(run_id = %rid, "Sub-agent process starting");
+            // Registry row for this run. The parent is captured *here*, on the
+            // spawning task, because a freshly spawned task inherits no
+            // task-locals. No abort handle is attached: this monitor is the sole
+            // owner responsible for signalling and reaping the OS child, so
+            // aborting it would strand the very process a kill is meant to end.
+            // Killing this row instead cascades onto the worker process row that
+            // `run_sub_agent_process` registers underneath it.
+            let sub_agent_parent = crate::runtime::registry::current_work_id();
+            let sub_agent_label = process_agent_id
+                .clone()
+                .unwrap_or_else(|| "sub-agent (process)".to_string());
+            let sub_agent_work =
+                crate::runtime::registry::register_sub_agent(&sub_agent_label, &rid, sub_agent_parent, None);
+            let jh = tokio::spawn(crate::runtime::registry::scoped(
+                sub_agent_work,
+                SPAWN_EXECUTION_CONTEXT.scope(process_execution_ctx, async move {
+                    let failure_active_runs = active_runs.clone();
+                    let failure_run_id = rid.clone();
+                    let monitor_result = std::panic::AssertUnwindSafe(async {
+                        tracing::info!(run_id = %rid, "Sub-agent process starting");
 
-                    let worker_result = run_sub_agent_process(
-                        &rid,
-                        &task_owned,
-                        &provider_name,
-                        &model,
-                        api_key.as_deref(),
-                        temperature,
-                        timeout_secs,
-                        max_iterations,
-                        &workspace_root,
-                        &worker_workspace_root,
-                        identity_dir.as_deref(),
-                        &allowed_tools,
-                        keep_workspace,
-                        process_scope.as_ref(),
-                        process_spawn_depth,
-                        &process_session_scope_key,
-                        process_parent_run_id.as_deref(),
-                        process_agent_id.as_deref(),
-                        &process_lineage,
-                        &process_memory_strategy,
-                        &process_memory_backend,
-                        &process_config_dir,
-                        &process_config_generation,
-                        process_event_recording,
-                        &process_compaction_config,
-                        monitor_process_control.as_ref(),
-                    )
+                        let worker_result = run_sub_agent_process(
+                            &rid,
+                            &task_owned,
+                            &provider_name,
+                            &model,
+                            api_key.as_deref(),
+                            temperature,
+                            timeout_secs,
+                            max_iterations,
+                            &workspace_root,
+                            &worker_workspace_root,
+                            identity_dir.as_deref(),
+                            &allowed_tools,
+                            keep_workspace,
+                            process_scope.as_ref(),
+                            process_spawn_depth,
+                            &process_session_scope_key,
+                            process_parent_run_id.as_deref(),
+                            process_agent_id.as_deref(),
+                            &process_lineage,
+                            &process_memory_strategy,
+                            &process_memory_backend,
+                            &process_config_dir,
+                            &process_config_generation,
+                            process_event_recording,
+                            &process_compaction_config,
+                            monitor_process_control.as_ref(),
+                        )
+                        .await;
+
+                        let (status, result_text, token_usage_records, finalization) = match worker_result {
+                            Ok(ProcessWorkerOutcome::Finished(result)) if result.success => {
+                                let token_usage_records = result
+                                    .tokens_used
+                                    .as_ref()
+                                    .and_then(|usage| {
+                                        crate::llm::route_decision::MeteredTokenUsageRecord::from_parts(
+                                            &provider_name,
+                                            &model,
+                                            usage,
+                                            &process_cost_config,
+                                        )
+                                    })
+                                    .into_iter()
+                                    .collect::<Vec<_>>();
+                                (
+                                    SubAgentStatus::Completed(result.output.clone()),
+                                    result.output,
+                                    token_usage_records,
+                                    ProcessFinalization::Natural,
+                                )
+                            }
+                            Ok(ProcessWorkerOutcome::Finished(result)) => {
+                                let error = result.error.unwrap_or_else(|| "worker failed".to_string());
+                                let msg = format!("Sub-agent error: {error}");
+                                (
+                                    SubAgentStatus::Failed(error),
+                                    msg,
+                                    Vec::new(),
+                                    ProcessFinalization::Natural,
+                                )
+                            }
+                            Ok(ProcessWorkerOutcome::Terminated(reason)) => {
+                                let msg = format!("Sub-agent process terminated: {reason}");
+                                (
+                                    SubAgentStatus::Failed(reason),
+                                    msg,
+                                    Vec::new(),
+                                    ProcessFinalization::Terminated,
+                                )
+                            }
+                            Ok(ProcessWorkerOutcome::TerminationFailed(error)) => {
+                                let msg = format!("Sub-agent process termination failed: {error}");
+                                (
+                                    SubAgentStatus::Failed(error),
+                                    msg,
+                                    Vec::new(),
+                                    ProcessFinalization::TerminationFailed,
+                                )
+                            }
+                            Err(error) => {
+                                let msg = format!("Sub-agent process error: {error}");
+                                (
+                                    SubAgentStatus::Failed(error.to_string()),
+                                    msg,
+                                    Vec::new(),
+                                    ProcessFinalization::Natural,
+                                )
+                            }
+                        };
+
+                        let announce = format_announce_message(&rid, &status, &result_text);
+                        record_spawn_result_event(
+                            process_memory_fabric.as_ref(),
+                            process_result_scope,
+                            &result_text,
+                            &status,
+                            &process_lineage,
+                            (finalization == ProcessFinalization::Terminated).then_some("task.killed"),
+                        )
+                        .await;
+
+                        commit_process_terminal_state(
+                            &active_runs,
+                            &rid,
+                            status,
+                            token_usage_records,
+                            monitor_process_control.as_ref(),
+                            finalization,
+                            #[cfg(test)]
+                            None,
+                        )
+                        .await;
+                        if let Some(target) = recipient {
+                            let msg = SendMessage::new(&announce, &target);
+                            if let Err(error) = channel.send(&msg).await {
+                                tracing::error!(
+                                    run_id = %rid,
+                                    "Failed to announce sub-agent process result: {error}"
+                                );
+                            }
+                        }
+
+                        tracing::info!(run_id = %rid, "Sub-agent process finished");
+                    })
+                    .catch_unwind()
                     .await;
 
-                    let (status, result_text, token_usage_records, finalization) = match worker_result {
-                        Ok(ProcessWorkerOutcome::Finished(result)) if result.success => {
-                            let token_usage_records = result
-                                .tokens_used
-                                .as_ref()
-                                .and_then(|usage| {
-                                    crate::llm::route_decision::MeteredTokenUsageRecord::from_parts(
-                                        &provider_name,
-                                        &model,
-                                        usage,
-                                        &process_cost_config,
-                                    )
-                                })
-                                .into_iter()
-                                .collect::<Vec<_>>();
-                            (
-                                SubAgentStatus::Completed(result.output.clone()),
-                                result.output,
-                                token_usage_records,
-                                ProcessFinalization::Natural,
-                            )
-                        }
-                        Ok(ProcessWorkerOutcome::Finished(result)) => {
-                            let error = result.error.unwrap_or_else(|| "worker failed".to_string());
-                            let msg = format!("Sub-agent error: {error}");
-                            (
-                                SubAgentStatus::Failed(error),
-                                msg,
-                                Vec::new(),
-                                ProcessFinalization::Natural,
-                            )
-                        }
-                        Ok(ProcessWorkerOutcome::Terminated(reason)) => {
-                            let msg = format!("Sub-agent process terminated: {reason}");
-                            (
-                                SubAgentStatus::Failed(reason),
-                                msg,
-                                Vec::new(),
-                                ProcessFinalization::Terminated,
-                            )
-                        }
-                        Ok(ProcessWorkerOutcome::TerminationFailed(error)) => {
-                            let msg = format!("Sub-agent process termination failed: {error}");
-                            (
-                                SubAgentStatus::Failed(error),
-                                msg,
-                                Vec::new(),
-                                ProcessFinalization::TerminationFailed,
-                            )
-                        }
-                        Err(error) => {
-                            let msg = format!("Sub-agent process error: {error}");
-                            (
-                                SubAgentStatus::Failed(error.to_string()),
-                                msg,
-                                Vec::new(),
-                                ProcessFinalization::Natural,
-                            )
-                        }
-                    };
-
-                    let announce = format_announce_message(&rid, &status, &result_text);
-                    record_spawn_result_event(
-                        process_memory_fabric.as_ref(),
-                        process_result_scope,
-                        &result_text,
-                        &status,
-                        &process_lineage,
-                        (finalization == ProcessFinalization::Terminated).then_some("task.killed"),
-                    )
-                    .await;
-
-                    commit_process_terminal_state(
-                        &active_runs,
-                        &rid,
-                        status,
-                        token_usage_records,
-                        monitor_process_control.as_ref(),
-                        finalization,
-                        #[cfg(test)]
-                        None,
-                    )
-                    .await;
-                    if let Some(target) = recipient {
-                        let msg = SendMessage::new(&announce, &target);
-                        if let Err(error) = channel.send(&msg).await {
-                            tracing::error!(
-                                run_id = %rid,
-                                "Failed to announce sub-agent process result: {error}"
-                            );
-                        }
+                    if monitor_result.is_err() {
+                        commit_process_owner_failure_if_unfinalized(
+                            &failure_active_runs,
+                            &failure_run_id,
+                            monitor_process_control.as_ref(),
+                            "process owner panicked".to_string(),
+                        )
+                        .await;
                     }
-
-                    tracing::info!(run_id = %rid, "Sub-agent process finished");
-                })
-                .catch_unwind()
-                .await;
-
-                if monitor_result.is_err() {
-                    commit_process_owner_failure_if_unfinalized(
-                        &failure_active_runs,
-                        &failure_run_id,
-                        monitor_process_control.as_ref(),
-                        "process owner panicked".to_string(),
-                    )
-                    .await;
-                }
-            }));
+                }),
+            ));
 
             // Process-mode callers must never abort this monitor: it is the
             // sole owner responsible for signalling and reaping the OS child.
@@ -1842,6 +1858,7 @@ impl Tool for SessionsSpawnTool {
         let task_memory_fabric = memory_fabric.clone();
         let task_result_scope = spawn_scope_for_event.clone();
         let task_lineage = run_lineage.clone();
+        let agent_label_for_registry = selected_agent.as_ref().map(|(name, _)| name.clone());
         let (system_prompt, filtered_tools) = if let Some((agent, cfg)) = selected_agent {
             let identity_prompt = cfg
                 .identity_dir
@@ -1873,8 +1890,19 @@ impl Tool for SessionsSpawnTool {
             (DEFAULT_SUB_AGENT_SYSTEM_PROMPT.to_string(), tools)
         };
 
+        // Registry row for this run. Parent captured on the spawning task, which
+        // is the tool call that requested the spawn; a spawned task inherits no
+        // task-locals of its own.
+        let sub_agent_parent = crate::runtime::registry::current_work_id();
+        let sub_agent_label = agent_label_for_registry.unwrap_or_else(|| "sub-agent".to_string());
+        let sub_agent_work =
+            crate::runtime::registry::register_sub_agent(&sub_agent_label, &rid, sub_agent_parent, None);
+        let sub_agent_work_id = sub_agent_work.id();
+
         // Spawn async task (fire-and-forget); capture handle to support kill
-        let jh = tokio::spawn(SPAWN_EXECUTION_CONTEXT.scope(task_execution_ctx, async move {
+        let jh = tokio::spawn(crate::runtime::registry::scoped(
+            sub_agent_work,
+            SPAWN_EXECUTION_CONTEXT.scope(task_execution_ctx, async move {
             tracing::info!(run_id = %rid, "Sub-agent task starting");
             let provider_started_at = Utc::now();
             let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
@@ -2056,7 +2084,8 @@ impl Tool for SessionsSpawnTool {
                     "Sub-agent completed but no recipient configured for announcement"
                 );
             }
-        }));
+            }),
+        ));
 
         // Store the abort handle so kill action can cancel this run
         {
@@ -2065,6 +2094,9 @@ impl Tool for SessionsSpawnTool {
                 run.abort_handle = Some(jh.abort_handle());
             }
         }
+        // Same handle for `prx tasks kill`: aborting drops the run future, which
+        // drops its registry guard, which is how the kill is confirmed.
+        crate::runtime::registry::attach_abort_handle(sub_agent_work_id, jh.abort_handle());
 
         Ok(ToolResult {
             success: true,
@@ -3906,6 +3938,18 @@ async fn run_sub_agent_process(
 
     let payload = serde_json::to_string(&manifest)?;
     let mut child = command.spawn()?;
+    // Ledger row for the worker process itself, carrying the process group so a
+    // kill reaches anything the worker forks. Its parent resolves to the
+    // sub-agent row, because this future runs inside that row's scope.
+    #[cfg(unix)]
+    let worker_pgid = child
+        .id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .filter(|pid| *pid > 0);
+    #[cfg(not(unix))]
+    let worker_pgid: Option<i32> = None;
+    let mut worker_registration =
+        crate::runtime::registry::register_process(&format!("session-worker {run_id}"), child.id(), worker_pgid);
     let mut process_group = match OwnedProcessGroup::from_child(&child) {
         Ok(group) => group,
         Err(error) => {
@@ -3937,6 +3981,11 @@ async fn run_sub_agent_process(
     ))
     .catch_unwind()
     .await;
+    // Every branch below reaps the leader and tears the group down, so the
+    // ledger row is retired here rather than being reported as an orphan. If the
+    // await above is cancelled instead, the guard drops unreaped and the row
+    // stays visible — which is exactly the orphan report it exists for.
+    worker_registration.mark_reaped();
     let owned_phase = match owned_phase {
         Ok(Ok(phase)) => phase,
         Ok(Err(error)) => {

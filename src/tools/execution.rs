@@ -1304,6 +1304,22 @@ impl ToolExecutionService {
         cancellation: Option<CancellationToken>,
     ) -> ToolExecutionOutcome {
         let started = Instant::now();
+        // Every production tool call passes through here, which makes this the
+        // one place that has to register for the runtime work registry to be
+        // complete. The call gets its own kill handle, derived from the turn
+        // token so turn-level cancellation still reaches it, but cancellable on
+        // its own so an operator can end one stuck call without taking the
+        // whole turn down with it.
+        let cancellation = Some(
+            cancellation
+                .as_ref()
+                .map_or_else(CancellationToken::new, CancellationToken::child_token),
+        );
+        let work = crate::runtime::registry::register_tool_call(
+            &command.name,
+            context.envelope.task_id.as_deref(),
+            cancellation.clone(),
+        );
         let input_sha256 = format!("{:x}", Sha256::digest(command.arguments.to_string().as_bytes()));
         let Some(resolved) = self.resolve(&command.name) else {
             let available = self
@@ -1491,7 +1507,12 @@ impl ToolExecutionService {
         // The resolved Arc is immutable for the in-flight call even if a
         // dynamic catalog refresh changes future descriptor snapshots.
         let backend = resolved.backend;
-        let tool_future = backend.invoke(&command.name, arguments, cancellation.clone());
+        // Scoped so any child process the tool spawns registers with this call
+        // as its parent, which is what makes a cascading kill possible.
+        let tool_future = crate::runtime::registry::scope_current(
+            work.id(),
+            backend.invoke(&command.name, arguments, cancellation.clone()),
+        );
         let mut cancelled_before_invoke = false;
         let raw_result = if let (Some(token), Some(_)) = (cancellation.clone(), idempotency_lease.as_ref()) {
             // The outer cancellation race owns only the ReservedNotStarted
@@ -1925,6 +1946,78 @@ mod tests {
         }
     }
 
+    /// Records what the runtime work registry looked like from *inside* the
+    /// backend call, which is the only place that can prove the production
+    /// execute path registers a row and scopes it as the current work item.
+    struct RegistryObservingBackend {
+        observed: Arc<Mutex<Option<(crate::runtime::registry::WorkId, String, String)>>>,
+        started: Arc<tokio::sync::Notify>,
+        wait_for_cancellation: bool,
+    }
+
+    #[async_trait]
+    impl ToolBackend for RegistryObservingBackend {
+        fn root_name(&self) -> &str {
+            "native_write"
+        }
+
+        fn specs(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "native_write".to_string(),
+                description: "observes the runtime work registry".to_string(),
+                parameters: serde_json::json!({"type":"object", "required":["value"]}),
+            }]
+        }
+
+        fn supports_name(&self, public_name: &str) -> bool {
+            public_name == "native_write"
+        }
+
+        fn tier(&self) -> ToolTier {
+            ToolTier::Standard
+        }
+
+        fn categories(&self) -> Vec<ToolCategory> {
+            Vec::new()
+        }
+
+        fn adapter_kind(&self, _public_name: &str) -> ToolAdapterKind {
+            ToolAdapterKind::Native
+        }
+
+        async fn invoke(
+            &self,
+            _public_name: &str,
+            _arguments: serde_json::Value,
+            cancellation: Option<CancellationToken>,
+        ) -> anyhow::Result<ToolResult> {
+            if let Some(id) = crate::runtime::registry::current_work_id() {
+                if let Some(row) = crate::runtime::registry::snapshot(id) {
+                    *self.observed.lock() = Some((
+                        id,
+                        row.name.to_string(),
+                        row.run_id.map(|run_id| run_id.to_string()).unwrap_or_default(),
+                    ));
+                }
+            }
+            self.started.notify_one();
+            if self.wait_for_cancellation {
+                let cancellation = cancellation.expect("test: execute must supply a per-call token");
+                cancellation.cancelled().await;
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(TOOL_EXECUTION_CANCELLED.to_string()),
+                });
+            }
+            Ok(ToolResult {
+                success: true,
+                output: "executed".to_string(),
+                error: None,
+            })
+        }
+    }
+
     struct CancellationAwareBackend {
         calls: Arc<AtomicUsize>,
         started: Arc<tokio::sync::Notify>,
@@ -2282,6 +2375,107 @@ mod tests {
         assert_eq!(first.status, ToolExecutionStatus::Indeterminate);
         assert_eq!(second.status, ToolExecutionStatus::Indeterminate);
         assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    }
+
+    fn registry_observing_service(
+        fixture: &Fixture,
+        observed: &Arc<Mutex<Option<(crate::runtime::registry::WorkId, String, String)>>>,
+        started: &Arc<tokio::sync::Notify>,
+        wait_for_cancellation: bool,
+    ) -> ToolExecutionService {
+        ToolExecutionService::from_backends(
+            vec![Arc::new(RegistryObservingBackend {
+                observed: Arc::clone(observed),
+                started: Arc::clone(started),
+                wait_for_cancellation,
+            })],
+            Arc::new(FixedPolicy {
+                decision: ToolExecutionDecision::Allow,
+                stages: Arc::clone(&fixture.stages),
+            }),
+            Arc::new(FixedApproval {
+                decision: approved(),
+                stages: Arc::clone(&fixture.stages),
+            }),
+            Arc::new(RecordingPreparation {
+                stages: Arc::clone(&fixture.stages),
+                allowed: true,
+            }),
+            Arc::new(RecordingAudit {
+                records: Arc::clone(&fixture.records),
+                stages: Arc::clone(&fixture.stages),
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn production_execute_registers_the_call_and_deregisters_on_return() {
+        let fixture = fixture();
+        let observed = Arc::new(Mutex::new(None));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let service = registry_observing_service(&fixture, &observed, &started, false);
+
+        let outcome = service
+            .execute(
+                ToolExecutionCommand::new("native_write", serde_json::json!({"value":"ok"})),
+                context(),
+                None,
+            )
+            .await;
+        assert!(outcome.succeeded());
+
+        let (id, name, run_id) = observed.lock().clone().expect("the call must register a work item");
+        assert_eq!(name, "native_write", "the row must be named after the tool");
+        assert_eq!(run_id, "task-a", "the row must carry the envelope's run correlation");
+        assert!(
+            crate::runtime::registry::snapshot(id).is_none(),
+            "the row must be gone once execute returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn killing_a_registered_tool_call_cancels_only_that_call() {
+        let fixture = fixture();
+        let observed = Arc::new(Mutex::new(None));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let service = Arc::new(registry_observing_service(&fixture, &observed, &started, true));
+
+        // The turn token stands in for the surrounding agent turn: killing one
+        // tool call must not cancel it.
+        let turn_token = CancellationToken::new();
+        let task = {
+            let service = Arc::clone(&service);
+            let turn_token = turn_token.clone();
+            tokio::spawn(async move {
+                service
+                    .execute(
+                        ToolExecutionCommand::new("native_write", serde_json::json!({"value":"slow"})),
+                        context(),
+                        Some(turn_token),
+                    )
+                    .await
+            })
+        };
+
+        started.notified().await;
+        let id = observed
+            .lock()
+            .as_ref()
+            .map(|(id, _, _)| *id)
+            .expect("test: registered id");
+        let results = crate::runtime::registry::kill(id, false).await;
+        assert_eq!(
+            results.first().map(|result| result.outcome),
+            Some(crate::runtime::registry::KillOutcome::Killed),
+            "the kill must be confirmed by the row disappearing"
+        );
+
+        let outcome = task.await.expect("test: join");
+        assert_eq!(outcome.status, ToolExecutionStatus::Cancelled);
+        assert!(
+            !turn_token.is_cancelled(),
+            "killing one tool call must not cancel the whole turn"
+        );
     }
 
     #[tokio::test]

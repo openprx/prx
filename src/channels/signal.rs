@@ -188,6 +188,9 @@ async fn extract_document_text(path: &str, content_type: &str, filename: &str) -
 
 const GROUP_TARGET_PREFIX: &str = "group:";
 const SIGNAL_DM_DEDUPE_WINDOW_SECS: u64 = 5;
+/// Slack added to the worst-case REST poll spacing before a missing round-trip
+/// is reported (not acted upon) as a stall.
+const SIGNAL_LIVENESS_GRACE_SECS: u64 = 15;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RecipientTarget {
@@ -1884,6 +1887,17 @@ impl SignalChannel {
         let mut retry_delay_secs = 2u64;
         let max_delay_secs = 60u64;
 
+        // The transport is only chosen here, at runtime, so the liveness model
+        // declared by `liveness_expectation()` is refined once it is known:
+        // polling completes a round-trip on a bounded cadence, so silence beyond
+        // it is real evidence of a wedged listener.
+        crate::channels::activity::register(
+            self.name(),
+            crate::channels::activity::LivenessModel::Bounded(
+                poll_interval + Duration::from_secs(max_delay_secs + SIGNAL_LIVENESS_GRACE_SECS),
+            ),
+        );
+
         loop {
             let resp = self
                 .http_client()
@@ -1895,6 +1909,9 @@ impl SignalChannel {
             match resp {
                 Ok(r) if r.status().is_success() => {
                     retry_delay_secs = 2;
+                    // The receive endpoint answered. Recorded before the empty-body
+                    // shortcut below so a quiet account still counts as alive.
+                    crate::channels::activity::record_upstream(self.name());
                     let text = r.text().await.unwrap_or_default();
                     if text.is_empty() || text == "[]" {
                         tokio::time::sleep(poll_interval).await;
@@ -1937,6 +1954,13 @@ impl SignalChannel {
     /// SSE-based listener for signal-cli daemon `/api/v1/events`.
     async fn listen_sse(&self, sse_url: &str, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let url = reqwest::Url::parse(sse_url)?;
+
+        // signal-cli's event stream makes no keepalive promise: a healthy account
+        // with no traffic legitimately sends nothing for hours, so silence here is
+        // genuinely indistinguishable from a dead stream. Claiming a stall
+        // threshold would be a guess dressed up as evidence, so none is declared —
+        // the chunk timestamps below are still published for operators to judge.
+        crate::channels::activity::register(self.name(), crate::channels::activity::LivenessModel::Passive);
 
         let mut retry_delay_secs = 2u64;
         let max_delay_secs = 60u64;
@@ -1990,6 +2014,8 @@ impl SignalChannel {
                     }
                 };
 
+                // A stream chunk arrived — event or `:` keepalive comment alike.
+                crate::channels::activity::record_upstream(self.name());
                 buffer.push_str(&text);
 
                 while let Some(newline_pos) = buffer.find('\n') {
@@ -2053,6 +2079,15 @@ impl SignalChannel {
 impl Channel for SignalChannel {
     fn name(&self) -> &str {
         "signal"
+    }
+
+    /// Declared passive because the transport is picked inside `listen()`: REST
+    /// polling re-declares itself as bounded, while the SSE stream stays passive
+    /// (see `listen_sse`).
+    ///
+    /// Report-only (see `channels::activity`): never a timeout.
+    fn liveness_expectation(&self) -> crate::channels::activity::LivenessModel {
+        crate::channels::activity::LivenessModel::Passive
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {

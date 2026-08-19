@@ -358,6 +358,18 @@ impl PostgresConnectionPool {
         }
     }
 
+    fn describe(&self) -> String {
+        // Never the URL: it carries credentials. The pool is identified by the
+        // database it serves, which is what an operator needs to tell two pools
+        // apart.
+        self.db_url
+            .rsplit('/')
+            .next()
+            .and_then(|tail| tail.split('?').next())
+            .filter(|name| !name.is_empty())
+            .map_or_else(|| "postgres".to_string(), ToString::to_string)
+    }
+
     pub(crate) fn stats(&self) -> PostgresPoolStats {
         let guard = self.state.lock();
         PostgresPoolStats {
@@ -471,6 +483,31 @@ impl Drop for PostgresConnectionPool {
 ///
 /// Returning it to the pool happens in `Drop`, so a caller that fails or
 /// unwinds mid-query can never leak a slot.
+impl crate::runtime::registry::PoolStatsSource for PostgresConnectionPool {
+    fn pool_kind(&self) -> &'static str {
+        "postgres"
+    }
+
+    fn pool_name(&self) -> String {
+        self.describe()
+    }
+
+    fn pool_metrics(&self) -> serde_json::Value {
+        let stats = self.stats();
+        serde_json::json!({
+            "max_size": stats.max_size,
+            "in_use": stats.in_use,
+            "idle": stats.idle,
+            "waiters": stats.waiters,
+            "acquisitions": stats.acquisitions,
+            "saturated_acquisitions": stats.saturated_acquisitions,
+            "total_wait_ms": stats.total_wait.as_millis(),
+            "connects": stats.connects,
+            "discards": stats.discards,
+        })
+    }
+}
+
 pub(crate) struct PooledConnection<'pool> {
     pool: &'pool PostgresConnectionPool,
     client: Option<Client>,
@@ -766,6 +803,9 @@ impl PostgresMemory {
         embedding_dimensions: usize,
     ) -> Result<(Arc<PostgresConnectionPool>, bool)> {
         let pool = Arc::new(PostgresConnectionPool::new(db_url, connect_timeout_secs, pool_max_size));
+        let concrete_pool = Arc::clone(&pool);
+        let metrics_source: Arc<dyn crate::runtime::registry::PoolStatsSource> = concrete_pool;
+        crate::runtime::registry::register_pool(&metrics_source);
         let init_pool = Arc::clone(&pool);
         let init_handle = std::thread::Builder::new()
             .name("postgres-memory-init".to_string())

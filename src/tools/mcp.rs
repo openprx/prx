@@ -120,6 +120,17 @@ pub struct McpTool {
     state: RwLock<RuntimeState>,
 }
 
+/// Put an MCP stdio server's child into the runtime work registry.
+///
+/// The transport owns the child, so the ledger row is bound to the returned
+/// guard's scope instead of to a `Child` we hold. The pid doubles as the group
+/// id because the command is spawned with `process_group(0)`.
+fn register_mcp_child(server_name: &str, transport: &TokioChildProcess) -> crate::runtime::registry::WorkGuard {
+    let pid = transport.id();
+    let pgid = pid.and_then(|pid| i32::try_from(pid).ok()).filter(|pid| *pid > 0);
+    crate::runtime::registry::register_process(&format!("mcp:{server_name}"), pid, pgid)
+}
+
 impl McpTool {
     pub fn new(security: Arc<SecurityPolicy>, base_config: McpConfig, workspace_dir: PathBuf) -> Self {
         let state = RuntimeState {
@@ -447,8 +458,14 @@ impl McpTool {
             cmd.envs(server.env.clone());
         }
 
+        // Own process group, matching every other child PRX spawns: an MCP
+        // server that forks helpers of its own can then be ended as a whole.
+        #[cfg(unix)]
+        cmd.process_group(0);
+
         let startup_timeout = Duration::from_millis(server.startup_timeout_ms);
         let transport = TokioChildProcess::new(cmd)?;
+        let _registration = register_mcp_child(server_name, &transport);
         let client = tokio::time::timeout(startup_timeout, ().serve(transport))
             .await
             .map_err(|_| anyhow::anyhow!("MCP startup timed out after {} ms", server.startup_timeout_ms))??;
@@ -549,9 +566,14 @@ impl McpTool {
             cmd.envs(server.env.clone());
         }
 
+        // Own process group; see `discover_stdio` for the rationale.
+        #[cfg(unix)]
+        cmd.process_group(0);
+
         let startup_timeout = Duration::from_millis(server.startup_timeout_ms);
         let request_timeout = Duration::from_millis(server.request_timeout_ms);
         let transport = TokioChildProcess::new(cmd)?;
+        let _registration = register_mcp_child(server_name, &transport);
         let client = tokio::time::timeout(startup_timeout, ().serve(transport))
             .await
             .map_err(|_| anyhow::anyhow!("MCP startup timed out after {} ms", server.startup_timeout_ms))??;

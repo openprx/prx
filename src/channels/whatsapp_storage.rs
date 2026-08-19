@@ -157,9 +157,11 @@ impl RusqliteStore {
             .reader_pragmas(SESSION_DB_PRAGMAS)
             .build()?;
 
+        let pool = Arc::new(pool);
+        SqliteConnectionPool::publish_metrics(&pool);
         let store = Self {
             db_path: Arc::from(db_path.as_str()),
-            pool: Arc::new(pool),
+            pool,
             device_id: 1, // Default device ID
         };
 

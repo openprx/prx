@@ -44,7 +44,8 @@ use crate::{
     providers, service, skills,
 };
 use crate::{
-    handle_approval_command, handle_audit_command, handle_auth_command, handle_memory_command, redact_config_show_value,
+    handle_approval_command, handle_audit_command, handle_auth_command, handle_memory_command, handle_tasks_command,
+    redact_config_show_value,
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -248,6 +249,12 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
     // the process default termination). Borrow `&command` so the owning `match`
     // below still consumes it.
     let root_shutdown = CancellationToken::new();
+    // Long-running work is normal business in an unbounded runtime, so this
+    // sweeper only ever *logs*: it must never terminate anything. See
+    // `registry::warn_long_running` for the full rationale.
+    crate::runtime::registry::start_long_task_warner(crate::runtime::registry::long_task_warn_threshold(
+        config.runtime.long_task_warn_secs,
+    ));
     if should_bind_signal(&command) {
         spawn_signal_task(root_shutdown.clone());
     }
@@ -341,6 +348,10 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
                 .run(root_shutdown.clone())
                 .await
         }
+
+        // Runtime work inspection and manual kill. Read-only for the local
+        // process: it is an HTTP client of whichever process owns the work.
+        Commands::Tasks { tasks_command } => handle_tasks_command(tasks_command, &config).await,
 
         Commands::Status => {
             println!("🦀 OpenPRX Status");

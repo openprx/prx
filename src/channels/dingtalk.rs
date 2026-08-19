@@ -8,6 +8,11 @@ use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 use uuid::Uuid;
 
 const DINGTALK_BOT_CALLBACK_TOPIC: &str = "/v1.0/im/bot/messages/get";
+/// Longest gap between two stream frames that is still considered normal.
+///
+/// The stream gateway drives its own ping/pong; this budget is generous enough
+/// to cover a slow keepalive and is used for reporting only, never as a timeout.
+const DINGTALK_STREAM_SILENCE_BUDGET_SECS: u64 = 180;
 
 /// DingTalk channel — connects via Stream Mode WebSocket for real-time messages.
 /// Replies are sent through per-message session webhook URLs.
@@ -116,6 +121,15 @@ impl Channel for DingTalkChannel {
         "dingtalk"
     }
 
+    /// The stream gateway pings periodically and every ping arrives as a frame.
+    ///
+    /// Report-only (see `channels::activity`): never a timeout.
+    fn liveness_expectation(&self) -> crate::channels::activity::LivenessModel {
+        crate::channels::activity::LivenessModel::Bounded(std::time::Duration::from_secs(
+            DINGTALK_STREAM_SILENCE_BUDGET_SECS,
+        ))
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let webhooks = self.session_webhooks.read().await;
         let webhook_url = webhooks.get(&message.recipient).ok_or_else(|| {
@@ -162,6 +176,10 @@ impl Channel for DingTalkChannel {
         tracing::info!("DingTalk: connected and listening for messages...");
 
         while let Some(msg) = read.next().await {
+            // Any frame counts, including the server's SYSTEM ping, so an idle
+            // conversation still proves the stream is carrying traffic.
+            crate::channels::activity::record_upstream(self.name());
+
             let msg = match msg {
                 Ok(Message::Text(t)) => t,
                 Ok(Message::Close(_)) => break,

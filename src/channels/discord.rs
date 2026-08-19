@@ -79,6 +79,12 @@ const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstu
 ///
 /// Discord rejects longer payloads with `50035 Invalid Form Body`.
 const DISCORD_MAX_MESSAGE_LENGTH: usize = 2000;
+/// Longest gap between two gateway frames that is still considered normal.
+///
+/// Discord's Hello frame asks for a heartbeat roughly every 41.25s and answers
+/// each one with an ACK, so twice that window plus slack covers a healthy but
+/// completely silent guild.
+const DISCORD_GATEWAY_SILENCE_BUDGET_SECS: u64 = 90;
 
 /// Split a message into chunks that respect Discord's 2000-character limit.
 /// Tries to split at word boundaries when possible.
@@ -204,6 +210,16 @@ impl Channel for DiscordChannel {
         "discord"
     }
 
+    /// The gateway drives a heartbeat (`heartbeat_interval`, 41.25s by default)
+    /// and ACKs every one, so frames keep arriving on an idle guild.
+    ///
+    /// Report-only (see `channels::activity`): never a timeout.
+    fn liveness_expectation(&self) -> crate::channels::activity::LivenessModel {
+        crate::channels::activity::LivenessModel::Bounded(std::time::Duration::from_secs(
+            DISCORD_GATEWAY_SILENCE_BUDGET_SECS,
+        ))
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let chunks = split_message_for_discord(&message.content);
 
@@ -322,6 +338,11 @@ impl Channel for DiscordChannel {
                     }
                 }
                 msg = read.next() => {
+                    // Any gateway frame — dispatch, heartbeat ACK, ping — proves the
+                    // socket is still carrying traffic. Recorded before the frame is
+                    // classified so keepalives count too.
+                    crate::channels::activity::record_upstream(self.name());
+
                     let msg = match msg {
                         Some(Ok(Message::Text(t))) => t,
                         Some(Ok(Message::Close(_))) | None => break,
