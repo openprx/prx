@@ -167,7 +167,7 @@ impl Tool for FileWriteTool {
         // eliminating the TOCTOU race between symlink check and write.
         let target = resolved_target.clone();
         let data = content.to_string();
-        let write_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let write_result = crate::runtime::blocking::spawn_blocking(move || -> Result<(), String> {
             use std::io::Write;
             let mut opts = std::fs::OpenOptions::new();
             opts.write(true).create(true).truncate(true);
@@ -230,7 +230,7 @@ async fn read_existing_file_for_diff(path: &std::path::Path) -> anyhow::Result<O
     }
 
     let target = path.to_path_buf();
-    let read_result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+    let read_result = crate::runtime::blocking::spawn_blocking(move || -> Result<String, String> {
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true);
         #[cfg(unix)]

@@ -312,16 +312,32 @@ fn copy_to_tmux_buffer(text: &str) -> io::Result<()> {
         return Ok(());
     }
 
+    // Stays synchronous on purpose: the whole clipboard path is blocking terminal
+    // I/O driven from the TUI event loop. `std::process::Child` does not kill or
+    // reap on drop, so every early return has to tear the child down explicitly.
     let mut child = Command::new("tmux")
         .args(["load-buffer", "-w", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(text.as_bytes())?;
+    let write_result = child
+        .stdin
+        .take()
+        .map_or(Ok(()), |mut stdin| stdin.write_all(text.as_bytes()));
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
     }
-    let status = child.wait()?;
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
     if status.success() {
         Ok(())
     } else {

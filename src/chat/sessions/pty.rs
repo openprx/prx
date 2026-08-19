@@ -2292,7 +2292,7 @@ mod tests {
         // comes (orphan holds the slave). It runs on a blocking thread so the test
         // runtime is free.
         let session_for_reap = session.clone();
-        let reaped = tokio::task::spawn_blocking(move || {
+        let reaped = crate::runtime::blocking::spawn_blocking(move || {
             let start = std::time::Instant::now();
             session_for_reap.reap_reader();
             start.elapsed()

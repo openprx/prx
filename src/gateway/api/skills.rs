@@ -232,11 +232,11 @@ pub async fn install_skill(
 
     // This explicit mutation endpoint is a control-plane operation. Clone into
     // an inactive same-filesystem directory, validate, then atomically rename.
-    let output = tokio::process::Command::new("git")
-        .args(["clone", "--depth", "1", &req.url])
-        .arg(&staging_dir)
-        .output()
-        .await;
+    // `git clone` forks transport helpers; a cancelled request must not leave
+    // them behind, so the whole process group is torn down with the future.
+    let mut command = tokio::process::Command::new("git");
+    command.args(["clone", "--depth", "1", &req.url]).arg(&staging_dir);
+    let output = crate::runtime::shell_process::run_managed_output(command).await;
 
     match output {
         Ok(out) if out.status.success() => {

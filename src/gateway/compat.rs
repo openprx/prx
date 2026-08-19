@@ -724,10 +724,8 @@ async fn prewarm_remote_jwks(config: &crate::config::McpServerRuntimeConfig) {
         return;
     }
 
-    let fetch_uri = uri.clone();
-    let fetched = tokio::task::spawn_blocking(move || fetch_remote_jwks(&fetch_uri)).await;
-    match fetched {
-        Ok(Ok(jwks)) => {
+    match fetch_remote_jwks(&uri).await {
+        Ok(jwks) => {
             REMOTE_JWKS_CACHE.write().insert(
                 uri,
                 CachedJwks {
@@ -736,31 +734,34 @@ async fn prewarm_remote_jwks(config: &crate::config::McpServerRuntimeConfig) {
                 },
             );
         }
-        Ok(Err(error)) => {
-            tracing::warn!(error = %error, "remote jwks refresh failed; relying on existing cache (fail-closed if stale)");
-        }
         Err(error) => {
-            tracing::warn!(error = %error, "remote jwks fetch task failed to join");
+            tracing::warn!(error = %error, "remote jwks refresh failed; relying on existing cache (fail-closed if stale)");
         }
     }
 }
 
-/// Blocking fetch + parse of a remote JWKS document. Runs only inside
-/// `spawn_blocking`. Uses the rustls-backed blocking reqwest client with a
-/// bounded timeout so a hung endpoint cannot stall a worker thread indefinitely.
-fn fetch_remote_jwks(uri: &str) -> Result<JwkSet, anyhow::Error> {
+/// Fetch + parse a remote JWKS document.
+///
+/// Deliberately async rather than `reqwest::blocking` inside `spawn_blocking`:
+/// a blocking HTTP call holds one of the process's finite blocking-pool threads
+/// for the whole round trip (up to `JWKS_FETCH_TIMEOUT_SECS`), while the async
+/// client holds none. With unbounded concurrent gateway traffic, a slow or
+/// unreachable JWKS endpoint could otherwise drain the pool on its own.
+/// The bounded timeout is retained so a hung endpoint cannot stall the caller.
+async fn fetch_remote_jwks(uri: &str) -> Result<JwkSet, anyhow::Error> {
     use anyhow::Context as _;
-    let client = reqwest::blocking::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(JWKS_FETCH_TIMEOUT_SECS))
         .build()
         .context("failed to build jwks http client")?;
     let response = client
         .get(uri)
         .send()
+        .await
         .context("jwks endpoint request failed")?
         .error_for_status()
         .context("jwks endpoint returned an error status")?;
-    let body = response.text().context("failed to read jwks response body")?;
+    let body = response.text().await.context("failed to read jwks response body")?;
     serde_json::from_str::<JwkSet>(&body).context("jwks endpoint returned invalid json")
 }
 

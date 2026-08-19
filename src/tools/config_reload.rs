@@ -70,7 +70,9 @@ impl Tool for ConfigReloadTool {
         let config_path = self.config.load_full().config_path.clone();
         let manager = Arc::clone(&self.config);
         let report =
-            match tokio::task::spawn_blocking(move || manager.reload_from_disk(ConfigReloadTrigger::Tool)).await {
+            match crate::runtime::blocking::spawn_blocking(move || manager.reload_from_disk(ConfigReloadTrigger::Tool))
+                .await
+            {
                 Ok(Ok(report)) => report,
                 Ok(Err(error)) => {
                     return Ok(ToolResult {

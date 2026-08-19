@@ -725,6 +725,22 @@ fn spawn_config_generation_supervisor(
     runner: GenerationComponentRunner,
     root_shutdown: CancellationToken,
 ) -> (JoinHandle<()>, GenerationSupervisorController) {
+    // Class A — unbounded is safe here because production is self-limiting, not
+    // because nothing is watched.
+    //
+    // Every command except `Finalize` carries a `sync_channel(1)` reply handle
+    // that the sender immediately blocks on (`recv_timeout(45s)`), so a given
+    // caller can never have more than one command outstanding; `Finalize` is
+    // fire-and-forget but is emitted exactly once per generation, right after a
+    // `Commit` that was already acknowledged. The steady-state queue depth is
+    // therefore the number of concurrent config-generation drivers — a handful,
+    // not a function of agent concurrency or stream volume.
+    //
+    // Bounding it would also be actively wrong: all senders are synchronous
+    // trait methods (`PreparedConfigGeneration::{commit,rollback,finalize}`)
+    // with no `.await` available, so a full bounded channel could only be
+    // handled by dropping a commit or a rollback — silently corrupting the
+    // generation state machine.
     let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
     let controller = GenerationSupervisorController {
         name,
@@ -1701,7 +1717,7 @@ mod tests {
     async fn receive_generation_ack(
         receiver: std::sync::mpsc::Receiver<std::result::Result<(), String>>,
     ) -> std::result::Result<(), String> {
-        tokio::task::spawn_blocking(move || {
+        crate::runtime::blocking::spawn_blocking(move || {
             receiver
                 .recv_timeout(Duration::from_secs(2))
                 .map_err(|error| error.to_string())?

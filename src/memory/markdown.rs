@@ -49,7 +49,7 @@ impl MarkdownMemory {
         let is_core = path == self.core_path();
         let data = content.to_string();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
             use std::io::Write as _;
             let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path_buf)?;
 

@@ -148,7 +148,11 @@ impl Tool for SessionsSendTool {
             });
         }
 
-        let steered_run = {
+        // The sender is cloned out and the registry guard dropped before the
+        // send: the message channel is bounded, so a send can park until the
+        // session drains it, and parking while holding this guard would deadlock
+        // against the receiving loop's own registry writes.
+        let (steer_tx, steered_run) = {
             let runs = self.active_runs.read().await;
             let Some(run) = runs.iter().find(|r| r.id == run_id) else {
                 return Ok(ToolResult {
@@ -164,9 +168,7 @@ impl Tool for SessionsSendTool {
                 // session.
                 SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => {
                     if let Some(ref tx) = run.steer_tx {
-                        tx.send(message.to_string())
-                            .map_err(|_| anyhow::anyhow!("Session message channel closed unexpectedly"))?;
-                        run.clone()
+                        (tx.clone(), run.clone())
                     } else {
                         return Ok(ToolResult {
                             success: false,
@@ -195,6 +197,13 @@ impl Tool for SessionsSendTool {
             }
         };
 
+        // Backpressure, not loss: a full queue slows this caller down instead of
+        // growing without bound. `send` only fails once the receiver is gone.
+        steer_tx
+            .send(message.to_string())
+            .await
+            .map_err(|_| anyhow::anyhow!("Session message channel closed unexpectedly"))?;
+
         self.record_steer_event(&steered_run, message).await;
         Ok(ToolResult {
             success: true,
@@ -221,8 +230,8 @@ mod tests {
     use crate::tools::sessions_spawn::{SubAgentRun, SubAgentStatus};
     use chrono::Utc;
 
-    fn make_running_run(id: &str) -> (SubAgentRun, tokio::sync::mpsc::UnboundedReceiver<String>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    fn make_running_run(id: &str) -> (SubAgentRun, tokio::sync::mpsc::Receiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::tools::sessions_spawn::STEER_CHANNEL_CAPACITY);
         let run = SubAgentRun {
             id: id.to_string(),
             task: "some task".to_string(),

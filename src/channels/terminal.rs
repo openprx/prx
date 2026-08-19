@@ -7,7 +7,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use super::traits::{Channel, ChannelCapabilities, ChannelMessage, SendMessage};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use crossterm::{execute, style, terminal};
 use std::io::{self, IsTerminal as _, Write as _};
@@ -989,65 +989,74 @@ impl Drop for TerminalChannel {
 /// Reads user input, recognizes slash-commands, and sends `ChannelMessage`s
 /// to the agent pipeline.
 async fn terminal_input_loop(tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
-    // Run stdin reads on a blocking thread. The legacy fallback deliberately
-    // uses a simple prompt instead of reedline: reedline consumes Ctrl+C and
-    // redraws over concurrent chat output unless wired through its optional
-    // external-printer feature.
-    let handle = tokio::task::spawn_blocking(move || -> Result<()> {
-        use std::io::BufRead as _;
+    // Run stdin reads on a dedicated OS thread rather than the tokio blocking
+    // pool. The loop blocks on stdin until EOF, i.e. for the life of the
+    // process, so a pool slot given to it is never returned — and with no cap
+    // on concurrent agent work, permanently retired slots are what turn pool
+    // pressure into deadlock. The legacy fallback deliberately uses a simple
+    // prompt instead of reedline: reedline consumes Ctrl+C and redraws over
+    // concurrent chat output unless wired through its optional external-printer
+    // feature.
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<()>>();
+    crate::runtime::blocking::spawn_detached_thread("prx-terminal-stdin", move || {
+        let outcome = (move || -> Result<()> {
+            use std::io::BufRead as _;
 
-        let stdin_is_tty = io::stdin().is_terminal();
-        let stdin = io::stdin();
-        let mut lines = stdin.lock().lines();
-        loop {
-            if stdin_is_tty {
-                print!("prx〉");
-                let _ = io::stdout().flush();
+            let stdin_is_tty = io::stdin().is_terminal();
+            let stdin = io::stdin();
+            let mut lines = stdin.lock().lines();
+            loop {
+                if stdin_is_tty {
+                    print!("prx〉");
+                    let _ = io::stdout().flush();
+                }
+                let line = match lines.next() {
+                    Some(Ok(line)) => line,
+                    Some(Err(_)) | None => break,
+                };
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let should_exit_input_loop = trimmed == "/quit" || trimmed == "/exit";
+
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                let msg = ChannelMessage {
+                    id: Uuid::new_v4().to_string(),
+                    sender: "user".to_string(),
+                    reply_target: "user".to_string(),
+                    content: trimmed,
+                    channel: "terminal".to_string(),
+                    timestamp,
+                    thread_ts: None,
+                    chat_kind: crate::channels::traits::ChatKind::Dm,
+                    chat_title: None,
+                    sender_display: None,
+                    mentioned_uuids: vec![],
+                    mentioned: false,
+                    is_group_hint: false,
+                    sender_is_bot: false,
+                };
+
+                if tx.blocking_send(msg).is_err() {
+                    break;
+                }
+                if should_exit_input_loop {
+                    break;
+                }
             }
-            let line = match lines.next() {
-                Some(Ok(line)) => line,
-                Some(Err(_)) | None => break,
-            };
-            let trimmed = line.trim().to_string();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let should_exit_input_loop = trimmed == "/quit" || trimmed == "/exit";
+            Ok(())
+        })();
+        // Receiver dropped means the caller already gave up on this loop.
+        let _ = done_tx.send(outcome);
+    })
+    .context("failed to start terminal stdin thread")?;
 
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            let msg = ChannelMessage {
-                id: Uuid::new_v4().to_string(),
-                sender: "user".to_string(),
-                reply_target: "user".to_string(),
-                content: trimmed,
-                channel: "terminal".to_string(),
-                timestamp,
-                thread_ts: None,
-                chat_kind: crate::channels::traits::ChatKind::Dm,
-                chat_title: None,
-                sender_display: None,
-                mentioned_uuids: vec![],
-                mentioned: false,
-                is_group_hint: false,
-                sender_is_bot: false,
-            };
-
-            if tx.blocking_send(msg).is_err() {
-                break;
-            }
-            if should_exit_input_loop {
-                break;
-            }
-        }
-        Ok(())
-    });
-
-    handle.await??;
-    Ok(())
+    done_rx.await.context("terminal stdin thread ended without a result")?
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

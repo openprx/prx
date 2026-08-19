@@ -115,6 +115,7 @@ impl RuntimeAdapter for DockerRuntime {
         }
 
         process.arg(self.config.image.trim()).arg("sh").arg("-c").arg(command);
+        process.kill_on_drop(true);
 
         Ok(process)
     }

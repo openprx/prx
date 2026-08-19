@@ -1,3 +1,4 @@
+pub mod blocking;
 pub mod bootstrap;
 pub mod control_ladder;
 pub mod docker;

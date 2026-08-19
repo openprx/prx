@@ -593,7 +593,7 @@ async fn read_current(file: &FilePatch, target: &Path) -> Result<String, DiffApp
         return Ok(String::new());
     }
     let target = target.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<String, DiffApplyError> {
+    crate::runtime::blocking::spawn_blocking(move || -> Result<String, DiffApplyError> {
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true);
         #[cfg(unix)]
@@ -628,7 +628,7 @@ fn authorize_write(target: &Path, security: &SecurityPolicy) -> Result<(), DiffA
 
 async fn write_target(target: &Path, content: String, create_new: bool) -> Result<(), DiffApplyError> {
     let target = target.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<(), DiffApplyError> {
+    crate::runtime::blocking::spawn_blocking(move || -> Result<(), DiffApplyError> {
         use std::io::Write as _;
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true);

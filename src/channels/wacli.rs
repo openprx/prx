@@ -170,7 +170,7 @@ async fn resolve_chat_title(msg: &WacliParsedMessage, cfg: &WacliChannelConfig, 
     }
     let store_dir = store_dir.to_string();
     let chat_id = msg.chat.trim().to_string();
-    match tokio::task::spawn_blocking(move || read_chat_title_from_store(&store_dir, &chat_id)).await {
+    match crate::runtime::blocking::spawn_blocking(move || read_chat_title_from_store(&store_dir, &chat_id)).await {
         Ok(Ok(title)) => title,
         Ok(Err(error)) => {
             tracing::debug!("wacli: failed to resolve chat title from read-only store: {error}");
@@ -329,7 +329,7 @@ async fn resolve_inbound_image_marker(
     let chat_id = msg.chat.trim().to_string();
     let message_id = msg.id.trim().to_string();
 
-    let source = match tokio::task::spawn_blocking(move || {
+    let source = match crate::runtime::blocking::spawn_blocking(move || {
         wait_for_local_media_path(&store_dir, &chat_id, &message_id, MEDIA_RESOLVE_TIMEOUT)
     })
     .await

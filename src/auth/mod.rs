@@ -141,7 +141,7 @@ impl AuthService {
     }
 
     pub async fn get_valid_openai_access_token(&self, profile_override: Option<&str>) -> Result<Option<String>> {
-        let data = tokio::task::spawn_blocking({
+        let data = crate::runtime::blocking::spawn_blocking({
             let auth = self.clone();
             let profile_override = profile_override.map(str::to_string);
             move || auth.prepare_openai_profile_data(profile_override.as_deref())
@@ -172,7 +172,7 @@ impl AuthService {
         let _guard = refresh_lock.lock().await;
 
         // Re-load after waiting for lock to avoid duplicate refreshes.
-        let data = tokio::task::spawn_blocking({
+        let data = crate::runtime::blocking::spawn_blocking({
             let store = self.store.clone();
             move || store.load()
         })
@@ -213,7 +213,7 @@ impl AuthService {
         let account_id = openai_oauth::extract_account_id_from_jwt(&refreshed.access_token)
             .or_else(|| latest_profile.account_id.clone());
 
-        let updated = tokio::task::spawn_blocking({
+        let updated = crate::runtime::blocking::spawn_blocking({
             let store = self.store.clone();
             let profile_id = profile_id.clone();
             let refreshed = refreshed.clone();

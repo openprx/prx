@@ -572,7 +572,7 @@ async fn check_postgres_health(config: &Config, items: &mut Vec<DiagItem>) {
     // The `postgres` crate is synchronous and blocking; run the probe on a
     // blocking thread and bound the whole thing with a 5s timeout.
     let probe_url = db_url.clone();
-    let probe = tokio::task::spawn_blocking(move || postgres_probe(&probe_url));
+    let probe = crate::runtime::blocking::spawn_blocking(move || postgres_probe(&probe_url));
     let outcome = match tokio::time::timeout(Duration::from_secs(5), probe).await {
         Ok(Ok(outcome)) => outcome,
         Ok(Err(join_err)) => {

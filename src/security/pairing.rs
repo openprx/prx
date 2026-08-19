@@ -151,7 +151,7 @@ impl PairingGuard {
         let code = code.to_string();
         let client_id = client_id.to_string();
         // TODO: make this function the main one without spawning a task
-        let handle = tokio::task::spawn_blocking(move || this.try_pair_blocking(&code, &client_id));
+        let handle = crate::runtime::blocking::spawn_blocking(move || this.try_pair_blocking(&code, &client_id));
 
         match handle.await {
             Ok(result) => result,

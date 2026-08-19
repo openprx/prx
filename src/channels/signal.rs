@@ -62,7 +62,12 @@ fn attachment_max_bytes(content_type: &str, config: &crate::config::MediaConfig)
 
 /// Run an external command and return its stdout as a string (if successful and non-empty).
 async fn run_command(cmd: &str, args: &[&str]) -> Option<String> {
-    let output = tokio::process::Command::new(cmd).args(args).output().await.ok()?;
+    let output = tokio::process::Command::new(cmd)
+        .args(args)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
     if output.status.success() {
         let text = String::from_utf8_lossy(&output.stdout).to_string();
         if text.trim().is_empty() { None } else { Some(text) }

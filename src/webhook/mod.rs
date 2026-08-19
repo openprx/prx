@@ -502,7 +502,7 @@ impl WebhookRepository for SqliteWebhookRepository {
     ) -> Result<WebhookClaimOutcome> {
         let repository = self.clone_for_worker();
         let event = event.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::runtime::blocking::spawn_blocking(move || {
             repository.claim_blocking(ingestion_key, event_identity, request_hash, &event)
         })
         .await
@@ -520,16 +520,18 @@ impl WebhookRepository for SqliteWebhookRepository {
         let claim = claim.clone();
         let event = event.clone();
         let memory_content = memory_content.to_string();
-        tokio::task::spawn_blocking(move || repository.commit_blocking(&claim, &event, &memory_content, memory_saved))
-            .await
-            .context("webhook commit worker panicked")?
+        crate::runtime::blocking::spawn_blocking(move || {
+            repository.commit_blocking(&claim, &event, &memory_content, memory_saved)
+        })
+        .await
+        .context("webhook commit worker panicked")?
     }
 
     async fn fail(&self, claim: &WebhookIngestionClaim, error: &str) -> Result<()> {
         let repository = self.clone_for_worker();
         let claim = claim.clone();
         let error = error.to_string();
-        tokio::task::spawn_blocking(move || repository.fail_blocking(&claim, &error))
+        crate::runtime::blocking::spawn_blocking(move || repository.fail_blocking(&claim, &error))
             .await
             .context("webhook failure worker panicked")?
     }
@@ -1015,7 +1017,7 @@ impl WebhookRepository for PostgresWebhookRepository {
     ) -> Result<WebhookClaimOutcome> {
         let repository = self.clone();
         let event = event.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::runtime::blocking::spawn_blocking(move || {
             repository.claim_blocking(ingestion_key, event_identity, request_hash, &event)
         })
         .await
@@ -1033,16 +1035,18 @@ impl WebhookRepository for PostgresWebhookRepository {
         let claim = claim.clone();
         let event = event.clone();
         let memory_content = memory_content.to_string();
-        tokio::task::spawn_blocking(move || repository.commit_blocking(&claim, &event, &memory_content, memory_saved))
-            .await
-            .context("PostgreSQL webhook commit worker panicked")?
+        crate::runtime::blocking::spawn_blocking(move || {
+            repository.commit_blocking(&claim, &event, &memory_content, memory_saved)
+        })
+        .await
+        .context("PostgreSQL webhook commit worker panicked")?
     }
 
     async fn fail(&self, claim: &WebhookIngestionClaim, error: &str) -> Result<()> {
         let repository = self.clone();
         let claim = claim.clone();
         let error = error.to_string();
-        tokio::task::spawn_blocking(move || repository.fail_blocking(&claim, &error))
+        crate::runtime::blocking::spawn_blocking(move || repository.fail_blocking(&claim, &error))
             .await
             .context("PostgreSQL webhook failure worker panicked")?
     }
@@ -2522,7 +2526,7 @@ mod tests {
         let qualified_ingestions = repository.qualified_ingestions.to_string();
         let qualified_memories = repository.qualified_memories.to_string();
         let qualified_memory_events = repository.qualified_memory_events.to_string();
-        let (ingestion_count, memory_count, event_count) = tokio::task::spawn_blocking(move || {
+        let (ingestion_count, memory_count, event_count) = crate::runtime::blocking::spawn_blocking(move || {
             let mut client = PostgresClient::connect(&query_url, NoTls).unwrap();
             let ingestion_count: i64 = client
                 .query_one(
@@ -2558,7 +2562,7 @@ mod tests {
         assert_eq!((ingestion_count, memory_count, event_count), (1, 1, 1));
 
         drop(repository);
-        tokio::task::spawn_blocking(move || {
+        crate::runtime::blocking::spawn_blocking(move || {
             let mut client = PostgresClient::connect(&db_url, NoTls).unwrap();
             client
                 .batch_execute(&format!(

@@ -1754,7 +1754,7 @@ async fn persist_pairing_tokens(config: &crate::config::SharedConfig, pairing: &
         .await
         .context("Failed to persist paired tokens to config.toml")?;
     let manager = Arc::clone(config);
-    tokio::task::spawn_blocking(move || {
+    crate::runtime::blocking::spawn_blocking(move || {
         manager.reload_from_disk(crate::config::ConfigReloadTrigger::PairingPersistence)
     })
     .await

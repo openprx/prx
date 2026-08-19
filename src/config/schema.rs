@@ -2849,9 +2849,23 @@ pub struct StorageProviderConfig {
     #[serde(default = "default_storage_table")]
     pub table: String,
 
-    /// Optional connection timeout in seconds for remote providers.
+    /// Optional timeout in seconds for *establishing* a connection to a remote
+    /// provider. Defaults to 15s when unset.
+    ///
+    /// This bounds the TCP/startup handshake only. Statement execution is never
+    /// bounded (no `statement_timeout` is applied) because long-running queries
+    /// are normal for agent workloads.
     #[serde(default)]
     pub connect_timeout_secs: Option<u64>,
+
+    /// Maximum number of pooled connections for remote providers.
+    ///
+    /// The pool exists for connection *reuse*, not to throttle work: a caller
+    /// that finds the pool saturated queues for a connection rather than
+    /// failing. Size it against the database's own `max_connections` budget,
+    /// not against expected task concurrency.
+    #[serde(default = "default_storage_pool_max_size")]
+    pub pool_max_size: usize,
 }
 
 fn default_storage_schema() -> String {
@@ -2862,6 +2876,10 @@ fn default_storage_table() -> String {
     "memories".into()
 }
 
+const fn default_storage_pool_max_size() -> usize {
+    32
+}
+
 impl Default for StorageProviderConfig {
     fn default() -> Self {
         Self {
@@ -2870,6 +2888,7 @@ impl Default for StorageProviderConfig {
             schema: default_storage_schema(),
             table: default_storage_table(),
             connect_timeout_secs: None,
+            pool_max_size: default_storage_pool_max_size(),
         }
     }
 }
@@ -3450,6 +3469,21 @@ pub struct RuntimeConfig {
     /// Codex reasoning effort (replaces ZEROCLAW_CODEX_REASONING_EFFORT)
     #[serde(default)]
     pub codex_reasoning_effort: Option<String>,
+
+    /// Hard cap on the tokio blocking-thread pool.
+    ///
+    /// PRX places no ceiling on concurrent turns, sub-agents or sessions, which
+    /// makes this pool the last implicit concurrency gate in the process — and
+    /// it fails by deadlock, not by rejection: once every slot is held, further
+    /// blocking work queues forever with no timeout. Tokio's built-in default
+    /// is a hardware-agnostic 512; leaving this unset instead derives the cap
+    /// from `available_parallelism()` (cgroup-aware) with a 2048 floor. Raise
+    /// it when `[runtime] blocking pool is saturated` warnings appear.
+    ///
+    /// Read during process bootstrap, before the runtime exists, so it takes
+    /// effect only on restart — config hot-reload cannot resize a live pool.
+    #[serde(default)]
+    pub max_blocking_threads: Option<usize>,
 }
 
 /// Docker runtime configuration (`[runtime.docker]` section).
@@ -3526,6 +3560,7 @@ impl Default for RuntimeConfig {
             reasoning_enabled: None,
             codex_stream_idle_timeout_secs: None,
             codex_reasoning_effort: None,
+            max_blocking_threads: None,
         }
     }
 }
@@ -5446,6 +5481,96 @@ fn env_openprx(name_suffix: &str) -> std::result::Result<String, std::env::VarEr
     std::env::var(format!("OPENPRX_{name_suffix}"))
 }
 
+/// Minimal `runtime` view used during process bootstrap.
+///
+/// Deliberately *not* the full [`Config`]: this is parsed before the tokio
+/// runtime exists, so it must stay synchronous, allocation-light and immune to
+/// validation failures in unrelated sections.
+#[derive(Debug, Default, Deserialize)]
+struct BootstrapRuntimeSection {
+    #[serde(default)]
+    max_blocking_threads: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct BootstrapConfig {
+    #[serde(default)]
+    runtime: BootstrapRuntimeSection,
+}
+
+/// Synchronous, best-effort resolution of the config directory for bootstrap
+/// reads.
+///
+/// Mirrors [`resolve_runtime_config_dirs`] minus its async marker read, which is
+/// replaced by a blocking read of the same file. Any failure degrades to the
+/// default directory rather than propagating: bootstrap must never prevent the
+/// process from starting.
+fn bootstrap_config_dir(explicit_config_dir: Option<&str>) -> Option<PathBuf> {
+    if let Some(dir) = explicit_config_dir {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+
+    if let Ok(custom_config_dir) = env_openprx("CONFIG_DIR") {
+        let custom_config_dir = custom_config_dir.trim();
+        if !custom_config_dir.is_empty() {
+            return Some(PathBuf::from(custom_config_dir));
+        }
+    }
+
+    if let Ok(custom_workspace) = env_openprx("WORKSPACE") {
+        if !custom_workspace.is_empty() {
+            let (config_dir, _) = resolve_config_dir_for_workspace(&PathBuf::from(custom_workspace));
+            return Some(config_dir);
+        }
+    }
+
+    let default_dir = default_config_dir().ok()?;
+    let state_path = active_workspace_state_path(&default_dir);
+    if let Ok(contents) = std::fs::read_to_string(&state_path) {
+        if let Ok(state) = toml::from_str::<ActiveWorkspaceState>(&contents) {
+            let raw = state.config_dir.trim();
+            if !raw.is_empty() {
+                let parsed = PathBuf::from(raw);
+                return Some(if parsed.is_absolute() {
+                    parsed
+                } else {
+                    default_dir.join(parsed)
+                });
+            }
+        }
+    }
+
+    Some(default_dir)
+}
+
+/// Read `[runtime] max_blocking_threads` before the tokio runtime is built.
+///
+/// The tokio blocking-pool size is fixed at `Builder` time, so it cannot come
+/// from the normal (async, side-effecting) config load — that load itself needs
+/// a runtime. This performs a synchronous, read-only, side-effect-free parse of
+/// the same merged TOML.
+///
+/// Returns `None` when no config exists yet, when the key is unset, or when
+/// anything at all goes wrong; the caller then uses
+/// [`crate::runtime::blocking::default_max_blocking_threads`]. A value of zero
+/// is rejected here as well as in [`Config::validate`], so a malformed file
+/// cannot produce an unusable pool.
+#[must_use]
+pub fn bootstrap_max_blocking_threads(explicit_config_dir: Option<&str>) -> Option<usize> {
+    let config_dir = bootstrap_config_dir(explicit_config_dir)?;
+    let config_path = config_dir.join("config.toml");
+    if !config_path.is_file() {
+        return None;
+    }
+
+    let merged = crate::config::files::read_merged_toml_with_gate_once(&config_path).ok()?;
+    let bootstrap: BootstrapConfig = merged.try_into().ok()?;
+    bootstrap.runtime.max_blocking_threads.filter(|value| *value > 0)
+}
+
 async fn resolve_runtime_config_dirs(
     default_openprx_dir: &Path,
     default_workspace_dir: &Path,
@@ -5866,6 +5991,11 @@ impl Config {
                 "compliance.eu_ai_act.classification requires owner and assessed_at for a legal applicability decision"
             );
         }
+        // Storage
+        if self.storage.provider.config.pool_max_size == 0 {
+            anyhow::bail!("storage.provider.config.pool_max_size must be greater than 0");
+        }
+
         // Gateway
         if self.gateway.host.trim().is_empty() {
             anyhow::bail!("gateway.host must not be empty");
@@ -5898,6 +6028,14 @@ impl Config {
         // Autonomy
         if self.autonomy.max_actions_per_hour == 0 {
             anyhow::bail!("autonomy.max_actions_per_hour must be greater than 0");
+        }
+
+        // Runtime. A zero-sized blocking pool cannot run any blocking work, so
+        // every `spawn_blocking` would queue forever instead of failing fast.
+        if let Some(max_blocking_threads) = self.runtime.max_blocking_threads {
+            if max_blocking_threads == 0 {
+                anyhow::bail!("runtime.max_blocking_threads must be greater than 0");
+            }
         }
 
         // Scheduler
@@ -6473,6 +6611,7 @@ min_chars = 12
         assert_eq!(storage.provider.config.schema, "public");
         assert_eq!(storage.provider.config.table, "memories");
         assert!(storage.provider.config.connect_timeout_secs.is_none());
+        assert_eq!(storage.provider.config.pool_max_size, 32);
     }
 
     #[test]
@@ -6740,6 +6879,7 @@ dbURL = "postgres://postgres:postgres@localhost:5432/openprx"
 schema = "public"
 table = "memories"
 connect_timeout_secs = 12
+pool_max_size = 64
 "#;
 
         let parsed: Config = toml::from_str(raw).unwrap();
@@ -6751,6 +6891,7 @@ connect_timeout_secs = 12
         assert_eq!(parsed.storage.provider.config.schema, "public");
         assert_eq!(parsed.storage.provider.config.table, "memories");
         assert_eq!(parsed.storage.provider.config.connect_timeout_secs, Some(12));
+        assert_eq!(parsed.storage.provider.config.pool_max_size, 64);
     }
 
     #[test]

@@ -442,6 +442,7 @@ impl McpTool {
 
         let mut cmd = Command::new(command);
         cmd.args(&server.args);
+        cmd.kill_on_drop(true);
         if !server.env.is_empty() {
             cmd.envs(server.env.clone());
         }
@@ -543,6 +544,7 @@ impl McpTool {
 
         let mut cmd = Command::new(command);
         cmd.args(&server.args);
+        cmd.kill_on_drop(true);
         if !server.env.is_empty() {
             cmd.envs(server.env.clone());
         }

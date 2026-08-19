@@ -2293,7 +2293,7 @@ impl SqliteMemory {
         let write_ctx = context.cloned();
         let metadata = metadata.unwrap_or_default();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = conn.lock();
             let now = Local::now().to_rfc3339();
             let cat = Self::category_to_str(&category);
@@ -2584,7 +2584,7 @@ impl SqliteMemory {
         let now_c = now.clone();
         let provider_c = provider_name.clone();
         let model_c = model_name.clone();
-        let cached = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<f32>>> {
+        let cached = crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<Vec<f32>>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
                 "SELECT embedding FROM embedding_cache
@@ -2634,7 +2634,7 @@ impl SqliteMemory {
         let conn = self.conn.clone();
         #[allow(clippy::cast_possible_wrap)]
         let cache_max = self.cache_max as i64;
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = conn.lock();
             conn.execute(
                 "INSERT OR REPLACE INTO embedding_cache (
@@ -2771,7 +2771,7 @@ impl SqliteMemory {
         // Step 1: Rebuild FTS5
         {
             let conn = self.conn.clone();
-            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
                 let conn = conn.lock();
                 conn.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('rebuild');")?;
                 Ok(())
@@ -2788,7 +2788,7 @@ impl SqliteMemory {
         let model_name = self.embedding_model_name();
         let dimensions = self.embedding_dimensions_i64();
         let conn = self.conn.clone();
-        let entries: Vec<(String, String)> = tokio::task::spawn_blocking(move || {
+        let entries: Vec<(String, String)> = crate::runtime::blocking::spawn_blocking(move || {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
                 "SELECT id, content
@@ -2820,7 +2820,7 @@ impl SqliteMemory {
                 let provider_name = self.embedding_provider_name();
                 let model_name = self.embedding_model_name();
                 let dimensions = self.embedding_dimensions_i64();
-                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
                     let conn = conn.lock();
                     conn.execute(
                         "UPDATE memories
@@ -2842,7 +2842,7 @@ impl SqliteMemory {
         let model_name = self.embedding_model_name();
         let dimensions = self.embedding_dimensions_i64();
         let conn = self.conn.clone();
-        let chunks: Vec<(String, String)> = tokio::task::spawn_blocking(move || {
+        let chunks: Vec<(String, String)> = crate::runtime::blocking::spawn_blocking(move || {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
                 "SELECT chunk_id, content
@@ -2870,7 +2870,7 @@ impl SqliteMemory {
                 let provider_name = self.embedding_provider_name();
                 let model_name = self.embedding_model_name();
                 let dimensions = self.embedding_dimensions_i64();
-                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
                     let conn = conn.lock();
                     conn.execute(
                         "UPDATE document_chunks
@@ -2910,7 +2910,7 @@ impl Memory for SqliteMemory {
         let chat_id = chat_id.to_string();
         let chat_kind = chat_kind.to_string();
         let title = title.map(str::to_string);
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
             let now = Utc::now().to_rfc3339();
             let id = Uuid::new_v4().to_string();
             let conn = conn.lock();
@@ -2950,7 +2950,7 @@ impl Memory for SqliteMemory {
         let notes = notes.map(str::to_string);
         let tags_json = tags.map(serde_json::to_string).transpose()?;
         let updated_by = updated_by.to_string();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<ChatProfile> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<ChatProfile> {
             let now = Utc::now().to_rfc3339();
             let id = Uuid::new_v4().to_string();
             let conn = conn.lock();
@@ -2978,7 +2978,7 @@ impl Memory for SqliteMemory {
         let conn = self.conn.clone();
         let channel = channel.to_string();
         let chat_id = chat_id.to_string();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ChatProfile>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<ChatProfile>> {
             let conn = conn.lock();
             let profile = conn
                 .query_row(
@@ -3059,7 +3059,7 @@ impl Memory for SqliteMemory {
         let embedding_model = self.embedding_model_name();
         let embedding_dimensions = self.embedder.dimensions();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
             let session_ref = sid.as_deref();
 
@@ -3263,7 +3263,7 @@ impl Memory for SqliteMemory {
         let conn = self.conn.clone();
         let capped_limit = limit;
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
             let fallback_principal = Principal {
                 user_id: "anonymous:unknown:unknown".to_string(),
@@ -3342,38 +3342,39 @@ impl Memory for SqliteMemory {
             .iter()
             .map(|entry| entry.id.clone())
             .collect::<std::collections::HashSet<_>>();
-        let topic_rows = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<MemoryEntry>, Principal)> {
-            let conn = conn.lock();
-            let principal = sqlite_read_principal(&conn, &context);
-            let topic_principal = match mode {
-                MemoryReadMode::Enforce => principal.clone(),
-                MemoryReadMode::Observe => sqlite_owner_read_principal(),
-            };
-            let mut rows = Vec::new();
-            for topic in super::topic::search_topics_fts(&conn, &query_for_topics, 3)? {
-                for entry in super::topic::query_topic_context(&conn, &topic.id, &topic_principal, limit.max(1))? {
-                    rows.push(MemoryEntry {
-                        id: entry.id,
-                        key: entry.key,
-                        content: entry.content,
-                        category: MemoryCategory::Conversation,
-                        timestamp: entry.created_at,
-                        session_id: None,
-                        score: Some(0.55),
-                        tags: None,
-                        access_count: None,
-                        useful_count: None,
-                        source: Some("topic_projection".to_string()),
-                        source_confidence: None,
-                        verification_status: None,
-                        lifecycle_state: None,
-                        compressed_from: None,
-                    });
+        let topic_rows =
+            crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<(Vec<MemoryEntry>, Principal)> {
+                let conn = conn.lock();
+                let principal = sqlite_read_principal(&conn, &context);
+                let topic_principal = match mode {
+                    MemoryReadMode::Enforce => principal.clone(),
+                    MemoryReadMode::Observe => sqlite_owner_read_principal(),
+                };
+                let mut rows = Vec::new();
+                for topic in super::topic::search_topics_fts(&conn, &query_for_topics, 3)? {
+                    for entry in super::topic::query_topic_context(&conn, &topic.id, &topic_principal, limit.max(1))? {
+                        rows.push(MemoryEntry {
+                            id: entry.id,
+                            key: entry.key,
+                            content: entry.content,
+                            category: MemoryCategory::Conversation,
+                            timestamp: entry.created_at,
+                            session_id: None,
+                            score: Some(0.55),
+                            tags: None,
+                            access_count: None,
+                            useful_count: None,
+                            source: Some("topic_projection".to_string()),
+                            source_confidence: None,
+                            verification_status: None,
+                            lifecycle_state: None,
+                            compressed_from: None,
+                        });
+                    }
                 }
-            }
-            Ok((rows, principal))
-        })
-        .await??;
+                Ok((rows, principal))
+            })
+            .await??;
         for entry in topic_rows.0 {
             if selected_ids.insert(entry.id.clone()) {
                 selected.push(entry);
@@ -3395,7 +3396,7 @@ impl Memory for SqliteMemory {
         let conn = self.conn.clone();
         let principal = topic_rows.1;
         let selected_empty = selected.is_empty();
-        tokio::task::spawn_blocking(move || {
+        crate::runtime::blocking::spawn_blocking(move || {
             let conn = conn.lock();
             log_access(
                 &conn,
@@ -3424,7 +3425,7 @@ impl Memory for SqliteMemory {
         let conn = self.conn.clone();
         let key = key.to_string();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
                 "SELECT id, key, content, category, created_at, session_id, useful_count FROM memories WHERE key = ?1",
@@ -3466,7 +3467,7 @@ impl Memory for SqliteMemory {
         let context = context.cloned().unwrap_or_default();
         let conn = self.conn.clone();
         let key = key.to_string();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
             let conn = conn.lock();
             let principal = sqlite_read_principal(&conn, &context);
             let (scope_sql, scope_params) = principal.build_sql_scope();
@@ -3522,7 +3523,7 @@ impl Memory for SqliteMemory {
         let selected_is_some = selected.is_some();
         let key = key.to_string();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::runtime::blocking::spawn_blocking(move || {
             let conn = conn.lock();
             let principal = sqlite_read_principal(&conn, &context);
             log_access(
@@ -3559,7 +3560,7 @@ impl Memory for SqliteMemory {
         let category = category.cloned();
         let sid = session_id.map(String::from);
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
             let session_ref = sid.as_deref();
             let mut results = Vec::new();
@@ -3626,7 +3627,7 @@ impl Memory for SqliteMemory {
         let conn = self.conn.clone();
         let key = key.to_string();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<bool> {
             let conn = conn.lock();
             let affected = conn.execute("DELETE FROM memories WHERE key = ?1", params![key])?;
             Ok(affected > 0)
@@ -3642,7 +3643,7 @@ impl Memory for SqliteMemory {
         let conn = self.conn.clone();
         let key = key.to_string();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<bool> {
             let conn = conn.lock();
             let fallback_principal = Principal {
                 user_id: "anonymous:unknown:unknown".to_string(),
@@ -3699,7 +3700,7 @@ impl Memory for SqliteMemory {
         let conn = self.conn.clone();
         let key = key.to_string();
         let reason = reason.to_string();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<String>> {
             let conn = conn.lock();
             // FIX-P1-11: snapshot the row's value before soft-deleting it. We DO NOT
             // physically delete from `memories`; we record a trash row so it can be
@@ -3755,7 +3756,7 @@ impl Memory for SqliteMemory {
     ) -> anyhow::Result<String> {
         use crate::self_system::evolution::proposal::ProposalRowValues;
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<String> {
             let values = ProposalRowValues::encode(&draft)?;
             let conn = conn.lock();
             let now = Utc::now().to_rfc3339();
@@ -3811,7 +3812,7 @@ impl Memory for SqliteMemory {
     ) -> anyhow::Result<Vec<crate::self_system::evolution::EvolutionProposalDraft>> {
         let conn = self.conn.clone();
         let owner_scope = Self::evolution_owner_scope(principal);
-        tokio::task::spawn_blocking(
+        crate::runtime::blocking::spawn_blocking(
             move || -> anyhow::Result<Vec<crate::self_system::evolution::EvolutionProposalDraft>> {
                 let conn = conn.lock();
                 // Parameterized dynamic WHERE: every predicate binds a value; no
@@ -3897,7 +3898,7 @@ impl Memory for SqliteMemory {
         let conn = self.conn.clone();
         let owner_scope = Self::evolution_owner_scope(principal);
         let draft_id = draft_id.to_string();
-        tokio::task::spawn_blocking(
+        crate::runtime::blocking::spawn_blocking(
             move || -> anyhow::Result<Option<crate::self_system::evolution::EvolutionProposalDraft>> {
                 let conn = conn.lock();
                 let proposal = conn
@@ -3945,7 +3946,7 @@ impl Memory for SqliteMemory {
             .clone()
             .or_else(|| principal.agent_id.clone())
             .unwrap_or_else(|| "self_system".to_string());
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = conn.lock();
             // Fetch the row first to enforce owner ACL and re-judge guard.
             let existing: Option<(String, Option<String>, Option<String>)> = conn
@@ -4031,7 +4032,7 @@ impl Memory for SqliteMemory {
         let event_type = event_type.to_string();
         let actor = actor.to_string();
         let payload_json = payload_json.map(str::to_string);
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = conn.lock();
             let owner: Option<String> = conn
                 .query_row(
@@ -4063,7 +4064,7 @@ impl Memory for SqliteMemory {
         let conn = self.conn.clone();
         let id = id.to_string();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = conn.lock();
             conn.execute(
                 "UPDATE memories
@@ -4080,7 +4081,7 @@ impl Memory for SqliteMemory {
     async fn count(&self) -> anyhow::Result<usize> {
         let conn = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<usize> {
             let conn = conn.lock();
             let count: i64 = conn.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
@@ -4114,7 +4115,7 @@ impl Memory for SqliteMemory {
             .or_else(|| Some(format!("legacy:{session_key}")));
         let preview = Self::conversation_preview(&content);
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = conn.lock();
             let tx = conn.unchecked_transaction()?;
             tx.execute(
@@ -4173,7 +4174,7 @@ impl Memory for SqliteMemory {
         let offset = Self::sanitize_conversation_offset(offset);
         let channel = channel.map(str::to_string);
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ConversationSessionSummary>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<ConversationSessionSummary>> {
             let conn = conn.lock();
             let mut sessions = Vec::new();
 
@@ -4237,7 +4238,7 @@ impl Memory for SqliteMemory {
         let conn = self.conn.clone();
         let session_key = session_key.to_string();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ConversationSessionSummary>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<ConversationSessionSummary>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
                 "SELECT session_key, channel, sender, created_at, updated_at, message_count, last_message_preview
@@ -4302,7 +4303,7 @@ impl Memory for SqliteMemory {
         let session_fragment =
             crate::memory::session_predicate::session_key_match_fragment(SQLITE_DIALECT, &session_indices);
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ConversationTurn>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<ConversationTurn>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, session_key, role, content, timestamp, message_id
@@ -4360,7 +4361,7 @@ impl Memory for SqliteMemory {
         let max_sessions = Self::sanitize_hydrated_sessions_limit(max_sessions);
         let legacy_visible = 1_i64;
 
-        tokio::task::spawn_blocking(
+        crate::runtime::blocking::spawn_blocking(
             move || -> anyhow::Result<std::collections::HashMap<String, Vec<ConversationTurn>>> {
                 let conn = conn.lock();
                 let mut stmt = conn.prepare(
@@ -4422,7 +4423,7 @@ impl Memory for SqliteMemory {
         input.validate()?;
         let conn = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<MessageEvent> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<MessageEvent> {
             let mut conn = conn.lock();
             let tx = conn.transaction()?;
             let now = Utc::now().to_rfc3339();
@@ -4545,7 +4546,7 @@ impl Memory for SqliteMemory {
         let workspace_id = workspace_id.to_string();
         let idempotency_key = idempotency_key.to_string();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::runtime::blocking::spawn_blocking(move || {
             let conn = conn.lock();
             conn.query_row(
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
@@ -4583,7 +4584,7 @@ impl Memory for SqliteMemory {
         let session_fragment =
             crate::memory::session_predicate::session_visibility_or_fragment(SQLITE_DIALECT, &session_indices);
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
@@ -4654,7 +4655,7 @@ impl Memory for SqliteMemory {
         let session_fragment =
             crate::memory::session_predicate::session_visibility_or_fragment(SQLITE_DIALECT, &session_indices);
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
@@ -4726,7 +4727,7 @@ impl Memory for SqliteMemory {
         let session_fragment =
             crate::memory::session_predicate::session_visibility_or_fragment(SQLITE_DIALECT, &session_indices);
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
@@ -4815,7 +4816,7 @@ impl Memory for SqliteMemory {
         let session_fragment =
             crate::memory::session_predicate::session_key_match_fragment(SQLITE_DIALECT, &session_indices);
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
@@ -4876,7 +4877,7 @@ impl Memory for SqliteMemory {
     async fn append_memory_event(&self, input: MemoryEventInput) -> anyhow::Result<MemoryEvent> {
         let conn = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<MemoryEvent> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<MemoryEvent> {
             let conn = conn.lock();
             let now = Utc::now().to_rfc3339();
             let event_id = input.event_id.unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -4927,7 +4928,7 @@ impl Memory for SqliteMemory {
         let principal = principal.clone();
         let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEvent>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEvent>> {
             let conn = conn.lock();
             let system_allowed =
                 principal.agent_id.as_deref() == Some("system") || principal.persona_id.as_deref() == Some("system");
@@ -4984,7 +4985,7 @@ impl Memory for SqliteMemory {
         let principal = principal.clone();
         let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEvent>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEvent>> {
             let conn = conn.lock();
             let system_allowed =
                 principal.agent_id.as_deref() == Some("system") || principal.persona_id.as_deref() == Some("system");
@@ -5033,7 +5034,7 @@ impl Memory for SqliteMemory {
     async fn create_memory_draft(&self, input: MemoryDraftInput) -> anyhow::Result<MemoryDraft> {
         let conn = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<MemoryDraft> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<MemoryDraft> {
             let mut conn = conn.lock();
             let tx = conn.transaction()?;
             let now = Utc::now().to_rfc3339();
@@ -5128,7 +5129,7 @@ impl Memory for SqliteMemory {
                 .map(str::to_string)
         };
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryDraft>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MemoryDraft>> {
             let conn = conn.lock();
             if let Some(owner) = owner {
                 let mut stmt = conn.prepare(
@@ -5174,7 +5175,7 @@ impl Memory for SqliteMemory {
                 .map(str::to_string)
         };
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryDraft>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<MemoryDraft>> {
             let mut conn = conn.lock();
             let tx = conn.transaction()?;
             let mut draft = match tx.query_row(
@@ -5307,7 +5308,7 @@ impl Memory for SqliteMemory {
                 .map(str::to_string)
         };
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryDraft>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<MemoryDraft>> {
             let mut conn = conn.lock();
             let tx = conn.transaction()?;
             let mut draft = match tx.query_row(
@@ -5406,7 +5407,7 @@ impl Memory for SqliteMemory {
             prepared_chunks.push((chunk_index, heading, content, embedding_bytes));
         }
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<DocumentRecord> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<DocumentRecord> {
             let mut conn = conn.lock();
             let tx = conn.transaction()?;
             let now = Utc::now().to_rfc3339();
@@ -5556,7 +5557,7 @@ impl Memory for SqliteMemory {
         let embedding_dimensions = self.embedder.dimensions();
         let embedding_dimensions_i64 = self.embedding_dimensions_i64();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<DocumentSearchResult>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<DocumentSearchResult>> {
             let conn = conn.lock();
             let fts_query = super::topic::build_safe_fts_query(&query);
             let mut results = Vec::new();
@@ -5672,7 +5673,7 @@ impl Memory for SqliteMemory {
         let conn = self.conn.clone();
         let chunk_id = chunk_id.to_string();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<DocumentChunkRecord>> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<DocumentChunkRecord>> {
             let conn = conn.lock();
             conn.query_row(
                 "SELECT id, chunk_id, document_id, workspace_id, owner_id, topic_id, task_id,
@@ -5693,7 +5694,7 @@ impl Memory for SqliteMemory {
     async fn link_memory_source(&self, input: MemoryLinkInput) -> anyhow::Result<MemoryLink> {
         let conn = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<MemoryLink> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<MemoryLink> {
             let conn = conn.lock();
             let now = Utc::now().to_rfc3339();
             let link_id = input.link_id.unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -5734,7 +5735,7 @@ impl Memory for SqliteMemory {
     async fn append_retrieval_trace(&self, input: RetrievalTraceInput) -> anyhow::Result<RetrievalTrace> {
         let conn = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<RetrievalTrace> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<RetrievalTrace> {
             let conn = conn.lock();
             let now = Utc::now().to_rfc3339();
             let trace_id = input.trace_id.unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -5805,7 +5806,7 @@ impl Memory for SqliteMemory {
         input.validate_source_event_provenance()?;
         let conn = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<CompactionRun> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<CompactionRun> {
             let conn = conn.lock();
             let now = Utc::now().to_rfc3339();
             let run_id = input.run_id.unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -5877,7 +5878,7 @@ impl Memory for SqliteMemory {
 
     async fn health_check(&self) -> bool {
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || conn.lock().execute_batch("SELECT 1").is_ok())
+        crate::runtime::blocking::spawn_blocking(move || conn.lock().execute_batch("SELECT 1").is_ok())
             .await
             .unwrap_or(false)
     }

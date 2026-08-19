@@ -89,11 +89,11 @@ impl GitOperationsTool {
     }
 
     async fn run_git_command(&self, args: &[&str]) -> anyhow::Result<String> {
-        let output = tokio::process::Command::new("git")
-            .args(args)
-            .current_dir(&self.workspace_dir)
-            .output()
-            .await?;
+        // `git` forks its own helpers (git-remote-https, credential helpers), so
+        // cancelling this future must tear down the whole process group.
+        let mut command = tokio::process::Command::new("git");
+        command.args(args).current_dir(&self.workspace_dir);
+        let output = crate::runtime::shell_process::run_managed_output(command).await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -698,6 +698,17 @@ mod tests {
         GitOperationsTool::new(security, dir.to_path_buf())
     }
 
+    /// Initialize a git repository without blocking the test runtime.
+    async fn init_git_repo(dir: &std::path::Path) {
+        tokio::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .kill_on_drop(true)
+            .output()
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn sanitize_git_blocks_injection() {
         let tmp = TempDir::new().unwrap();
@@ -844,11 +855,7 @@ mod tests {
     async fn blocks_readonly_mode_for_write_ops() {
         let tmp = TempDir::new().unwrap();
         // Initialize a git repository
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
+        init_git_repo(tmp.path()).await;
 
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
@@ -868,11 +875,7 @@ mod tests {
     #[tokio::test]
     async fn supervised_write_ops_require_runtime_grant() {
         let tmp = TempDir::new().unwrap();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
+        init_git_repo(tmp.path()).await;
 
         let tool = test_tool(tmp.path());
         let result = tool
@@ -887,11 +890,7 @@ mod tests {
     #[tokio::test]
     async fn supervised_push_and_reset_hard_require_runtime_grant() {
         let tmp = TempDir::new().unwrap();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
+        init_git_repo(tmp.path()).await;
 
         let tool = test_tool(tmp.path());
         let push = tool
@@ -912,11 +911,7 @@ mod tests {
     #[tokio::test]
     async fn supervised_push_accepts_matching_runtime_grant() {
         let tmp = TempDir::new().unwrap();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
+        init_git_repo(tmp.path()).await;
 
         let tool = test_tool(tmp.path());
         let grant = ApprovalGrant::for_resource_operation("git_operations", "git_operations:push:origin", "test", None);
@@ -936,11 +931,7 @@ mod tests {
     #[tokio::test]
     async fn supervised_write_ops_accept_matching_runtime_grant() {
         let tmp = TempDir::new().unwrap();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
+        init_git_repo(tmp.path()).await;
 
         let tool = test_tool(tmp.path());
         let grant = ApprovalGrant::for_resource_operation("git_operations", "git_operations:commit", "test", None);
@@ -961,11 +952,7 @@ mod tests {
     async fn allows_branch_listing_in_readonly_mode() {
         let tmp = TempDir::new().unwrap();
         // Initialize a git repository so the command can succeed
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
+        init_git_repo(tmp.path()).await;
 
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
@@ -985,11 +972,7 @@ mod tests {
     #[tokio::test]
     async fn allows_readonly_ops_in_readonly_mode() {
         let tmp = TempDir::new().unwrap();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
+        init_git_repo(tmp.path()).await;
 
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
@@ -1019,11 +1002,7 @@ mod tests {
     async fn rejects_unknown_operation() {
         let tmp = TempDir::new().unwrap();
         // Initialize a git repository
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
+        init_git_repo(tmp.path()).await;
 
         let tool = test_tool(tmp.path());
 

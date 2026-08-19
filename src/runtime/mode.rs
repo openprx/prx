@@ -420,7 +420,7 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             ModelCommands::List { provider } => onboard::run_models_list(&config, provider.as_deref()),
             ModelCommands::Refresh { provider, force } => {
                 let config_for_refresh = config.clone();
-                tokio::task::spawn_blocking(move || {
+                crate::runtime::blocking::spawn_blocking(move || {
                     onboard::run_models_refresh(&config_for_refresh, provider.as_deref(), force)
                 })
                 .await
@@ -461,13 +461,13 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             service_init,
         } => {
             let init_system = service_init.parse()?;
-            service::handle_command(&service_command, &config, init_system)
+            service::handle_command(&service_command, &config, init_system).await
         }
 
         Commands::Doctor { doctor_command } => match doctor_command {
             Some(DoctorCommands::Models { provider, use_cache }) => {
                 let config_for_models = config.clone();
-                tokio::task::spawn_blocking(move || {
+                crate::runtime::blocking::spawn_blocking(move || {
                     doctor::run_models(&config_for_models, provider.as_deref(), use_cache)
                 })
                 .await
@@ -475,7 +475,15 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             }
             Some(DoctorCommands::Memory) => doctor::run_memory(&config),
             Some(DoctorCommands::Runtime) => doctor::run_runtime(&config).await,
-            None => doctor::run(&config),
+            None => {
+                // `doctor::run` is fully synchronous (filesystem probes plus
+                // short-lived `df`/`--version` subprocesses); keep it off the
+                // async workers the same way `doctor models` does.
+                let config_for_doctor = config.clone();
+                crate::runtime::blocking::spawn_blocking(move || doctor::run(&config_for_doctor))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("doctor task failed: {e}"))?
+            }
         },
 
         Commands::Channel { channel_command } => match channel_command {
@@ -493,7 +501,7 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             integrations::handle_command(integration_command.unwrap_or(IntegrationCommands::List), &config)
         }
 
-        Commands::Skills { skill_command } => skills::handle_command(skill_command, &config),
+        Commands::Skills { skill_command } => skills::handle_command(skill_command, &config).await,
 
         Commands::Migrate { migrate_command } => migration::handle_command(migrate_command, &config).await,
 

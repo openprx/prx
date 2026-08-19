@@ -143,7 +143,11 @@ pub async fn post_config(State(state): State<AppState>, Json(incoming): Json<Val
     }
 
     let manager = Arc::clone(&state.config);
-    match tokio::task::spawn_blocking(move || manager.reload_from_disk(crate::config::ConfigReloadTrigger::Api)).await {
+    match crate::runtime::blocking::spawn_blocking(move || {
+        manager.reload_from_disk(crate::config::ConfigReloadTrigger::Api)
+    })
+    .await
+    {
         Ok(Ok(report)) => Json(serde_json::json!({
             "status": report.status(),
             "active_generation": report.active_generation.0,
@@ -314,7 +318,7 @@ pub async fn put_config_file(
     }
 
     let manager = Arc::clone(&state.config);
-    match tokio::task::spawn_blocking(move || {
+    match crate::runtime::blocking::spawn_blocking(move || {
         manager.reload_from_disk(crate::config::ConfigReloadTrigger::ConfigFileApi)
     })
     .await

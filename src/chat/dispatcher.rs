@@ -902,7 +902,10 @@ pub struct EffectDeps {
     pub action_tx: mpsc::Sender<Action>,
     /// Provider task lifecycle event bridge back to chat::run. This is separate
     /// from action_tx because it is orchestration metadata, not reducer state.
-    pub provider_turn_lifecycle_tx: Option<mpsc::UnboundedSender<ProviderTurnLifecycleEvent>>,
+    ///
+    /// Bounded at [`crate::chat::PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY`]; a
+    /// full queue parks the emitting turn rather than growing without bound.
+    pub provider_turn_lifecycle_tx: Option<mpsc::Sender<ProviderTurnLifecycleEvent>>,
     /// 双写抑制 guard（Both/Redux 模式下持久化 effect 前置位）
     pub dual_write_guard: RuntimeDualWriteGuard,
     /// 渲染重绘 channel（RequestRedraw 唤醒主循环）
@@ -1189,7 +1192,11 @@ impl EffectExecutor {
                         provider_turn_execution_lease_id,
                         provider_turn_lifecycle_tx.as_ref(),
                     ) {
-                        let _ = tx.send(ProviderTurnLifecycleEvent::Started { task_id, lease_id });
+                        // Backpressure point: awaiting here slows turn startup
+                        // when chat::run is behind on lifecycle bookkeeping,
+                        // which is exactly the desired coupling — the registry
+                        // must not fall arbitrarily far behind reality.
+                        let _ = tx.send(ProviderTurnLifecycleEvent::Started { task_id, lease_id }).await;
                     }
                     tracing::debug!(
                         provider_turn_task_id = provider_turn_task_id_for_trace,
@@ -1209,7 +1216,7 @@ impl EffectExecutor {
                             provider_turn_execution_lease_id,
                             provider_turn_lifecycle_tx.as_ref(),
                         ) {
-                            let _ = tx.send(ProviderTurnLifecycleEvent::Exited { task_id, lease_id });
+                            let _ = tx.send(ProviderTurnLifecycleEvent::Exited { task_id, lease_id }).await;
                         }
                         return;
                     }
@@ -1294,7 +1301,7 @@ impl EffectExecutor {
                         provider_turn_execution_lease_id,
                         provider_turn_lifecycle_tx.as_ref(),
                     ) {
-                        let _ = tx.send(ProviderTurnLifecycleEvent::Exited { task_id, lease_id });
+                        let _ = tx.send(ProviderTurnLifecycleEvent::Exited { task_id, lease_id }).await;
                     }
                 });
                 if let (Some(task_id), Some(lease_id), Some(tx)) = (
@@ -1302,11 +1309,13 @@ impl EffectExecutor {
                     provider_turn_execution_lease_id,
                     provider_turn_handle_tx.as_ref(),
                 ) {
-                    let _ = tx.send(ProviderTurnLifecycleEvent::HandleAttached {
-                        task_id,
-                        lease_id,
-                        abort_handle: provider_task_handle.abort_handle(),
-                    });
+                    let _ = tx
+                        .send(ProviderTurnLifecycleEvent::HandleAttached {
+                            task_id,
+                            lease_id,
+                            abort_handle: provider_task_handle.abort_handle(),
+                        })
+                        .await;
                 }
             }
             Effect::SaveSession(session) => {
@@ -5004,7 +5013,7 @@ mod integration_tests {
         let _handle = spawn_dispatcher_task(make_state(shutdown.clone()), action_rx, shutdown.clone());
 
         let dispatcher_clone = dispatcher.clone();
-        let r = tokio::task::spawn_blocking(move || dispatcher_clone.blocking_dispatch(Action::ForceQuit))
+        let r = crate::runtime::blocking::spawn_blocking(move || dispatcher_clone.blocking_dispatch(Action::ForceQuit))
             .await
             .expect("spawn_blocking join");
         assert_eq!(r, DispatchResult::Sent);

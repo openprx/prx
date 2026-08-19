@@ -264,12 +264,13 @@ impl MediaArtifactOwner {
         max_bytes: usize,
     ) -> Result<ManagedArtifact, ArtifactError> {
         let source = source.to_path_buf();
-        let bytes = tokio::task::spawn_blocking(move || read_local_file_no_follow_bounded(&source, max_bytes))
-            .await
-            .map_err(|error| ArtifactError::Io {
-                path: "channel attachment".to_string(),
-                reason: error.to_string(),
-            })??;
+        let bytes =
+            crate::runtime::blocking::spawn_blocking(move || read_local_file_no_follow_bounded(&source, max_bytes))
+                .await
+                .map_err(|error| ArtifactError::Io {
+                    path: "channel attachment".to_string(),
+                    reason: error.to_string(),
+                })??;
         self.store_bytes(&bytes, extension).await
     }
 
@@ -397,7 +398,7 @@ async fn read_workspace_source_bounded(
     let workspace_dir = workspace_dir.to_path_buf();
     let source = source.to_string();
     let source_label = source.clone();
-    tokio::task::spawn_blocking(move || {
+    crate::runtime::blocking::spawn_blocking(move || {
         #[cfg(unix)]
         {
             read_workspace_source_bounded_unix(&workspace_dir, &source, max_bytes)

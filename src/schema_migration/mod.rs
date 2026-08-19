@@ -566,7 +566,7 @@ mod tests {
         let schema = format!("prx_schema_inspect_runtime_{}", std::process::id());
         let setup_url = db_url.clone();
         let setup_schema = schema.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::runtime::blocking::spawn_blocking(move || {
             let config = setup_url.parse::<postgres::Config>().unwrap();
             let mut client = config.connect(NoTls).unwrap();
             client
@@ -587,7 +587,7 @@ mod tests {
 
         let cleanup_url = config.storage.provider.config.db_url.clone().unwrap();
         let cleanup_schema = schema;
-        tokio::task::spawn_blocking(move || {
+        crate::runtime::blocking::spawn_blocking(move || {
             let postgres_config = cleanup_url.parse::<postgres::Config>().unwrap();
             let mut client = postgres_config.connect(NoTls).unwrap();
             client

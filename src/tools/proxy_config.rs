@@ -183,7 +183,7 @@ impl ProxyConfigTool {
 
     async fn reload_saved_config(&self) -> anyhow::Result<ConfigApplyReport> {
         let manager = Arc::clone(&self.config);
-        tokio::task::spawn_blocking(move || manager.reload_from_disk(ConfigReloadTrigger::Tool))
+        crate::runtime::blocking::spawn_blocking(move || manager.reload_from_disk(ConfigReloadTrigger::Tool))
             .await
             .map_err(|error| anyhow::anyhow!("proxy config reload worker failed: {error}"))?
     }

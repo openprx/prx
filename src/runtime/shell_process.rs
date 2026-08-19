@@ -480,6 +480,46 @@ pub(crate) fn spawn_managed_shell_child(mut cmd: tokio::process::Command) -> io:
     })
 }
 
+/// Run a command to completion and capture its output, with full process-tree
+/// cleanup.
+///
+/// Semantically equivalent to `cmd.output().await`, but the child leads its own
+/// process group and the whole group is killed when the returned future is
+/// dropped. `tokio::process::Command::kill_on_drop` only reaches the direct
+/// child, which is not enough for helpers that fork their own workers (`git`
+/// spawning `git-remote-https`, `npm` spawning `node`, ...). Callers must not
+/// preconfigure stdio: stdin is closed and both output streams are captured.
+pub(crate) async fn run_managed_output(mut cmd: tokio::process::Command) -> io::Result<std::process::Output> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = spawn_managed_shell_child(cmd)?;
+    let mut stdout_pipe = child.take_stdout();
+    let mut stderr_pipe = child.take_stderr();
+
+    let read_stdout = async {
+        let mut buffer = Vec::new();
+        if let Some(pipe) = stdout_pipe.as_mut() {
+            pipe.read_to_end(&mut buffer).await?;
+        }
+        io::Result::Ok(buffer)
+    };
+    let read_stderr = async {
+        let mut buffer = Vec::new();
+        if let Some(pipe) = stderr_pipe.as_mut() {
+            pipe.read_to_end(&mut buffer).await?;
+        }
+        io::Result::Ok(buffer)
+    };
+
+    let (stdout, stderr, status) = tokio::join!(read_stdout, read_stderr, child.wait());
+    let status = status?;
+    let stdout = stdout?;
+    let stderr = stderr?;
+    child.mark_complete();
+
+    Ok(std::process::Output { status, stdout, stderr })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,6 +753,60 @@ mod tests {
         let pid = canceller.await.expect("canceller task");
 
         assert!(matches!(result, Err(ShellProcessError::Cancelled)));
+        wait_until_process_gone(pid).await;
+    }
+
+    #[tokio::test]
+    async fn run_managed_output_reports_stdout_stderr_and_status() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "echo out; echo err 1>&2; exit 3"]);
+
+        let output = run_managed_output(command).await.expect("managed output");
+
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "out");
+        assert_eq!(String::from_utf8_lossy(&output.stderr).trim(), "err");
+        assert_eq!(output.status.code(), Some(3));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_run_managed_output_kills_the_whole_process_group() {
+        let temp = TempDir::new().expect("temp dir");
+        let pid_file = temp.path().join("managed-output-descendant.pid");
+        let script = format!("sleep 300 & echo $! > '{}'; wait", pid_file.display());
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", &script]);
+
+        // The timeout is a test device for dropping the future, not a runtime
+        // policy: it is what a cancelled task or an exiting parent would do.
+        let execution = tokio::spawn(async move {
+            let _ = tokio::time::timeout(Duration::from_millis(200), run_managed_output(command)).await;
+        });
+        let pid = wait_for_pid_file(&pid_file).await;
+        execution.await.expect("execution task");
+
+        wait_until_process_gone(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_on_drop_reaches_the_direct_child_when_the_future_is_dropped() {
+        let temp = TempDir::new().expect("temp dir");
+        let pid_file = temp.path().join("direct-child.pid");
+        let script = format!("echo $$ > '{}'; sleep 300", pid_file.display());
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", &script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+
+        let execution = tokio::spawn(async move {
+            let _ = tokio::time::timeout(Duration::from_millis(200), command.output()).await;
+        });
+        let pid = wait_for_pid_file(&pid_file).await;
+        execution.await.expect("execution task");
+
         wait_until_process_gone(pid).await;
     }
 

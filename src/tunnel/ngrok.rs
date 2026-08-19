@@ -33,6 +33,7 @@ impl Tunnel for NgrokTunnel {
         // Set auth token
         Command::new("ngrok")
             .args(["config", "add-authtoken", &self.auth_token])
+            .kill_on_drop(true)
             .output()
             .await?;
 

@@ -4,8 +4,8 @@ use crate::config::Config;
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::str::FromStr;
+use tokio::process::Command;
 
 const SERVICE_LABEL: &str = "com.prx.daemon";
 const WINDOWS_TASK_NAME: &str = "PRX Daemon";
@@ -138,43 +138,43 @@ const fn windows_task_name() -> &'static str {
     WINDOWS_TASK_NAME
 }
 
-pub fn handle_command(command: &crate::ServiceCommands, config: &Config, init_system: InitSystem) -> Result<()> {
+pub async fn handle_command(command: &crate::ServiceCommands, config: &Config, init_system: InitSystem) -> Result<()> {
     match command {
-        crate::ServiceCommands::Install => install(config, init_system),
-        crate::ServiceCommands::Start => start(config, init_system),
-        crate::ServiceCommands::Stop => stop(config, init_system),
-        crate::ServiceCommands::Restart => restart(config, init_system),
-        crate::ServiceCommands::Status => status(config, init_system),
-        crate::ServiceCommands::Uninstall => uninstall(config, init_system),
+        crate::ServiceCommands::Install => install(config, init_system).await,
+        crate::ServiceCommands::Start => start(config, init_system).await,
+        crate::ServiceCommands::Stop => stop(config, init_system).await,
+        crate::ServiceCommands::Restart => restart(config, init_system).await,
+        crate::ServiceCommands::Status => status(config, init_system).await,
+        crate::ServiceCommands::Uninstall => uninstall(config, init_system).await,
     }
 }
 
-fn install(config: &Config, init_system: InitSystem) -> Result<()> {
+async fn install(config: &Config, init_system: InitSystem) -> Result<()> {
     if cfg!(target_os = "macos") {
         install_macos(config)
     } else if cfg!(target_os = "linux") {
         let resolved = init_system.resolve()?;
-        install_linux(config, resolved)
+        install_linux(config, resolved).await
     } else if cfg!(target_os = "windows") {
-        install_windows(config)
+        install_windows(config).await
     } else {
         anyhow::bail!("Service management is supported on macOS and Linux only");
     }
 }
 
-fn start(config: &Config, init_system: InitSystem) -> Result<()> {
+async fn start(config: &Config, init_system: InitSystem) -> Result<()> {
     if cfg!(target_os = "macos") {
         let plist = macos_service_file()?;
-        run_checked(Command::new("launchctl").arg("load").arg("-w").arg(&plist))?;
-        run_checked(Command::new("launchctl").arg("start").arg(SERVICE_LABEL))?;
+        run_checked(Command::new("launchctl").arg("load").arg("-w").arg(&plist)).await?;
+        run_checked(Command::new("launchctl").arg("start").arg(SERVICE_LABEL)).await?;
         println!("✅ Service started");
         Ok(())
     } else if cfg!(target_os = "linux") {
         let resolved = init_system.resolve()?;
-        start_linux(resolved)
+        start_linux(resolved).await
     } else if cfg!(target_os = "windows") {
         let _ = config;
-        run_checked(Command::new("schtasks").args(["/Run", "/TN", windows_task_name()]))?;
+        run_checked(Command::new("schtasks").args(["/Run", "/TN", windows_task_name()])).await?;
         println!("✅ Service started");
         Ok(())
     } else {
@@ -183,14 +183,14 @@ fn start(config: &Config, init_system: InitSystem) -> Result<()> {
     }
 }
 
-fn start_linux(init_system: InitSystem) -> Result<()> {
+async fn start_linux(init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-            run_checked(Command::new("systemctl").args(["--user", "start", "prx.service"]))?;
+            run_checked(Command::new("systemctl").args(["--user", "daemon-reload"])).await?;
+            run_checked(Command::new("systemctl").args(["--user", "start", "prx.service"])).await?;
         }
         InitSystem::Openrc => {
-            run_checked(Command::new("rc-service").args(["prx", "start"]))?;
+            run_checked(Command::new("rc-service").args(["prx", "start"])).await?;
         }
         InitSystem::Auto => anyhow::bail!("InitSystem::Auto should be resolved before this point"),
     }
@@ -198,20 +198,20 @@ fn start_linux(init_system: InitSystem) -> Result<()> {
     Ok(())
 }
 
-fn stop(config: &Config, init_system: InitSystem) -> Result<()> {
+async fn stop(config: &Config, init_system: InitSystem) -> Result<()> {
     if cfg!(target_os = "macos") {
         let plist = macos_service_file()?;
-        run_checked(Command::new("launchctl").arg("stop").arg(SERVICE_LABEL))?;
-        run_checked(Command::new("launchctl").arg("unload").arg("-w").arg(&plist))?;
+        run_checked(Command::new("launchctl").arg("stop").arg(SERVICE_LABEL)).await?;
+        run_checked(Command::new("launchctl").arg("unload").arg("-w").arg(&plist)).await?;
         println!("✅ Service stopped");
         Ok(())
     } else if cfg!(target_os = "linux") {
         let resolved = init_system.resolve()?;
-        stop_linux(resolved)
+        stop_linux(resolved).await
     } else if cfg!(target_os = "windows") {
         let _ = config;
         let task_name = windows_task_name();
-        run_checked(Command::new("schtasks").args(["/End", "/TN", task_name]))?;
+        run_checked(Command::new("schtasks").args(["/End", "/TN", task_name])).await?;
         println!("✅ Service stopped");
         Ok(())
     } else {
@@ -220,13 +220,13 @@ fn stop(config: &Config, init_system: InitSystem) -> Result<()> {
     }
 }
 
-fn stop_linux(init_system: InitSystem) -> Result<()> {
+async fn stop_linux(init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            run_checked(Command::new("systemctl").args(["--user", "stop", "prx.service"]))?;
+            run_checked(Command::new("systemctl").args(["--user", "stop", "prx.service"])).await?;
         }
         InitSystem::Openrc => {
-            run_checked(Command::new("rc-service").args(["prx", "stop"]))?;
+            run_checked(Command::new("rc-service").args(["prx", "stop"])).await?;
         }
         InitSystem::Auto => anyhow::bail!("InitSystem::Auto should be resolved before this point"),
     }
@@ -234,22 +234,22 @@ fn stop_linux(init_system: InitSystem) -> Result<()> {
     Ok(())
 }
 
-fn restart(config: &Config, init_system: InitSystem) -> Result<()> {
+async fn restart(config: &Config, init_system: InitSystem) -> Result<()> {
     if cfg!(target_os = "macos") {
-        stop(config, init_system)?;
-        start(config, init_system)?;
+        stop(config, init_system).await?;
+        start(config, init_system).await?;
         println!("✅ Service restarted");
         return Ok(());
     }
 
     if cfg!(target_os = "linux") {
         let resolved = init_system.resolve()?;
-        return restart_linux(resolved);
+        return restart_linux(resolved).await;
     }
 
     if cfg!(target_os = "windows") {
-        stop(config, init_system)?;
-        start(config, init_system)?;
+        stop(config, init_system).await?;
+        start(config, init_system).await?;
         println!("✅ Service restarted");
         return Ok(());
     }
@@ -257,14 +257,14 @@ fn restart(config: &Config, init_system: InitSystem) -> Result<()> {
     anyhow::bail!("Service management is supported on macOS and Linux only")
 }
 
-fn restart_linux(init_system: InitSystem) -> Result<()> {
+async fn restart_linux(init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-            run_checked(Command::new("systemctl").args(["--user", "restart", "prx.service"]))?;
+            run_checked(Command::new("systemctl").args(["--user", "daemon-reload"])).await?;
+            run_checked(Command::new("systemctl").args(["--user", "restart", "prx.service"])).await?;
         }
         InitSystem::Openrc => {
-            run_checked(Command::new("rc-service").args(["prx", "restart"]))?;
+            run_checked(Command::new("rc-service").args(["prx", "restart"])).await?;
         }
         InitSystem::Auto => anyhow::bail!("InitSystem::Auto should be resolved before this point"),
     }
@@ -272,16 +272,16 @@ fn restart_linux(init_system: InitSystem) -> Result<()> {
     Ok(())
 }
 
-fn status(config: &Config, init_system: InitSystem) -> Result<()> {
-    let report = query_status(config, init_system)?;
+async fn status(config: &Config, init_system: InitSystem) -> Result<()> {
+    let report = query_status(config, init_system).await?;
     report.print();
     report.ensure_running()
 }
 
-pub fn query_status(config: &Config, init_system: InitSystem) -> Result<ServiceStatus> {
+pub async fn query_status(config: &Config, init_system: InitSystem) -> Result<ServiceStatus> {
     if cfg!(target_os = "macos") {
         let unit = macos_service_file()?;
-        let output = run_capture_status(Command::new("launchctl").arg("list"))?;
+        let output = run_capture_status(Command::new("launchctl").arg("list")).await?;
         if !output.success {
             bail!("launchctl list failed: {}", output.detail());
         }
@@ -301,12 +301,13 @@ pub fn query_status(config: &Config, init_system: InitSystem) -> Result<ServiceS
     }
 
     if cfg!(target_os = "linux") {
-        return query_status_linux(config, init_system.resolve()?);
+        return query_status_linux(config, init_system.resolve()?).await;
     }
 
     if cfg!(target_os = "windows") {
         let output =
-            run_capture_status(Command::new("schtasks").args(["/Query", "/TN", windows_task_name(), "/FO", "LIST"]))?;
+            run_capture_status(Command::new("schtasks").args(["/Query", "/TN", windows_task_name(), "/FO", "LIST"]))
+                .await?;
         let detail = output.detail();
         let state = if !output.success {
             ServiceState::NotInstalled
@@ -326,11 +327,12 @@ pub fn query_status(config: &Config, init_system: InitSystem) -> Result<ServiceS
     anyhow::bail!("Service management is supported on macOS and Linux only")
 }
 
-fn query_status_linux(config: &Config, init_system: InitSystem) -> Result<ServiceStatus> {
+async fn query_status_linux(config: &Config, init_system: InitSystem) -> Result<ServiceStatus> {
     match init_system {
         InitSystem::Systemd => {
             let unit = linux_service_file(config)?;
-            let output = run_capture_status(Command::new("systemctl").args(["--user", "is-active", "prx.service"]))?;
+            let output =
+                run_capture_status(Command::new("systemctl").args(["--user", "is-active", "prx.service"])).await?;
             let state = classify_systemd_state(output.success, &output.stdout, unit.is_file());
             Ok(ServiceStatus {
                 state,
@@ -349,7 +351,7 @@ fn query_status_linux(config: &Config, init_system: InitSystem) -> Result<Servic
                     detail: "init script is missing".to_string(),
                 });
             }
-            let output = run_capture_status(Command::new("rc-service").args(["prx", "status"]))?;
+            let output = run_capture_status(Command::new("rc-service").args(["prx", "status"])).await?;
             let normalized = output.detail().to_ascii_lowercase();
             let state = if output.success && normalized.contains("started") {
                 ServiceState::Running
@@ -385,8 +387,8 @@ fn classify_systemd_state(success: bool, stdout: &str, unit_exists: bool) -> Ser
     }
 }
 
-fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
-    stop(config, init_system)?;
+async fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
+    stop(config, init_system).await?;
 
     if cfg!(target_os = "macos") {
         let file = macos_service_file()?;
@@ -399,12 +401,12 @@ fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
 
     if cfg!(target_os = "linux") {
         let resolved = init_system.resolve()?;
-        return uninstall_linux(config, resolved);
+        return uninstall_linux(config, resolved).await;
     }
 
     if cfg!(target_os = "windows") {
         let task_name = windows_task_name();
-        run_checked(Command::new("schtasks").args(["/Delete", "/TN", task_name, "/F"]))?;
+        run_checked(Command::new("schtasks").args(["/Delete", "/TN", task_name, "/F"])).await?;
         // Remove the wrapper script
         let wrapper = config
             .config_path
@@ -422,20 +424,20 @@ fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
     anyhow::bail!("Service management is supported on macOS and Linux only")
 }
 
-fn uninstall_linux(config: &Config, init_system: InitSystem) -> Result<()> {
+async fn uninstall_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
             let file = linux_service_file(config)?;
             if file.exists() {
                 fs::remove_file(&file).with_context(|| format!("Failed to remove {}", file.display()))?;
             }
-            run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
+            run_checked(Command::new("systemctl").args(["--user", "daemon-reload"])).await?;
             println!("✅ Service uninstalled ({})", file.display());
         }
         InitSystem::Openrc => {
             let init_script = Path::new("/etc/init.d/prx");
             if init_script.exists() {
-                run_checked(Command::new("rc-update").args(["del", "prx", "default"]))?;
+                run_checked(Command::new("rc-update").args(["del", "prx", "default"])).await?;
                 fs::remove_file(init_script).with_context(|| format!("Failed to remove {}", init_script.display()))?;
             }
             println!("✅ Service uninstalled (/etc/init.d/prx)");
@@ -501,15 +503,15 @@ fn generate_launchd_plist(exe: &Path, config_dir: &Path, stdout: &Path, stderr: 
     )
 }
 
-fn install_linux(config: &Config, init_system: InitSystem) -> Result<()> {
+async fn install_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
-        InitSystem::Systemd => install_linux_systemd(config),
-        InitSystem::Openrc => install_linux_openrc(config),
+        InitSystem::Systemd => install_linux_systemd(config).await,
+        InitSystem::Openrc => install_linux_openrc(config).await,
         InitSystem::Auto => anyhow::bail!("InitSystem::Auto should be resolved before this point"),
     }
 }
 
-fn install_linux_systemd(config: &Config) -> Result<()> {
+async fn install_linux_systemd(config: &Config) -> Result<()> {
     let file = linux_service_file(config)?;
     if let Some(parent) = file.parent() {
         fs::create_dir_all(parent)?;
@@ -519,8 +521,8 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
     let unit = generate_systemd_unit(&exe, selected_config_dir(config)?);
 
     fs::write(&file, unit)?;
-    run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-    run_checked(Command::new("systemctl").args(["--user", "enable", "prx.service"]))?;
+    run_checked(Command::new("systemctl").args(["--user", "daemon-reload"])).await?;
+    run_checked(Command::new("systemctl").args(["--user", "enable", "prx.service"])).await?;
     println!("✅ Installed systemd user service: {}", file.display());
     println!("   Start with: prx service start");
     Ok(())
@@ -561,8 +563,12 @@ fn is_root() -> bool {
 /// Check if the openprx user exists and has expected properties.
 /// Returns Ok if user doesn't exist (OpenRC will handle creation or fail gracefully).
 /// Returns error if user exists but has unexpected properties.
-fn check_openprx_user() -> Result<()> {
-    let output = Command::new("getent").args(["passwd", "prx"]).output();
+async fn check_openprx_user() -> Result<()> {
+    let output = Command::new("getent")
+        .args(["passwd", "prx"])
+        .kill_on_drop(true)
+        .output()
+        .await;
     let is_alpine = Path::new("/etc/alpine-release").exists();
 
     let (del_cmd, add_cmd) = if is_alpine {
@@ -624,24 +630,34 @@ fn check_openprx_user() -> Result<()> {
     }
 }
 
-fn ensure_openprx_user() -> Result<()> {
-    let output = Command::new("getent").args(["passwd", "prx"]).output();
+async fn ensure_openprx_user() -> Result<()> {
+    let output = Command::new("getent")
+        .args(["passwd", "prx"])
+        .kill_on_drop(true)
+        .output()
+        .await;
     if let Ok(output) = output {
         if output.status.success() {
-            return check_openprx_user();
+            return check_openprx_user().await;
         }
     }
 
     let is_alpine = Path::new("/etc/alpine-release").exists();
 
     if is_alpine {
-        let group_output = Command::new("getent").args(["group", "prx"]).output();
+        let group_output = Command::new("getent")
+            .args(["group", "prx"])
+            .kill_on_drop(true)
+            .output()
+            .await;
         let group_exists = group_output.map(|o| o.status.success()).unwrap_or(false);
 
         if !group_exists {
             let output = Command::new("addgroup")
                 .args(["-S", "prx"])
+                .kill_on_drop(true)
                 .output()
+                .await
                 .context("Failed to create prx group")?;
 
             if !output.status.success() {
@@ -653,7 +669,9 @@ fn ensure_openprx_user() -> Result<()> {
 
         let output = Command::new("adduser")
             .args(["-S", "-s", "/sbin/nologin", "-H", "-D", "-G", "prx", "prx"])
+            .kill_on_drop(true)
             .output()
+            .await
             .context("Failed to create prx user")?;
 
         if !output.status.success() {
@@ -663,7 +681,9 @@ fn ensure_openprx_user() -> Result<()> {
     } else {
         let output = Command::new("useradd")
             .args(["-r", "-s", "/sbin/nologin", "prx"])
+            .kill_on_drop(true)
             .output()
+            .await
             .context("Failed to create prx user")?;
 
         if !output.status.success() {
@@ -678,10 +698,12 @@ fn ensure_openprx_user() -> Result<()> {
 
 /// Change ownership of a path to prx:prx
 #[cfg(unix)]
-fn chown_to_openprx(path: &Path) -> Result<()> {
+async fn chown_to_openprx(path: &Path) -> Result<()> {
     let output = Command::new("chown")
         .args(["prx:prx", &path.to_string_lossy()])
+        .kill_on_drop(true)
         .output()
+        .await
         .context("Failed to run chown")?;
 
     if !output.status.success() {
@@ -696,15 +718,17 @@ fn chown_to_openprx(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn chown_to_openprx(_path: &Path) -> Result<()> {
+async fn chown_to_openprx(_path: &Path) -> Result<()> {
     Ok(())
 }
 
 #[cfg(unix)]
-fn chown_recursive_to_openprx(path: &Path) -> Result<()> {
+async fn chown_recursive_to_openprx(path: &Path) -> Result<()> {
     let output = Command::new("chown")
         .args(["-R", "prx:prx", &path.to_string_lossy()])
+        .kill_on_drop(true)
         .output()
+        .await
         .context("Failed to run recursive chown")?;
 
     if !output.status.success() {
@@ -720,7 +744,7 @@ fn chown_recursive_to_openprx(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn chown_recursive_to_openprx(_path: &Path) -> Result<()> {
+async fn chown_recursive_to_openprx(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -754,7 +778,7 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-fn resolve_invoking_user_config_dir() -> Option<PathBuf> {
+async fn resolve_invoking_user_config_dir() -> Option<PathBuf> {
     fn preferred_user_config_dir(home: PathBuf) -> PathBuf {
         let primary = home.join(".openprx");
         if primary.exists() {
@@ -773,7 +797,12 @@ fn resolve_invoking_user_config_dir() -> Option<PathBuf> {
         .filter(|value| !value.is_empty() && value != "root");
 
     if let Some(user) = sudo_user {
-        if let Ok(output) = Command::new("getent").args(["passwd", &user]).output() {
+        if let Ok(output) = Command::new("getent")
+            .args(["passwd", &user])
+            .kill_on_drop(true)
+            .output()
+            .await
+        {
             if output.status.success() {
                 let entry = String::from_utf8_lossy(&output.stdout);
                 let fields: Vec<&str> = entry.trim().split(':').collect();
@@ -792,14 +821,14 @@ fn resolve_invoking_user_config_dir() -> Option<PathBuf> {
         .map(preferred_user_config_dir)
 }
 
-fn migrate_openrc_runtime_state_if_needed(config_dir: &Path) -> Result<()> {
+async fn migrate_openrc_runtime_state_if_needed(config_dir: &Path) -> Result<()> {
     let target_config = config_dir.join("config.toml");
     if target_config.exists() {
         println!("✅ Reusing existing OpenRC config at {}", target_config.display());
         return Ok(());
     }
 
-    let Some(source_dir) = resolve_invoking_user_config_dir() else {
+    let Some(source_dir) = resolve_invoking_user_config_dir().await else {
         return Ok(());
     };
 
@@ -851,12 +880,14 @@ fn build_openrc_writability_probe_command(path: &Path, has_runuser: bool) -> (St
 }
 
 #[cfg(unix)]
-fn ensure_openrc_runtime_path_writable(path: &Path) -> Result<()> {
+async fn ensure_openrc_runtime_path_writable(path: &Path) -> Result<()> {
     let has_runuser = which::which("runuser").is_ok();
     let (program, args) = build_openrc_writability_probe_command(path, has_runuser);
     let output = Command::new(&program)
         .args(args.iter().map(String::as_str))
+        .kill_on_drop(true)
         .output()
+        .await
         .with_context(|| format!("Failed to verify OpenRC runtime write access for {}", path.display()))?;
 
     if !output.status.success() {
@@ -877,15 +908,15 @@ fn ensure_openrc_runtime_path_writable(path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn ensure_openrc_runtime_dirs_writable(config_dir: &Path, workspace_dir: &Path, log_dir: &Path) -> Result<()> {
+async fn ensure_openrc_runtime_dirs_writable(config_dir: &Path, workspace_dir: &Path, log_dir: &Path) -> Result<()> {
     for path in [config_dir, workspace_dir, log_dir] {
-        ensure_openrc_runtime_path_writable(path)?;
+        ensure_openrc_runtime_path_writable(path).await?;
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn ensure_openrc_runtime_dirs_writable(_config_dir: &Path, _workspace_dir: &Path, _log_dir: &Path) -> Result<()> {
+async fn ensure_openrc_runtime_dirs_writable(_config_dir: &Path, _workspace_dir: &Path, _log_dir: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -940,7 +971,7 @@ fn resolve_openrc_executable() -> Result<PathBuf> {
     Ok(exe)
 }
 
-fn install_linux_openrc(config: &Config) -> Result<()> {
+async fn install_linux_openrc(config: &Config) -> Result<()> {
     if !is_root() {
         bail!(
             "OpenRC service installation requires root privileges.\n\
@@ -948,7 +979,7 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
         );
     }
 
-    ensure_openprx_user()?;
+    ensure_openprx_user().await?;
 
     let exe = resolve_openrc_executable()?;
     warn_if_binary_in_home(&exe);
@@ -968,7 +999,7 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
         println!("✅ Created directory: {}", config_dir.display());
     }
 
-    migrate_openrc_runtime_state_if_needed(config_dir)?;
+    migrate_openrc_runtime_state_if_needed(config_dir).await?;
 
     if !workspace_dir.exists() {
         fs::create_dir_all(&workspace_dir).with_context(|| format!("Failed to create {}", workspace_dir.display()))?;
@@ -978,7 +1009,7 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
             fs::set_permissions(&workspace_dir, fs::Permissions::from_mode(0o750))
                 .with_context(|| format!("Failed to set permissions on {}", workspace_dir.display()))?;
         }
-        chown_to_openprx(&workspace_dir)?;
+        chown_to_openprx(&workspace_dir).await?;
         println!("✅ Created directory: {} (owned by prx:prx)", workspace_dir.display());
     }
 
@@ -1006,7 +1037,7 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
         }
     }
 
-    chown_recursive_to_openprx(config_dir)?;
+    chown_recursive_to_openprx(config_dir).await?;
 
     let created_log_dir = !log_dir.exists();
     if created_log_dir {
@@ -1019,9 +1050,9 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
         }
     }
 
-    chown_to_openprx(log_dir)?;
+    chown_to_openprx(log_dir).await?;
 
-    ensure_openrc_runtime_dirs_writable(config_dir, &workspace_dir, log_dir)?;
+    ensure_openrc_runtime_dirs_writable(config_dir, &workspace_dir, log_dir).await?;
 
     if created_log_dir {
         println!("✅ Created directory: {} (owned by prx:prx)", log_dir.display());
@@ -1038,7 +1069,7 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
             .with_context(|| format!("Failed to set permissions on {}", init_path.display()))?;
     }
 
-    run_checked(Command::new("rc-update").args(["add", "prx", "default"]))?;
+    run_checked(Command::new("rc-update").args(["add", "prx", "default"])).await?;
     println!("✅ Installed OpenRC service: /etc/init.d/prx");
     println!("   Config path: /etc/prx/config.toml");
     println!("   Start with: sudo prx service start");
@@ -1046,7 +1077,7 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn install_windows(config: &Config) -> Result<()> {
+async fn install_windows(config: &Config) -> Result<()> {
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
     let config_dir = selected_config_dir(config)?;
     let logs_dir = config_dir.join("logs");
@@ -1073,7 +1104,8 @@ fn install_windows(config: &Config) -> Result<()> {
         "/RL",
         "HIGHEST",
         "/F",
-    ]))?;
+    ]))
+    .await?;
 
     println!("✅ Installed Windows scheduled task: {}", task_name);
     println!("   Wrapper: {}", wrapper.display());
@@ -1110,10 +1142,12 @@ fn linux_service_file(config: &Config) -> Result<PathBuf> {
     Ok(home.join(".config").join("systemd").join("user").join("prx.service"))
 }
 
-fn run_checked(command: &mut Command) -> Result<()> {
+async fn run_checked(command: &mut Command) -> Result<()> {
     let description = format!("{command:?}");
+    command.kill_on_drop(true);
     let output = command
         .output()
+        .await
         .with_context(|| format!("Failed to spawn command {description}"))?;
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1131,8 +1165,8 @@ fn run_checked(command: &mut Command) -> Result<()> {
     Ok(())
 }
 
-fn run_capture(command: &mut Command) -> Result<String> {
-    let output = run_capture_status(command)?;
+async fn run_capture(command: &mut Command) -> Result<String> {
+    let output = run_capture_status(command).await?;
     if !output.success {
         bail!(
             "Command failed (exit={}): {}",
@@ -1170,10 +1204,12 @@ impl CapturedCommand {
     }
 }
 
-fn run_capture_status(command: &mut Command) -> Result<CapturedCommand> {
+async fn run_capture_status(command: &mut Command) -> Result<CapturedCommand> {
     let description = format!("{command:?}");
+    command.kill_on_drop(true);
     let output = command
         .output()
+        .await
         .with_context(|| format!("Failed to spawn command {description}"))?;
     Ok(CapturedCommand {
         success: output.status.success(),
@@ -1202,24 +1238,29 @@ mod tests {
     }
 
     #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn run_capture_reads_stdout() {
-        let out = run_capture(Command::new("sh").args(["-lc", "echo hello"])).expect("stdout capture should succeed");
+    #[tokio::test]
+    async fn run_capture_reads_stdout() {
+        let out = run_capture(Command::new("sh").args(["-lc", "echo hello"]))
+            .await
+            .expect("stdout capture should succeed");
         assert_eq!(out.trim(), "hello");
     }
 
     #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn run_capture_falls_back_to_stderr() {
-        let out =
-            run_capture(Command::new("sh").args(["-lc", "echo warn 1>&2"])).expect("stderr capture should succeed");
+    #[tokio::test]
+    async fn run_capture_falls_back_to_stderr() {
+        let out = run_capture(Command::new("sh").args(["-lc", "echo warn 1>&2"]))
+            .await
+            .expect("stderr capture should succeed");
         assert_eq!(out.trim(), "warn");
     }
 
     #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn run_checked_errors_on_non_zero_status() {
-        let err = run_checked(Command::new("sh").args(["-lc", "exit 17"])).expect_err("non-zero exit should error");
+    #[tokio::test]
+    async fn run_checked_errors_on_non_zero_status() {
+        let err = run_checked(Command::new("sh").args(["-lc", "exit 17"]))
+            .await
+            .expect_err("non-zero exit should error");
         assert!(err.to_string().contains("Command failed"));
     }
 
@@ -1309,9 +1350,9 @@ mod tests {
     }
 
     #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn run_capture_rejects_non_zero_status() {
-        let result = run_capture(Command::new("sh").args(["-lc", "echo inactive; exit 3"]));
+    #[tokio::test]
+    async fn run_capture_rejects_non_zero_status() {
+        let result = run_capture(Command::new("sh").args(["-lc", "echo inactive; exit 3"])).await;
         assert!(
             result.is_err(),
             "nonzero service status must not be reported as success"
@@ -1324,16 +1365,20 @@ mod tests {
     }
 
     #[cfg(target_os = "windows")]
-    #[test]
-    fn run_capture_reads_stdout_windows() {
-        let out = run_capture(Command::new("cmd").args(["/C", "echo hello"])).expect("stdout capture should succeed");
+    #[tokio::test]
+    async fn run_capture_reads_stdout_windows() {
+        let out = run_capture(Command::new("cmd").args(["/C", "echo hello"]))
+            .await
+            .expect("stdout capture should succeed");
         assert_eq!(out.trim(), "hello");
     }
 
     #[cfg(target_os = "windows")]
-    #[test]
-    fn run_checked_errors_on_non_zero_status_windows() {
-        let err = run_checked(Command::new("cmd").args(["/C", "exit /b 17"])).expect_err("non-zero exit should error");
+    #[tokio::test]
+    async fn run_checked_errors_on_non_zero_status_windows() {
+        let err = run_checked(Command::new("cmd").args(["/C", "exit /b 17"]))
+            .await
+            .expect_err("non-zero exit should error");
         assert!(err.to_string().contains("Command failed"));
     }
 

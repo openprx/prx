@@ -332,6 +332,7 @@ pub fn create_memory_with_storage_and_routes_with_acl(
             vector_weight as f32,
             keyword_weight as f32,
             embedding_cache_size,
+            storage_provider.pool_max_size,
         )
     }
 

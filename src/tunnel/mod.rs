@@ -325,6 +325,7 @@ mod tests {
             .arg("30")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
             .spawn()
             .expect("sleep should spawn for lifecycle test");
 

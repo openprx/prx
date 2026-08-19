@@ -192,7 +192,7 @@ impl Tool for FileEditTool {
         // Read the current contents. Use O_NOFOLLOW on Unix so a symlinked target
         // is rejected atomically (no TOCTOU between resolve and open).
         let read_target = resolved_target.clone();
-        let read_result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let read_result = crate::runtime::blocking::spawn_blocking(move || -> Result<String, String> {
             let mut opts = std::fs::OpenOptions::new();
             opts.read(true);
             #[cfg(unix)]
@@ -269,7 +269,7 @@ impl Tool for FileEditTool {
         // swapped in between read and write.
         let write_target = resolved_target.clone();
         let data = new_contents;
-        let write_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let write_result = crate::runtime::blocking::spawn_blocking(move || -> Result<(), String> {
             use std::io::Write;
             let mut opts = std::fs::OpenOptions::new();
             opts.write(true).create(false).truncate(true);

@@ -8,6 +8,12 @@ ignore = [
     "RUSTSEC-2024-0388",
     # proc-macro-error2 unmaintained — transitive via matrix-sdk (vodozemac/aquamarine), no maintained alternative
     "RUSTSEC-2026-0173",
+    # wasmtime 45.0.3 cross-engine type-index confusion — unreachable: PRX creates a
+    # single Engine (plugins/mod.rs) and every Store is built from it; the CVE needs
+    # Stores mixed across two Engines. Revisit when upgrading to wasmtime >=46.
+    "RUSTSEC-2026-0222",
+    # bitmaps unmaintained — transitive via matrix-sdk -> imbl -> bitmaps, no direct dep
+    "RUSTSEC-2026-0247",
 ]
 informational_warnings = ["unmaintained"]
 severity_threshold = "low"

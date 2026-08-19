@@ -84,6 +84,24 @@ max_history = 200
 [gateway]
 request_timeout_secs = 180
 
+[runtime]
+# Hard cap on the tokio blocking-thread pool (optional).
+#
+# PRX places no ceiling on concurrent turns, sub-agents, or sessions, which
+# makes this pool the last implicit concurrency gate in the process — and it
+# fails by deadlock rather than rejection: once every slot is held, further
+# blocking work (SQLite writes, subprocess reaps, config reloads) queues
+# forever with no timeout.
+#
+# Leave it unset to derive the cap from `available_parallelism()`, which is
+# cgroup-aware, with a floor of 2048 and a ceiling of 16384. Set it explicitly
+# to go beyond that ceiling, or to pin a value for reproducible capacity
+# planning. Must be greater than 0.
+#
+# Read during process bootstrap, before the tokio runtime exists, so it takes
+# effect only on restart: hot reload cannot resize a live pool.
+# max_blocking_threads = 8192
+
 [memory]
 backend = "sqlite"
 # Compatibility gate for semantic promotion. Message events are controlled below.
@@ -271,6 +289,36 @@ These files are automatically injected into the agent context at startup.
 | **Lucid** | Lightweight markdown-based memory |
 | **PostgreSQL** | Scalable, multi-user |
 | **Markdown** | File-based, human-readable |
+
+### PostgreSQL Connection Pool
+
+The PostgreSQL backend reuses connections through a pool configured under
+`[storage.provider.config]`:
+
+```toml
+[storage.provider.config]
+provider = "postgres"
+dbURL = "postgres://user:password@localhost:5432/openprx"
+schema = "public"
+table = "memories"
+# Maximum live connections (default: 32). Must be greater than 0.
+pool_max_size = 32
+# Timeout in seconds for establishing a connection (default: 15).
+connect_timeout_secs = 15
+```
+
+The pool is a connection *reuse* mechanism, not a concurrency limiter. Size
+`pool_max_size` against the database's own `max_connections` budget rather than
+against expected task concurrency: when every connection is checked out, callers
+**queue** for one instead of failing, and that wait has no deadline.
+
+`connect_timeout_secs` is the only timeout the backend applies. It bounds the
+TCP/startup handshake, which is a network fault rather than a long-running task.
+No `statement_timeout` is set, so queries are never cut off — long-running
+queries are normal for agent workloads.
+
+Connections are health-checked on checkout: one closed by the server (restart,
+failover, idle reaper) is discarded and transparently replaced.
 
 ## Security
 

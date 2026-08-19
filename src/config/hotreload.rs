@@ -37,7 +37,9 @@ pub fn new_shared(initial: Config) -> SharedConfig {
 
 /// Watches `config.toml` and submits stable candidates to [`SharedConfig`].
 pub struct HotReloadManager {
-    _handle: tokio::task::JoinHandle<()>,
+    /// Dedicated watcher thread. `None` only if the OS refused to create it,
+    /// in which case hot-reload is inactive and the failure was logged.
+    _handle: Option<std::thread::JoinHandle<()>>,
     reload_version: Arc<AtomicU64>,
 }
 
@@ -50,11 +52,21 @@ impl HotReloadManager {
         let reload_version = Arc::new(AtomicU64::new(0));
         let rv_clone = Arc::clone(&reload_version);
 
-        let handle = tokio::task::spawn_blocking(move || {
+        // Dedicated OS thread, not the tokio blocking pool: the watcher blocks
+        // on `notify` events until process exit, so a pool slot handed to it is
+        // never returned. With no ceiling on concurrent agent work, permanently
+        // retired slots are exactly what drives the pool into deadlock.
+        let handle = match crate::runtime::blocking::spawn_detached_thread("prx-config-watch", move || {
             if let Err(e) = run_watcher(config_path, shared, rv_clone) {
                 tracing::error!("Config hot-reload watcher exited: {e}");
             }
-        });
+        }) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                tracing::error!("failed to start config hot-reload watcher thread: {error}");
+                None
+            }
+        };
 
         Self {
             _handle: handle,

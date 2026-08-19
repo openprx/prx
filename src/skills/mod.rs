@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, LazyLock};
+use tokio::process::Command;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".openprx-open-skills-sync";
@@ -517,7 +517,7 @@ fn resolve_open_skills_dir(config_open_skills_dir: Option<&str>) -> Option<PathB
     UserDirs::new().map(|dirs| dirs.home_dir().join("open-skills"))
 }
 
-fn clone_open_skills_repo(repo_dir: &Path) -> bool {
+async fn clone_open_skills_repo(repo_dir: &Path) -> bool {
     if let Some(parent) = repo_dir.parent() {
         if let Err(err) = std::fs::create_dir_all(parent) {
             tracing::warn!(
@@ -528,10 +528,9 @@ fn clone_open_skills_repo(repo_dir: &Path) -> bool {
         }
     }
 
-    let output = Command::new("git")
-        .args(["clone", "--depth", "1", OPEN_SKILLS_REPO_URL])
-        .arg(repo_dir)
-        .output();
+    let mut cmd = Command::new("git");
+    cmd.args(["clone", "--depth", "1", OPEN_SKILLS_REPO_URL]).arg(repo_dir);
+    let output = crate::runtime::shell_process::run_managed_output(cmd).await;
 
     match output {
         Ok(result) if result.status.success() => {
@@ -550,17 +549,15 @@ fn clone_open_skills_repo(repo_dir: &Path) -> bool {
     }
 }
 
-fn pull_open_skills_repo(repo_dir: &Path) -> bool {
+async fn pull_open_skills_repo(repo_dir: &Path) -> bool {
     // If user points to a non-git directory via env var, keep using it without pulling.
     if !repo_dir.join(".git").exists() {
         return true;
     }
 
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_dir)
-        .args(["pull", "--ff-only"])
-        .output();
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(repo_dir).args(["pull", "--ff-only"]);
+    let output = crate::runtime::shell_process::run_managed_output(cmd).await;
 
     match output {
         Ok(result) if result.status.success() => true,
@@ -717,7 +714,7 @@ fn resolve_openclaw_skills_dir(config_openclaw_skills_dir: Option<&str>) -> Opti
 }
 
 /// Sparse-clone the OpenClaw repository, checking out only the `skills/` directory.
-fn clone_openclaw_skills_repo(repo_dir: &Path) -> bool {
+async fn clone_openclaw_skills_repo(repo_dir: &Path) -> bool {
     if let Some(parent) = repo_dir.parent() {
         if let Err(err) = std::fs::create_dir_all(parent) {
             tracing::warn!(
@@ -728,26 +725,27 @@ fn clone_openclaw_skills_repo(repo_dir: &Path) -> bool {
         }
     }
 
-    let output = Command::new("git")
-        .args([
-            "clone",
-            "--depth",
-            "1",
-            "--filter=blob:none",
-            "--sparse",
-            OPENCLAW_SKILLS_REPO_URL,
-        ])
-        .arg(repo_dir)
-        .output();
+    let mut cmd = Command::new("git");
+    cmd.args([
+        "clone",
+        "--depth",
+        "1",
+        "--filter=blob:none",
+        "--sparse",
+        OPENCLAW_SKILLS_REPO_URL,
+    ])
+    .arg(repo_dir);
+    let output = crate::runtime::shell_process::run_managed_output(cmd).await;
 
     match output {
         Ok(result) if result.status.success() => {
             // Configure sparse checkout to include only skills/
-            let sparse = Command::new("git")
+            let mut sparse_cmd = Command::new("git");
+            sparse_cmd
                 .arg("-C")
                 .arg(repo_dir)
-                .args(["sparse-checkout", "set", "skills"])
-                .output();
+                .args(["sparse-checkout", "set", "skills"]);
+            let sparse = crate::runtime::shell_process::run_managed_output(sparse_cmd).await;
             match sparse {
                 Ok(r) if r.status.success() => {
                     tracing::info!("initialized openclaw-skills at {}", repo_dir.display());
@@ -774,17 +772,15 @@ fn clone_openclaw_skills_repo(repo_dir: &Path) -> bool {
     }
 }
 
-fn pull_openclaw_skills_repo(repo_dir: &Path) -> bool {
+async fn pull_openclaw_skills_repo(repo_dir: &Path) -> bool {
     // Skip pull for non-git directories (e.g. user-provided local path).
     if !repo_dir.join(".git").exists() {
         return true;
     }
 
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_dir)
-        .args(["pull", "--ff-only"])
-        .output();
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(repo_dir).args(["pull", "--ff-only"]);
+    let output = crate::runtime::shell_process::run_managed_output(cmd).await;
 
     match output {
         Ok(result) if result.status.success() => true,
@@ -807,13 +803,13 @@ fn mark_openclaw_skills_synced(repo_dir: &Path) -> Result<()> {
 
 /// Explicitly clone/pull enabled community repositories outside inference and
 /// catalog request paths.
-pub fn sync_community_skill_repositories(config: &crate::config::Config) -> Result<()> {
+pub async fn sync_community_skill_repositories(config: &crate::config::Config) -> Result<()> {
     let repo_dir = resolve_open_skills_dir(config.skills.open_skills_dir.as_deref())
         .context("could not resolve open-skills directory")?;
     let synced = if repo_dir.exists() {
-        pull_open_skills_repo(&repo_dir)
+        pull_open_skills_repo(&repo_dir).await
     } else {
-        clone_open_skills_repo(&repo_dir)
+        clone_open_skills_repo(&repo_dir).await
     };
     if !synced {
         bail!("failed to synchronize open-skills repository");
@@ -823,9 +819,9 @@ pub fn sync_community_skill_repositories(config: &crate::config::Config) -> Resu
     let repo_dir = resolve_openclaw_skills_dir(config.skills.openclaw_skills_dir.as_deref())
         .context("could not resolve OpenClaw skills directory")?;
     let synced = if repo_dir.exists() {
-        pull_openclaw_skills_repo(&repo_dir)
+        pull_openclaw_skills_repo(&repo_dir).await
     } else {
-        clone_openclaw_skills_repo(&repo_dir)
+        clone_openclaw_skills_repo(&repo_dir).await
     };
     if !synced {
         bail!("failed to synchronize OpenClaw skills repository");
@@ -1274,7 +1270,7 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
 
 /// Handle the `skills` CLI command
 #[allow(clippy::too_many_lines)]
-pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Config) -> Result<()> {
+pub async fn handle_command(command: crate::SkillCommands, config: &crate::config::Config) -> Result<()> {
     let workspace_dir = &config.workspace_dir;
     match command {
         crate::SkillCommands::List => {
@@ -1316,7 +1312,7 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             Ok(())
         }
         crate::SkillCommands::Sync => {
-            sync_community_skill_repositories(config)?;
+            sync_community_skill_repositories(config).await?;
             println!(
                 "  {} Community skill repositories synchronized.",
                 console::style("✓").green().bold()
@@ -1338,12 +1334,11 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             };
             let (staging, target) = skill_staging_paths(&skills_path, &name)?;
 
-            let staging_result = (|| -> Result<()> {
+            let staging_result: Result<()> = async {
                 if is_git_source(&source) {
-                    let output = std::process::Command::new("git")
-                        .args(["clone", "--depth", "1", &source])
-                        .arg(&staging)
-                        .output()?;
+                    let mut cmd = Command::new("git");
+                    cmd.args(["clone", "--depth", "1", &source]).arg(&staging);
+                    let output = crate::runtime::shell_process::run_managed_output(cmd).await?;
                     if !output.status.success() {
                         let stderr = String::from_utf8_lossy(&output.stderr);
                         bail!("Git clone failed: {stderr}");
@@ -1364,11 +1359,13 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                 {
                     use std::os::windows::fs::symlink_dir;
                     if symlink_dir(&src, &staging).is_err() {
-                        let junction_result = std::process::Command::new("cmd")
+                        let mut junction_cmd = Command::new("cmd");
+                        junction_cmd
                             .args(["/C", "mklink", "/J"])
                             .arg(&staging)
                             .arg(&src)
-                            .output();
+                            .kill_on_drop(true);
+                        let junction_result = junction_cmd.output().await;
                         if !junction_result.as_ref().is_ok_and(|output| output.status.success()) {
                             copy_dir_recursive(&src, &staging)?;
                         }
@@ -1379,7 +1376,8 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                     copy_dir_recursive(&src, &staging)?;
                 }
                 Ok(())
-            })();
+            }
+            .await;
 
             if let Err(error) = staging_result {
                 cleanup_staged_skill(&staging);
@@ -1658,8 +1656,8 @@ command = "echo hello"
         assert!(!staging.exists());
     }
 
-    #[test]
-    fn cli_local_install_and_remove_use_catalog_invalidation() {
+    #[tokio::test]
+    async fn cli_local_install_and_remove_use_catalog_invalidation() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("local-source");
         fs::create_dir(&source).unwrap();
@@ -1674,6 +1672,7 @@ command = "echo hello"
             },
             &config,
         )
+        .await
         .unwrap();
         assert_eq!(load_skills_with_config(&workspace_dir, &config).len(), 1);
 
@@ -1683,6 +1682,7 @@ command = "echo hello"
             },
             &config,
         )
+        .await
         .unwrap();
         assert!(std::fs::symlink_metadata(workspace_dir.join("skills/local-source")).is_err());
         assert!(load_skills_with_config(&workspace_dir, &config).is_empty());

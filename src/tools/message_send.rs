@@ -47,17 +47,18 @@ pub(crate) async fn auto_generate_voice(text: &str, voice: &str) -> anyhow::Resu
     );
 
     // Resolve the global node_modules path so `require('node-edge-tts')` works.
-    let npm_root_out = tokio::process::Command::new("npm")
-        .args(["root", "-g"])
-        .output()
+    // npm/node/ffmpeg all fork helper processes of their own, so every step runs
+    // in its own process group and is torn down as a group with this future.
+    let mut npm_cmd = tokio::process::Command::new("npm");
+    npm_cmd.args(["root", "-g"]);
+    let npm_root_out = crate::runtime::shell_process::run_managed_output(npm_cmd)
         .await
         .map_err(|e| anyhow::anyhow!("npm not found: {e}"))?;
     let node_modules = String::from_utf8_lossy(&npm_root_out.stdout).trim().to_string();
 
-    let tts_out = tokio::process::Command::new("node")
-        .args(["-e", &tts_script])
-        .env("NODE_PATH", &node_modules)
-        .output()
+    let mut node_cmd = tokio::process::Command::new("node");
+    node_cmd.args(["-e", &tts_script]).env("NODE_PATH", &node_modules);
+    let tts_out = crate::runtime::shell_process::run_managed_output(node_cmd)
         .await
         .map_err(|e| anyhow::anyhow!("node not found: {e}"))?;
 
@@ -67,9 +68,9 @@ pub(crate) async fn auto_generate_voice(text: &str, voice: &str) -> anyhow::Resu
     }
 
     // 2. Convert MP3 → M4A (AAC) — Signal displays M4A as a playable voice note.
-    let ffmpeg_out = tokio::process::Command::new("ffmpeg")
-        .args(["-y", "-i", &mp3_path, "-c:a", "aac", "-b:a", "64k", &m4a_path])
-        .output()
+    let mut ffmpeg_cmd = tokio::process::Command::new("ffmpeg");
+    ffmpeg_cmd.args(["-y", "-i", &mp3_path, "-c:a", "aac", "-b:a", "64k", &m4a_path]);
+    let ffmpeg_out = crate::runtime::shell_process::run_managed_output(ffmpeg_cmd)
         .await
         .map_err(|e| anyhow::anyhow!("ffmpeg not found: {e}"))?;
 

@@ -131,6 +131,18 @@ const COMPACT_TOTAL_CHARS: usize = 2400;
 /// Capacity for the user-input mpsc channel.
 const INPUT_CHANNEL_CAPACITY: usize = 16;
 const CHAT_CONTROL_CHANNEL_CAPACITY: usize = 8;
+/// Queue depth for provider-turn lifecycle events (`HandleAttached`, `Started`,
+/// `Exited`) travelling from the effect executor back to the chat loop.
+///
+/// Sized as a backpressure valve, not a concurrency limit. Each turn emits
+/// exactly three of these small, `Copy`-sized records, so this depth absorbs
+/// roughly 1300 turns' worth of lifecycle traffic — far more than the chat loop
+/// can fall behind by in practice, since it drains the queue at several points
+/// in every iteration. If it ever does fill, the emitting turn parks on
+/// `send().await` instead of the queue growing without bound; slowing turn
+/// startup is the correct outcome, because the worker registry driving aborts
+/// and completion routing must not fall arbitrarily far behind reality.
+pub(crate) const PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY: usize = 4096;
 const SYNTHETIC_UI_COMMAND_SENDER: &str = "prx-ui";
 const SESSION_LOGS_MAX_LINES: usize = 200;
 
@@ -4029,8 +4041,12 @@ pub async fn run(
     #[cfg(not(feature = "terminal-tui"))]
     let visible_input_admission_kind = crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited;
 
+    // Class B — bounded. Three events are emitted per provider turn, and with
+    // no cap on concurrent turns the emission rate is unbounded while the sole
+    // consumer is this loop, which also renders and handles input. See
+    // `PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY` for the sizing rationale.
     let (provider_turn_lifecycle_tx, mut provider_turn_lifecycle_rx) =
-        mpsc::unbounded_channel::<dispatcher::ProviderTurnLifecycleEvent>();
+        mpsc::channel::<dispatcher::ProviderTurnLifecycleEvent>(PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY);
     #[cfg(not(feature = "terminal-tui"))]
     let _ = &provider_turn_lifecycle_tx;
 
@@ -8773,7 +8789,13 @@ fn spawn_tui_unified_loop(
     workspace_dir: std::path::PathBuf,
     security: Arc<crate::security::SecurityPolicy>,
 ) {
-    tokio::task::spawn_blocking(move || {
+    // Dedicated OS thread, not the tokio blocking pool: this loop only ends at
+    // shutdown, so parking it in the pool would permanently retire one of the
+    // `max_blocking_threads` slots that every SQLite write, subprocess reap and
+    // config reload competes for. The loop needs no tokio context — it drives
+    // crossterm synchronously and hands work off via `blocking_send`, which is
+    // in fact only legal *outside* a runtime context.
+    let thread_result = crate::runtime::blocking::spawn_detached_thread("prx-tui-render", move || {
         let result = run_tui_unified_loop(
             input_tx,
             control_tx,
@@ -8792,6 +8814,9 @@ fn spawn_tui_unified_loop(
             tracing::error!("TUI unified loop error: {e}");
         }
     });
+    if let Err(error) = thread_result {
+        tracing::error!("failed to start TUI render thread: {error}");
+    }
 }
 
 #[cfg(feature = "terminal-tui")]
@@ -9282,7 +9307,7 @@ fn provider_turn_visible_admission(
 }
 
 fn drain_provider_turn_lifecycle_events(
-    rx: &mut mpsc::UnboundedReceiver<dispatcher::ProviderTurnLifecycleEvent>,
+    rx: &mut mpsc::Receiver<dispatcher::ProviderTurnLifecycleEvent>,
     events_open: &mut bool,
     workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
 ) -> bool {
@@ -9353,7 +9378,7 @@ fn record_provider_turn_completion_ready(
 }
 
 fn route_provider_completion_event(
-    lifecycle_rx: &mut mpsc::UnboundedReceiver<dispatcher::ProviderTurnLifecycleEvent>,
+    lifecycle_rx: &mut mpsc::Receiver<dispatcher::ProviderTurnLifecycleEvent>,
     lifecycle_events_open: &mut bool,
     workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
     pending: &mut std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, ProviderTurnCompletionEvent>,
@@ -9381,7 +9406,7 @@ fn route_provider_completion_event(
 }
 
 fn route_provider_completion_event_and_publish(
-    lifecycle_rx: &mut mpsc::UnboundedReceiver<dispatcher::ProviderTurnLifecycleEvent>,
+    lifecycle_rx: &mut mpsc::Receiver<dispatcher::ProviderTurnLifecycleEvent>,
     lifecycle_events_open: &mut bool,
     workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
     pending: &mut std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, ProviderTurnCompletionEvent>,
@@ -11644,6 +11669,7 @@ async fn run_git_diff_bounded(workspace_dir: &std::path::Path, cached: bool) -> 
         .current_dir(workspace_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|err| format!("diff unavailable: {err}"))?;
 
@@ -12045,7 +12071,7 @@ async fn reattach_pty(
 
     let handoff = Arc::clone(handoff);
     let session_for_passthrough = session.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
+    let outcome = crate::runtime::blocking::spawn_blocking(move || {
         // Acquire the handoff guard: pause the render loop and wait for its ack. If
         // the ack times out we do NOT proceed (running while the render loop might
         // still touch the terminal would corrupt the screen). `acquire` un-pauses
@@ -17605,6 +17631,77 @@ mod p3_directional_switch_tests {
         );
     }
 
+    /// Backpressure contract for the provider-turn lifecycle channel.
+    ///
+    /// The channel is bounded, so the guarantee under load is: a producer that
+    /// finds it full is *slowed down* (its `send` parks until the chat loop
+    /// drains) rather than dropping events or panicking, and every event
+    /// eventually arrives in order.
+    #[cfg(feature = "terminal-tui")]
+    #[tokio::test]
+    async fn provider_turn_lifecycle_channel_backpressures_instead_of_dropping() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue("turn", crate::chat::turn_scheduler::TurnPriority::Normal, 1);
+
+        let (tx, mut rx) =
+            mpsc::channel::<dispatcher::ProviderTurnLifecycleEvent>(PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY);
+
+        // Fill the queue exactly to capacity.
+        for lease_id in 0..PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY as u64 {
+            tx.try_send(dispatcher::ProviderTurnLifecycleEvent::Started { task_id, lease_id })
+                .expect("channel accepts events up to its capacity");
+        }
+        assert!(
+            tx.try_send(dispatcher::ProviderTurnLifecycleEvent::Started {
+                task_id,
+                lease_id: u64::MAX,
+            })
+            .is_err(),
+            "channel must be bounded at PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY"
+        );
+
+        // The overflow send parks; it neither resolves nor discards the event.
+        let overflow = tx.send(dispatcher::ProviderTurnLifecycleEvent::Exited {
+            task_id,
+            lease_id: u64::MAX,
+        });
+        tokio::pin!(overflow);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut overflow)
+                .await
+                .is_err(),
+            "a full queue must park the producer rather than complete the send"
+        );
+
+        // Draining frees a permit, which wakes the parked producer.
+        let first = rx.recv().await.expect("queued event is delivered");
+        assert!(matches!(
+            first,
+            dispatcher::ProviderTurnLifecycleEvent::Started { lease_id: 0, .. }
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), overflow)
+            .await
+            .expect("parked producer resumes once the consumer drains")
+            .expect("receiver is still alive");
+
+        // Nothing was lost or reordered: the remaining fillers arrive in order,
+        // followed by the event that had been waiting on backpressure.
+        for expected_lease in 1..PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY as u64 {
+            match rx.recv().await.expect("queued event is delivered") {
+                dispatcher::ProviderTurnLifecycleEvent::Started { lease_id, .. } => {
+                    assert_eq!(lease_id, expected_lease);
+                }
+                other => panic!("unexpected event while draining: {other:?}"),
+            }
+        }
+        match rx.recv().await.expect("backpressured event is delivered") {
+            dispatcher::ProviderTurnLifecycleEvent::Exited { lease_id, .. } => {
+                assert_eq!(lease_id, u64::MAX);
+            }
+            other => panic!("unexpected trailing event: {other:?}"),
+        }
+    }
+
     #[cfg(feature = "terminal-tui")]
     #[test]
     fn non_current_provider_completion_is_retained_and_marks_ready() {
@@ -17631,7 +17728,7 @@ mod p3_directional_switch_tests {
             .record_execution_started(second, 42)
             .expect("second worker execution starts");
 
-        let (_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_tx, mut lifecycle_rx) = tokio::sync::mpsc::channel(PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY);
         let mut lifecycle_open = true;
         let mut pending = std::collections::HashMap::new();
         let completion = ProviderTurnCompletionEvent {
@@ -17697,7 +17794,7 @@ mod p3_directional_switch_tests {
             .record_execution_started(task_id, 43)
             .expect("worker execution starts");
 
-        let (_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_tx, mut lifecycle_rx) = tokio::sync::mpsc::channel(PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY);
         let mut lifecycle_open = true;
         let mut pending = std::collections::HashMap::new();
         let completion = ProviderTurnCompletionEvent {
@@ -17756,7 +17853,7 @@ mod p3_directional_switch_tests {
         workers
             .record_execution_started(task_id, 60)
             .expect("worker execution starts");
-        let (_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_tx, mut lifecycle_rx) = tokio::sync::mpsc::channel(PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY);
         let mut lifecycle_open = true;
         let mut pending = std::collections::HashMap::new();
         let (chat_dispatcher, _action_rx) = dispatcher::ChatDispatcher::new();
@@ -17820,7 +17917,7 @@ mod p3_directional_switch_tests {
         workers
             .record_execution_started(task_id, 64)
             .expect("worker execution starts");
-        let (_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_tx, mut lifecycle_rx) = tokio::sync::mpsc::channel(PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY);
         let mut lifecycle_open = true;
         let mut pending = std::collections::HashMap::new();
         let (chat_dispatcher, _action_rx) = dispatcher::ChatDispatcher::new();

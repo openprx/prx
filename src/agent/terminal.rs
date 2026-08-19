@@ -133,7 +133,7 @@ async fn ensure_runtime_authority(scope: &MessageEventScope, phase: &'static str
         return Ok(());
     };
     anyhow::ensure!(
-        tokio::task::spawn_blocking(move || authority_guard.validate())
+        crate::runtime::blocking::spawn_blocking(move || authority_guard.validate())
             .await
             .context("runtime authority validation task failed")??,
         "runtime execution authority was lost during terminal finalization phase {phase}"
@@ -177,7 +177,7 @@ pub async fn finalize_turn(
             let workspace_dir = workspace_dir.to_path_buf();
             let usage = usage.clone();
             Some(
-                match tokio::task::spawn_blocking(move || {
+                match crate::runtime::blocking::spawn_blocking(move || {
                     let tracker = crate::cost::tracker::CostTracker::for_workspace(cost_config, &workspace_dir)?;
                     tracker.settle_metered(&usage)
                 })

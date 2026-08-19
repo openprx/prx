@@ -22,6 +22,11 @@ ignore = [
     # proc-macro-error2 unmaintained: transitive via matrix-sdk (vodozemac → matrix-pickle-derive)
     # and aquamarine (matrix-sdk-crypto). No maintained alternative; upstream matrix-sdk tracks this.
     { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2: transitive via matrix-sdk/vodozemac, no maintained alternative, upstream matrix-sdk tracks migration" },
+    # wasmtime cross-engine type-index confusion. PRX builds exactly one Engine
+    # (plugins/mod.rs) and derives every Store from it, so the two-Engine mixing the
+    # advisory requires cannot occur. Lift on the wasmtime >=46 upgrade.
+    { id = "RUSTSEC-2026-0222", reason = "wasmtime: single-Engine architecture makes cross-engine store confusion unreachable" },
+    { id = "RUSTSEC-2026-0247", reason = "bitmaps unmaintained: transitive via matrix-sdk -> imbl, no direct dependency" },
 ]
 
 # ===== 许可证合规 =====

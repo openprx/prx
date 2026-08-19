@@ -111,6 +111,7 @@ end tell"#
         let output = tokio::process::Command::new("osascript")
             .arg("-e")
             .arg(&script)
+            .kill_on_drop(true)
             .output()
             .await?;
 
@@ -141,7 +142,7 @@ end tell"#
         // Open a persistent read-only connection instead of creating
         // a new one on every 3-second poll cycle.
         let path = db_path.to_path_buf();
-        let conn = tokio::task::spawn_blocking(move || -> anyhow::Result<Connection> {
+        let conn = crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Connection> {
             Ok(Connection::open_with_flags(
                 &path,
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -150,23 +151,24 @@ end tell"#
         .await??;
 
         // Track the last ROWID we've seen (shuttle conn in and out)
-        let (mut conn, initial_rowid) = tokio::task::spawn_blocking(move || -> anyhow::Result<(Connection, i64)> {
-            let rowid = {
-                let mut stmt = conn.prepare("SELECT MAX(ROWID) FROM message WHERE is_from_me = 0")?;
-                let rowid: Option<i64> = stmt.query_row([], |row| row.get(0))?;
-                rowid.unwrap_or(0)
-            };
-            Ok((conn, rowid))
-        })
-        .await??;
+        let (mut conn, initial_rowid) =
+            crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<(Connection, i64)> {
+                let rowid = {
+                    let mut stmt = conn.prepare("SELECT MAX(ROWID) FROM message WHERE is_from_me = 0")?;
+                    let rowid: Option<i64> = stmt.query_row([], |row| row.get(0))?;
+                    rowid.unwrap_or(0)
+                };
+                Ok((conn, rowid))
+            })
+            .await??;
         let mut last_rowid = initial_rowid;
 
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(self.poll_interval_secs)).await;
 
             let since = last_rowid;
-            let (returned_conn, poll_result) =
-                tokio::task::spawn_blocking(move || -> (Connection, anyhow::Result<Vec<(i64, String, String)>>) {
+            let (returned_conn, poll_result) = crate::runtime::blocking::spawn_blocking(
+                move || -> (Connection, anyhow::Result<Vec<(i64, String, String)>>) {
                     let result = (|| -> anyhow::Result<Vec<(i64, String, String)>> {
                         let mut stmt = conn.prepare(
                             "SELECT m.ROWID, h.id, m.text \
@@ -190,9 +192,10 @@ end tell"#
                     })();
 
                     (conn, result)
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("iMessage poll worker join error: {e}"))?;
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("iMessage poll worker join error: {e}"))?;
             conn = returned_conn;
 
             match poll_result {
@@ -261,7 +264,7 @@ end tell"#
 #[cfg(test)]
 async fn get_max_rowid(db_path: &Path) -> anyhow::Result<i64> {
     let path = db_path.to_path_buf();
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
+    let result = crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<i64> {
         let conn = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -281,7 +284,7 @@ async fn get_max_rowid(db_path: &Path) -> anyhow::Result<i64> {
 #[cfg(test)]
 async fn fetch_new_messages(db_path: &Path, since_rowid: i64) -> anyhow::Result<Vec<(i64, String, String)>> {
     let path = db_path.to_path_buf();
-    let results = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(i64, String, String)>> {
+    let results = crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<(i64, String, String)>> {
         let conn = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,

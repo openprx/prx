@@ -36,7 +36,11 @@ impl Tunnel for TailscaleTunnel {
             h.clone()
         } else {
             // Query tailscale for the current hostname
-            let output = Command::new("tailscale").args(["status", "--json"]).output().await?;
+            let output = Command::new("tailscale")
+                .args(["status", "--json"])
+                .kill_on_drop(true)
+                .output()
+                .await?;
 
             if !output.status.success() {
                 bail!("tailscale status failed: {}", String::from_utf8_lossy(&output.stderr));
@@ -76,6 +80,7 @@ impl Tunnel for TailscaleTunnel {
         let subcommand = if self.funnel { "funnel" } else { "serve" };
         Command::new("tailscale")
             .args([subcommand, "reset"])
+            .kill_on_drop(true)
             .output()
             .await
             .ok();

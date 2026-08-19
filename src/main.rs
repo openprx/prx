@@ -977,15 +977,41 @@ enum DoctorCommands {
 /// well-behaved shutdowns time to finish while preventing the foot-gun.
 const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Resolve the blocking-pool cap before the runtime exists.
+///
+/// The pool size is fixed at `Builder` time, so it cannot come from the normal
+/// config load (which is async and needs a runtime). We therefore do a
+/// synchronous, read-only pre-read of `[runtime] max_blocking_threads`, falling
+/// back to a cgroup-aware hardware-derived default.
+///
+/// `try_parse` rather than `parse`: a malformed command line must still reach
+/// the real `Cli::parse()` in `async_main` so the user gets clap's diagnostics,
+/// not a bootstrap failure.
+fn resolve_max_blocking_threads() -> usize {
+    let explicit_config_dir = Cli::try_parse().ok().and_then(|cli| cli.config_dir);
+    openprx::config::bootstrap_max_blocking_threads(explicit_config_dir.as_deref())
+        .unwrap_or_else(openprx::runtime::blocking::default_max_blocking_threads)
+}
+
 #[allow(unsafe_code)]
 fn main() -> Result<()> {
     // Build the runtime explicitly (instead of using `#[tokio::main]`) so
     // that we can bound how long runtime drop waits for blocking threads.
     // See `RUNTIME_SHUTDOWN_TIMEOUT` above for the rationale.
+    //
+    // The blocking pool is sized explicitly too. Tokio's default is a
+    // hardware-agnostic 512 threads, which is the process's last implicit
+    // concurrency gate now that turns, sub-agents and sessions are unbounded —
+    // and it fails by deadlock, not rejection: once every slot is held, further
+    // `spawn_blocking` calls queue forever with no timeout.
+    let max_blocking_threads = resolve_max_blocking_threads();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .max_blocking_threads(max_blocking_threads)
         .build()
         .context("failed to build tokio runtime")?;
+    // Publish the real cap so blocking-pool saturation is measured against it.
+    openprx::runtime::blocking::configure(max_blocking_threads);
     let result = runtime.block_on(async_main());
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
     result

@@ -10,11 +10,12 @@ use super::{embeddings, vector};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use postgres::{Client, GenericClient, NoTls, Row};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// D11: lower the shared dialect-agnostic scope parameters into owned strings
@@ -40,6 +41,26 @@ const PG_DIALECT: crate::memory::session_predicate::PlaceholderDialect =
 const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
 const POSTGRES_EMBEDDING_CACHE_MAX_ROWS: i64 = 10_000;
 
+/// Default ceiling on live pooled PostgreSQL connections.
+///
+/// PRX is positioned as an LLM agent runtime that does not cap task
+/// concurrency, so the pool is sized generously and exists for connection
+/// *reuse*, never as a throttle: a caller that finds it saturated queues for a
+/// connection instead of failing. Deployments with a different
+/// `max_connections` budget override this via
+/// `[storage.provider.config].pool_max_size`.
+const POSTGRES_DEFAULT_POOL_MAX_SIZE: usize = 32;
+
+/// Default timeout for *establishing* a connection when none is configured.
+///
+/// This is deliberately the only timeout this backend applies. A stalled TCP or
+/// startup handshake is a network fault rather than a long-running task, so
+/// bounding it keeps a dead endpoint from wedging checkouts forever. Statement
+/// execution is never bounded (no `statement_timeout` is set anywhere in this
+/// backend) and waiting for a pooled connection is never bounded either,
+/// because long queries and queueing are both normal for agent workloads.
+const POSTGRES_DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 15;
+
 /// FIX-P2-03: safety cap on the BYTEA-fallback (no-pgvector) candidate scan.
 ///
 /// When pgvector is unavailable we cannot `ORDER BY` vector distance in SQL, so
@@ -60,7 +81,7 @@ const POSTGRES_BYTEA_FALLBACK_CANDIDATE_CAP: i64 = 4_096;
 /// This backend focuses on reliable CRUD and keyword recall using SQL, without
 /// requiring extension setup (for example pgvector).
 pub struct PostgresMemory {
-    client: Arc<PostgresClientSlot>,
+    client: Arc<PostgresConnectionPool>,
     /// Quoted schema identifier (for example `"public"`). Used to build the
     /// qualified names of schema-scoped helper tables (sessions,
     /// conversation_turns, identity_bindings, user_policies, access_audit_log)
@@ -83,43 +104,348 @@ pub struct PostgresMemory {
     keyword_weight: f32,
 }
 
-struct PostgresClientSlot {
-    client: Mutex<Option<Client>>,
+/// Point-in-time snapshot of PostgreSQL connection pool utilisation.
+///
+/// Exposed so an observability surface can chart saturation without reaching
+/// into pool internals. `in_use + idle` is the number of live connections the
+/// pool currently owns, and `waiters` is how many checkouts are queued because
+/// the pool is already at `max_size`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PostgresPoolStats {
+    /// Configured ceiling on live connections.
+    pub max_size: usize,
+    /// Connections checked out, including in-flight connect attempts.
+    pub in_use: usize,
+    /// Established connections parked for reuse.
+    pub idle: usize,
+    /// Checkouts currently blocked waiting for a connection to come back.
+    pub waiters: usize,
+    /// Total checkouts served since startup.
+    pub acquisitions: u64,
+    /// Checkouts that had to wait because the pool was saturated.
+    pub saturated_acquisitions: u64,
+    /// Cumulative time callers spent waiting to obtain a connection.
+    pub total_wait: Duration,
+    /// Connections established since startup.
+    pub connects: u64,
+    /// Connections torn down instead of recycled.
+    pub discards: u64,
 }
 
-impl PostgresClientSlot {
-    const fn new(client: Client) -> Self {
+#[derive(Debug, Default)]
+struct PostgresPoolMetrics {
+    acquisitions: AtomicU64,
+    saturated_acquisitions: AtomicU64,
+    wait_nanos: AtomicU64,
+    connects: AtomicU64,
+    discards: AtomicU64,
+}
+
+/// Mutable pool state guarded by a single lock.
+struct PostgresPoolState {
+    /// Established connections available for reuse.
+    idle: Vec<Client>,
+    /// Connections handed to callers plus slots reserved for connect attempts.
+    /// Tracked separately from `idle` so `leased + idle.len()` never exceeds
+    /// `max_size`.
+    leased: usize,
+    /// Callers currently parked on `available`.
+    waiters: usize,
+    /// Set during teardown so queued callers fail instead of hanging forever.
+    closed: bool,
+}
+
+/// A bounded pool of synchronous PostgreSQL connections.
+///
+/// The `postgres` crate ships a blocking client with no pool of its own, and
+/// every caller here already runs inside `tokio::task::spawn_blocking`, so a
+/// blocking pool is the right shape. It is built on the `parking_lot`
+/// primitives this crate already depends on rather than pulling in `r2d2`,
+/// because `r2d2` cannot express an unbounded checkout wait: its `get()`
+/// always carries a deadline, and failing work merely because the pool is
+/// momentarily busy is exactly the behaviour this runtime must not have.
+///
+/// The pool is a connection *reuse* mechanism, not a concurrency limiter.
+/// Connections are opened lazily on first demand.
+struct PostgresConnectionPool {
+    state: Mutex<PostgresPoolState>,
+    /// Signalled whenever a connection is returned or a reserved slot is freed.
+    available: Condvar,
+    db_url: String,
+    connect_timeout: Duration,
+    max_size: usize,
+    metrics: PostgresPoolMetrics,
+}
+
+impl PostgresConnectionPool {
+    fn new(db_url: String, connect_timeout_secs: Option<u64>, max_size: usize) -> Self {
+        let timeout_secs = connect_timeout_secs
+            .unwrap_or(POSTGRES_DEFAULT_CONNECT_TIMEOUT_SECS)
+            .clamp(1, POSTGRES_CONNECT_TIMEOUT_CAP_SECS);
         Self {
-            client: Mutex::new(Some(client)),
+            state: Mutex::new(PostgresPoolState {
+                idle: Vec::new(),
+                leased: 0,
+                waiters: 0,
+                closed: false,
+            }),
+            available: Condvar::new(),
+            db_url,
+            connect_timeout: Duration::from_secs(timeout_secs),
+            max_size: max_size.max(1),
+            metrics: PostgresPoolMetrics::default(),
         }
     }
 
+    /// Open a new connection.
+    ///
+    /// Only the handshake is bounded: `connect_timeout` covers TCP/startup, and
+    /// nothing here sets `statement_timeout`.
+    fn connect_new(&self) -> Result<Client> {
+        let mut config: postgres::Config = self.db_url.parse().context("invalid PostgreSQL connection URL")?;
+        config.connect_timeout(self.connect_timeout);
+        config
+            .connect(NoTls)
+            .context("failed to connect to PostgreSQL memory backend")
+    }
+
+    /// Check out a connection, waiting indefinitely when the pool is saturated.
+    ///
+    /// Queueing is the intended back-pressure: this runtime does not cap task
+    /// concurrency, so a busy pool must slow callers down rather than fail work
+    /// that is only waiting its turn. The wait is therefore deadline-free, and
+    /// its duration is recorded instead so saturation stays observable.
+    fn acquire(&self) -> Result<PooledConnection<'_>> {
+        let started = Instant::now();
+        let mut waited = false;
+        let mut guard = self.state.lock();
+        loop {
+            if guard.closed {
+                anyhow::bail!("PostgreSQL memory backend pool is closed");
+            }
+
+            if let Some(client) = guard.idle.pop() {
+                if client.is_closed() {
+                    // Never hand out a connection the server already closed.
+                    MutexGuard::unlocked(&mut guard, || {
+                        self.metrics.discards.fetch_add(1, Ordering::Relaxed);
+                        drop_client_off_runtime(client);
+                    });
+                    continue;
+                }
+                guard.leased += 1;
+                self.record_acquisition(started, waited);
+                return Ok(PooledConnection {
+                    pool: self,
+                    client: Some(client),
+                    recycled: true,
+                });
+            }
+
+            if guard.leased < self.max_size {
+                // Reserve the slot before unlocking so concurrent callers
+                // cannot collectively overshoot `max_size` while this handshake
+                // is in flight.
+                guard.leased += 1;
+                match MutexGuard::unlocked(&mut guard, || self.connect_new()) {
+                    Ok(client) => {
+                        self.metrics.connects.fetch_add(1, Ordering::Relaxed);
+                        self.record_acquisition(started, waited);
+                        return Ok(PooledConnection {
+                            pool: self,
+                            client: Some(client),
+                            recycled: false,
+                        });
+                    }
+                    Err(error) => {
+                        // Hand the reserved slot back, otherwise a transient
+                        // connect failure would permanently shrink the pool.
+                        guard.leased = guard.leased.saturating_sub(1);
+                        self.available.notify_one();
+                        return Err(error);
+                    }
+                }
+            }
+
+            waited = true;
+            guard.waiters += 1;
+            self.available.wait(&mut guard);
+            guard.waiters = guard.waiters.saturating_sub(1);
+        }
+    }
+
+    fn record_acquisition(&self, started: Instant, waited: bool) {
+        let elapsed = started.elapsed();
+        self.metrics.acquisitions.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .wait_nanos
+            .fetch_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed);
+        if waited {
+            self.metrics.saturated_acquisitions.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                waited_ms = elapsed.as_millis(),
+                max_size = self.max_size,
+                "PostgreSQL connection pool saturated; checkout was queued"
+            );
+        }
+    }
+
+    /// Return a connection, or release a reserved slot when `client` is `None`.
+    fn release_slot(&self, client: Option<Client>) {
+        let discarded = {
+            let mut guard = self.state.lock();
+            guard.leased = guard.leased.saturating_sub(1);
+            match client {
+                // A connection the server closed underneath us must never be
+                // recycled, or the next caller inherits the failure.
+                Some(client) if !guard.closed && !client.is_closed() => {
+                    guard.idle.push(client);
+                    None
+                }
+                other => other,
+            }
+        };
+        self.available.notify_one();
+        if let Some(client) = discarded {
+            self.metrics.discards.fetch_add(1, Ordering::Relaxed);
+            drop_client_off_runtime(client);
+        }
+    }
+
+    fn stats(&self) -> PostgresPoolStats {
+        let guard = self.state.lock();
+        PostgresPoolStats {
+            max_size: self.max_size,
+            in_use: guard.leased,
+            idle: guard.idle.len(),
+            waiters: guard.waiters,
+            acquisitions: self.metrics.acquisitions.load(Ordering::Relaxed),
+            saturated_acquisitions: self.metrics.saturated_acquisitions.load(Ordering::Relaxed),
+            total_wait: Duration::from_nanos(self.metrics.wait_nanos.load(Ordering::Relaxed)),
+            connects: self.metrics.connects.load(Ordering::Relaxed),
+            discards: self.metrics.discards.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Check out a connection whose session context has been reset to the
+    /// neutral system state, reconnecting once when a recycled connection turns
+    /// out to have been closed by the server (restart, failover, idle reaper).
+    fn acquire_reset(&self) -> Result<PooledConnection<'_>> {
+        // Bounded so a pathological churn cycle cannot spin forever. Every
+        // iteration either returns or permanently removes one connection from
+        // the pool, and an exhausted pool opens a fresh connection, so the loop
+        // makes progress and only ever reaches the bound under active churn.
+        let attempts = self.max_size.saturating_add(2);
+        let mut last_error = None;
+        for _ in 0..attempts {
+            let mut checkout = self.acquire()?;
+            let recycled = checkout.recycled;
+            // Pooled clients are reused across requests, while PostgreSQL RLS
+            // settings are session-scoped. Always start a checkout in the
+            // neutral system context; owner-scoped operations override this on
+            // the same checkout before issuing their query. This prevents one
+            // principal's owner setting from leaking into the next operation,
+            // and is why a connection is never shared concurrently.
+            let reset = checkout.client_mut().and_then(|client| {
+                client
+                    .execute("SELECT set_config('prx.rls_bypass', 'on', false)", &[])
+                    .context("failed to reset PostgreSQL session context")
+            });
+            match reset {
+                Ok(_) => return Ok(checkout),
+                Err(error) => {
+                    checkout.discard();
+                    // A recycled connection may have been closed by the server
+                    // (restart, failover, idle reaper) since its last use, so
+                    // drop it and try the next one. A *freshly opened*
+                    // connection failing the reset is a real fault instead, and
+                    // is reported as-is.
+                    if !recycled {
+                        return Err(error);
+                    }
+                    tracing::debug!(%error, "discarding stale pooled PostgreSQL connection");
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("failed to obtain a usable PostgreSQL connection")))
+    }
+
     fn with_client<T>(&self, f: impl FnOnce(&mut Client) -> Result<T>) -> Result<T> {
-        let mut guard = self.client.lock();
-        let client = guard.as_mut().context("PostgreSQL memory backend client is closed")?;
-        // The synchronous client is reused across requests, while PostgreSQL
-        // RLS settings are session-scoped. Always start a checkout in the
-        // neutral system context; owner-scoped operations override this inside
-        // the same lock before issuing their query. This prevents one
-        // principal's owner setting from leaking into the next operation.
-        client.execute("SELECT set_config('prx.rls_bypass', 'on', false)", &[])?;
-        f(client)
+        let mut checkout = self.acquire_reset()?;
+        f(checkout.client_mut()?)
     }
 }
 
-impl Drop for PostgresClientSlot {
+impl Drop for PostgresConnectionPool {
     fn drop(&mut self) {
-        let Some(client) = self.client.get_mut().take() else {
-            return;
+        let idle = {
+            let mut guard = self.state.lock();
+            guard.closed = true;
+            std::mem::take(&mut guard.idle)
         };
+        // Wake anyone still queued so they observe the closed pool.
+        self.available.notify_all();
+        if idle.is_empty() {
+            return;
+        }
 
         let handle = std::thread::Builder::new()
             .name("postgres-memory-drop".to_string())
-            .spawn(move || drop(client));
+            .spawn(move || drop(idle));
 
         if let Ok(handle) = handle {
             let _ = handle.join();
         }
+    }
+}
+
+/// A connection checked out of [`PostgresConnectionPool`].
+///
+/// Returning it to the pool happens in `Drop`, so a caller that fails or
+/// unwinds mid-query can never leak a slot.
+struct PooledConnection<'pool> {
+    pool: &'pool PostgresConnectionPool,
+    client: Option<Client>,
+    /// `true` when the connection came from the idle list and therefore may
+    /// have been closed by the server since its last use.
+    recycled: bool,
+}
+
+impl PooledConnection<'_> {
+    fn client_mut(&mut self) -> Result<&mut Client> {
+        self.client
+            .as_mut()
+            .context("pooled PostgreSQL connection is unavailable")
+    }
+
+    /// Tear this connection down instead of recycling it.
+    fn discard(&mut self) {
+        if let Some(client) = self.client.take() {
+            self.pool.metrics.discards.fetch_add(1, Ordering::Relaxed);
+            drop_client_off_runtime(client);
+        }
+    }
+}
+
+impl Drop for PooledConnection<'_> {
+    fn drop(&mut self) {
+        self.pool.release_slot(self.client.take());
+    }
+}
+
+/// Tear a client down on a dedicated OS thread.
+///
+/// `postgres::Client` owns an internal Tokio runtime, and dropping a runtime
+/// from within a runtime context panics. Checkouts run on `spawn_blocking`
+/// workers that still carry that context, so connections are always dropped off
+/// the runtime rather than inline.
+fn drop_client_off_runtime(client: Client) {
+    if let Err(error) = std::thread::Builder::new()
+        .name("postgres-memory-drop".to_string())
+        .spawn(move || drop(client))
+    {
+        tracing::warn!(%error, "failed to spawn PostgreSQL connection teardown thread");
     }
 }
 
@@ -155,9 +481,14 @@ impl PostgresMemory {
         let chunks = related_table_name(table, "_document_chunks")?;
         let cache = related_table_name(table, "_embedding_cache")?;
         let mut pg_config: postgres::Config = db_url.parse().context("invalid PostgreSQL connection URL")?;
-        if let Some(timeout) = connect_timeout_secs {
-            pg_config.connect_timeout(Duration::from_secs(timeout.max(1)));
-        }
+        // A stalled handshake is a network fault, not a long-running task, so it
+        // stays bounded even when the operator configures nothing. See
+        // `POSTGRES_DEFAULT_CONNECT_TIMEOUT_SECS`.
+        pg_config.connect_timeout(Duration::from_secs(
+            connect_timeout_secs
+                .unwrap_or(POSTGRES_DEFAULT_CONNECT_TIMEOUT_SECS)
+                .clamp(1, POSTGRES_CONNECT_TIMEOUT_CAP_SECS),
+        ));
         let mut client = pg_config
             .connect(NoTls)
             .context("PostgreSQL isolation evidence connection failed")?;
@@ -256,6 +587,7 @@ impl PostgresMemory {
             vector_weight,
             keyword_weight,
             usize::try_from(POSTGRES_EMBEDDING_CACHE_MAX_ROWS).unwrap_or(10_000),
+            POSTGRES_DEFAULT_POOL_MAX_SIZE,
         )
     }
 
@@ -268,6 +600,7 @@ impl PostgresMemory {
         vector_weight: f32,
         keyword_weight: f32,
         cache_max: usize,
+        pool_max_size: usize,
     ) -> Result<Self> {
         validate_identifier(schema, "storage schema")?;
         validate_identifier(table, "storage table")?;
@@ -304,9 +637,10 @@ impl PostgresMemory {
         let qualified_embedding_cache_table = format!("{schema_ident}.{embedding_cache_table_ident}");
 
         let schema_ident_field = schema_ident.clone();
-        let (client, pgvector_available) = Self::initialize_client(
+        let (pool, pgvector_available) = Self::initialize_pool(
             db_url.to_string(),
             connect_timeout_secs,
+            pool_max_size,
             schema_ident,
             qualified_table.clone(),
             qualified_message_events_table.clone(),
@@ -322,7 +656,7 @@ impl PostgresMemory {
         )?;
 
         Ok(Self {
-            client: Arc::new(PostgresClientSlot::new(client)),
+            client: pool,
             schema_ident: schema_ident_field,
             qualified_table,
             qualified_message_events_table,
@@ -342,9 +676,15 @@ impl PostgresMemory {
         })
     }
 
-    fn initialize_client(
+    /// Build the connection pool and run schema initialisation through it.
+    ///
+    /// Initialisation runs on a dedicated OS thread because this constructor is
+    /// reachable from an async context, and the blocking `postgres` client
+    /// cannot open a connection from inside a Tokio runtime.
+    fn initialize_pool(
         db_url: String,
         connect_timeout_secs: Option<u64>,
+        pool_max_size: usize,
         schema_ident: String,
         qualified_table: String,
         qualified_message_events_table: String,
@@ -357,43 +697,41 @@ impl PostgresMemory {
         qualified_compaction_runs_table: String,
         qualified_embedding_cache_table: String,
         embedding_dimensions: usize,
-    ) -> Result<(Client, bool)> {
+    ) -> Result<(Arc<PostgresConnectionPool>, bool)> {
+        let pool = Arc::new(PostgresConnectionPool::new(db_url, connect_timeout_secs, pool_max_size));
+        let init_pool = Arc::clone(&pool);
         let init_handle = std::thread::Builder::new()
             .name("postgres-memory-init".to_string())
-            .spawn(move || -> Result<(Client, bool)> {
-                let mut config: postgres::Config = db_url.parse().context("invalid PostgreSQL connection URL")?;
-
-                if let Some(timeout_secs) = connect_timeout_secs {
-                    let bounded = timeout_secs.min(POSTGRES_CONNECT_TIMEOUT_CAP_SECS);
-                    config.connect_timeout(Duration::from_secs(bounded));
-                }
-
-                let mut client = config
-                    .connect(NoTls)
-                    .context("failed to connect to PostgreSQL memory backend")?;
-
-                let pgvector_available = Self::init_schema(
-                    &mut client,
-                    &schema_ident,
-                    &qualified_table,
-                    &qualified_message_events_table,
-                    &qualified_memory_events_table,
-                    &qualified_drafts_table,
-                    &qualified_documents_table,
-                    &qualified_document_chunks_table,
-                    &qualified_memory_links_table,
-                    &qualified_retrieval_traces_table,
-                    &qualified_compaction_runs_table,
-                    &qualified_embedding_cache_table,
-                    embedding_dimensions,
-                )?;
-                Ok((client, pgvector_available))
+            .spawn(move || -> Result<bool> {
+                init_pool.with_client(|client| {
+                    Self::init_schema(
+                        client,
+                        &schema_ident,
+                        &qualified_table,
+                        &qualified_message_events_table,
+                        &qualified_memory_events_table,
+                        &qualified_drafts_table,
+                        &qualified_documents_table,
+                        &qualified_document_chunks_table,
+                        &qualified_memory_links_table,
+                        &qualified_retrieval_traces_table,
+                        &qualified_compaction_runs_table,
+                        &qualified_embedding_cache_table,
+                        embedding_dimensions,
+                    )
+                })
             })
             .context("failed to spawn PostgreSQL initializer thread")?;
 
-        init_handle
+        let pgvector_available = init_handle
             .join()
-            .map_err(|_| anyhow::anyhow!("PostgreSQL initializer thread panicked"))?
+            .map_err(|_| anyhow::anyhow!("PostgreSQL initializer thread panicked"))??;
+        Ok((pool, pgvector_available))
+    }
+
+    /// Current connection pool utilisation, for observability surfaces.
+    pub fn pool_stats(&self) -> PostgresPoolStats {
+        self.client.stats()
     }
 
     // SAFETY: `schema_ident` and `qualified_table` are validated+quoted at
@@ -1865,7 +2203,7 @@ impl PostgresMemory {
     /// System/owner principals are not audited. Best-effort: a logging failure
     /// must not abort the caller's operation, so errors are traced and dropped.
     fn log_access_best_effort_blocking(
-        client: &PostgresClientSlot,
+        client: &PostgresConnectionPool,
         audit_table: &str,
         principal: &Principal,
         action: &str,
@@ -1906,7 +2244,7 @@ impl PostgresMemory {
     }
 
     async fn log_access_best_effort(
-        client: Arc<PostgresClientSlot>,
+        client: Arc<PostgresConnectionPool>,
         audit_table: String,
         principal: Principal,
         action: &'static str,
@@ -5573,6 +5911,123 @@ mod tests {
             outcome.unwrap().is_err(),
             "PostgresMemory::new should return a connect error for an unreachable endpoint"
         );
+    }
+
+    /// Exercises the connection pool against a live PostgreSQL instance:
+    /// concurrent checkouts genuinely overlap, a saturated pool makes callers
+    /// queue instead of fail, and a connection killed server-side is replaced
+    /// transparently on the next use.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn postgres_connection_pool_saturates_and_recovers_from_env() {
+        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let schema = format!("prx_pool_{}", Uuid::new_v4().simple());
+        const POOL_SIZE: usize = 4;
+        const CONCURRENCY: usize = 24;
+
+        let mem = Arc::new(
+            PostgresMemory::with_embedder_and_cache(
+                &db_url,
+                &schema,
+                "memories",
+                Some(5),
+                Arc::new(embeddings::NoopEmbedding),
+                0.35,
+                0.65,
+                256,
+                POOL_SIZE,
+            )
+            .unwrap(),
+        );
+
+        // Far more concurrent work than connections: every call must complete.
+        let mut tasks = Vec::new();
+        for index in 0..CONCURRENCY {
+            let mem = Arc::clone(&mem);
+            tasks.push(tokio::spawn(async move {
+                mem.store(
+                    &format!("pool-key-{index}"),
+                    "pool contention probe",
+                    MemoryCategory::Core,
+                    None,
+                )
+                .await
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+
+        let stats = mem.pool_stats();
+        assert_eq!(stats.max_size, POOL_SIZE, "pool must honour the configured size");
+        assert!(
+            stats.connects <= POOL_SIZE as u64,
+            "pool must never open more connections than max_size, opened {}",
+            stats.connects
+        );
+        assert!(stats.idle <= POOL_SIZE, "idle connections must stay within max_size");
+        assert_eq!(stats.in_use, 0, "every checkout must be returned");
+        assert!(
+            stats.acquisitions >= CONCURRENCY as u64,
+            "every operation must have checked a connection out"
+        );
+        assert!(
+            stats.connects > 1,
+            "concurrent load must open more than one connection, opened {}",
+            stats.connects
+        );
+        assert!(
+            stats.saturated_acquisitions > 0,
+            "a pool of {POOL_SIZE} under {CONCURRENCY}-way load must have queued callers"
+        );
+        assert!(
+            stats.total_wait > Duration::ZERO,
+            "queued callers must record their wait time"
+        );
+
+        // Kill every pooled backend server-side, then prove the next call still
+        // succeeds: stale connections are discarded and replaced, not surfaced.
+        let kill_url = db_url.clone();
+        let kill_schema = schema.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut admin = kill_url.parse::<postgres::Config>().unwrap().connect(NoTls).unwrap();
+            admin
+                .execute(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                     WHERE pid <> pg_backend_pid() AND application_name IS NOT NULL \
+                     AND query LIKE $1",
+                    &[&format!("%{kill_schema}%")],
+                )
+                .unwrap();
+        })
+        .await
+        .unwrap();
+
+        let discards_before = mem.pool_stats().discards;
+        let recovered = mem.get("pool-key-0").await.unwrap();
+        assert!(
+            recovered.is_some(),
+            "pool must transparently reconnect after the server closes connections"
+        );
+        let stats = mem.pool_stats();
+        assert_eq!(stats.in_use, 0, "recovery must not leak a checkout slot");
+        assert!(stats.discards >= discards_before, "discard counter must not regress");
+
+        let cleanup_url = db_url.clone();
+        let cleanup_schema = schema.clone();
+        drop(mem);
+        tokio::task::spawn_blocking(move || {
+            let mut client = cleanup_url.parse::<postgres::Config>().unwrap().connect(NoTls).unwrap();
+            client
+                .batch_execute(&format!(
+                    "DROP SCHEMA IF EXISTS {} CASCADE",
+                    quote_identifier(&cleanup_schema)
+                ))
+                .unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

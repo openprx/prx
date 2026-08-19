@@ -95,10 +95,10 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 /// Per-sender conversation history for channel messages.
@@ -4307,7 +4307,7 @@ async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
     updated.save().await?;
     println!("✅ Bound Telegram identity: {normalized}");
     println!("   Saved to {}", updated.config_path.display());
-    match maybe_restart_managed_daemon_service() {
+    match maybe_restart_managed_daemon_service().await {
         Ok(true) => {
             println!("🔄 Detected running managed daemon service; reloaded automatically.");
         }
@@ -4326,7 +4326,7 @@ async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
     Ok(())
 }
 
-fn maybe_restart_managed_daemon_service() -> Result<bool> {
+async fn maybe_restart_managed_daemon_service() -> Result<bool> {
     if cfg!(target_os = "macos") {
         let home = directories::UserDirs::new()
             .map(|u| u.home_dir().to_path_buf())
@@ -4338,17 +4338,25 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
 
         let list_output = Command::new("launchctl")
             .arg("list")
+            .kill_on_drop(true)
             .output()
+            .await
             .context("Failed to query launchctl list")?;
         let listed = String::from_utf8_lossy(&list_output.stdout);
         if !listed.contains("com.prx.daemon") {
             return Ok(false);
         }
 
-        let _ = Command::new("launchctl").args(["stop", "com.prx.daemon"]).output();
+        let _ = Command::new("launchctl")
+            .args(["stop", "com.prx.daemon"])
+            .kill_on_drop(true)
+            .output()
+            .await;
         let start_output = Command::new("launchctl")
             .args(["start", "com.prx.daemon"])
+            .kill_on_drop(true)
             .output()
+            .await
             .context("Failed to start launchd daemon service")?;
         if !start_output.status.success() {
             let stderr = String::from_utf8_lossy(&start_output.stderr);
@@ -4362,12 +4370,19 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
         // OpenRC (system-wide) takes precedence over systemd (user-level)
         let openrc_init_script = PathBuf::from("/etc/init.d/prx");
         if openrc_init_script.exists() {
-            if let Ok(status_output) = Command::new("rc-service").args(OPENRC_STATUS_ARGS).output() {
+            if let Ok(status_output) = Command::new("rc-service")
+                .args(OPENRC_STATUS_ARGS)
+                .kill_on_drop(true)
+                .output()
+                .await
+            {
                 // rc-service exits 0 if running, non-zero otherwise
                 if status_output.status.success() {
                     let restart_output = Command::new("rc-service")
                         .args(OPENRC_RESTART_ARGS)
+                        .kill_on_drop(true)
                         .output()
+                        .await
                         .context("Failed to restart OpenRC daemon service")?;
                     if !restart_output.status.success() {
                         let stderr = String::from_utf8_lossy(&restart_output.stderr);
@@ -4389,7 +4404,9 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
 
         let active_output = Command::new("systemctl")
             .args(SYSTEMD_STATUS_ARGS)
+            .kill_on_drop(true)
             .output()
+            .await
             .context("Failed to query systemd service state")?;
         let state = String::from_utf8_lossy(&active_output.stdout);
         if !state.trim().eq_ignore_ascii_case("active") {
@@ -4398,7 +4415,9 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
 
         let restart_output = Command::new("systemctl")
             .args(SYSTEMD_RESTART_ARGS)
+            .kill_on_drop(true)
             .output()
+            .await
             .context("Failed to restart systemd daemon service")?;
         if !restart_output.status.success() {
             let stderr = String::from_utf8_lossy(&restart_output.stderr);

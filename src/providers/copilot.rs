@@ -553,7 +553,7 @@ async fn write_file_secure(path: &Path, content: &str) {
     let path = path.to_path_buf();
     let content = content.to_string();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = crate::runtime::blocking::spawn_blocking(move || {
         #[cfg(unix)]
         {
             use std::io::Write;

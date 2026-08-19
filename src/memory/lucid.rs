@@ -214,6 +214,7 @@ impl LucidMemory {
     ) -> anyhow::Result<String> {
         let mut cmd = Command::new(lucid_cmd);
         cmd.args(args);
+        cmd.kill_on_drop(true);
 
         let output = timeout(timeout_window, cmd.output())
             .await

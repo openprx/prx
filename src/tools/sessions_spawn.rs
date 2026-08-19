@@ -108,7 +108,9 @@ pub struct SubAgentRun {
     /// Accumulated conversation history from the sub-agent's execution.
     pub history: Arc<RwLock<Vec<HistoryEntry>>>,
     /// Channel to inject steering messages into the running sub-agent.
-    pub steer_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    ///
+    /// Bounded at [`STEER_CHANNEL_CAPACITY`]; see that constant for why.
+    pub steer_tx: Option<tokio::sync::mpsc::Sender<String>>,
     pub parent_run_id: Option<String>,
     pub session_scope_key: String,
     pub spawn_depth: usize,
@@ -1727,7 +1729,12 @@ impl Tool for SessionsSpawnTool {
 
         // Create shared history and steer channel for this run
         let history_arc: Arc<RwLock<Vec<HistoryEntry>>> = Arc::new(RwLock::new(Vec::new()));
-        let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // Class B — bounded. Steering messages are produced by operators and by
+        // model tool calls, neither of which is rate-limited now that sub-agent
+        // concurrency is uncapped, while the consumer only polls between tool
+        // iterations. An unbounded queue therefore grows for the whole lifetime
+        // of a long-running sub-agent.
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<String>(STEER_CHANNEL_CAPACITY);
 
         // Register the run (abort_handle set after spawn)
         {
@@ -2379,7 +2386,12 @@ impl SessionsSpawnTool {
         message: &str,
         approval_grant: Option<&ApprovalGrant>,
     ) -> anyhow::Result<ToolResult> {
-        let run_snapshot = {
+        // The steer sender is cloned out of the registry and the guard is
+        // dropped *before* the send. The channel is bounded, so a send can now
+        // park until the sub-agent drains it; parking while still holding a
+        // read guard would deadlock, because the receiving loop takes a write
+        // guard (`restore_running`) as its very next step after `recv`.
+        let (steer_tx, run_snapshot) = {
             let runs = self.active_runs.read().await;
             let Some(run) = runs.iter().find(|r| r.id == run_id) else {
                 return Ok(ToolResult {
@@ -2418,9 +2430,7 @@ impl SessionsSpawnTool {
                             error: Some(error),
                         });
                     }
-                    tx.send(message.to_string())
-                        .map_err(|_| anyhow::anyhow!("Sub-agent steer channel closed unexpectedly"))?;
-                    run.clone()
+                    (tx.clone(), run.clone())
                 }
                 SubAgentStatus::Completed(_) => {
                     return Ok(ToolResult {
@@ -2438,6 +2448,14 @@ impl SessionsSpawnTool {
                 }
             }
         };
+
+        // Backpressure, not loss: if the sub-agent has not drained its queue,
+        // this await slows the steering caller down instead of growing the
+        // queue without bound. `send` only fails once the receiver is gone.
+        steer_tx
+            .send(message.to_string())
+            .await
+            .map_err(|_| anyhow::anyhow!("Sub-agent steer channel closed unexpectedly"))?;
 
         self.record_active_run_task_event(
             &run_snapshot,
@@ -2641,6 +2659,18 @@ fn resolve_tools_for_agent(
 
     Arc::new(resolved)
 }
+
+/// Queue depth for a sub-agent's steering channel.
+///
+/// This is a backpressure valve, not a rate limit: it is sized so that no
+/// realistic operator or model ever reaches it, because a steering message is
+/// an explicit, deliberate redirection of a running agent — a session with a
+/// thousand of them pending has a runaway producer, not a busy one. When the
+/// queue does fill, `sessions_spawn:steer` parks on `send().await` so the
+/// producer is slowed rather than having messages dropped or the process
+/// growing without bound. Each queued entry is one operator string, so the
+/// worst-case memory held here is negligible next to the run's own history.
+pub(crate) const STEER_CHANNEL_CAPACITY: usize = 1024;
 
 /// Maximum tool-call iterations for a sub-agent run (per steering segment).
 const SUB_AGENT_MAX_ITERATIONS: usize = 200;
@@ -2875,7 +2905,7 @@ async fn run_sub_agent_task(
     multimodal_config: &MultimodalConfig,
     compaction_config: &AgentCompactionConfig,
     max_iterations: usize,
-    mut steer_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    mut steer_rx: tokio::sync::mpsc::Receiver<String>,
     history_out: Arc<RwLock<Vec<HistoryEntry>>>,
     scope: Option<SpawnScope>,
     memory: Option<Arc<dyn Memory>>,
@@ -4555,7 +4585,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_mode_no_tools_preserves_single_turn_trace_usage() {
-        let (_steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_steer_tx, steer_rx) = tokio::sync::mpsc::channel(STEER_CHANNEL_CAPACITY);
         let history_out = Arc::new(RwLock::new(Vec::new()));
 
         let result = run_sub_agent_task(
@@ -5757,6 +5787,94 @@ mod tests {
         assert!(result.error.unwrap().contains("No run found"));
     }
 
+    /// Backpressure contract for a sub-agent's steering channel.
+    ///
+    /// The channel is bounded, so when a sub-agent has not drained it the
+    /// steering tool must *park* rather than drop the message or fail. Just as
+    /// importantly, it must park without holding the `active_runs` guard —
+    /// otherwise the very loop that would free a slot (which takes a write
+    /// guard right after `recv`) could never run, and backpressure would become
+    /// deadlock.
+    #[tokio::test]
+    async fn steer_backpressures_when_full_without_dropping_or_holding_the_registry_lock() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+        let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel(STEER_CHANNEL_CAPACITY);
+        let filler = steer_tx.clone();
+        {
+            let mut runs = tool.active_runs.write().await;
+            runs.push(SubAgentRun {
+                id: "run-backpressure".to_string(),
+                task: "task".to_string(),
+                owner_id: None,
+                topic_id: None,
+                source_message_event_id: None,
+                started_at: Utc::now(),
+                finished_at: None,
+                status: SubAgentStatus::Running,
+                recipient: None,
+                channel_name: None,
+                abort_handle: None,
+                process_control: None,
+                history: Arc::new(RwLock::new(Vec::new())),
+                steer_tx: Some(steer_tx),
+                parent_run_id: None,
+                session_scope_key: "test-session".to_string(),
+                spawn_depth: 0,
+                token_usage_records: Vec::new(),
+            });
+        }
+
+        for i in 0..STEER_CHANNEL_CAPACITY {
+            filler
+                .try_send(format!("filler-{i}"))
+                .expect("channel accepts messages up to its capacity");
+        }
+        assert!(
+            filler.try_send("overflow".to_string()).is_err(),
+            "steer channel must be bounded at STEER_CHANNEL_CAPACITY"
+        );
+
+        let steer = tool.execute(json!({
+            "action": "steer",
+            "run_id": "run-backpressure",
+            "message": "pivot now",
+        }));
+        tokio::pin!(steer);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut steer)
+                .await
+                .is_err(),
+            "a full steer queue must slow the producer, not complete or drop"
+        );
+
+        // The parked steer released the registry guard before awaiting, so the
+        // sub-agent loop can still reach the receiver. This read would hang if
+        // the guard were held across the send.
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), tool.active_runs.read())
+                .await
+                .expect("registry stays readable while a steer is parked")
+                .len(),
+            1
+        );
+
+        // Freeing one slot wakes the parked producer.
+        assert_eq!(steer_rx.recv().await.as_deref(), Some("filler-0"));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), steer)
+            .await
+            .expect("parked steer resumes once the sub-agent drains")
+            .expect("steer tool call succeeds");
+        assert!(result.success, "{result:?}");
+
+        // Nothing was dropped: every filler still arrives, in order, followed by
+        // the message that had been waiting on backpressure.
+        for i in 1..STEER_CHANNEL_CAPACITY {
+            assert_eq!(steer_rx.recv().await, Some(format!("filler-{i}")));
+        }
+        assert_eq!(steer_rx.recv().await.as_deref(), Some("pivot now"));
+    }
+
     #[tokio::test]
     async fn steer_action_persists_task_event() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -5764,7 +5882,7 @@ mod tests {
         let (ch, _) = RecordingChannel::new();
         let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }))
             .with_shared_memory(memory.clone());
-        let (steer_tx, mut steer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel(STEER_CHANNEL_CAPACITY);
         {
             let mut runs = tool.active_runs.write().await;
             runs.push(SubAgentRun {

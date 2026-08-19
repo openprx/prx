@@ -243,7 +243,11 @@ impl SubagentsTool {
         message: &str,
         approval_grant: Option<&ApprovalGrant>,
     ) -> anyhow::Result<ToolResult> {
-        let steered_run = {
+        // The sender is cloned out and the registry guard dropped before the
+        // send: the steer channel is bounded, so a send can park until the
+        // sub-agent drains it, and parking while holding this guard would
+        // deadlock against the receiving loop's own registry writes.
+        let (steer_tx, steered_run) = {
             let runs = self.active_runs.read().await;
             let Some(run) = runs.iter().find(|r| r.id == run_id) else {
                 return Ok(ToolResult {
@@ -269,9 +273,7 @@ impl SubagentsTool {
                                 error: Some(error),
                             });
                         }
-                        tx.send(message.to_string())
-                            .map_err(|_| anyhow::anyhow!("Subagent message channel closed"))?;
-                        run.clone()
+                        (tx.clone(), run.clone())
                     } else {
                         return Ok(ToolResult {
                             success: false,
@@ -296,6 +298,14 @@ impl SubagentsTool {
                 }
             }
         };
+
+        // Backpressure, not loss: a full queue slows this caller down instead of
+        // growing without bound. `send` only fails once the receiver is gone.
+        steer_tx
+            .send(message.to_string())
+            .await
+            .map_err(|_| anyhow::anyhow!("Subagent message channel closed"))?;
+
         self.record_run_task_event(
             &steered_run,
             "task.steered",
@@ -655,7 +665,7 @@ mod tests {
 
     #[tokio::test]
     async fn steer_running_sends_message() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(crate::tools::sessions_spawn::STEER_CHANNEL_CAPACITY);
         let run = SubAgentRun {
             id: "run-2".into(),
             task: "task".into(),
@@ -690,7 +700,7 @@ mod tests {
     async fn steer_running_records_task_event() {
         let tmp = tempfile::TempDir::new().unwrap();
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(crate::tools::sessions_spawn::STEER_CHANNEL_CAPACITY);
         let run = SubAgentRun {
             id: "run-steer-ledger".into(),
             task: "task".into(),
