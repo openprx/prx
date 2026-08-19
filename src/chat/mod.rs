@@ -282,18 +282,6 @@ const DELTA_CHANNEL_CAPACITY: usize = 64;
 /// Capacity for the tool-call notification mpsc channel (visual feedback).
 const TOOL_EVENT_CHANNEL_CAPACITY: usize = 32;
 
-/// Minimum base timeout (seconds) for per-turn timeout budget.
-const TIMEOUT_MIN_BASE_SECS: u64 = 30;
-
-/// Maximum multiplier applied to the base timeout (caps iterations-based scaling).
-const TIMEOUT_MAX_SCALE_FACTOR: u64 = 4;
-
-pub(crate) fn turn_timeout_budget(message_timeout_secs: u64, max_tool_iterations: usize) -> Duration {
-    let base = message_timeout_secs.max(TIMEOUT_MIN_BASE_SECS);
-    let scale = (max_tool_iterations.max(1) as u64).min(TIMEOUT_MAX_SCALE_FACTOR);
-    Duration::from_secs(base.saturating_mul(scale))
-}
-
 const FILE_MENTION_MAX_FILES: usize = 5;
 const FILE_MENTION_MAX_BYTES: usize = 64 * 1024;
 
@@ -4070,10 +4058,6 @@ pub async fn run(
             temperature,
             tools_registry: Some(Arc::clone(&tools_registry)),
             max_tool_iterations: config.agent.max_tool_iterations,
-            turn_timeout_budget: Some(turn_timeout_budget(
-                config.channels_config.message_timeout_secs,
-                config.agent.max_tool_iterations,
-            )),
             approval_router: Arc::new(dispatcher::ApprovalRouter::new()),
             tool_security_policy: Arc::clone(&security),
         };
@@ -6957,12 +6941,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
             config_source_revision: runtime_envelope.config_source_revision.as_deref(),
         };
 
-        // ── Timeout budget ───────────────────────────────────────
-        let timeout_budget = turn_timeout_budget(
-            config.channels_config.message_timeout_secs,
-            config.agent.max_tool_iterations,
-        );
-
         let effective_compaction = crate::router::resolve_effective_compaction_config(
             &config.agent.compaction,
             provider_name,
@@ -7008,13 +6986,15 @@ Retry with a compatible model: /provider {new_provider} <model>"
         }
         let provider_started_at = chrono::Utc::now();
 
-        // ── Retry loop (context overflow recovery + timeout retry) ──
+        // ── Retry loop (context overflow recovery) ──
         //
         // Mirrors the retry strategy in channels/mod.rs process_channel_message:
         //  - Context overflow: compact history, retry up to MAX_CONTEXT_OVERFLOW_RETRIES
-        //  - Timeout: sleep 2s, retry once
+        //
+        // There is deliberately no wall-clock budget around the turn. A chat turn
+        // ends when it finishes, when the user cancels it, or when the stall
+        // detector in `crate::agent::idle` finds it has stopped making progress.
         let mut context_overflow_retries = 0usize;
-        let mut timeout_retries = 0usize;
         #[cfg(feature = "terminal-tui")]
         let mut history_len_before_tools;
 
@@ -7749,9 +7729,8 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 history_len_before_tools = history.len();
             }
 
-            let result = tokio::time::timeout(
-                timeout_budget,
-                crate::tools::message_send::MESSAGE_SEND_EXECUTION_CONTEXT.scope(
+            let result = crate::tools::message_send::MESSAGE_SEND_EXECUTION_CONTEXT
+                .scope(
                     turn_message_send_ctx.clone(),
                     crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.scope(
                         turn_spawn_ctx.clone(),
@@ -7782,46 +7761,14 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             chat_session.mode,
                         ),
                     ),
-                ),
-            )
-            .await;
+                )
+                .await;
 
             match result {
-                // ── Timeout ───────────────────────────────────────
-                Err(_elapsed) => {
-                    if timeout_retries < 1 {
-                        timeout_retries += 1;
-                        tracing::warn!("LLM timeout, retrying (attempt {timeout_retries}/1)");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        continue;
-                    }
-                    // Exhausted timeout retries
-                    cancellation.cancel();
-                    if let Some(ref d_id) = draft_id {
-                        let _ = terminal.cancel_draft("user", d_id).await;
-                    }
-                    eprintln!("\nError: operation timed out\n");
-                    if plain_mode {
-                        plain_mode_turn_failed = true;
-                    }
-                    // Phase E (5a-4): dual_write_guard 守卫防止与 reducer 的 NotifyHook(Error)
-                    // 在 Both / Redux 双写期产生双发（reducer 通过 Effect::NotifyHook 已发）。
-                    // Off 模式 guard 永远 false → 行为不变（旧路径单发）。
-                    if !dual_write_guard.is_active() {
-                        hooks
-                            .emit(HookEvent::Error, payload_error("chat-turn", "timeout"))
-                            .await;
-                    }
-                    // S2-A: timeout exhausted is a non-retryable hard failure.
-                    break TurnOutcome::FailedWithError {
-                        err: "timeout".to_string(),
-                        retryable: false,
-                    };
-                }
                 // ── Success ───────────────────────────────────────
-                Ok(Ok((resp, trace))) => break TurnOutcome::Success(resp, trace),
+                Ok((resp, trace)) => break TurnOutcome::Success(resp, trace),
                 // ── Cancelled (Ctrl+C) ────────────────────────────
-                Ok(Err(ref e)) if is_tool_loop_cancelled(e) || cancellation.is_cancelled() => {
+                Err(ref e) if is_tool_loop_cancelled(e) || cancellation.is_cancelled() => {
                     if let Some(ref d_id) = draft_id {
                         let _ = terminal.cancel_draft("user", d_id).await;
                     }
@@ -7831,7 +7778,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     break TurnOutcome::Cancelled;
                 }
                 // ── Context window overflow → compact + retry ─────
-                Ok(Err(ref e)) if is_context_window_overflow_error(e) => {
+                Err(ref e) if is_context_window_overflow_error(e) => {
                     let audit_source_history =
                         original_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
                     let summary_projection = bounded_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
@@ -7936,7 +7883,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     };
                 }
                 // ── Other errors ──────────────────────────────────
-                Ok(Err(e)) => {
+                Err(e) => {
                     if let Some(ref d_id) = draft_id {
                         let _ = terminal.cancel_draft("user", d_id).await;
                     }

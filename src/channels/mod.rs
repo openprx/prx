@@ -114,9 +114,6 @@ const BOOTSTRAP_MAX_CHARS: usize = 60_000;
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
-const MIN_CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 30;
-/// Cap timeout scaling so large max_tool_iterations values do not create unbounded waits.
-const CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP: u64 = 4;
 /// Depth of the single inbound message bus shared by every channel listener.
 ///
 /// Bounded on purpose: it is the process's backpressure surface. Listeners
@@ -154,16 +151,6 @@ const SIGNAL_VISION_PREFLIGHT_TIMEOUT_SECS: u64 = 45;
 
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
-
-fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
-    configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
-}
-
-fn channel_message_timeout_budget_secs(message_timeout_secs: u64, max_tool_iterations: usize) -> u64 {
-    let iterations = max_tool_iterations.max(1) as u64;
-    let scale = iterations.min(CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP);
-    message_timeout_secs.saturating_mul(scale)
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChannelRouteSelection {
@@ -244,6 +231,7 @@ struct ChannelRuntimeContext {
     temperature: f64,
     auto_save_memory: bool,
     memory_event_recording: MemoryEventRecording,
+    #[cfg(test)]
     max_tool_iterations: usize,
     #[cfg(test)]
     read_only_tool_concurrency_window: usize,
@@ -264,7 +252,6 @@ struct ChannelRuntimeContext {
     reliability: Arc<crate::config::ReliabilityConfig>,
     provider_runtime_options: providers::ProviderRuntimeOptions,
     workspace_dir: Arc<PathBuf>,
-    message_timeout_secs: u64,
     interrupt_on_new_message: bool,
     #[cfg(test)]
     multimodal: crate::config::MultimodalConfig,
@@ -2619,6 +2606,48 @@ fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
     }
 }
 
+/// Streamed assistant text written into a channel draft, one draft per turn.
+///
+/// `has_text` goes true the moment the first delta arrives and is the interlock
+/// with [`spawn_channel_progress_reporter`]: progress notes are only ever
+/// written into a draft that has no real text in it yet, so a long turn shows
+/// what it is doing without a reply ever being overwritten by a status line.
+/// Every update rewrites the whole accumulated string, so even a lost race with
+/// a progress note repairs itself on the next delta.
+fn spawn_channel_draft_updater(
+    channel: Arc<dyn Channel>,
+    reply_target: String,
+    draft_id: String,
+    mut rx: tokio::sync::mpsc::Receiver<String>,
+    has_text: Arc<std::sync::atomic::AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut accumulated = String::new();
+        while let Some(delta) = rx.recv().await {
+            accumulated.push_str(&delta);
+            has_text.store(true, std::sync::atomic::Ordering::Release);
+            if let Err(e) = channel.update_draft(&reply_target, &draft_id, &accumulated).await {
+                tracing::debug!("Draft update failed: {e}");
+            }
+        }
+    })
+}
+
+/// One line of "still working" for a turn that has not produced text yet.
+fn channel_progress_line(tool: &str, iteration: usize, elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    let elapsed_text = if secs >= 60 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    };
+    if tool.is_empty() {
+        format!("⏳ working… (step {iteration}, {elapsed_text})")
+    } else {
+        format!("⏳ {tool}… (step {iteration}, {elapsed_text})")
+    }
+}
+
 fn spawn_scoped_typing_task(
     channel: Arc<dyn Channel>,
     recipient: String,
@@ -3210,7 +3239,7 @@ async fn run_channel_turn(
     let mut history = rebuild_history();
     let use_streaming = target_channel.as_ref().is_some_and(|ch| ch.supports_draft_updates());
 
-    let (delta_tx, delta_rx) = if use_streaming {
+    let (mut delta_tx, delta_rx) = if use_streaming {
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
         (Some(tx), Some(rx))
     } else {
@@ -3236,21 +3265,17 @@ async fn run_channel_turn(
         None
     };
 
-    let draft_updater = if let (Some(mut rx), Some(draft_id_ref), Some(channel_ref)) =
+    let draft_has_text = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut draft_updater = if let (Some(rx), Some(draft_id_ref), Some(channel_ref)) =
         (delta_rx, draft_message_id.as_deref(), target_channel.as_ref())
     {
-        let channel = Arc::clone(channel_ref);
-        let reply_target = msg.reply_target.clone();
-        let draft_id = draft_id_ref.to_string();
-        Some(tokio::spawn(async move {
-            let mut accumulated = String::new();
-            while let Some(delta) = rx.recv().await {
-                accumulated.push_str(&delta);
-                if let Err(e) = channel.update_draft(&reply_target, &draft_id, &accumulated).await {
-                    tracing::debug!("Draft update failed: {e}");
-                }
-            }
-        }))
+        Some(spawn_channel_draft_updater(
+            Arc::clone(channel_ref),
+            msg.reply_target.clone(),
+            draft_id_ref.to_string(),
+            rx,
+            Arc::clone(&draft_has_text),
+        ))
     } else {
         None
     };
@@ -3265,13 +3290,52 @@ async fn run_channel_turn(
         _ => None,
     };
 
-    // ── Tool event forwarding (structured logging for channel messages) ──
+    // ── Tool event forwarding: structured logging plus user-visible progress ──
+    //
+    // Nothing ends a turn on a clock any more, so a turn that legitimately runs
+    // for an hour used to look, from the user's side, exactly like one that had
+    // died. These notifications already existed and were only logged; feeding
+    // them into the draft turns them into the presence signal a long turn needs.
+    // This reports, it never terminates: no branch here can end any work.
     let (tool_event_tx, mut tool_event_rx) =
         tokio::sync::mpsc::channel::<crate::agent::loop_::ToolCallNotification>(32);
     let tool_event_channel_name = msg.channel.clone();
     let tool_event_sender_name = msg.sender.clone();
+    let progress_draft = match (target_channel.as_ref(), draft_message_id.as_deref()) {
+        (Some(channel), Some(draft_id)) => Some((
+            Arc::clone(channel),
+            msg.reply_target.clone(),
+            draft_id.to_string(),
+            Arc::clone(&draft_has_text),
+        )),
+        _ => None,
+    };
+    let progress_started_at = started_at;
     let tool_event_forwarder = tokio::spawn(async move {
+        let mut iteration_seen = 0usize;
         while let Some(notif) = tool_event_rx.recv().await {
+            // A progress note only ever lands in a draft that has no streamed
+            // text in it yet, so it can never overwrite part of a reply.
+            let progress = match &notif {
+                crate::agent::loop_::ToolCallNotification::Started { name, .. } => Some(channel_progress_line(
+                    name,
+                    iteration_seen,
+                    progress_started_at.elapsed(),
+                )),
+                crate::agent::loop_::ToolCallNotification::Progress { iteration, .. } => {
+                    iteration_seen = *iteration;
+                    Some(channel_progress_line("", *iteration, progress_started_at.elapsed()))
+                }
+                crate::agent::loop_::ToolCallNotification::Finished { .. } => None,
+            };
+            if let (Some(line), Some((channel, reply_target, draft_id, has_text))) = (progress, progress_draft.as_ref())
+            {
+                if !has_text.load(std::sync::atomic::Ordering::Acquire) {
+                    if let Err(e) = channel.update_draft(reply_target, draft_id, &line).await {
+                        tracing::debug!("Draft progress update failed: {e}");
+                    }
+                }
+            }
             match notif {
                 crate::agent::loop_::ToolCallNotification::Started { name, args_summary } => {
                     tracing::info!(
@@ -3314,7 +3378,7 @@ async fn run_channel_turn(
 
     type LoopResult = Result<(crate::agent::loop_::ToolLoopOutcome, crate::agent::loop_::ToolLoopTrace), anyhow::Error>;
     enum LlmExecutionResult {
-        Completed(Box<Result<LoopResult, tokio::time::error::Elapsed>>),
+        Completed(Box<LoopResult>),
         Cancelled,
     }
 
@@ -3331,14 +3395,10 @@ async fn run_channel_turn(
             trace: crate::agent::loop_::ToolLoopTrace,
         },
         Error(anyhow::Error),
-        Timeout,
         ContextOverflowExhausted,
     }
 
     const MAX_CONTEXT_OVERFLOW_RETRIES: usize = 2;
-
-    let timeout_budget_secs =
-        channel_message_timeout_budget_secs(ctx.message_timeout_secs, message_runtime.max_tool_iterations);
 
     let scope_owner_id = runtime_envelope.resolved_owner_id();
     // Borrow the policy derived from this message's pinned ConfigGeneration for
@@ -3376,13 +3436,14 @@ async fn run_channel_turn(
     });
 
     let mut context_overflow_retries = 0usize;
-    let mut timeout_retries = 0usize;
+    // No wall clock wraps this loop. A turn runs for as long as it keeps
+    // working; the only automatic end is the stall detector inside
+    // `run_tool_call_loop_outcome` (see `crate::agent::idle`), and the only
+    // manual one is cancellation — a newer message or `prx tasks kill`.
     let final_outcome = loop {
         let llm_result = tokio::select! {
             () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
-            result = tokio::time::timeout(
-                Duration::from_secs(timeout_budget_secs),
-                async {
+            result = async {
                     let scoped_tool_loop = crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.scope(
                         turn_spawn_ctx.clone(),
                         crate::agent::loop_::run_tool_call_loop_outcome(
@@ -3425,14 +3486,13 @@ async fn run_channel_turn(
                         }
                         None => scoped_tool_loop.await,
                     }
-                },
-            ) => LlmExecutionResult::Completed(Box::new(result)),
+                } => LlmExecutionResult::Completed(Box::new(result)),
         };
 
         match llm_result {
             LlmExecutionResult::Cancelled => break LlmFinalOutcome::Cancelled,
             LlmExecutionResult::Completed(result) => match *result {
-                Ok(Ok((outcome, trace))) => match outcome {
+                Ok((outcome, trace)) => match outcome {
                     crate::agent::loop_::ToolLoopOutcome::Text(response) => {
                         break LlmFinalOutcome::Success { response, trace };
                     }
@@ -3452,7 +3512,7 @@ async fn run_channel_turn(
                         };
                     }
                 },
-                Ok(Err(e)) => {
+                Err(e) => {
                     if crate::agent::loop_::is_tool_loop_cancelled(&e) || cancellation_token.is_cancelled() {
                         break LlmFinalOutcome::Cancelled;
                     }
@@ -3475,6 +3535,32 @@ async fn run_channel_turn(
 
                         if context_overflow_retries < MAX_CONTEXT_OVERFLOW_RETRIES {
                             context_overflow_retries += 1;
+                            // Restart the draft accumulator for the retried
+                            // attempt. The accumulator used to live for the whole
+                            // turn, so a retry's deltas were appended to the
+                            // half-finished text of the attempt that failed and
+                            // the user read "half a sentence + the whole answer
+                            // again". Closing the delta channel and waiting for
+                            // the old task to drain it means no stale delta can
+                            // arrive after the fresh accumulator starts.
+                            if let (Some(channel), Some(draft_id)) =
+                                (target_channel.as_ref(), draft_message_id.as_deref())
+                            {
+                                drop(delta_tx.take());
+                                if let Some(handle) = draft_updater.take() {
+                                    log_worker_join_result(handle.await);
+                                }
+                                draft_has_text.store(false, std::sync::atomic::Ordering::Release);
+                                let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+                                delta_tx = Some(tx);
+                                draft_updater = Some(spawn_channel_draft_updater(
+                                    Arc::clone(channel),
+                                    msg.reply_target.clone(),
+                                    draft_id.to_string(),
+                                    rx,
+                                    Arc::clone(&draft_has_text),
+                                ));
+                            }
                             history = replayed_history(&history, &rebuild_history);
                             continue;
                         }
@@ -3483,20 +3569,6 @@ async fn run_channel_turn(
                     }
 
                     break LlmFinalOutcome::Error(e);
-                }
-                Err(_) => {
-                    if timeout_retries < 1 {
-                        timeout_retries += 1;
-                        tracing::warn!(
-                            "LLM timeout after {}ms, retrying (attempt {}/1)",
-                            started_at.elapsed().as_millis(),
-                            timeout_retries
-                        );
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        history = replayed_history(&history, &rebuild_history);
-                        continue;
-                    }
-                    break LlmFinalOutcome::Timeout;
                 }
             },
         }
@@ -3753,58 +3825,6 @@ async fn run_channel_turn(
                         channel.as_ref(),
                         &SendMessage::new("⚠️ Something went wrong. Please try again later.", &msg.reply_target)
                             .in_thread(msg.thread_ts.clone()),
-                    )
-                    .await;
-                }
-            }
-        }
-        LlmFinalOutcome::Timeout => {
-            let timeout_msg = format!(
-                "LLM response timed out after {}s (base={}s, max_tool_iterations={})",
-                timeout_budget_secs, ctx.message_timeout_secs, ctx.max_tool_iterations
-            );
-            let timeout_error = anyhow::anyhow!(timeout_msg.clone());
-            let provider_outcome = crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
-                &route_decision,
-                provider_started_at,
-                &timeout_error,
-            );
-            if let Err(error) = crate::agent::terminal::finalize_turn(
-                &terminal_fabric,
-                crate::agent::terminal::TurnTerminalCommit {
-                    terminal_id: turn_run_id.clone(),
-                    scope: runtime_envelope.message_scope(),
-                    status: crate::agent::terminal::TurnTerminalStatus::Failed,
-                    history: None,
-                    history_scope: None,
-                    provider_outcome: Some(provider_outcome),
-                    telemetry: crate::agent::terminal::TurnTerminalTelemetry {
-                        summary: timeout_msg.clone(),
-                        started_at: provider_started_at,
-                        finished_at: chrono::Utc::now(),
-                    },
-                    delivery_intent: crate::agent::terminal::TurnDeliveryIntent::Reply {
-                        target: msg.reply_target.clone(),
-                    },
-                },
-                &crate::config::schema::CostConfig::default(),
-                ctx.workspace_dir.as_path(),
-            )
-            .await
-            {
-                tracing::warn!(error = %error, "Failed to commit shared timeout channel terminal event");
-            }
-            eprintln!("  ❌ {} (elapsed: {}ms)", timeout_msg, started_at.elapsed().as_millis());
-            if let Some(channel) = target_channel.as_ref() {
-                let error_text = "⚠️ Request timed out. Please try again shortly.";
-                if let Some(ref draft_id) = draft_message_id {
-                    let _ =
-                        finalize_draft_recording_activity(channel.as_ref(), &msg.reply_target, draft_id, error_text)
-                            .await;
-                } else {
-                    let _ = send_recording_activity(
-                        channel.as_ref(),
-                        &SendMessage::new(error_text, &msg.reply_target).in_thread(msg.thread_ts.clone()),
                     )
                     .await;
                 }
@@ -5673,7 +5693,6 @@ pub async fn start_channels_with_config(
 
     let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     provider_cache_seed.insert(provider_name.clone(), Arc::clone(&provider));
-    let message_timeout_secs = effective_channel_message_timeout_secs(config.channels_config.message_timeout_secs);
     let signal_inbound_policy = config.channels_config.signal.as_ref().map(|signal| {
         let allowed_from = normalize_allowlist(&signal.allowed_from);
         let group_allow_from = normalize_allowlist(&signal.group_allow_from);
@@ -5736,6 +5755,7 @@ pub async fn start_channels_with_config(
         temperature,
         auto_save_memory: config.memory.auto_save && config.memory.semantic.auto_promote_user_messages,
         memory_event_recording: config.memory.event_recording_config(),
+        #[cfg(test)]
         max_tool_iterations: config.agent.max_tool_iterations,
         #[cfg(test)]
         read_only_tool_concurrency_window: config.agent.read_only_tool_concurrency_window,
@@ -5756,7 +5776,6 @@ pub async fn start_channels_with_config(
         reliability: Arc::new(config.reliability.clone()),
         provider_runtime_options,
         workspace_dir: Arc::new(config.workspace_dir.clone()),
-        message_timeout_secs,
         interrupt_on_new_message,
         #[cfg(test)]
         multimodal: config.multimodal.clone(),
@@ -5817,7 +5836,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
     use tempfile::TempDir;
 
     fn smart_test_msg(sender: &str, reply_target: &str) -> traits::ChannelMessage {
@@ -6262,37 +6280,6 @@ mod tests {
     }
 
     #[test]
-    fn effective_channel_message_timeout_secs_clamps_to_minimum() {
-        assert_eq!(
-            effective_channel_message_timeout_secs(0),
-            MIN_CHANNEL_MESSAGE_TIMEOUT_SECS
-        );
-        assert_eq!(
-            effective_channel_message_timeout_secs(15),
-            MIN_CHANNEL_MESSAGE_TIMEOUT_SECS
-        );
-        assert_eq!(effective_channel_message_timeout_secs(300), 300);
-    }
-
-    #[test]
-    fn channel_message_timeout_budget_scales_with_tool_iterations() {
-        assert_eq!(channel_message_timeout_budget_secs(300, 1), 300);
-        assert_eq!(channel_message_timeout_budget_secs(300, 2), 600);
-        assert_eq!(channel_message_timeout_budget_secs(300, 3), 900);
-    }
-
-    #[test]
-    fn channel_message_timeout_budget_uses_safe_defaults_and_cap() {
-        // 0 iterations falls back to 1x timeout budget.
-        assert_eq!(channel_message_timeout_budget_secs(300, 0), 300);
-        // Large iteration counts are capped to avoid runaway waits.
-        assert_eq!(
-            channel_message_timeout_budget_secs(300, 10),
-            300 * CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
-        );
-    }
-
-    #[test]
     fn context_window_overflow_error_detector_matches_known_messages() {
         let overflow_err =
             anyhow::anyhow!("OpenAI Codex stream error: Your input exceeds the context window of this model.");
@@ -6401,7 +6388,6 @@ mod tests {
             })),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -6473,7 +6459,6 @@ mod tests {
             })),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -6881,7 +6866,6 @@ mod tests {
             })),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(tmp.path().to_path_buf()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -7656,7 +7640,6 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -7859,7 +7842,6 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(dir.path().to_path_buf()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -7917,6 +7899,551 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(
             lines, 1,
             "the replay must not run the tool a second time; audit file: {appended:?}"
+        );
+    }
+
+    /// Shared runtime context for the unbounded-turn evidence tests.
+    ///
+    /// A real SQLite backend, because a side-effecting tool is refused outright
+    /// without the durable idempotency ledger.
+    fn evidence_runtime_ctx(
+        dir: &TempDir,
+        provider: Arc<dyn Provider>,
+        tools: Vec<Box<dyn Tool>>,
+        channel: Arc<dyn Channel>,
+    ) -> Arc<ChannelRuntimeContext> {
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).expect("test: sqlite memory"));
+        Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory,
+            tools_registry: Arc::new(tools),
+            observer: Arc::new(NoopObserver),
+            hooks: Arc::new(HookManager::new(std::env::temp_dir())),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
+            max_tool_iterations: 10,
+            read_only_tool_concurrency_window: 2,
+            priority_scheduling_enabled: false,
+            low_priority_tools: Vec::new(),
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(dir.path().to_path_buf()),
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            tool_tiering: crate::config::ToolTieringConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
+            bot_names: vec!["prx".to_string()],
+            bot_uuids: vec![],
+            mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+            })),
+            native_tools: false,
+            skill_rag_ctx: None,
+            test_inbound_authorizer: None,
+        })
+    }
+
+    fn evidence_message(id: &str, content: &str) -> traits::ChannelMessage {
+        traits::ChannelMessage {
+            id: id.to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-evidence".to_string(),
+            content: content.to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
+            mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
+            sender_is_bot: false,
+        }
+    }
+
+    /// Answers only after a stretch of wall clock far beyond the deleted per-turn
+    /// budget, then replies normally.
+    struct GlacialProvider {
+        delay: Duration,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for GlacialProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            Ok("here is the slow answer".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            Ok("here is the slow answer".to_string())
+        }
+    }
+
+    /// **Core evidence 1** — a channel turn that runs far past the deleted wall
+    /// clock finishes and answers.
+    ///
+    /// The deleted budget was `message_timeout_secs` (300) times the iteration
+    /// scale cap (4) = 1200s; the turn below takes two hours, six times that.
+    /// Time is paused, so the two hours cost no real seconds — the point is that
+    /// nothing on the channel path measures them any more. Before this change
+    /// the turn was aborted at 1200s, the whole turn was replayed once, and the
+    /// user was sent "⚠️ Request timed out. Please try again shortly."
+    ///
+    /// MUTATION: wrapping the tool loop in `process_channel_message` in a
+    /// `tokio::time::timeout` again turns this test red.
+    #[tokio::test(start_paused = true)]
+    async fn channel_turn_running_far_past_the_deleted_wall_clock_still_answers() {
+        let dir = TempDir::new().expect("test: tempdir");
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(GlacialProvider {
+            delay: Duration::from_hours(2),
+            calls: Arc::clone(&calls),
+        });
+        let ctx = evidence_runtime_ctx(
+            &dir,
+            Arc::clone(&provider) as Arc<dyn Provider>,
+            Vec::new(),
+            Arc::clone(&channel_impl) as Arc<dyn Channel>,
+        );
+
+        process_channel_message(
+            ctx,
+            evidence_message("msg-glacial-1", "take as long as you need"),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await.clone();
+        let replies = response_messages(&sent);
+        assert!(
+            replies
+                .iter()
+                .any(|message| message.contains("here is the slow answer")),
+            "a two-hour turn must still deliver its answer: {replies:?}"
+        );
+        assert!(
+            replies.iter().all(|message| !message.contains("timed out")),
+            "nothing may report a timeout any more: {replies:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the turn must run once; a wall clock would have aborted and replayed it"
+        );
+    }
+
+    /// A turn that produces nothing at all: no chunk, no tool, no output.
+    struct HangingProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for HangingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            std::future::pending().await
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            std::future::pending().await
+        }
+    }
+
+    /// **Core evidence 2** — deleting the wall clock deleted a clock, not the
+    /// defence. A turn that genuinely hangs is still ended, by the stall
+    /// detector, and the termination is visible in the runtime registry.
+    ///
+    /// Paired with evidence 1 this is the whole claim: duration is not a fault
+    /// (evidence 1 runs for two hours untouched) but silence is (this one is
+    /// terminated after a fifth of a second of it).
+    #[tokio::test]
+    async fn hung_channel_turn_is_still_terminated_and_recorded_in_the_registry() {
+        let dir = TempDir::new().expect("test: tempdir");
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let ctx = evidence_runtime_ctx(
+            &dir,
+            Arc::new(HangingProvider) as Arc<dyn Provider>,
+            Vec::new(),
+            Arc::clone(&channel_impl) as Arc<dyn Channel>,
+        );
+
+        let before = crate::runtime::registry::hang_terminations().len();
+        crate::agent::idle::with_guard(
+            crate::agent::idle::IdleGuard {
+                idle: Some(Duration::from_millis(200)),
+                max_total: None,
+            },
+            process_channel_message(
+                ctx,
+                evidence_message("msg-hang-1", "this one wedges"),
+                CancellationToken::new(),
+            ),
+        )
+        .await;
+
+        let terminations = crate::runtime::registry::hang_terminations();
+        assert!(
+            terminations.len() > before,
+            "a hung turn must be recorded in the registry's hang ledger"
+        );
+        let recorded = terminations
+            .iter()
+            .skip(before)
+            .find(|entry| &*entry.label == "test-channel")
+            .expect("test: the hung channel turn must appear in the hang ledger");
+        assert_eq!(
+            recorded.reason,
+            crate::agent::idle::HangReason::NoProgress.as_str(),
+            "the turn must be reported as silent, not as having run too long"
+        );
+    }
+
+    /// Second side-effecting tool, so one iteration can carry a real batch and
+    /// "did each of them run exactly once?" is answered by counting lines.
+    struct SecondAppendingTool {
+        path: std::path::PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for SecondAppendingTool {
+        fn name(&self) -> &str {
+            "append_second_line"
+        }
+
+        fn description(&self) -> &str {
+            "Append one line to the audit file"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {}, "additionalProperties": false })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
+            writeln!(file, "appended-second")?;
+            Ok(ToolResult {
+                success: true,
+                output: "appended the second line".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    /// Like [`ReplayProbeProvider`] but asks for a *batch* of two side-effecting
+    /// tools in one iteration, which is the shape that used to lose records.
+    #[derive(Default)]
+    struct BatchReplayProbeProvider {
+        saw_tool_evidence: parking_lot::Mutex<Vec<bool>>,
+    }
+
+    fn append_batch_call_payload() -> String {
+        r#"<tool_call>
+{"name":"append_line","arguments":{}}
+</tool_call>
+<tool_call>
+{"name":"append_second_line","arguments":{}}
+</tool_call>"#
+            .to_string()
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for BatchReplayProbeProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(append_batch_call_payload())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let evidence = messages.iter().any(is_tool_result_message);
+            self.saw_tool_evidence.lock().push(evidence);
+            if evidence {
+                Err(anyhow::anyhow!("input is too long"))
+            } else {
+                Ok(append_batch_call_payload())
+            }
+        }
+    }
+
+    /// **Core evidence 3 (end to end)** — a replayed turn re-runs none of the
+    /// tools a whole batch already executed.
+    ///
+    /// Two side-effecting tools in a single iteration, one audit file, and the
+    /// context-overflow replay path (the one that survived the timeout's
+    /// deletion). Each tool must appear exactly once in the file.
+    #[tokio::test]
+    async fn channel_turn_replay_does_not_re_execute_an_already_executed_batch() {
+        let dir = TempDir::new().expect("test: tempdir");
+        let audit = dir.path().join("batch-audit.log");
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let provider = Arc::new(BatchReplayProbeProvider::default());
+        let ctx = evidence_runtime_ctx(
+            &dir,
+            Arc::clone(&provider) as Arc<dyn Provider>,
+            vec![
+                Box::new(AppendingTool { path: audit.clone() }) as Box<dyn Tool>,
+                Box::new(SecondAppendingTool { path: audit.clone() }) as Box<dyn Tool>,
+            ],
+            Arc::clone(&channel_impl) as Arc<dyn Channel>,
+        );
+
+        process_channel_message(
+            ctx,
+            evidence_message("msg-batch-replay-1", "append both lines please"),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let evidence = provider.saw_tool_evidence.lock().clone();
+        assert!(
+            evidence.len() >= 3,
+            "test: the turn must actually have been replayed: {evidence:?}"
+        );
+        let appended = std::fs::read_to_string(&audit).expect("test: audit file written by the tools");
+        let first = appended.lines().filter(|line| *line == "appended").count();
+        let second = appended.lines().filter(|line| *line == "appended-second").count();
+        assert_eq!(
+            (first, second),
+            (1, 1),
+            "each tool in the batch must run exactly once across the replay; audit file: {appended:?}"
+        );
+    }
+
+    /// Records every draft write, so "what did the user actually see, and in what
+    /// order?" is answerable.
+    #[derive(Default)]
+    struct DraftRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+        draft_updates: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for DraftRecordingChannel {
+        fn name(&self) -> &str {
+            "test-channel"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn supports_draft_updates(&self) -> bool {
+            true
+        }
+
+        async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
+            Ok(Some("draft-1".to_string()))
+        }
+
+        async fn update_draft(&self, _recipient: &str, _message_id: &str, text: &str) -> anyhow::Result<()> {
+            self.draft_updates.lock().await.push(text.to_string());
+            Ok(())
+        }
+
+        async fn finalize_draft(&self, _recipient: &str, _message_id: &str, text: &str) -> anyhow::Result<()> {
+            self.sent_messages.lock().await.push(format!("final:{text}"));
+            Ok(())
+        }
+    }
+
+    /// Asks for the tool once, then answers.
+    #[derive(Default)]
+    struct ToolThenAnswerProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ToolThenAnswerProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(append_tool_call_payload())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(append_tool_call_payload())
+            } else {
+                Ok("all done".to_string())
+            }
+        }
+    }
+
+    /// Removing the wall clock removed the only thing that ever told a user a
+    /// long turn was still alive, so the tool notifications — which until now
+    /// were only logged — are shown in the draft while the turn has produced no
+    /// text of its own.
+    ///
+    /// This reports and never terminates: no assertion here involves a deadline.
+    #[tokio::test]
+    async fn a_working_turn_shows_progress_in_its_draft_before_any_text_arrives() {
+        let dir = TempDir::new().expect("test: tempdir");
+        let audit = dir.path().join("progress-audit.log");
+        let channel_impl = Arc::new(DraftRecordingChannel::default());
+        let ctx = evidence_runtime_ctx(
+            &dir,
+            Arc::new(ToolThenAnswerProvider::default()) as Arc<dyn Provider>,
+            vec![Box::new(AppendingTool { path: audit }) as Box<dyn Tool>],
+            Arc::clone(&channel_impl) as Arc<dyn Channel>,
+        );
+
+        process_channel_message(
+            ctx,
+            evidence_message("msg-progress-1", "do the slow thing"),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let updates = channel_impl.draft_updates.lock().await.clone();
+        assert!(
+            updates
+                .iter()
+                .any(|update| update.starts_with("⏳") && update.contains("append_line")),
+            "a turn running tools with no text yet must say what it is doing: {updates:?}"
+        );
+        let sent = channel_impl.sent_messages.lock().await.clone();
+        assert!(
+            sent.iter().any(|message| message.contains("all done")),
+            "the progress notes must not displace the real answer: {sent:?}"
+        );
+    }
+
+    /// A replayed turn starts its draft over instead of appending to the text of
+    /// the attempt that failed.
+    ///
+    /// The accumulator used to live for the whole turn, so the retry's deltas
+    /// were appended to the aborted attempt's half-finished sentence and the
+    /// user read "half a thought + the whole answer again". Restarting the
+    /// updater is what makes the second attempt begin from empty.
+    #[tokio::test]
+    async fn a_restarted_draft_updater_does_not_carry_the_previous_attempts_text() {
+        let channel_impl = Arc::new(DraftRecordingChannel::default());
+        let channel: Arc<dyn Channel> = Arc::clone(&channel_impl) as Arc<dyn Channel>;
+        let has_text = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let (first_tx, first_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let first = spawn_channel_draft_updater(
+            Arc::clone(&channel),
+            "chat-evidence".to_string(),
+            "draft-1".to_string(),
+            first_rx,
+            Arc::clone(&has_text),
+        );
+        first_tx
+            .send("half a thou".to_string())
+            .await
+            .expect("test: send delta");
+        drop(first_tx);
+        first.await.expect("test: first updater should finish");
+        assert!(has_text.load(std::sync::atomic::Ordering::Acquire));
+
+        // What the replay branch does before it retries.
+        has_text.store(false, std::sync::atomic::Ordering::Release);
+        let (second_tx, second_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let second = spawn_channel_draft_updater(
+            Arc::clone(&channel),
+            "chat-evidence".to_string(),
+            "draft-1".to_string(),
+            second_rx,
+            Arc::clone(&has_text),
+        );
+        second_tx
+            .send("the whole answer".to_string())
+            .await
+            .expect("test: send delta");
+        drop(second_tx);
+        second.await.expect("test: second updater should finish");
+
+        let updates = channel_impl.draft_updates.lock().await.clone();
+        assert_eq!(
+            updates,
+            vec!["half a thou".to_string(), "the whole answer".to_string()],
+            "the retried attempt must start from empty, not from the aborted attempt's text"
+        );
+    }
+
+    #[test]
+    fn progress_lines_read_as_progress_and_never_as_a_deadline() {
+        assert_eq!(
+            channel_progress_line("web_fetch", 7, Duration::from_secs(252)),
+            "⏳ web_fetch… (step 7, 4m12s)"
+        );
+        assert_eq!(
+            channel_progress_line("", 3, Duration::from_secs(9)),
+            "⏳ working… (step 3, 9s)"
         );
     }
 
@@ -7982,7 +8509,6 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -8071,7 +8597,6 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -8162,7 +8687,6 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -8252,7 +8776,6 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -8347,7 +8870,6 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -8469,7 +8991,6 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -8564,7 +9085,6 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -8663,7 +9183,6 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..providers::ProviderRuntimeOptions::default()
             },
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -8751,7 +9270,6 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -8841,7 +9359,6 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -9096,7 +9613,6 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -9476,7 +9992,6 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(tmp.path().to_path_buf()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -9869,7 +10384,6 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -9984,7 +10498,6 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -10114,7 +10627,6 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -10226,7 +10738,6 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(tmp.path().to_path_buf()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -10887,7 +11398,6 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -11004,7 +11514,6 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -11111,7 +11620,6 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -11877,7 +12385,6 @@ After"#;
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,

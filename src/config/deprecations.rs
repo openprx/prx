@@ -158,6 +158,12 @@ pub(crate) const DEPRECATED_CONFIG_KEYS: &[DeprecatedKey] = &[
         shape: DeprecatedShape::Field,
         reason: REASON_NO_TIMEOUT,
     },
+    // ── [channels_config]: the per-turn wall clock ────────────────────────
+    DeprecatedKey {
+        path: &["channels_config", "message_timeout_secs"],
+        shape: DeprecatedShape::Field,
+        reason: REASON_NO_TIMEOUT,
+    },
     // ── [security.resources]: limits nothing ever applied ─────────────────
     DeprecatedKey {
         path: &["security", "resources"],

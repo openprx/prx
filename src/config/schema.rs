@@ -4133,17 +4133,6 @@ pub struct ChannelsConfig {
     pub dingtalk: Option<DingTalkConfig>,
     /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
-    /// Base timeout in seconds for processing a single channel message (LLM + tools).
-    /// Runtime uses this as a per-turn budget that scales with tool-loop depth
-    /// (up to 4x, capped) so one slow/retried model call does not consume the
-    /// entire conversation budget.
-    /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
-    #[serde(default = "default_channel_message_timeout_secs")]
-    pub message_timeout_secs: u64,
-}
-
-const fn default_channel_message_timeout_secs() -> u64 {
-    300
 }
 
 impl Default for ChannelsConfig {
@@ -4167,7 +4156,6 @@ impl Default for ChannelsConfig {
             lark: None,
             dingtalk: None,
             qq: None,
-            message_timeout_secs: default_channel_message_timeout_secs(),
         }
     }
 }
@@ -6740,7 +6728,6 @@ min_chars = 12
                 lark: None,
                 dingtalk: None,
                 qq: None,
-                message_timeout_secs: 300,
             },
             memory: MemoryConfig::default(),
             identity_bindings: Vec::new(),
@@ -7875,7 +7862,6 @@ allowed_users = ["@ops:matrix.org"]
             lark: None,
             dingtalk: None,
             qq: None,
-            message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -8167,7 +8153,6 @@ channel_id = "C123"
             lark: None,
             dingtalk: None,
             qq: None,
-            message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

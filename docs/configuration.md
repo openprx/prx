@@ -340,6 +340,7 @@ convenient. Nothing rewrites your config files.
 | `scheduler.max_concurrent` | due cron jobs all start at once; use `prx tasks` to see and end them |
 | `autonomy.max_actions_per_hour` | no hourly action budget |
 | `gateway.request_timeout_secs` | no request deadline on gateway handlers |
+| `channels_config.message_timeout_secs` | no wall clock on a channel or chat turn; a stalled turn is ended by `runtime.idle_hang_secs`, a running one by `prx tasks kill` |
 | `[security.resources]` (whole table) | never enforced by any code path |
 | `memory.events.retention_days` | never read by the hygiene pass |
 

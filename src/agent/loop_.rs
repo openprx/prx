@@ -5168,6 +5168,160 @@ async fn run_streaming_provider_turn(
     }
 }
 
+/// Text substituted for a tool call that never got to run, or that was still
+/// running when the turn was interrupted.
+///
+/// Every tool call the model asked for needs *some* result message, or the
+/// assistant message carrying the `tool_calls` is left unanswered and the next
+/// provider request is malformed. This marker fills the gap while saying
+/// plainly that the call did not happen, so a model reading the transcript
+/// re-issues that one call and leaves the calls that did happen alone.
+const INTERRUPTED_TOOL_RESULT: &str = "Error: this tool call was interrupted before it ran; it may be retried.";
+
+/// Per-call tool output, captured the instant each call returns.
+///
+/// # Why this is not just the returned `Vec<String>`
+///
+/// A batch of tool calls is executed concurrently, so the results cannot be
+/// written straight into `history` — that is a `&mut` borrow the caller holds.
+/// Historically they were collected and written to history only after the
+/// *whole* batch finished, which meant an interruption partway through a batch
+/// left no trace in history of the calls that had already run and already had
+/// side effects. A replay then re-issued the identical batch and ran them all
+/// a second time.
+///
+/// So each call reports here the moment it completes. Whatever this holds is
+/// exactly the set of calls that ran, which is exactly the set a replay must
+/// not run again, and [`ExecutedToolRecords`] guarantees it reaches history
+/// whether the batch finishes or is dropped mid-flight.
+#[derive(Debug)]
+struct ToolResultRecorder {
+    slots: parking_lot::Mutex<Vec<Option<String>>>,
+}
+
+impl ToolResultRecorder {
+    fn new(len: usize) -> Self {
+        Self {
+            slots: parking_lot::Mutex::new(vec![None; len]),
+        }
+    }
+
+    fn record(&self, index: usize, result: &str) {
+        let mut slots = self.slots.lock();
+        if let Some(slot) = slots.get_mut(index) {
+            *slot = Some(result.to_string());
+        }
+    }
+
+    /// Results captured so far, one entry per requested call.
+    fn snapshot(&self) -> Vec<Option<String>> {
+        self.slots.lock().clone()
+    }
+}
+
+/// Guarantees that every tool call which actually ran is represented in
+/// `history`, including when the turn is interrupted partway through the batch.
+///
+/// The guard owns the history borrow for the duration of tool execution and
+/// post-processing. On the normal path [`Self::commit`] writes the fully
+/// processed result messages — document-backed truncation and all — exactly as
+/// before. On any other path (an error propagated with `?`, cancellation, or
+/// the whole turn future being dropped by the stall detector) `Drop` writes a
+/// plain-text record of the same calls instead. Either way the transcript that
+/// survives says which calls ran, so a replay re-issues only the ones that did
+/// not.
+struct ExecutedToolRecords<'a> {
+    history: &'a mut Vec<ChatMessage>,
+    recorder: &'a ToolResultRecorder,
+    tool_calls: &'a [ParsedToolCall],
+    native_tool_calls: &'a [ToolCall],
+    armed: bool,
+}
+
+impl<'a> ExecutedToolRecords<'a> {
+    const fn new(
+        history: &'a mut Vec<ChatMessage>,
+        recorder: &'a ToolResultRecorder,
+        tool_calls: &'a [ParsedToolCall],
+        native_tool_calls: &'a [ToolCall],
+    ) -> Self {
+        Self {
+            history,
+            recorder,
+            tool_calls,
+            native_tool_calls,
+            armed: true,
+        }
+    }
+
+    /// History, still borrowed by the guard. Reads are needed while
+    /// post-processing (the inline budget is measured against it).
+    const fn history(&self) -> &Vec<ChatMessage> {
+        self.history
+    }
+
+    /// Write the fully processed result messages and stand down.
+    fn commit(mut self, messages: Vec<ChatMessage>) {
+        self.armed = false;
+        self.history.extend(messages);
+    }
+}
+
+impl Drop for ExecutedToolRecords<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let slots = self.recorder.snapshot();
+        if slots.iter().all(Option::is_none) {
+            // Nothing ran, so there is nothing a replay could duplicate. The
+            // unanswered assistant message is dropped with the rest of this
+            // attempt's history rather than being papered over here.
+            return;
+        }
+        let resolve = |index: usize| -> &str {
+            slots
+                .get(index)
+                .and_then(Option::as_deref)
+                .unwrap_or(INTERRUPTED_TOOL_RESULT)
+        };
+        if self.native_tool_calls.is_empty() {
+            let mut tool_results = String::new();
+            for (index, call) in self.tool_calls.iter().enumerate() {
+                let _ = writeln!(
+                    tool_results,
+                    "<tool_result name=\"{}\">\n{}\n</tool_result>",
+                    call.name,
+                    truncate_with_ellipsis(resolve(index), MAX_TOOL_RESULT_INLINE_CHARS)
+                );
+            }
+            self.history.push(ChatMessage::user(format!(
+                "{}\n{tool_results}",
+                crate::causal_tree::snapshot::TOOL_RESULTS_PREFIX
+            )));
+        } else {
+            for (index, native_call) in self.native_tool_calls.iter().enumerate() {
+                let tool_msg = serde_json::json!({
+                    "tool_call_id": native_call.id,
+                    "content": truncate_with_ellipsis(resolve(index), MAX_TOOL_RESULT_INLINE_CHARS),
+                });
+                self.history.push(ChatMessage::tool(tool_msg.to_string()));
+            }
+        }
+        tracing::warn!(
+            recorded = slots.iter().filter(|slot| slot.is_some()).count(),
+            requested = self.tool_calls.len(),
+            "turn interrupted mid tool batch; already-executed calls recorded in history so a replay cannot repeat them"
+        );
+    }
+}
+
+/// Execute one tool call.
+///
+/// There is deliberately no deadline parameter. A tool runs until it returns,
+/// is cancelled, or the turn's stall detector (`crate::agent::idle`) ends the
+/// whole turn; reintroducing a per-call clock here would put back exactly the
+/// ceiling the unbounded-runtime work removed.
 async fn execute_one_with_service(
     index: usize,
     call: &ParsedToolCall,
@@ -5175,7 +5329,22 @@ async fn execute_one_with_service(
     adapter: &ToolLoopRuntimeAdapter,
     cancellation: Option<&CancellationToken>,
     chat_mode: ChatMode,
-    timeout: Option<std::time::Duration>,
+    recorder: &ToolResultRecorder,
+) -> Result<String> {
+    let result = execute_one_unrecorded(index, call, native_tool_calls, adapter, cancellation, chat_mode).await?;
+    // Recorded before returning, so a caller dropped between here and the end
+    // of the batch still leaves evidence that this call ran.
+    recorder.record(index, &result);
+    Ok(result)
+}
+
+async fn execute_one_unrecorded(
+    index: usize,
+    call: &ParsedToolCall,
+    native_tool_calls: &[ToolCall],
+    adapter: &ToolLoopRuntimeAdapter,
+    cancellation: Option<&CancellationToken>,
+    chat_mode: ChatMode,
 ) -> Result<String> {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return Err(ToolLoopCancelled.into());
@@ -5236,29 +5405,9 @@ async fn execute_one_with_service(
     } else {
         None
     };
-    let execute = service.execute(command, adapter.tool_execution_context.clone(), cancellation.cloned());
-    let outcome = if let Some(timeout) = timeout {
-        match tokio::time::timeout(timeout, execute).await {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                let result = format!("Error: Tool '{}' timed out after {}s.", call.name, timeout.as_secs());
-                emit_tool_loop_event(
-                    adapter,
-                    ToolLoopEvent::ToolFinished {
-                        tool_call_id,
-                        name: call.name.clone(),
-                        success: false,
-                        duration_ms: timeout.as_millis() as u64,
-                        result: result.clone(),
-                    },
-                )
-                .await?;
-                return Ok(result);
-            }
-        }
-    } else {
-        execute.await
-    };
+    let outcome = service
+        .execute(command, adapter.tool_execution_context.clone(), cancellation.cloned())
+        .await;
     if outcome.status == crate::tools::ToolExecutionStatus::Cancelled {
         return Err(ToolLoopCancelled.into());
     }
@@ -5287,6 +5436,7 @@ async fn execute_tools_with_service(
     cancellation: Option<&CancellationToken>,
     chat_mode: ChatMode,
     observer: &dyn Observer,
+    recorder: &ToolResultRecorder,
 ) -> Result<Vec<String>> {
     use futures::stream::{self, StreamExt};
 
@@ -5307,8 +5457,9 @@ async fn execute_tools_with_service(
         }
         let index = ordered_indices[cursor];
         // Read-only calls always take the parallel lane; there is no switch that
-        // can force them back to serial. Both lanes hand `None` as the deadline,
-        // so a tool behaves identically whichever lane it runs in.
+        // can force them back to serial. Neither lane can carry a deadline —
+        // `execute_one_with_service` takes none — so a tool behaves identically
+        // whichever lane it runs in.
         if classify_tool_call(&tool_calls[index].name) == ToolSchedulingClass::ReadOnly {
             let start = cursor;
             let mut end = cursor + 1;
@@ -5326,7 +5477,7 @@ async fn execute_tools_with_service(
                         adapter,
                         cancellation,
                         chat_mode,
-                        None,
+                        recorder,
                     )
                     .await?;
                     Ok::<_, anyhow::Error>((batch_index, result))
@@ -5353,7 +5504,7 @@ async fn execute_tools_with_service(
             adapter,
             cancellation,
             chat_mode,
-            None,
+            recorder,
         )
         .await?;
         cursor += 1;
@@ -6323,6 +6474,15 @@ async fn run_tool_call_loop_outcome_unguarded(
         }
 
         let tools_started_at = Instant::now();
+        let recorder = ToolResultRecorder::new(tool_calls.len());
+        // The assistant message that *requested* these calls goes into history
+        // before any of them runs. Written after the batch, as it used to be, an
+        // interruption partway through the batch left the calls that had already
+        // run — and already had side effects — with nothing in history to attach
+        // to, so a replay repeated every one of them.
+        history.push(ChatMessage::assistant(assistant_history_content));
+        let executed = ExecutedToolRecords::new(history, &recorder, &tool_calls, &native_tool_calls);
+
         let individual_results = execute_tools_with_service(
             &tool_calls,
             &native_tool_calls,
@@ -6331,6 +6491,7 @@ async fn run_tool_call_loop_outcome_unguarded(
             cancellation_token.as_ref(),
             chat_mode,
             observer,
+            &recorder,
         )
         .await?;
         let tools_elapsed_ms = tools_started_at.elapsed().as_millis() as u64;
@@ -6410,7 +6571,7 @@ async fn run_tool_call_loop_outcome_unguarded(
             // FIX-P2-02: record the status so the native-history branch can reuse
             // it without persisting the same document a second time.
             document_statuses.push(document_status);
-            let max_inline_chars = tool_result_inline_budget_for_history(history, compaction_config);
+            let max_inline_chars = tool_result_inline_budget_for_history(executed.history(), compaction_config);
             let truncated_result =
                 compact_tool_result_for_history_with_status(&call.name, result, max_inline_chars, document_status);
             let _ = writeln!(
@@ -6420,16 +6581,16 @@ async fn run_tool_call_loop_outcome_unguarded(
             );
         }
 
-        // Add assistant message with tool calls + tool results to history.
+        // Tool results follow the assistant message already in history.
         // Native mode: use JSON-structured messages so convert_messages() can
         // reconstruct proper OpenAI-format tool_calls and tool result messages.
         // Prompt mode: use XML-based text format as before.
-        history.push(ChatMessage::assistant(assistant_history_content));
+        let mut result_messages: Vec<ChatMessage> = Vec::with_capacity(native_tool_calls.len().max(1));
         if native_tool_calls.is_empty() {
             // Prompt/text mode marker. Shares the prefix constant with the CTE
             // snapshot parser (`build_causal_state_from_chat`) so a wording change
             // stays consistent across producer and parser.
-            history.push(ChatMessage::user(format!(
+            result_messages.push(ChatMessage::user(format!(
                 "{}\n{tool_results}",
                 crate::causal_tree::snapshot::TOOL_RESULTS_PREFIX
             )));
@@ -6446,7 +6607,7 @@ async fn run_tool_call_loop_outcome_unguarded(
                     .get(index)
                     .copied()
                     .unwrap_or("pending_document_backend");
-                let max_inline_chars = tool_result_inline_budget_for_history(history, compaction_config);
+                let max_inline_chars = tool_result_inline_budget_for_history(executed.history(), compaction_config);
                 let truncated_result = compact_tool_result_for_history_with_status(
                     &native_call.name,
                     result,
@@ -6457,9 +6618,10 @@ async fn run_tool_call_loop_outcome_unguarded(
                     "tool_call_id": native_call.id,
                     "content": truncated_result,
                 });
-                history.push(ChatMessage::tool(tool_msg.to_string()));
+                result_messages.push(ChatMessage::tool(tool_msg.to_string()));
             }
         }
+        executed.commit(result_messages);
 
         // P1-4: Token-aware mid-turn trim (primary) + count-based safety net (secondary).
         if let Some(config) = compaction_config {
@@ -10133,6 +10295,176 @@ mod tests {
         ]
     }
 
+    /// Appends one line per execution, so "did it run twice?" is answered by
+    /// counting lines in a real file rather than by trusting a counter.
+    struct AuditAppendTool {
+        path: std::path::PathBuf,
+    }
+
+    #[async_trait]
+    impl Tool for AuditAppendTool {
+        fn name(&self) -> &str {
+            "append_line"
+        }
+
+        fn description(&self) -> &str {
+            "Append one line to the audit file"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {}, "additionalProperties": false })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
+            writeln!(file, "appended")?;
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "appended one line".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    /// Never returns, so its batch is still in flight when the turn is ended.
+    struct NeverReturningTool;
+
+    #[async_trait]
+    impl Tool for NeverReturningTool {
+        fn name(&self) -> &str {
+            "wedge"
+        }
+
+        fn description(&self) -> &str {
+            "Never returns"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {}, "additionalProperties": false })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+            std::future::pending().await
+        }
+    }
+
+    fn interrupted_batch_registry(audit: &std::path::Path) -> Vec<Box<dyn Tool>> {
+        vec![
+            Box::new(AuditAppendTool {
+                path: audit.to_path_buf(),
+            }) as Box<dyn Tool>,
+            Box::new(NeverReturningTool) as Box<dyn Tool>,
+        ]
+    }
+
+    /// **Core evidence 3** — a tool batch interrupted partway through still
+    /// leaves the calls that already ran recorded in history.
+    ///
+    /// History used to be written only once the *whole* batch had finished. An
+    /// interruption partway through it — the commonest way a batch ends badly —
+    /// therefore left the calls that had already run, and had already had their
+    /// side effects, with no record at all, and anything that rebuilt the turn
+    /// from that history re-issued every one of them.
+    ///
+    /// Here `append_line` runs (one line in the audit file) and `wedge` never
+    /// returns, so the stall detector ends the turn with the batch half done.
+    /// The assistant message that requested the calls and the result of the call
+    /// that completed must both survive, and the call that did not complete must
+    /// be marked as not having happened.
+    ///
+    /// MUTATION: moving the `history.push(ChatMessage::assistant(..))` and the
+    /// tool-result messages back to after `execute_tools_with_service` — that
+    /// is, deleting `ExecutedToolRecords` — turns this test red.
+    #[tokio::test]
+    async fn an_interrupted_tool_batch_still_records_the_calls_that_ran() {
+        let dir = TempDir::new().expect("test: temp dir should be creatable");
+        let audit = dir.path().join("audit.log");
+        let ledger_dir = TempDir::new().expect("test: ledger dir should be creatable");
+        let adapter = scheduler_test_adapter(interrupted_batch_registry(&audit), &ledger_dir);
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "<tool_call>\n{\"name\":\"append_line\",\"arguments\":{}}\n</tool_call>\n<tool_call>\n{\"name\":\"wedge\",\"arguments\":{}}\n</tool_call>",
+        ]);
+        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("append then wedge")];
+        let hooks_dir = TempDir::new().expect("test: hooks dir should be creatable");
+
+        let result = crate::agent::idle::with_guard(
+            crate::agent::idle::IdleGuard {
+                idle: Some(Duration::from_millis(200)),
+                max_total: None,
+            },
+            run_tool_call_loop_outcome(
+                &provider,
+                &mut history,
+                Arc::new(interrupted_batch_registry(&audit)),
+                &NoopObserver,
+                &crate::hooks::HookManager::new(hooks_dir.path().to_path_buf()),
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                None,
+                "cli",
+                &crate::config::MultimodalConfig::default(),
+                4,
+                2,
+                false,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ChatMode::default(),
+                None,
+                false,
+                Some(adapter),
+            ),
+        )
+        .await;
+
+        let error = result.expect_err("the wedged batch must end the turn");
+        assert!(
+            crate::agent::idle::is_hang_termination(&error),
+            "the turn must end through the stall detector, not a clock: {error}"
+        );
+
+        let audited = std::fs::read_to_string(&audit).expect("test: the appending tool must have written the file");
+        assert_eq!(
+            audited.lines().filter(|line| !line.is_empty()).count(),
+            1,
+            "the appending tool must have run exactly once: {audited:?}"
+        );
+
+        assert!(
+            history
+                .iter()
+                .any(|message| message.role == "assistant" && message.content.contains("append_line")),
+            "the assistant message requesting the batch must survive the interruption: {history:?}"
+        );
+        let record = history
+            .iter()
+            .find(|message| {
+                message.role == "user"
+                    && message
+                        .content
+                        .starts_with(crate::causal_tree::snapshot::TOOL_RESULTS_PREFIX)
+            })
+            .expect("the executed call must leave a tool-result record in history");
+        assert!(
+            record.content.contains("appended one line"),
+            "the completed call's own output must be what is recorded: {:?}",
+            record.content
+        );
+        assert!(
+            record.content.contains(INTERRUPTED_TOOL_RESULT),
+            "the call that never completed must be marked as not having happened: {:?}",
+            record.content
+        );
+    }
+
     fn unlimited_schedule(concurrency_window: usize) -> ReadOnlyToolScheduleConfig {
         ReadOnlyToolScheduleConfig {
             concurrency_window,
@@ -10154,10 +10486,19 @@ mod tests {
             name: tool_name.to_string(),
             arguments: serde_json::json!({"value": "x"}),
         }];
-        let mut results =
-            execute_tools_with_service(&calls, &[], &adapter, schedule, None, ChatMode::default(), observer)
-                .await
-                .expect("scheduler should complete without error");
+        let recorder = ToolResultRecorder::new(calls.len());
+        let mut results = execute_tools_with_service(
+            &calls,
+            &[],
+            &adapter,
+            schedule,
+            None,
+            ChatMode::default(),
+            observer,
+            &recorder,
+        )
+        .await
+        .expect("scheduler should complete without error");
         assert_eq!(results.len(), 1, "one call in, one result out");
         results.remove(0)
     }
@@ -10169,12 +10510,13 @@ mod tests {
     /// while the serial lane passed `None`. Turning parallelism off therefore
     /// also turned the timeout off — the timeout rode on the concurrency switch.
     ///
-    /// Now both lanes hand `None` as the deadline, so a tool that runs for ten
+    /// Now neither lane can carry a deadline at all — `execute_one_with_service`
+    /// has no timeout parameter left to pass — so a tool that runs for ten
     /// simulated minutes returns its real output on either lane, and the two
     /// lanes produce byte-identical results.
     ///
-    /// Mutation check: restoring `Some(timeout)` on either lane in
-    /// `execute_tools_with_service` turns this test red.
+    /// Mutation check: re-adding a `tokio::time::timeout` around the tool
+    /// execution in `execute_one_with_service` turns this test red.
     #[tokio::test(start_paused = true)]
     async fn parallel_and_serial_lanes_agree_that_tools_have_no_timeout() {
         let observer = SchedulerEventObserver::default();
@@ -10271,6 +10613,7 @@ mod tests {
             },
         ];
         let observer = SchedulerEventObserver::default();
+        let recorder = ToolResultRecorder::new(calls.len());
         let results = execute_tools_with_service(
             &calls,
             &[],
@@ -10279,6 +10622,7 @@ mod tests {
             None,
             ChatMode::default(),
             &observer,
+            &recorder,
         )
         .await
         .expect("scheduler should complete without error");

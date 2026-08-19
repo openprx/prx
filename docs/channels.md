@@ -39,6 +39,26 @@ copies the image into its workspace-owned media store with the configured
 `[multimodal].max_image_size_mb` limit, and then sends it through the normal
 multimodal provider path. Source paths outside `store_dir` are rejected.
 
+## Turn Duration
+
+A channel turn has no wall-clock budget. It runs until it finishes, until it is
+cancelled (a newer message from the same sender where `interrupt_on_new_message`
+is on, or `prx tasks kill <id>`), or until the stall detector judges it hung —
+`[runtime] idle_hang_secs`, which measures *silence*, not duration, and is reset
+by every provider chunk, tool call and channel write. A turn that works for
+hours is never ended for working for hours.
+
+The `[channels_config] message_timeout_secs` key that used to impose a per-turn
+budget is retired. A config that still sets it keeps loading and logs a `WARN`
+naming the line to delete.
+
+Because a long turn no longer ends on a clock, it says what it is doing instead.
+On channels that support draft edits the draft carries a progress line — the
+tool currently running, the iteration, and the elapsed time — for as long as the
+turn has produced no text of its own; the first streamed token replaces it and
+progress notes stop. Channels that support typing indicators keep those
+refreshed throughout. Both are reports: neither can end anything.
+
 ## Listener Liveness Reporting
 
 Channel health is derived from what a listener has actually been observed doing,

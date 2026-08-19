@@ -929,9 +929,6 @@ pub struct EffectDeps {
     pub tools_registry: Option<Arc<Vec<Box<dyn crate::tools::Tool>>>>,
     /// **5a-6**: max tool iterations — 防 LLM 死循环。0 走默认 (16)，上限受 driver 内部保护。
     pub max_tool_iterations: usize,
-    /// Per-turn Redux driver timeout. Production mirrors the legacy loop budget;
-    /// tests may set `None` to avoid time-coupling unrelated scenarios.
-    pub turn_timeout_budget: Option<std::time::Duration>,
     /// **S3 T3-1**: approval 请求-应答路由器 (driver↔dispatcher 桥接 oneshot).
     ///
     /// driver 在执行需 approval 的 tool 前注册 oneshot tx；dispatcher_task 在
@@ -1160,7 +1157,6 @@ impl EffectExecutor {
                 // 5a-6: 透传 tool registry + max iterations (None / 0 → driver 退化为纯文本流式).
                 let tools_registry = deps.tools_registry.as_ref().map(Arc::clone);
                 let max_tool_iterations = deps.max_tool_iterations;
-                let turn_timeout_budget = deps.turn_timeout_budget;
                 let tool_security_policy = Arc::clone(&deps.tool_security_policy);
                 let tool_execution_context = chat_tool_execution_context(
                     tool_security_policy.as_ref(),
@@ -1273,24 +1269,10 @@ impl EffectExecutor {
                             None => scoped_spawn_driver.await,
                         }
                     };
-                    if let Some(timeout_budget) = turn_timeout_budget {
-                        if tokio::time::timeout(timeout_budget, scoped_driver).await.is_err() {
-                            cancel.cancel();
-                            let err = format!("redux driver: turn timed out after {}s", timeout_budget.as_secs());
-                            if let Err(e) = action_tx
-                                .send(Action::StreamFailed {
-                                    draft_id,
-                                    err,
-                                    retryable: true,
-                                })
-                                .await
-                            {
-                                tracing::debug!(error = %e, "StartTurn: action_tx closed on turn timeout");
-                            }
-                        }
-                    } else {
-                        scoped_driver.await;
-                    }
+                    // No wall clock: a provider turn ends when it finishes, when
+                    // `cancel` fires, or when the stall detector in
+                    // `crate::agent::idle` finds it has stopped making progress.
+                    scoped_driver.await;
                     tracing::debug!(
                         provider_turn_task_id = provider_turn_task_id_for_trace,
                         provider_turn_execution_lease_id,
@@ -5209,7 +5191,6 @@ mod real_mode_tests {
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
-            turn_timeout_budget: None,
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
         };
@@ -5657,7 +5638,6 @@ mod real_mode_tests {
                 temperature: 0.0,
                 tools_registry: None,
                 max_tool_iterations: 0,
-                turn_timeout_budget: None,
                 approval_router: Arc::new(ApprovalRouter::new()),
                 tool_security_policy: full_tool_security_policy(),
             };
@@ -5727,7 +5707,6 @@ mod real_mode_tests {
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
-            turn_timeout_budget: None,
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
         };
@@ -6697,7 +6676,6 @@ mod real_mode_tests {
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
-            turn_timeout_budget: None,
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
         };
@@ -6848,7 +6826,6 @@ mod real_mode_tests {
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
-            turn_timeout_budget: None,
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
         };
@@ -7003,7 +6980,6 @@ mod real_mode_tests {
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
-            turn_timeout_budget: None,
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
         };
@@ -8151,110 +8127,6 @@ mod real_mode_tests {
             Action::StreamCancelled { draft_id } => assert_eq!(draft_id, "draft-cancel-mid"),
             other => panic!("expected StreamCancelled after mid-turn cancel, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn redux_driver_turn_timeout_fails_soft_and_clears_generating() {
-        use crate::providers::traits::{
-            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
-            StreamResult,
-        };
-        use async_trait::async_trait;
-        use futures::stream::{self, BoxStream, StreamExt};
-
-        struct NeverStreamProvider;
-        #[async_trait]
-        impl Provider for NeverStreamProvider {
-            fn capabilities(&self) -> ProviderCapabilities {
-                ProviderCapabilities::default()
-            }
-            async fn chat_with_system(
-                &self,
-                _sys: Option<&str>,
-                _msg: &str,
-                _model: &str,
-                _temp: f64,
-            ) -> anyhow::Result<String> {
-                Ok(String::new())
-            }
-            async fn chat(&self, _r: ChatRequest<'_>, _model: &str, _temp: f64) -> anyhow::Result<ChatResponse> {
-                Ok(ChatResponse {
-                    text: None,
-                    tool_calls: Vec::new(),
-                    reasoning_content: None,
-                })
-            }
-            fn supports_streaming(&self) -> bool {
-                true
-            }
-            fn stream_chat_with_history(
-                &self,
-                _messages: &[PMsg],
-                _model: &str,
-                _temp: f64,
-                _options: StreamOptions,
-            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
-                stream::pending().boxed()
-            }
-            async fn warmup(&self) -> anyhow::Result<()> {
-                Ok(())
-            }
-        }
-
-        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
-        let shutdown = CancellationToken::new();
-        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
-        deps.provider = Arc::new(NeverStreamProvider);
-        deps.turn_timeout_budget = Some(Duration::from_millis(50));
-        let executor = EffectExecutor::new_with_deps(deps);
-
-        let mut state = crate::chat::state::ChatState::new(
-            Arc::from("test-provider"),
-            Arc::from("test-model"),
-            CancellationToken::new(),
-        );
-        let cancel = CancellationToken::new();
-        let start_effect = state
-            .reduce(Action::StartLLMTurn {
-                provider_turn_task_id: None,
-                provider_turn_sequence: None,
-                draft_id: "draft-timeout".to_string(),
-                history: Vec::new(),
-                compaction_guard_history: None,
-                compaction_config: None,
-                cancel: cancel.clone(),
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-            })
-            .into_iter()
-            .find(|effect| matches!(effect, Effect::StartTurn { .. }))
-            .expect("StartLLMTurn must emit StartTurn");
-        assert!(state.control.generating);
-        assert!(state.stream.primary_streaming_draft().is_some());
-
-        executor.execute(start_effect).await;
-        let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
-            .await
-            .expect("timeout StreamFailed within 2s")
-            .expect("timeout StreamFailed action");
-        match &action {
-            Action::StreamFailed {
-                draft_id,
-                err,
-                retryable,
-            } => {
-                assert_eq!(draft_id, "draft-timeout");
-                assert!(err.contains("redux driver: turn timed out"));
-                assert!(*retryable);
-            }
-            other => panic!("expected StreamFailed timeout, got {other:?}"),
-        }
-        assert!(cancel.is_cancelled(), "timeout must cancel the pending provider stream");
-
-        let _ = state.reduce(action);
-        assert!(!state.control.generating, "StreamFailed must clear generating");
-        assert!(state.control.active_cancel.is_none());
-        assert!(state.stream.primary_streaming_draft().is_none());
     }
 
     /// P0-1 简化版: try_dispatch ChannelClosed 时返回 ChannelClosed
@@ -11715,7 +11587,6 @@ mod real_mode_tests {
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
-            turn_timeout_budget: None,
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
         };
