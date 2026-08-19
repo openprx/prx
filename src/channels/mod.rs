@@ -117,9 +117,17 @@ const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
 const MIN_CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 30;
 /// Cap timeout scaling so large max_tool_iterations values do not create unbounded waits.
 const CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP: u64 = 4;
-const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 4;
-const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
-const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
+/// Depth of the single inbound message bus shared by every channel listener.
+///
+/// Bounded on purpose: it is the process's backpressure surface. Listeners
+/// publish with `send(..).await`, so a producer that outruns the process is
+/// slowed down rather than having its messages dropped, and the platforms
+/// themselves stop advancing (Telegram's offset, an IMAP IDLE cycle) instead of
+/// PRX buffering without limit. Since `run_message_dispatch_loop` no longer
+/// blocks on anything a turn holds, a queue that stays full now means the
+/// machine cannot spawn turns fast enough — a real signal — rather than one
+/// wedged conversation holding the door shut for everyone.
+const CHANNEL_INBOUND_QUEUE_CAPACITY: usize = 100;
 const CHANNEL_CIRCUIT_BREAKER_FAILURES: u32 = 5;
 const CHANNEL_CIRCUIT_BREAKER_BACKOFF_MULTIPLIER: u32 = 5;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
@@ -2605,12 +2613,6 @@ fn channel_supervisor_sleep_duration(consecutive_failures: u32, backoff: u64, ma
     Duration::from_secs(backoff.max(1))
 }
 
-fn compute_max_in_flight_messages(channel_count: usize) -> usize {
-    channel_count
-        .saturating_mul(CHANNEL_PARALLELISM_PER_CHANNEL)
-        .clamp(CHANNEL_MIN_IN_FLIGHT_MESSAGES, CHANNEL_MAX_IN_FLIGHT_MESSAGES)
-}
-
 fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
     if let Err(error) = result {
         tracing::error!("Channel message worker crashed: {error}");
@@ -2645,10 +2647,56 @@ fn spawn_scoped_typing_task(
     })
 }
 
+/// Registry label for one channel turn — enough to tell two live turns apart in
+/// `prx tasks list` without spilling message content into an operator listing.
+fn channel_turn_label(msg: &traits::ChannelMessage) -> String {
+    use std::fmt::Write as _;
+    let mut label = format!("channel:{}:{}", msg.channel, msg.sender);
+    if !msg.reply_target.is_empty() && msg.reply_target != msg.sender {
+        // Writing into a String is infallible; the Result is discarded rather
+        // than unwrapped so this stays panic-free by construction.
+        let _ = write!(label, " in {}", msg.reply_target);
+    }
+    label
+}
+
+/// Handle one inbound channel message as a registered agent turn.
+///
+/// Nothing ends a turn on a clock any more, so a turn that wedges — in a tool,
+/// in a provider call, or anywhere between them — can only be dealt with if an
+/// operator can *see* it and end it by hand. That is what this wrapper exists
+/// for: the turn is registered before any of its own work starts, and the whole
+/// turn runs inside [`crate::runtime::registry::scoped`], so the tool calls,
+/// sub-agents and child processes it goes on to start resolve it as their
+/// parent and `prx tasks kill --cascade <turn>` reaches every one of them.
+///
+/// The guard is owned by the awaited future rather than by this scope, so the
+/// row disappears with the turn however the turn ends — normal return, panic,
+/// or a dropped future.
 async fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: traits::ChannelMessage,
     cancellation_token: CancellationToken,
+) {
+    // D8-1: one run_id per channel turn. Minted here rather than deeper inside
+    // the turn so the registry row and the turn's stored provenance (every
+    // append_sender_turn call, the per-turn context envelope, the terminal
+    // record) all carry the same id, and an operator reading `prx tasks list`
+    // can correlate a live row with what it later wrote.
+    let turn_run_id = uuid::Uuid::new_v4().to_string();
+    let guard = crate::runtime::registry::register_turn(
+        &channel_turn_label(&msg),
+        &turn_run_id,
+        Some(cancellation_token.clone()),
+    );
+    crate::runtime::registry::scoped(guard, run_channel_turn(ctx, msg, cancellation_token, turn_run_id)).await;
+}
+
+async fn run_channel_turn(
+    ctx: Arc<ChannelRuntimeContext>,
+    msg: traits::ChannelMessage,
+    cancellation_token: CancellationToken,
+    turn_run_id: String,
 ) {
     if cancellation_token.is_cancelled() {
         return;
@@ -2729,13 +2777,6 @@ async fn process_channel_message(
         );
         return;
     }
-
-    // D8-1: one run_id per channel turn, generated at the turn entry (right after
-    // the inbound gate, before any persistence). It is threaded through every
-    // append_sender_turn call for this turn and reused for the per-turn context
-    // envelope below, so the inbound user event and the outbound assistant event
-    // share a single run_id (per-turn provenance, not per-session).
-    let turn_run_id = uuid::Uuid::new_v4().to_string();
 
     if let Err(error) = ctx
         .memory
@@ -4028,20 +4069,41 @@ async fn run_smart_pre_gate(
     }
 }
 
+/// Fan every inbound channel message out to its own turn.
+///
+/// **There is deliberately no concurrency gate here, and nothing may
+/// reintroduce one.** This loop used to acquire a semaphore permit — one pool
+/// for user messages, a smaller one for `system:` senders — on the dispatch
+/// task itself, before it could come back around to `rx.recv()`. That was
+/// survivable only while a turn was guaranteed to end on a clock. Now that a
+/// turn can legitimately run for hours and nothing expires on its own, a
+/// handful of wedged turns would hold every permit forever, the loop would stop
+/// receiving, the bounded inbound queue would fill, and every listener's
+/// `tx.send(..).await` would park: one stuck conversation deafens the whole
+/// process, for every channel and every user, until it is restarted. Spawning
+/// unconditionally is what keeps a stuck turn a *local* failure.
+///
+/// Removing the gate does not remove backpressure, it moves it to where it can
+/// be honest. The inbound channel is still bounded and every listener publishes
+/// with `send(..).await`, so a producer that outruns the process is slowed down
+/// rather than having its messages dropped. What changed is what a full queue
+/// *means*: the loop no longer blocks on anything a turn holds, so it can only
+/// fall behind if the machine genuinely cannot spawn tasks fast enough. Live
+/// turns are the memory that grows, and every one of them is registered,
+/// listable and killable — see [`process_channel_message`].
+///
+/// The old user/system split is not replaced by another mechanism because it
+/// never delivered the property it claimed. Both semaphores gated the same
+/// task, so an exhausted *system* pool stalled user messages exactly as hard as
+/// an exhausted user pool; with no shared permits at all there is nothing left
+/// for system traffic to starve user traffic out of. The distinction survives
+/// where it does real work — [`is_system_message`] at the smart-group gate, and
+/// the `system:` sender prefix that a turn carries into its registry label.
 async fn run_message_dispatch_loop(
     mut rx: tokio::sync::mpsc::Receiver<traits::ChannelMessage>,
     ctx: Arc<ChannelRuntimeContext>,
-    max_in_flight_messages: usize,
     shutdown: CancellationToken,
 ) {
-    // User messages always get full capacity — system tasks (webhooks, heartbeats)
-    // get a separate, smaller pool (30% of max, min 1) so they can never starve
-    // user messages even when the system pool is exhausted.
-    let user_capacity = max_in_flight_messages.max(1);
-    let system_capacity = (max_in_flight_messages * 3 / 10).max(1);
-    let user_semaphore = Arc::new(tokio::sync::Semaphore::new(user_capacity));
-    let system_semaphore = Arc::new(tokio::sync::Semaphore::new(system_capacity));
-
     let mut workers = tokio::task::JoinSet::new();
     let in_flight_by_sender = Arc::new(tokio::sync::Mutex::new(
         HashMap::<String, InFlightSenderTaskState>::new(),
@@ -4060,6 +4122,14 @@ async fn run_message_dispatch_loop(
                 crate::health::mark_component_ok("channels");
                 continue;
             }
+            // Reap finished workers as they land instead of only when the
+            // next message arrives, so a burst followed by silence does not
+            // leave completed handles sitting in the set. Guarded because
+            // `join_next` on an empty set resolves immediately.
+            Some(result) = workers.join_next(), if !workers.is_empty() => {
+                log_worker_join_result(result);
+                continue;
+            }
             maybe_msg = rx.recv() => match maybe_msg {
                 Some(msg) => {
                     // The single point every channel's inbound traffic passes
@@ -4070,21 +4140,11 @@ async fn run_message_dispatch_loop(
                 None => break,
             },
         };
-        let sem = if is_system_message(&msg) {
-            Arc::clone(&system_semaphore)
-        } else {
-            Arc::clone(&user_semaphore)
-        };
-        let permit = match sem.acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => break,
-        };
 
         let worker_ctx = Arc::clone(&ctx);
         let in_flight = Arc::clone(&in_flight_by_sender);
         let task_sequence = Arc::clone(&task_sequence);
         workers.spawn(async move {
-            let _permit = permit;
             let interrupt_enabled = worker_ctx.interrupt_on_new_message && msg.channel == "telegram";
             let sender_scope_key = interruption_scope_key(&msg);
             let cancellation_token = CancellationToken::new();
@@ -5586,7 +5646,7 @@ pub async fn start_channels_with_config(
         .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS);
 
     // Single message bus — all channels send messages here
-    let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(100);
+    let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(CHANNEL_INBOUND_QUEUE_CAPACITY);
 
     // Spawn a listener for each channel
     let mut handles = Vec::new();
@@ -5607,9 +5667,9 @@ pub async fn start_channels_with_config(
             .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
             .collect::<HashMap<_, _>>(),
     );
-    let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
-
-    println!("  🚦 In-flight message limit: {max_in_flight_messages}");
+    // No cap: a wedged turn must not be able to stop the dispatch loop from
+    // receiving. `prx tasks list` is where in-flight turns are counted now.
+    println!("  🚦 In-flight messages: unbounded (inspect with `prx tasks list`)");
 
     let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     provider_cache_seed.insert(provider_name.clone(), Arc::clone(&provider));
@@ -5724,7 +5784,7 @@ pub async fn start_channels_with_config(
         test_inbound_authorizer: None,
     });
 
-    run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages, shutdown).await;
+    run_message_dispatch_loop(rx, runtime_ctx, shutdown).await;
 
     // Wait for all channel tasks. On shutdown the supervised listeners break out
     // of their loops (ListenerOutcome::Shutdown above), so these joins complete
@@ -9870,7 +9930,7 @@ BTC is currently around $65,000 based on latest tool output."#
         drop(tx);
 
         let started = Instant::now();
-        run_message_dispatch_loop(rx, runtime_ctx, 2, CancellationToken::new()).await;
+        run_message_dispatch_loop(rx, runtime_ctx, CancellationToken::new()).await;
         let elapsed = started.elapsed();
 
         assert!(
@@ -9986,7 +10046,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, runtime_ctx, 4, CancellationToken::new()).await;
+        run_message_dispatch_loop(rx, runtime_ctx, CancellationToken::new()).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -10116,7 +10176,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, runtime_ctx, 4, CancellationToken::new()).await;
+        run_message_dispatch_loop(rx, runtime_ctx, CancellationToken::new()).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -11761,5 +11821,370 @@ After"#;
     fn maybe_restart_daemon_openrc_args_regression() {
         assert_eq!(OPENRC_STATUS_ARGS, ["prx", "status"]);
         assert_eq!(OPENRC_RESTART_ARGS, ["prx", "restart"]);
+    }
+
+    // ── Runtime registry coverage for channel turns ─────────────────────────
+    //
+    // These two tests are the load-bearing evidence for taking the channel turn
+    // timeout out. Before it goes, a stuck turn has to be visible and killable
+    // (first test), and one stuck turn must not be able to stop the process from
+    // hearing anybody else (second test).
+
+    /// Poll `probe` until it yields a value, or give up after ~15s.
+    async fn wait_for<T>(mut probe: impl FnMut() -> Option<T>) -> Option<T> {
+        for _ in 0..600 {
+            if let Some(value) = probe() {
+                return Some(value);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        None
+    }
+
+    fn registry_probe_ctx(
+        channel: Arc<dyn Channel>,
+        provider: Arc<dyn Provider>,
+        tools_registry: Arc<Vec<Box<dyn Tool>>>,
+    ) -> Arc<ChannelRuntimeContext> {
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
+            channels_by_name: Arc::new(channels_by_name),
+            provider,
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry,
+            observer: Arc::new(NoopObserver),
+            hooks: Arc::new(HookManager::new(std::env::temp_dir())),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
+            max_tool_iterations: 10,
+            read_only_tool_concurrency_window: 2,
+            priority_scheduling_enabled: false,
+            low_priority_tools: Vec::new(),
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            tool_tiering: crate::config::ToolTieringConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
+            bot_names: vec!["prx".to_string()],
+            bot_uuids: vec![],
+            mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+            })),
+            native_tools: false,
+            skill_rag_ctx: None,
+            test_inbound_authorizer: None,
+        })
+    }
+
+    /// Sleep duration used as an unmistakable process label, since the rest of
+    /// the suite shares this process-wide registry and runs in parallel.
+    const TURN_PROBE_SLEEP: &str = "302.17";
+
+    /// The probe tool borrows the name of a read-effect tool on purpose: this
+    /// harness has no durable idempotency ledger, so an `Act`-effect tool would
+    /// be refused before it ever runs and the turn would never reach the state
+    /// this test is about.
+    fn turn_probe_tool_call() -> String {
+        r#"<tool_call>
+{"name":"web_fetch","arguments":{"url":"https://example.invalid/never-returns"}}
+</tool_call>"#
+            .to_string()
+    }
+
+    struct TurnProbeProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for TurnProbeProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(turn_probe_tool_call())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(turn_probe_tool_call())
+        }
+    }
+
+    /// A tool that owns a real child process and never returns on its own —
+    /// the shape a turn takes when it wedges with side effects still running.
+    struct TurnProbeBlockingTool;
+
+    #[async_trait::async_trait]
+    impl Tool for TurnProbeBlockingTool {
+        fn name(&self) -> &str {
+            "web_fetch"
+        }
+
+        fn description(&self) -> &str {
+            "Hold a registered child process open until the turn is killed"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "url": { "type": "string" } },
+                "required": ["url"]
+            })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            let mut command = tokio::process::Command::new("sleep");
+            command.arg(TURN_PROBE_SLEEP);
+            let mut child = crate::runtime::shell_process::spawn_managed_shell_child(command)?;
+            // The only way out is an operator kill reaching this process group,
+            // which is precisely what the test measures.
+            let _ = child.wait().await;
+            child.mark_complete();
+            Ok(ToolResult {
+                success: true,
+                output: "child exited".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    /// Core evidence 1: a live channel turn is a first-class registry row, and
+    /// killing it with cascade reaches the tool call it started and the child
+    /// process under that tool call.
+    #[tokio::test]
+    async fn channel_turn_is_registered_and_cascade_kill_reaches_its_tool_and_child_process() {
+        use crate::runtime::registry;
+
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = registry_probe_ctx(
+            channel,
+            Arc::new(TurnProbeProvider),
+            Arc::new(vec![Box::new(TurnProbeBlockingTool) as Box<dyn Tool>]),
+        );
+
+        let turn = tokio::spawn(process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "turn-registry-probe".to_string(),
+                sender: "turn-registry-probe-alice".to_string(),
+                reply_target: "turn-registry-probe-room".to_string(),
+                content: "hold on to something".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        ));
+
+        let turn_row = wait_for(|| {
+            registry::snapshot_all()
+                .into_iter()
+                .find(|row| row.kind == registry::WorkKind::Turn && row.name.contains("turn-registry-probe-alice"))
+        })
+        .await
+        .expect("test: a live channel turn must be listed by the runtime registry");
+
+        assert_eq!(turn_row.state, registry::WorkState::Running);
+        assert!(
+            turn_row.name.contains("test-channel") && turn_row.name.contains("turn-registry-probe-room"),
+            "test: the turn row must identify channel, sender and conversation: {}",
+            turn_row.name
+        );
+        assert!(
+            turn_row.run_id.is_some(),
+            "test: the turn row must carry the run id its stored records use"
+        );
+
+        let child_row = wait_for(|| {
+            registry::snapshot_all()
+                .into_iter()
+                .find(|row| row.name.contains(TURN_PROBE_SLEEP))
+        })
+        .await
+        .expect("test: the child process started inside the turn must be registered");
+        assert_eq!(child_row.kind, registry::WorkKind::Process);
+        assert!(
+            child_row.pgid.is_some(),
+            "test: the child must be registered by process group so a kill reaches its forks"
+        );
+
+        let results = registry::kill(turn_row.id, true).await;
+        let kinds: Vec<registry::WorkKind> = results.iter().map(|result| result.kind).collect();
+        assert!(
+            kinds.contains(&registry::WorkKind::Turn),
+            "test: the turn itself must be a kill target: {results:?}"
+        );
+        assert!(
+            kinds.contains(&registry::WorkKind::ToolCall),
+            "test: the turn's tool call must be reached by cascade: {results:?}"
+        );
+        assert!(
+            kinds.contains(&registry::WorkKind::Process),
+            "test: the turn's child process must be reached by cascade: {results:?}"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .find(|result| result.kind == registry::WorkKind::Process)
+                .map(|result| result.outcome),
+            Some(registry::KillOutcome::Killed),
+            "test: the child process must be confirmed dead against the OS: {results:?}"
+        );
+
+        assert!(
+            wait_for(|| registry::snapshot(turn_row.id).is_none().then_some(()))
+                .await
+                .is_some(),
+            "test: a killed turn must retire from the registry instead of lingering"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(20), turn).await;
+    }
+
+    /// More stuck turns than the largest capacity the removed dispatch gate ever
+    /// handed out (`CHANNEL_MIN_IN_FLIGHT_MESSAGES` was 8; the system pool was
+    /// 30% of that).
+    const DISPATCH_GATE_STUCK_TURNS: usize = 12;
+
+    async fn respond_or_block_forever(is_ping: bool) -> anyhow::Result<String> {
+        if is_ping {
+            return Ok("PONG-PROBE".to_string());
+        }
+        // A turn that never finishes and is never timed out — exactly the shape
+        // that used to hold a dispatch permit forever.
+        let never: std::convert::Infallible = std::future::pending().await;
+        match never {}
+    }
+
+    struct StuckUnlessPingProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for StuckUnlessPingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            respond_or_block_forever(message.contains("PING-PROBE")).await
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let is_ping = messages.iter().any(|message| message.content.contains("PING-PROBE"));
+            respond_or_block_forever(is_ping).await
+        }
+    }
+
+    /// Core evidence 2: with more permanently stuck turns in flight than the old
+    /// semaphore would ever have admitted, the dispatch loop still receives and
+    /// answers the next message. With the gate in place this deadlocked — the
+    /// permit was taken on the dispatch task itself, so the 9th message was
+    /// never even read off the bus.
+    #[tokio::test]
+    async fn dispatch_keeps_answering_while_more_turns_are_stuck_than_the_old_gate_allowed() {
+        use crate::runtime::registry;
+
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = registry_probe_ctx(channel, Arc::new(StuckUnlessPingProvider), Arc::new(vec![]));
+
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<traits::ChannelMessage>(DISPATCH_GATE_STUCK_TURNS.saturating_add(4));
+        for index in 0..DISPATCH_GATE_STUCK_TURNS {
+            let sender = format!("dispatch-gate-stuck-{index}");
+            tx.send(traits::ChannelMessage {
+                id: format!("dispatch-gate-stuck-msg-{index}"),
+                sender: sender.clone(),
+                reply_target: sender,
+                content: "STUCK-PROBE".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("test: queue a stuck message");
+        }
+        tx.send(traits::ChannelMessage {
+            id: "dispatch-gate-ping-msg".to_string(),
+            sender: "dispatch-gate-ping".to_string(),
+            reply_target: "dispatch-gate-ping".to_string(),
+            content: "PING-PROBE".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 2,
+            ..Default::default()
+        })
+        .await
+        .expect("test: queue the message that must still be answered");
+        drop(tx);
+
+        let dispatch = tokio::spawn(run_message_dispatch_loop(rx, runtime_ctx, CancellationToken::new()));
+
+        let mut answered = false;
+        for _ in 0..600 {
+            {
+                let sent = channel_impl.sent_messages.lock().await;
+                if sent.iter().any(|message| message.contains("PONG-PROBE")) {
+                    answered = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            answered,
+            "test: {DISPATCH_GATE_STUCK_TURNS} wedged turns must not stop the dispatch loop from \
+             receiving and answering the next message"
+        );
+
+        let stuck_rows = wait_for(|| {
+            let count = registry::snapshot_all()
+                .into_iter()
+                .filter(|row| row.kind == registry::WorkKind::Turn && row.name.contains("dispatch-gate-stuck-"))
+                .count();
+            (count >= DISPATCH_GATE_STUCK_TURNS).then_some(count)
+        })
+        .await
+        .unwrap_or_default();
+        assert_eq!(
+            stuck_rows, DISPATCH_GATE_STUCK_TURNS,
+            "test: every wedged turn must be listed, so an operator can find and kill it"
+        );
+
+        dispatch.abort();
+        let _ = dispatch.await;
     }
 }

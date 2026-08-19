@@ -3027,7 +3027,13 @@ async fn run_sub_agent_task(
         // When absent (channels/gateway), no manager + no resolver = the
         // historical auto-fail-on-gate path (zero behaviour change).
         let approval_resolver_iter = approval_resolver.clone();
-        let mut loop_handle = tokio::spawn(async move {
+        // Task-locals do not cross `tokio::spawn`, so the spawner's idle-hang
+        // beat is captured and re-installed inside the child run. Without it a
+        // parent turn that is legitimately blocked on a sub-agent which is
+        // visibly working would look silent to its own hang detector; with it
+        // the child's progress refreshes the parent's window too.
+        let spawner_beat = crate::agent::idle::current_beat();
+        let mut loop_handle = tokio::spawn(crate::agent::idle::scope_beat(spawner_beat, async move {
             let observer = NoopObserver;
             let hooks = HookManager::new(workspace_dir_owned);
             let scope_ctx = scope_owned.as_ref().map(|scope| ScopeContext {
@@ -3093,7 +3099,7 @@ async fn run_sub_agent_task(
                 history_commit_len: task_history.len(),
             });
             (task_history, result)
-        });
+        }));
 
         // Race: loop completion vs steering message
         tokio::select! {

@@ -1722,6 +1722,9 @@ async fn apply_configurable_compaction_with_replacement_len(
     else {
         return Ok(None);
     };
+    // Compacting history is real work done on the turn's behalf, so it counts
+    // as progress even though it produces no user-visible output.
+    crate::agent::idle::beat(crate::agent::idle::ProgressKind::Compaction);
     let replacement_len = patch.replacement.len();
     apply_compaction_patch_exact(history, &patch);
     Ok(Some(replacement_len))
@@ -3937,6 +3940,9 @@ async fn execute_one_tool(
     runtime_approval_granted: bool,
     chat_mode: ChatMode,
 ) -> Result<String> {
+    // The non-service tool path; the service path beats in
+    // `ToolExecutionService::execute` / `finish`.
+    crate::agent::idle::beat(crate::agent::idle::ProgressKind::ToolStart);
     if chat_mode.intercepts_writes() && is_write_tool(call_name) {
         let preview = preview_tool_arguments(&call_arguments);
         observer.record_event(&ObserverEvent::ToolCall {
@@ -4974,6 +4980,8 @@ impl SharedToolCallAggregator {
 }
 
 async fn emit_tool_loop_event(adapter: &ToolLoopRuntimeAdapter, event: ToolLoopEvent) -> Result<()> {
+    // Anything reaching a user-visible sink is progress by definition.
+    crate::agent::idle::beat(crate::agent::idle::ProgressKind::ChannelOutput);
     let Some(events) = adapter.events.as_ref() else {
         return Ok(());
     };
@@ -5034,6 +5042,11 @@ async fn run_streaming_provider_turn(
                     route_attempt,
                     ..
                 })) => {
+                    // Any chunk at all — text, reasoning, a tool-call
+                    // fragment, or a bare keepalive frame — is evidence the
+                    // provider connection is alive, which is the quantity a
+                    // stream should be judged on. Resets the idle window.
+                    crate::agent::idle::beat(crate::agent::idle::ProgressKind::ProviderStream);
                     if let Some(route_attempt) = route_attempt {
                         route_attempts.push(route_attempt);
                     }
@@ -5128,6 +5141,7 @@ async fn run_streaming_provider_turn(
                     }
                     .into());
                 }
+                crate::agent::idle::beat(crate::agent::idle::ProgressKind::ProviderRetry);
                 emit_tool_loop_event(
                     adapter,
                     ToolLoopEvent::RetryAttempt {
@@ -5521,8 +5535,103 @@ pub(crate) async fn run_tool_call_loop_traced(
 ///
 /// [`run_tool_call_loop`] and [`run_tool_call_loop_traced`] are behavior-
 /// preserving shells over this function.
+///
+/// # Hang detection
+///
+/// This entrypoint wraps the loop in [`crate::agent::idle::run_guarded`], which
+/// terminates the turn if it produces **no observable progress at all** for the
+/// configured window (`[runtime] idle_hang_secs`, default 1800s). That is a
+/// stall detector, not a turn timeout: every provider chunk, tool call, and
+/// compaction resets the window, so a turn that keeps working is never bounded
+/// by it however long it runs. Wall-clock turn budgets were removed from this
+/// runtime deliberately and this is not a way back to one — see the module
+/// documentation of [`crate::agent::idle`] before changing anything here.
+///
+/// The guard lives at this level rather than inside the loop so that returning
+/// from it *drops* the loop future, which drops every future nested in it and
+/// so every RAII guard owning a child process. That cleanup works even against
+/// a tool that ignores cancellation, which is the population a hang detector
+/// exists for.
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 pub(crate) async fn run_tool_call_loop_outcome(
+    provider: &dyn Provider,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: Arc<Vec<Box<dyn Tool>>>,
+    observer: &dyn Observer,
+    hooks: &HookManager,
+    provider_name: &str,
+    model: &str,
+    temperature: f64,
+    silent: bool,
+    approval: Option<Arc<ApprovalManager>>,
+    channel_name: &str,
+    multimodal_config: &crate::config::MultimodalConfig,
+    max_tool_iterations: usize,
+    read_only_tool_concurrency_window: usize,
+    priority_scheduling_enabled: bool,
+    low_priority_tool_names: Vec<String>,
+    compaction_config: Option<&crate::config::AgentCompactionConfig>,
+    cancellation_token: Option<CancellationToken>,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    scope_ctx: Option<&ScopeContext<'_>>,
+    on_tool_call: Option<tokio::sync::mpsc::Sender<ToolCallNotification>>,
+    tool_tiering: Option<&crate::config::ToolTieringConfig>,
+    document_ingest: Option<DocumentIngestRuntime>,
+    chat_mode: ChatMode,
+    approval_resolver: Option<Arc<dyn ApprovalResolver>>,
+    expose_stay_silent: bool,
+    runtime_adapter: Option<ToolLoopRuntimeAdapter>,
+) -> Result<(ToolLoopOutcome, ToolLoopTrace)> {
+    let guard_token = cancellation_token.clone();
+    // Boxed at the boundary, not inside the guard. The loop future is one of the
+    // largest in the process, and letting the guard hold it inline would place a
+    // second copy of it in this frame — enough to overflow a tokio worker's
+    // stack on the chat path. A pointer costs nothing here and keeps the guard's
+    // own future tiny.
+    let inner = Box::pin(run_tool_call_loop_outcome_unguarded(
+        provider,
+        history,
+        tools_registry,
+        observer,
+        hooks,
+        provider_name,
+        model,
+        temperature,
+        silent,
+        approval,
+        channel_name,
+        multimodal_config,
+        max_tool_iterations,
+        read_only_tool_concurrency_window,
+        priority_scheduling_enabled,
+        low_priority_tool_names,
+        compaction_config,
+        cancellation_token,
+        on_delta,
+        scope_ctx,
+        on_tool_call,
+        tool_tiering,
+        document_ingest,
+        chat_mode,
+        approval_resolver,
+        expose_stay_silent,
+        runtime_adapter,
+    ));
+    crate::agent::idle::run_guarded(
+        crate::agent::idle::configured(),
+        channel_name,
+        guard_token.as_ref(),
+        inner,
+    )
+    .await
+}
+
+/// The loop itself, without the hang guard.
+///
+/// Split out only so [`run_tool_call_loop_outcome`] can wrap it; every caller
+/// must go through the guarded entrypoint.
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+async fn run_tool_call_loop_outcome_unguarded(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
     tools_registry: Arc<Vec<Box<dyn Tool>>>,
@@ -5660,7 +5769,10 @@ pub(crate) async fn run_tool_call_loop_outcome(
             }
         }
         match apply_os_paging(history, config, document_ingest.as_ref()).await {
-            Ok(true) => tracing::debug!("os-paging: pre-turn eviction applied"),
+            Ok(true) => {
+                crate::agent::idle::beat(crate::agent::idle::ProgressKind::Compaction);
+                tracing::debug!("os-paging: pre-turn eviction applied");
+            }
             Ok(false) => {}
             Err(e) => tracing::warn!("os-paging: pre-turn eviction error (soft): {e}"),
         }
@@ -5703,6 +5815,9 @@ pub(crate) async fn run_tool_call_loop_outcome(
     let mut inject_tool_summary_retry_instruction = false;
 
     for iteration in 0..max_iterations {
+        // Reaching a new iteration means the previous one produced a complete
+        // model response and its tool results: unambiguous progress.
+        crate::agent::idle::beat(crate::agent::idle::ProgressKind::ProviderResponse);
         // Notify progress for multi-iteration tool loops (skip the first iteration).
         if iteration > 0 {
             if let Some(ref tx) = on_tool_call {
@@ -5826,6 +5941,10 @@ pub(crate) async fn run_tool_call_loop_outcome(
                 chat_future.await
             }
         };
+
+        // A completed provider round-trip is progress even on the buffered
+        // path, where no intermediate signal exists to observe.
+        crate::agent::idle::beat(crate::agent::idle::ProgressKind::ProviderResponse);
 
         // P0-1: chat_processed is Result so we can detect context overflow below.
         let chat_processed = match chat_result {
@@ -9356,6 +9475,318 @@ mod tests {
             max_active.load(Ordering::SeqCst),
             1,
             "stateful tools should never overlap in execution"
+        );
+    }
+
+    /// A tool that takes a fixed slice of time and counts its invocations, so a
+    /// test can assert both how long a turn really ran and how many rounds of
+    /// real work it did.
+    struct SteadyTool {
+        delay: Duration,
+        executions: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for SteadyTool {
+        fn name(&self) -> &str {
+            "delay_progress"
+        }
+
+        fn description(&self) -> &str {
+            "Sleeps for a fixed interval and reports progress"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "value": { "type": "string" } }
+            })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+            tokio::time::sleep(self.delay).await;
+            let round = self.executions.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: format!("tick {round}"),
+                error: None,
+            })
+        }
+    }
+
+    /// A provider whose call never returns and never errors — the exact shape
+    /// of the hang the idle detector exists to recover from.
+    struct HangingProvider;
+
+    #[async_trait]
+    impl Provider for HangingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            std::future::pending().await
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            std::future::pending().await
+        }
+    }
+
+    /// Core evidence 1, at the production entrypoint: a turn whose provider
+    /// call never returns is terminated by the idle detector, and the error
+    /// identifies it as a hang rather than a failure or an operator kill.
+    #[tokio::test]
+    async fn production_turn_that_hangs_is_terminated_by_the_idle_detector() {
+        let provider = HangingProvider;
+        let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user("hang please")];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let guard = crate::agent::idle::IdleGuard {
+            idle: Some(Duration::from_millis(300)),
+            max_total: None,
+        };
+        let error = crate::agent::idle::with_guard(
+            guard,
+            run_tool_call_loop(
+                &provider,
+                &mut history,
+                Arc::new(tools_registry),
+                &observer,
+                &crate::hooks::HookManager::new(std::env::temp_dir()),
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                None,
+                "telegram",
+                &crate::config::MultimodalConfig::default(),
+                4,
+                2,
+                false,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None, // no scope context
+                None,
+                None, // no tool tiering
+                None, // no document ingest
+                ChatMode::default(),
+            ),
+        )
+        .await
+        .expect_err("a turn whose provider never responds must be terminated");
+
+        assert!(
+            crate::agent::idle::is_hang_termination(&error),
+            "the production loop must surface a hang termination, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("no observable progress"),
+            "the message must say why: {error}"
+        );
+    }
+
+    /// Core evidence 2, at the production entrypoint, and the whole point of
+    /// this mechanism: a turn that runs many times longer than the idle window
+    /// but keeps working runs to its natural end untouched.
+    ///
+    /// MUTATION: make the idle check in `crate::agent::idle::verdict` read
+    /// total elapsed time instead of time since the last progress event and
+    /// this test fails, because the turn's total run time is six times the
+    /// window while its longest silence is a fraction of it.
+    #[tokio::test]
+    async fn production_turn_far_longer_than_the_idle_window_survives_on_progress() {
+        const ROUNDS: usize = 10;
+        const TOOL_DELAY_MS: u64 = 120;
+        let idle_window = Duration::from_millis(200);
+
+        let mut scripted: Vec<&str> = vec![
+            r#"<tool_call>
+{"name":"delay_progress","arguments":{"value":"tick"}}
+</tool_call>"#;
+            ROUNDS
+        ];
+        scripted.push("done");
+        let provider = ScriptedProvider::from_text_responses(scripted);
+
+        let executions = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(SteadyTool {
+            delay: Duration::from_millis(TOOL_DELAY_MS),
+            executions: Arc::clone(&executions),
+        })];
+        let ledger_dir = TempDir::new().unwrap();
+        let ledger_memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(ledger_dir.path()).unwrap());
+        let ledger_envelope = RuntimeEnvelope::agent(ledger_dir.path().to_string_lossy().to_string(), "idle-progress");
+        let document_ingest = DocumentIngestRuntime::from_envelope(ledger_memory, &ledger_envelope);
+
+        let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user("work steadily")];
+        let observer = NoopObserver;
+
+        let guard = crate::agent::idle::IdleGuard {
+            idle: Some(idle_window),
+            max_total: None,
+        };
+        let started = std::time::Instant::now();
+        let result = crate::agent::idle::with_guard(
+            guard,
+            run_tool_call_loop(
+                &provider,
+                &mut history,
+                Arc::new(tools_registry),
+                &observer,
+                &crate::hooks::HookManager::new(std::env::temp_dir()),
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                Some(Arc::new(ApprovalManager::new())),
+                "telegram",
+                &crate::config::MultimodalConfig::default(),
+                ROUNDS + 2,
+                2,
+                false,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None, // no scope context
+                None,
+                None, // no tool tiering
+                Some(document_ingest),
+                ChatMode::default(),
+            ),
+        )
+        .await
+        .expect("a turn that keeps making progress must never be terminated");
+        let elapsed = started.elapsed();
+
+        assert_eq!(result, "done", "the turn must reach its own natural end");
+        assert!(
+            elapsed > idle_window * 4,
+            "the test is only meaningful if the turn outlives the idle window several times over; \
+             elapsed={elapsed:?} window={idle_window:?} rounds={}",
+            executions.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            ROUNDS,
+            "every scripted round must have done real work"
+        );
+    }
+
+    /// A provider that never stops asking for the same tool, so the turn can
+    /// only end at the iteration budget.
+    struct LoopingToolProvider;
+
+    #[async_trait]
+    impl Provider for LoopingToolProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system is not used by this test provider")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some(
+                    "<tool_call>\n{\"name\":\"delay_progress\",\"arguments\":{\"value\":\"again\"}}\n</tool_call>"
+                        .to_string(),
+                ),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    /// The deliberate limit of this mechanism, pinned so nobody "fixes" it into
+    /// something worse.
+    ///
+    /// A model stuck calling the same tool forever is emitting real events, so
+    /// the runtime is not hung and the idle detector must not fire: it cannot
+    /// and must not judge whether progress is *useful*, only whether there is
+    /// any. Non-convergence is a different fault with its own existing bound,
+    /// `agent.max_tool_iterations`, and that is what ends this turn.
+    #[tokio::test]
+    async fn a_futile_but_active_loop_is_bounded_by_iterations_not_by_hang_detection() {
+        const BUDGET: usize = 6;
+        let provider = LoopingToolProvider;
+        let executions = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(SteadyTool {
+            delay: Duration::from_millis(60),
+            executions: Arc::clone(&executions),
+        })];
+        let ledger_dir = TempDir::new().unwrap();
+        let ledger_memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(ledger_dir.path()).unwrap());
+        let ledger_envelope = RuntimeEnvelope::agent(ledger_dir.path().to_string_lossy().to_string(), "futile-loop");
+        let document_ingest = DocumentIngestRuntime::from_envelope(ledger_memory, &ledger_envelope);
+
+        let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user("spin forever")];
+        let observer = NoopObserver;
+
+        let guard = crate::agent::idle::IdleGuard {
+            idle: Some(Duration::from_millis(200)),
+            max_total: None,
+        };
+        let outcome = crate::agent::idle::with_guard(
+            guard,
+            run_tool_call_loop(
+                &provider,
+                &mut history,
+                Arc::new(tools_registry),
+                &observer,
+                &crate::hooks::HookManager::new(std::env::temp_dir()),
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                Some(Arc::new(ApprovalManager::new())),
+                "telegram",
+                &crate::config::MultimodalConfig::default(),
+                BUDGET,
+                2,
+                false,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None, // no scope context
+                None,
+                None, // no tool tiering
+                Some(document_ingest),
+                ChatMode::default(),
+            ),
+        )
+        .await;
+
+        if let Err(error) = &outcome {
+            assert!(
+                !crate::agent::idle::is_hang_termination(error),
+                "a busy-but-futile loop is not a hang: {error}"
+            );
+        }
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            BUDGET,
+            "the iteration budget, not the idle detector, is what bounds this turn"
         );
     }
 

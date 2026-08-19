@@ -475,6 +475,10 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
         );
     }
     let mut config = Config::load_existing_read_only_with_config_dir(Some(explicit_config_dir)).await?;
+    // The worker is a separate process and never reaches `runtime::mode::dispatch`,
+    // so it installs the hang-detection thresholds itself. Without this it would
+    // silently run on the built-in defaults instead of the operator's config.
+    crate::agent::idle::install(config.runtime.idle_hang_secs, config.runtime.idle_hang_max_total_secs);
     let generation_after = config_source_generation(&manifest.config_dir)?;
     if generation_after != manifest.config_generation {
         anyhow::bail!(

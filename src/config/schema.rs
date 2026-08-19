@@ -1736,6 +1736,16 @@ pub struct GatewayConfig {
     /// Maximum distinct idempotency keys retained in memory.
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
+
+    /// How long an already-accepted platform webhook delivery (`/whatsapp`,
+    /// `/linq`, `/nextcloud-talk`) is remembered so a platform redelivery of the
+    /// same payload is answered instead of re-run.
+    ///
+    /// Sized against the sender, not the agent: Meta retries a WhatsApp delivery
+    /// for up to 7 days and Linq for ~25 minutes, so a window shorter than the
+    /// platform's retry schedule lets a late retry start the turn a second time.
+    #[serde(default = "default_channel_webhook_dedup_ttl_secs")]
+    pub channel_webhook_dedup_ttl_secs: u64,
 }
 
 const fn default_gateway_port() -> u16 {
@@ -1770,6 +1780,10 @@ const fn default_gateway_idempotency_max_keys() -> usize {
     10_000
 }
 
+const fn default_channel_webhook_dedup_ttl_secs() -> u64 {
+    86_400
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -1789,6 +1803,7 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
+            channel_webhook_dedup_ttl_secs: default_channel_webhook_dedup_ttl_secs(),
         }
     }
 }
@@ -3416,6 +3431,41 @@ pub struct RuntimeConfig {
     /// sweeper would warn about ordinary tool calls.
     #[serde(default)]
     pub long_task_warn_secs: Option<u64>,
+
+    /// Seconds an agent turn may produce **no observable progress at all**
+    /// before it is judged hung and terminated.
+    ///
+    /// **This is not a turn timeout.** The window is reset by every sign of
+    /// life — a provider stream chunk, a tool call starting or finishing,
+    /// history compaction, output written to a channel — so a turn that keeps
+    /// working runs for as long as it needs to, however long that is. Only
+    /// total silence for the whole window counts, which is a stall rather than
+    /// a slow task.
+    ///
+    /// Contrast [`RuntimeConfig::long_task_warn_secs`], which measures elapsed
+    /// run time, is *not* refreshed by progress, and never terminates anything.
+    /// The two must not be conflated or merged: one reports that work is long,
+    /// this one recovers from work that is wedged.
+    ///
+    /// Leave unset for the 1800s default; set `0` to disable hang detection
+    /// entirely. Enabled values must be at least 30 seconds.
+    #[serde(default)]
+    pub idle_hang_secs: Option<u64>,
+
+    /// Absolute ceiling in seconds on a single agent turn, regardless of
+    /// progress.
+    ///
+    /// A backstop for the one case [`RuntimeConfig::idle_hang_secs`] cannot
+    /// see: a run that keeps emitting faint but real events and so never goes
+    /// silent, yet never converges either. The default (86400s = 24h) is chosen
+    /// to be unreachable by legitimate work, and lowering it toward the idle
+    /// window turns it into the wall-clock turn timeout this runtime
+    /// deliberately does not have.
+    ///
+    /// Leave unset for the 86400s default; set `0` to disable it. Enabled
+    /// values must be at least 3600 seconds.
+    #[serde(default)]
+    pub idle_hang_max_total_secs: Option<u64>,
 }
 
 /// Docker runtime configuration (`[runtime.docker]` section).
@@ -3494,6 +3544,8 @@ impl Default for RuntimeConfig {
             codex_reasoning_effort: None,
             max_blocking_threads: None,
             long_task_warn_secs: None,
+            idle_hang_secs: None,
+            idle_hang_max_total_secs: None,
         }
     }
 }
@@ -5906,6 +5958,11 @@ impl Config {
         if self.gateway.host.trim().is_empty() {
             anyhow::bail!("gateway.host must not be empty");
         }
+        // A zero dedup window would remember nothing, so every platform retry of
+        // an already-running delivery would start a second copy of the turn.
+        if self.gateway.channel_webhook_dedup_ttl_secs == 0 {
+            anyhow::bail!("gateway.channel_webhook_dedup_ttl_secs must be greater than 0");
+        }
         if self.webhook.configured() {
             if self.webhook.bind.trim().is_empty() {
                 anyhow::bail!("webhook.bind must not be empty when a webhook token is configured");
@@ -5947,6 +6004,41 @@ impl Config {
                 anyhow::bail!(
                     "runtime.long_task_warn_secs must be 0 (disabled) or at least {} seconds",
                     crate::runtime::registry::MIN_LONG_TASK_WARN_SECS
+                );
+            }
+        }
+        // Idle hang detection is the one mechanism here that *does* terminate,
+        // so its bounds are stricter than the warning's. A window shorter than
+        // `MIN_IDLE_HANG_SECS` could not tell a wedged turn from an ordinary
+        // tool call that happens to be quiet while it works, and would start
+        // killing healthy work.
+        if let Some(idle_hang_secs) = self.runtime.idle_hang_secs {
+            if idle_hang_secs > 0 && idle_hang_secs < crate::agent::idle::MIN_IDLE_HANG_SECS {
+                anyhow::bail!(
+                    "runtime.idle_hang_secs must be 0 (disabled) or at least {} seconds",
+                    crate::agent::idle::MIN_IDLE_HANG_SECS
+                );
+            }
+        }
+        // The total ceiling is a backstop, not a turn budget: it has to stay
+        // far above the idle window, or it silently becomes the wall-clock turn
+        // timeout the runtime does not have.
+        if let Some(max_total_secs) = self.runtime.idle_hang_max_total_secs {
+            if max_total_secs > 0 && max_total_secs < crate::agent::idle::MIN_IDLE_HANG_MAX_TOTAL_SECS {
+                anyhow::bail!(
+                    "runtime.idle_hang_max_total_secs must be 0 (disabled) or at least {} seconds",
+                    crate::agent::idle::MIN_IDLE_HANG_MAX_TOTAL_SECS
+                );
+            }
+            let idle_secs = self
+                .runtime
+                .idle_hang_secs
+                .unwrap_or(crate::agent::idle::DEFAULT_IDLE_HANG_SECS);
+            if max_total_secs > 0 && idle_secs > 0 && max_total_secs < idle_secs {
+                anyhow::bail!(
+                    "runtime.idle_hang_max_total_secs ({max_total_secs}) must not be below \
+                     runtime.idle_hang_secs ({idle_secs}); the total ceiling is a backstop for \
+                     runs that never converge, not a shorter turn timeout"
                 );
             }
         }
@@ -8124,6 +8216,7 @@ channel_id = "C123"
         assert_eq!(g.rate_limit_max_keys, 10_000);
         assert_eq!(g.idempotency_ttl_secs, 300);
         assert_eq!(g.idempotency_max_keys, 10_000);
+        assert_eq!(g.channel_webhook_dedup_ttl_secs, 86_400);
     }
 
     #[test]
@@ -8150,6 +8243,7 @@ channel_id = "C123"
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
+            channel_webhook_dedup_ttl_secs: 7200,
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
@@ -8163,6 +8257,7 @@ channel_id = "C123"
         assert_eq!(parsed.rate_limit_max_keys, 2048);
         assert_eq!(parsed.idempotency_ttl_secs, 600);
         assert_eq!(parsed.idempotency_max_keys, 4096);
+        assert_eq!(parsed.channel_webhook_dedup_ttl_secs, 7200);
     }
 
     #[test]
@@ -9012,6 +9107,60 @@ allowed_from = ["*"]
             .validate()
             .expect_err("a reader pool with no connections must be rejected");
         assert!(error.to_string().contains("memory.sqlite_read_pool_size"));
+    }
+
+    #[test]
+    async fn idle_hang_thresholds_validate_and_stay_distinct_from_the_long_task_warning() {
+        let defaults = Config::default();
+        assert_eq!(defaults.runtime.idle_hang_secs, None, "unset means the 1800s default");
+        assert_eq!(defaults.runtime.idle_hang_max_total_secs, None);
+        defaults.validate().expect("defaults must validate");
+
+        // 0 disables either check.
+        let mut disabled = Config::default();
+        disabled.runtime.idle_hang_secs = Some(0);
+        disabled.runtime.idle_hang_max_total_secs = Some(0);
+        disabled.validate().expect("0 is the documented disable switch");
+
+        // Too short to tell a wedged turn from a quiet tool call.
+        let mut too_short = Config::default();
+        too_short.runtime.idle_hang_secs = Some(5);
+        let error = too_short
+            .validate()
+            .expect_err("an idle window this short would kill healthy work");
+        assert!(error.to_string().contains("runtime.idle_hang_secs"), "{error}");
+
+        // The total ceiling is a backstop, never a shorter turn budget.
+        let mut short_ceiling = Config::default();
+        short_ceiling.runtime.idle_hang_max_total_secs = Some(600);
+        let error = short_ceiling
+            .validate()
+            .expect_err("a 10-minute ceiling is a wall-clock turn timeout in disguise");
+        assert!(
+            error.to_string().contains("runtime.idle_hang_max_total_secs"),
+            "{error}"
+        );
+
+        let mut inverted = Config::default();
+        inverted.runtime.idle_hang_secs = Some(7_200);
+        inverted.runtime.idle_hang_max_total_secs = Some(3_600);
+        let error = inverted
+            .validate()
+            .expect_err("the ceiling must never sit below the idle window");
+        assert!(error.to_string().contains("must not be below"), "{error}");
+
+        // The two mechanisms are configured independently, and the shipped
+        // defaults keep the warning strictly ahead of the termination.
+        assert!(
+            crate::agent::idle::DEFAULT_IDLE_HANG_SECS > crate::runtime::registry::DEFAULT_LONG_TASK_WARN_SECS,
+            "an operator must always be warned before anything is terminated"
+        );
+        let mut warn_only = Config::default();
+        warn_only.runtime.long_task_warn_secs = Some(0);
+        warn_only.runtime.idle_hang_secs = Some(120);
+        warn_only
+            .validate()
+            .expect("silencing the warning must not affect hang detection");
     }
 
     // ---- FIX-P2-10: write_toml_string_atomic file lock -------------------

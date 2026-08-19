@@ -1320,6 +1320,9 @@ impl ToolExecutionService {
             context.envelope.task_id.as_deref(),
             cancellation.clone(),
         );
+        // A tool call starting is progress for the turn's idle detector, and
+        // this is the one place every production tool call passes through.
+        crate::agent::idle::beat(crate::agent::idle::ProgressKind::ToolStart);
         let input_sha256 = format!("{:x}", Sha256::digest(command.arguments.to_string().as_bytes()));
         let Some(resolved) = self.resolve(&command.name) else {
             let available = self
@@ -1670,6 +1673,8 @@ impl ToolExecutionService {
         preparation: Option<ToolExecutionPermit>,
         started: Instant,
     ) -> ToolExecutionOutcome {
+        // ... and a tool call producing its terminal outcome is progress too.
+        crate::agent::idle::beat(crate::agent::idle::ProgressKind::ToolEnd);
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.audit.record(ToolExecutionAuditRecord {
             operation_id: command.operation_id.clone(),

@@ -255,6 +255,11 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
     crate::runtime::registry::start_long_task_warner(crate::runtime::registry::long_task_warn_threshold(
         config.runtime.long_task_warn_secs,
     ));
+    // The opposite mechanism, and the only one that ends work by itself: a turn
+    // that goes completely silent is hung, not long, and is terminated. Reset by
+    // any progress, so it never bounds how long a working turn may run. See
+    // `crate::agent::idle` for why these two must stay separate.
+    crate::agent::idle::install(config.runtime.idle_hang_secs, config.runtime.idle_hang_max_total_secs);
     if should_bind_signal(&command) {
         spawn_signal_task(root_shutdown.clone());
     }

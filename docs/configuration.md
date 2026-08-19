@@ -87,6 +87,24 @@ max_history = 200
 # never destroys it. Use `prx tasks list` / `prx tasks kill <id>` (or
 # `GET /api/jobs`) to see and end long work.
 
+[gateway]
+# How long an already-accepted platform webhook delivery (`/whatsapp`, `/linq`,
+# `/nextcloud-talk`) is remembered, in seconds.
+#
+# These three routes answer the platform as soon as the delivery is accepted and
+# run the agent turn as a detached job, because every sender on them enforces a
+# response deadline no agent turn can promise to meet (Linq documents a 10-second
+# response timeout, and Meta retries a WhatsApp delivery "with decreasing
+# frequency ... for up to 7 days"). Fast acks make redelivery rare but not
+# impossible — a dropped connection or a proxy timeout still produces one — so
+# each delivery is recorded and a redelivery of the same payload is answered
+# instead of run a second time.
+#
+# Size it against the sender's retry schedule, not against the agent: a window
+# shorter than the platform's retry window lets a late retry start the turn
+# again. Must be greater than 0. Default: 86400 (24 hours).
+# channel_webhook_dedup_ttl_secs = 86400
+
 [runtime]
 # Hard cap on the tokio blocking-thread pool (optional).
 #
@@ -118,6 +136,52 @@ max_history = 200
 # values must be at least 10 seconds; below that the sweeper would warn about
 # ordinary tool calls and bury the signal it exists to raise.
 # long_task_warn_secs = 900
+
+# Seconds an agent turn may produce NO OBSERVABLE PROGRESS AT ALL before it is
+# judged hung and terminated.
+#
+# This is NOT a turn timeout. The window is reset by every sign of life — a
+# provider stream chunk, a tool call starting or finishing, history compaction,
+# output written to a channel — so a turn that keeps working runs as long as it
+# needs to, however long that is. Only complete silence for the whole window
+# counts, and complete silence is a stall, not a slow task.
+#
+# Compare `long_task_warn_secs` directly above; they are opposites and must not
+# be conflated:
+#
+#   long_task_warn_secs  measures elapsed run time, is NOT reset by progress,
+#                        and NEVER terminates anything (warning only).
+#   idle_hang_secs       measures time since the last progress event, IS reset
+#                        by progress, and DOES terminate the turn.
+#
+# A healthy six-hour turn is warned about repeatedly and never terminated. The
+# defaults are deliberately different numbers (900 vs 1800) so an operator
+# always sees the warning well before anything is killed.
+#
+# Termination goes through the normal cancellation path and the runtime
+# registry's kill path, so child process groups are cleaned up (`killpg`) and
+# the event is recorded in the registry. The error says explicitly that the turn
+# hung, which is how it is told apart from a task that failed and from a turn an
+# operator ended with `prx tasks kill`.
+#
+# Unset uses the 1800s default. Set 0 to disable hang detection entirely.
+# Enabled values must be at least 30 seconds; below that an ordinary quiet tool
+# call could be mistaken for a hang.
+# idle_hang_secs = 1800
+
+# Absolute ceiling in seconds on one agent turn, regardless of progress.
+#
+# Backstop for the single case `idle_hang_secs` cannot see: a run that keeps
+# emitting faint but real events, so never goes silent, yet never converges
+# either. The default of 86400s (24 hours) is chosen to be unreachable by
+# legitimate work — the longest healthy agent turn on record in the practice
+# survey behind this feature was about 41 minutes.
+#
+# Do NOT tune this down toward `idle_hang_secs`: doing so turns it into the
+# wall-clock turn timeout this runtime deliberately does not have. Set 0 to
+# disable it. Enabled values must be at least 3600 seconds and must not be
+# below `idle_hang_secs`.
+# idle_hang_max_total_secs = 86400
 
 [memory]
 backend = "sqlite"

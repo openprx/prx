@@ -27,6 +27,7 @@ mod api;
 mod compat;
 mod jobs;
 mod ui;
+mod webhook_dedup;
 
 use crate::agent::loop_::{
     DocumentIngestRuntime, build_context_with_shared_events_and_scope, run_tool_call_loop_traced,
@@ -2532,6 +2533,146 @@ async fn run_webhook_job(
     }
 }
 
+/// Shared tail of the three platform-pushed channel webhooks.
+///
+/// These routes differ from `POST /webhook` in one decisive way: the sender is a
+/// platform with a response deadline, not a client that chose to wait. Linq
+/// documents "Response timeout: 10 seconds" and retries "up to 10 times over ~25
+/// minutes"; Meta retries a WhatsApp delivery "with decreasing frequency until
+/// the request succeeds, for up to 7 days". An agent turn has no upper bound and
+/// routinely exceeds any of those, so awaiting the turn inside the handler — as
+/// these three did — guaranteed the platform would give up, mark the delivery
+/// failed, and redeliver, running the whole turn again for every retry.
+///
+/// The ack therefore reports that the work was *accepted*, not that it finished:
+/// the turns run as a detached job, visible in `prx tasks list` and killable with
+/// `prx tasks kill`, and the reply reaches the user through the channel's own
+/// outbound API exactly as before. The delivery is claimed before submission, so
+/// a retry that races the accepted run is answered as a duplicate instead of
+/// starting a second copy of it.
+fn accept_channel_webhook_delivery(
+    state: &AppState,
+    channel: Arc<dyn Channel>,
+    channel_key: &'static str,
+    body: &Bytes,
+    messages: Vec<crate::channels::traits::ChannelMessage>,
+    memory_key: fn(&crate::channels::traits::ChannelMessage) -> String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let dedup_ttl = Duration::from_secs(state.config.load_full().gateway.channel_webhook_dedup_ttl_secs.max(1));
+    let claim = match webhook_dedup::claim(webhook_dedup::delivery_key(channel_key, body), dedup_ttl) {
+        webhook_dedup::DeliveryOutcome::Fresh(claim) => claim,
+        webhook_dedup::DeliveryOutcome::Duplicate => {
+            tracing::info!("{channel_key} webhook: redelivery of an already accepted payload — not run again");
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": "duplicate", "idempotent": true })),
+            );
+        }
+    };
+
+    let label = messages.first().map_or_else(
+        || format!("gateway:{channel_key}"),
+        |msg| format!("gateway:{channel_key}:{}", msg.reply_target),
+    );
+    let job = jobs::submit(
+        jobs::KIND_CHANNEL_WEBHOOK,
+        label,
+        run_channel_webhook_job(state.clone(), channel, channel_key, messages, memory_key, claim),
+    );
+
+    // Every platform on this route treats any 2xx as delivered; 200 is the one
+    // status all three accept without special handling.
+    (StatusCode::OK, Json(job.accepted_body()))
+}
+
+/// The unbounded half of a platform channel webhook, run as a job.
+///
+/// Owns the delivery claim for the whole run, so the claim is resolved by code
+/// that knows whether the turn reached a side effect — never by the request
+/// future going away.
+async fn run_channel_webhook_job(
+    state: AppState,
+    channel: Arc<dyn Channel>,
+    channel_key: &'static str,
+    messages: Vec<crate::channels::traits::ChannelMessage>,
+    memory_key: fn(&crate::channels::traits::ChannelMessage) -> String,
+    mut claim: webhook_dedup::DeliveryClaim,
+) -> Result<jobs::JobOutput, String> {
+    let provider_label = state
+        .config
+        .load_full()
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+
+    for msg in &messages {
+        tracing::info!(
+            "{channel_key} message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
+        );
+
+        // Auto-save to memory
+        if state.auto_save && should_autosave_gateway_message(Some(&msg.reply_target), &msg.content) {
+            if let Err((status, body)) = authorize_gateway_resource_mutation(
+                &state,
+                &gateway_channel_webhook_operation(channel_key, "autosave"),
+                ResourceRiskLevel::Low,
+            ) {
+                return Ok(jobs::JobOutput::new(status, body.0));
+            }
+            // First observable side effect: past this point a redelivery would
+            // duplicate it, so the claim must outlive the run.
+            claim.mark_dispatched();
+            let key = memory_key(msg);
+            let _ = state
+                .mem
+                .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                .await;
+        }
+
+        let fabric_ctx = GatewayFabricContext::channel_message(msg);
+        // The turn records the inbound message and may call tools, so from here
+        // the delivery is not replayable by re-execution.
+        claim.mark_dispatched();
+        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content, &fabric_ctx).await {
+            Ok(response) => {
+                if let Err((status, body)) = authorize_gateway_resource_mutation(
+                    &state,
+                    &gateway_channel_webhook_operation(channel_key, "send"),
+                    ResourceRiskLevel::Low,
+                ) {
+                    return Ok(jobs::JobOutput::new(status, body.0));
+                }
+                if let Err(e) = channel.send(&SendMessage::new(response, &msg.reply_target)).await {
+                    tracing::error!("Failed to send {channel_key} reply: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::error!("LLM error for {channel_key} message: {e:#}");
+                if let Err((status, body)) = authorize_gateway_resource_mutation(
+                    &state,
+                    &gateway_channel_webhook_operation(channel_key, "send"),
+                    ResourceRiskLevel::Low,
+                ) {
+                    return Ok(jobs::JobOutput::new(status, body.0));
+                }
+                let _ = channel
+                    .send(&SendMessage::new(
+                        "Sorry, I couldn't process your message right now.",
+                        &msg.reply_target,
+                    ))
+                    .await;
+            }
+        }
+    }
+
+    Ok(jobs::JobOutput::new(
+        StatusCode::OK,
+        serde_json::json!({ "status": "ok", "messages": messages.len() }),
+    ))
+}
+
 /// `WhatsApp` verification query params
 #[derive(serde::Deserialize)]
 pub struct WhatsAppVerifyQuery {
@@ -2656,72 +2797,8 @@ async fn handle_whatsapp_message(State(state): State<AppState>, headers: HeaderM
     // `channels::activity`). Reporting only — nothing acts on it.
     crate::channels::activity::record_inbound(wa.name());
 
-    // Process each message
-    let provider_label = state
-        .config
-        .load_full()
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
-    for msg in &messages {
-        tracing::info!(
-            "WhatsApp message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
-        );
-
-        // Auto-save to memory
-        if state.auto_save && should_autosave_gateway_message(Some(&msg.reply_target), &msg.content) {
-            if let Err(error) = authorize_gateway_resource_mutation(
-                &state,
-                &gateway_channel_webhook_operation("whatsapp", "autosave"),
-                ResourceRiskLevel::Low,
-            ) {
-                return error;
-            }
-            let key = whatsapp_memory_key(msg);
-            let _ = state
-                .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                .await;
-        }
-
-        let fabric_ctx = GatewayFabricContext::channel_message(msg);
-        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content, &fabric_ctx).await {
-            Ok(response) => {
-                // Send reply via WhatsApp
-                if let Err(error) = authorize_gateway_resource_mutation(
-                    &state,
-                    &gateway_channel_webhook_operation("whatsapp", "send"),
-                    ResourceRiskLevel::Low,
-                ) {
-                    return error;
-                }
-                if let Err(e) = wa.send(&SendMessage::new(response, &msg.reply_target)).await {
-                    tracing::error!("Failed to send WhatsApp reply: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::error!("LLM error for WhatsApp message: {e:#}");
-                if let Err(error) = authorize_gateway_resource_mutation(
-                    &state,
-                    &gateway_channel_webhook_operation("whatsapp", "send"),
-                    ResourceRiskLevel::Low,
-                ) {
-                    return error;
-                }
-                let _ = wa
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
-                    .await;
-            }
-        }
-    }
-
-    // Acknowledge the webhook
-    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+    let channel: Arc<dyn Channel> = Arc::clone(wa) as Arc<dyn Channel>;
+    accept_channel_webhook_delivery(&state, channel, "whatsapp", &body, messages, whatsapp_memory_key)
 }
 
 /// POST /linq — incoming message webhook (iMessage/RCS/SMS via Linq)
@@ -2790,73 +2867,8 @@ async fn handle_linq_webhook(State(state): State<AppState>, headers: HeaderMap, 
     // `channels::activity`). Reporting only — nothing acts on it.
     crate::channels::activity::record_inbound(linq.name());
 
-    // Process each message
-    let provider_label = state
-        .config
-        .load_full()
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
-    for msg in &messages {
-        tracing::info!(
-            "Linq message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
-        );
-
-        // Auto-save to memory
-        if state.auto_save && should_autosave_gateway_message(Some(&msg.reply_target), &msg.content) {
-            if let Err(error) = authorize_gateway_resource_mutation(
-                &state,
-                &gateway_channel_webhook_operation("linq", "autosave"),
-                ResourceRiskLevel::Low,
-            ) {
-                return error;
-            }
-            let key = linq_memory_key(msg);
-            let _ = state
-                .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                .await;
-        }
-
-        // Call the LLM
-        let fabric_ctx = GatewayFabricContext::channel_message(msg);
-        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content, &fabric_ctx).await {
-            Ok(response) => {
-                // Send reply via Linq
-                if let Err(error) = authorize_gateway_resource_mutation(
-                    &state,
-                    &gateway_channel_webhook_operation("linq", "send"),
-                    ResourceRiskLevel::Low,
-                ) {
-                    return error;
-                }
-                if let Err(e) = linq.send(&SendMessage::new(response, &msg.reply_target)).await {
-                    tracing::error!("Failed to send Linq reply: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::error!("LLM error for Linq message: {e:#}");
-                if let Err(error) = authorize_gateway_resource_mutation(
-                    &state,
-                    &gateway_channel_webhook_operation("linq", "send"),
-                    ResourceRiskLevel::Low,
-                ) {
-                    return error;
-                }
-                let _ = linq
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
-                    .await;
-            }
-        }
-    }
-
-    // Acknowledge the webhook
-    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+    let channel: Arc<dyn Channel> = Arc::clone(linq) as Arc<dyn Channel>;
+    accept_channel_webhook_delivery(&state, channel, "linq", &body, messages, linq_memory_key)
 }
 
 /// POST /nextcloud-talk — incoming message webhook (Nextcloud Talk bot API)
@@ -2933,72 +2945,15 @@ async fn handle_nextcloud_talk_webhook(
     // `channels::activity`). Reporting only — nothing acts on it.
     crate::channels::activity::record_inbound(nextcloud_talk.name());
 
-    let provider_label = state
-        .config
-        .load_full()
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
-
-    for msg in &messages {
-        tracing::info!(
-            "Nextcloud Talk message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
-        );
-
-        if state.auto_save && should_autosave_gateway_message(Some(&msg.reply_target), &msg.content) {
-            if let Err(error) = authorize_gateway_resource_mutation(
-                &state,
-                &gateway_channel_webhook_operation("nextcloud_talk", "autosave"),
-                ResourceRiskLevel::Low,
-            ) {
-                return error;
-            }
-            let key = nextcloud_talk_memory_key(msg);
-            let _ = state
-                .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                .await;
-        }
-
-        let fabric_ctx = GatewayFabricContext::channel_message(msg);
-        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content, &fabric_ctx).await {
-            Ok(response) => {
-                if let Err(error) = authorize_gateway_resource_mutation(
-                    &state,
-                    &gateway_channel_webhook_operation("nextcloud_talk", "send"),
-                    ResourceRiskLevel::Low,
-                ) {
-                    return error;
-                }
-                if let Err(e) = nextcloud_talk
-                    .send(&SendMessage::new(response, &msg.reply_target))
-                    .await
-                {
-                    tracing::error!("Failed to send Nextcloud Talk reply: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
-                if let Err(error) = authorize_gateway_resource_mutation(
-                    &state,
-                    &gateway_channel_webhook_operation("nextcloud_talk", "send"),
-                    ResourceRiskLevel::Low,
-                ) {
-                    return error;
-                }
-                let _ = nextcloud_talk
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
-                    .await;
-            }
-        }
-    }
-
-    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+    let channel: Arc<dyn Channel> = Arc::clone(nextcloud_talk) as Arc<dyn Channel>;
+    accept_channel_webhook_delivery(
+        &state,
+        channel,
+        "nextcloud_talk",
+        &body,
+        messages,
+        nextcloud_talk_memory_key,
+    )
 }
 
 #[cfg(test)]
@@ -4968,6 +4923,388 @@ mod tests {
             .into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // Platform webhook routes: ack now, run the turn as a job
+    // ══════════════════════════════════════════════════════════
+    //
+    // `/whatsapp`, `/linq` and `/nextcloud-talk` used to await the whole agent
+    // turn inside the handler. Every sender on those routes enforces a response
+    // deadline no turn can promise to meet — Linq documents a 10-second response
+    // timeout and ~10 retries over ~25 minutes, Meta retries "for up to 7 days" —
+    // so the inline shape guaranteed a redelivery storm, each redelivery running
+    // the turn again. These tests hold the provider inside the turn and require
+    // the route to answer anyway, with the work visible and killable.
+
+    const PLATFORM_WA_SECRET: &str = "wa-app-secret";
+    const PLATFORM_LINQ_SECRET: &str = "linq-signing-secret";
+    const PLATFORM_NC_SECRET: &str = "nextcloud-webhook-secret";
+
+    fn platform_webhook_state(provider: Arc<dyn Provider>) -> AppState {
+        AppState {
+            whatsapp: Some(Arc::new(WhatsAppChannel::new(
+                "wa-token".into(),
+                "endpoint-id".into(),
+                "verify-token".into(),
+                vec!["*".into()],
+            ))),
+            whatsapp_app_secret: Some(Arc::from(PLATFORM_WA_SECRET)),
+            linq: Some(Arc::new(LinqChannel::new(
+                "linq-token".into(),
+                "+15550000000".into(),
+                vec!["*".into()],
+            ))),
+            linq_signing_secret: Some(Arc::from(PLATFORM_LINQ_SECRET)),
+            nextcloud_talk: Some(Arc::new(NextcloudTalkChannel::new(
+                "https://cloud.example.com".into(),
+                "app-token".into(),
+                vec!["*".into()],
+            ))),
+            nextcloud_talk_webhook_secret: Some(Arc::from(PLATFORM_NC_SECRET)),
+            ..webhook_test_state(provider)
+        }
+    }
+
+    /// Distinct payload bodies per test: the delivery ledger is process-wide, so
+    /// two tests sharing a body would see each other's claims.
+    fn whatsapp_payload(marker: &str) -> String {
+        serde_json::json!({
+            "object": "whatsapp_business_account",
+            "entry": [{"changes": [{"value": {"messages": [{
+                "from": "15551230000",
+                "id": format!("wamid.{marker}"),
+                "timestamp": "1700000000",
+                "text": {"body": format!("hello {marker}")},
+            }]}}]}],
+        })
+        .to_string()
+    }
+
+    fn linq_payload(marker: &str) -> String {
+        serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "from": "15551230000",
+                "chat_id": format!("chat-{marker}"),
+                "message": {"parts": [{"type": "text", "value": format!("hello {marker}")}]},
+            },
+        })
+        .to_string()
+    }
+
+    fn nextcloud_payload(marker: &str) -> String {
+        serde_json::json!({
+            "type": "message",
+            "object": {"token": format!("room-{marker}")},
+            "message": {
+                "id": marker,
+                "actorType": "users",
+                "actorId": "user_a",
+                "messageType": "comment",
+                "message": format!("hello {marker}"),
+            },
+        })
+        .to_string()
+    }
+
+    fn whatsapp_headers(body: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let signature = compute_whatsapp_signature_header(PLATFORM_WA_SECRET, body.as_bytes());
+        headers.insert(
+            "X-Hub-Signature-256",
+            HeaderValue::from_str(&signature).expect("test: signature header"),
+        );
+        headers
+    }
+
+    fn linq_headers(body: &str) -> HeaderMap {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let mut mac = Hmac::<Sha256>::new_from_slice(PLATFORM_LINQ_SECRET.as_bytes()).expect("test: linq hmac key");
+        mac.update(format!("{timestamp}.{body}").as_bytes());
+        let signature = hex::encode(mac.finalize().into_bytes());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Timestamp",
+            HeaderValue::from_str(&timestamp).expect("test: timestamp header"),
+        );
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_str(&signature).expect("test: signature header"),
+        );
+        headers
+    }
+
+    fn nextcloud_headers(body: &str) -> HeaderMap {
+        let random = "seed-value";
+        let signature = compute_nextcloud_signature_hex(PLATFORM_NC_SECRET, random, body);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Nextcloud-Talk-Random",
+            HeaderValue::from_str(random).expect("test: random header"),
+        );
+        headers.insert(
+            "X-Nextcloud-Talk-Signature",
+            HeaderValue::from_str(&signature).expect("test: signature header"),
+        );
+        headers
+    }
+
+    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        let payload = response.into_body().collect().await.expect("test: body").to_bytes();
+        serde_json::from_slice(&payload).expect("test: json body")
+    }
+
+    /// Bound the wait so the inline-await mutation fails in seconds instead of
+    /// hanging the suite. Nothing in production reads a clock here.
+    const PLATFORM_ACK_TEST_BUDGET: Duration = Duration::from_secs(20);
+
+    /// Drive one platform webhook while its turn is wedged inside the provider,
+    /// and assert the three properties the route now owes the platform: an
+    /// immediate ack, a running job the operator can see, and a kill that ends it.
+    async fn assert_acks_before_the_turn_finishes(
+        provider: Arc<BlockFirstProvider>,
+        expected_label_prefix: &str,
+        response: axum::response::Response,
+    ) {
+        assert_eq!(response.status(), StatusCode::OK, "the platform must see a 2xx ack");
+        let body = response_json(response).await;
+        assert_eq!(body["status"], "accepted", "the ack reports acceptance, not completion");
+        assert_eq!(body["kind"], jobs::KIND_CHANNEL_WEBHOOK);
+
+        let job_id = body["job_id"].as_str().expect("test: job id");
+        let job_uuid = Uuid::parse_str(job_id).expect("test: job uuid");
+        let work_id = runtime::registry::WorkId::parse(body["work_id"].as_str().expect("test: work id"))
+            .expect("test: work id parses");
+
+        // The turn is genuinely under way *after* the platform was answered.
+        tokio::time::timeout(PLATFORM_ACK_TEST_BUDGET, provider.first_started.notified())
+            .await
+            .expect("test: the turn must start in the background after the ack");
+
+        let registry_row = runtime::registry::snapshot(work_id).expect("test: job must appear in `prx tasks list`");
+        assert!(
+            registry_row.name.starts_with(expected_label_prefix),
+            "registry row should name the delivery target, got {}",
+            registry_row.name
+        );
+        assert_eq!(
+            jobs::snapshot(job_uuid).map(|snapshot| snapshot.status),
+            Some("running"),
+            "the job is still running while the platform already has its ack"
+        );
+
+        // `prx tasks kill <id>` ends it — the visibility is not decorative.
+        runtime::registry::kill(work_id, true).await;
+        for _ in 0..200u32 {
+            if jobs::snapshot(job_uuid).is_some_and(|snapshot| snapshot.status == "cancelled") {
+                provider.release_first.notify_one();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        provider.release_first.notify_one();
+        panic!("killing the registry row did not end the webhook job");
+    }
+
+    #[tokio::test]
+    async fn whatsapp_webhook_acks_before_the_turn_finishes() {
+        let provider_impl = Arc::new(BlockFirstProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let state = platform_webhook_state(provider);
+        let body = whatsapp_payload("ack-evidence");
+        let headers = whatsapp_headers(&body);
+
+        let response = tokio::time::timeout(
+            PLATFORM_ACK_TEST_BUDGET,
+            handle_whatsapp_message(State(state), headers, Bytes::from(body)),
+        )
+        .await
+        .expect("test: the webhook must answer while the turn is still running")
+        .into_response();
+
+        assert_acks_before_the_turn_finishes(provider_impl, "gateway:whatsapp:", response).await;
+    }
+
+    #[tokio::test]
+    async fn linq_webhook_acks_before_the_turn_finishes() {
+        let provider_impl = Arc::new(BlockFirstProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let state = platform_webhook_state(provider);
+        let body = linq_payload("ack-evidence");
+        let headers = linq_headers(&body);
+
+        let response = tokio::time::timeout(
+            PLATFORM_ACK_TEST_BUDGET,
+            handle_linq_webhook(State(state), headers, Bytes::from(body)),
+        )
+        .await
+        .expect("test: the webhook must answer while the turn is still running")
+        .into_response();
+
+        assert_acks_before_the_turn_finishes(provider_impl, "gateway:linq:", response).await;
+    }
+
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_acks_before_the_turn_finishes() {
+        let provider_impl = Arc::new(BlockFirstProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let state = platform_webhook_state(provider);
+        let body = nextcloud_payload("ack-evidence");
+        let headers = nextcloud_headers(&body);
+
+        let response = tokio::time::timeout(
+            PLATFORM_ACK_TEST_BUDGET,
+            handle_nextcloud_talk_webhook(State(state), headers, Bytes::from(body)),
+        )
+        .await
+        .expect("test: the webhook must answer while the turn is still running")
+        .into_response();
+
+        assert_acks_before_the_turn_finishes(provider_impl, "gateway:nextcloud_talk:", response).await;
+    }
+
+    /// A platform retry of a delivery already accepted must not start a second
+    /// turn. Meta alone will retry the same payload for up to seven days.
+    async fn assert_redelivery_runs_once(
+        provider: Arc<BlockFirstProvider>,
+        first: axum::response::Response,
+        second: axum::response::Response,
+    ) {
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK, "a retry must still be acked");
+        let first_body = response_json(first).await;
+        let second_body = response_json(second).await;
+        assert_eq!(first_body["status"], "accepted");
+        assert_eq!(second_body["status"], "duplicate");
+        assert_eq!(second_body["idempotent"], true);
+
+        tokio::time::timeout(PLATFORM_ACK_TEST_BUDGET, provider.first_started.notified())
+            .await
+            .expect("test: the first delivery must have started a turn");
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "the redelivery must not have started a second turn"
+        );
+
+        if let Some(work_id) = runtime::registry::WorkId::parse(first_body["work_id"].as_str().unwrap_or_default()) {
+            runtime::registry::kill(work_id, true).await;
+        }
+        provider.release_first.notify_one();
+    }
+
+    #[tokio::test]
+    async fn whatsapp_redelivery_does_not_run_the_turn_twice() {
+        let provider_impl = Arc::new(BlockFirstProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let state = platform_webhook_state(provider);
+        let body = whatsapp_payload("dedup-evidence");
+        let headers = whatsapp_headers(&body);
+
+        // Bounded so the inline-await shape fails here instead of hanging.
+        let first = tokio::time::timeout(
+            PLATFORM_ACK_TEST_BUDGET,
+            handle_whatsapp_message(State(state.clone()), headers.clone(), Bytes::from(body.clone())),
+        )
+        .await
+        .expect("test: the first delivery must be acked while its turn runs")
+        .into_response();
+        let second = tokio::time::timeout(
+            PLATFORM_ACK_TEST_BUDGET,
+            handle_whatsapp_message(State(state), headers, Bytes::from(body)),
+        )
+        .await
+        .expect("test: the redelivery must be acked without waiting on the first turn")
+        .into_response();
+
+        assert_redelivery_runs_once(provider_impl, first, second).await;
+    }
+
+    #[tokio::test]
+    async fn linq_redelivery_does_not_run_the_turn_twice() {
+        let provider_impl = Arc::new(BlockFirstProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let state = platform_webhook_state(provider);
+        let body = linq_payload("dedup-evidence");
+        let headers = linq_headers(&body);
+
+        // Bounded so the inline-await shape fails here instead of hanging.
+        let first = tokio::time::timeout(
+            PLATFORM_ACK_TEST_BUDGET,
+            handle_linq_webhook(State(state.clone()), headers.clone(), Bytes::from(body.clone())),
+        )
+        .await
+        .expect("test: the first delivery must be acked while its turn runs")
+        .into_response();
+        let second = tokio::time::timeout(
+            PLATFORM_ACK_TEST_BUDGET,
+            handle_linq_webhook(State(state), headers, Bytes::from(body)),
+        )
+        .await
+        .expect("test: the redelivery must be acked without waiting on the first turn")
+        .into_response();
+
+        assert_redelivery_runs_once(provider_impl, first, second).await;
+    }
+
+    #[tokio::test]
+    async fn nextcloud_talk_redelivery_does_not_run_the_turn_twice() {
+        let provider_impl = Arc::new(BlockFirstProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let state = platform_webhook_state(provider);
+        let body = nextcloud_payload("dedup-evidence");
+        let headers = nextcloud_headers(&body);
+
+        // Bounded so the inline-await shape fails here instead of hanging.
+        let first = tokio::time::timeout(
+            PLATFORM_ACK_TEST_BUDGET,
+            handle_nextcloud_talk_webhook(State(state.clone()), headers.clone(), Bytes::from(body.clone())),
+        )
+        .await
+        .expect("test: the first delivery must be acked while its turn runs")
+        .into_response();
+        let second = tokio::time::timeout(
+            PLATFORM_ACK_TEST_BUDGET,
+            handle_nextcloud_talk_webhook(State(state), headers, Bytes::from(body)),
+        )
+        .await
+        .expect("test: the redelivery must be acked without waiting on the first turn")
+        .into_response();
+
+        assert_redelivery_runs_once(provider_impl, first, second).await;
+    }
+
+    #[tokio::test]
+    async fn platform_webhook_rejects_bad_signature_before_claiming_the_delivery() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let state = platform_webhook_state(provider);
+        let body = whatsapp_payload("signature-evidence");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Hub-Signature-256", HeaderValue::from_static("sha256=deadbeef"));
+        let rejected = handle_whatsapp_message(State(state.clone()), headers, Bytes::from(body.clone()))
+            .await
+            .into_response();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+
+        // A forged delivery must not have consumed the ledger entry for the real
+        // one: the same payload, correctly signed, still runs.
+        let accepted = handle_whatsapp_message(State(state), whatsapp_headers(&body), Bytes::from(body))
+            .await
+            .into_response();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let accepted_body = response_json(accepted).await;
+        assert_eq!(accepted_body["status"], "accepted");
+        if let Some(work_id) = runtime::registry::WorkId::parse(accepted_body["work_id"].as_str().unwrap_or_default()) {
+            runtime::registry::kill(work_id, true).await;
+        }
     }
 
     // ══════════════════════════════════════════════════════════

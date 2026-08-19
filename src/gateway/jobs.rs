@@ -51,6 +51,7 @@ const MAX_JOB_RECORDS: usize = 512;
 /// Job kind tags. Stable strings: operators and the console filter on them.
 pub(super) const KIND_SESSION_MESSAGE: &str = "session_message";
 pub(super) const KIND_WEBHOOK: &str = "webhook";
+pub(super) const KIND_CHANNEL_WEBHOOK: &str = "channel_webhook";
 pub(super) const KIND_MCP_TOOL_CALL: &str = "mcp_tool_call";
 
 /// Lifecycle state of a submitted job.

@@ -10,9 +10,10 @@
 //! Once nothing expires by itself, **seeing** the work and **being able to end
 //! it by hand** are the only remaining backstops. This module is both halves:
 //!
-//! * a registry of everything currently running — tool calls, sub-agent runs,
-//!   and child processes — each with a stable id, a human-readable name, a
-//!   start time, and parent/child lineage ([`snapshot_all`]);
+//! * a registry of everything currently running — agent turns, tool calls,
+//!   sub-agent runs, and child processes — each with a stable id, a
+//!   human-readable name, a start time, and parent/child lineage
+//!   ([`snapshot_all`]);
 //! * a by-id kill path that terminates a process *group* (so forked
 //!   grandchildren cannot escape), cancels a cooperative task, and optionally
 //!   cascades down the lineage ([`kill`]);
@@ -81,6 +82,11 @@ pub const MIN_LONG_TASK_WARN_SECS: u64 = 10;
 /// Class of work tracked by the registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WorkKind {
+    /// One agent turn driven by an inbound message — the lineage root that
+    /// everything else in this enum hangs beneath. A turn is registered before
+    /// it starts any work of its own, so an operator can see and end a turn
+    /// that is stuck somewhere other than in a tool call.
+    Turn,
     /// One tool invocation inside an agent turn.
     ToolCall,
     /// A sub-agent run or background session started by `sessions_spawn`.
@@ -94,6 +100,7 @@ impl WorkKind {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Turn => "turn",
             Self::ToolCall => "tool_call",
             Self::SubAgent => "sub_agent",
             Self::Process => "process",
@@ -388,6 +395,31 @@ fn register(
     });
     REGISTRY.insert(Arc::clone(&slot));
     WorkGuard { slot, reaped: false }
+}
+
+/// Register one agent turn.
+///
+/// A turn is a lineage *root*: it is registered before it starts any work of
+/// its own, and running it inside [`scoped`] is what makes the tool calls,
+/// sub-agents and child processes it goes on to start resolve it as their
+/// parent — which is in turn what lets `kill --cascade` on the turn reach all
+/// of them.
+///
+/// `cancel` must be the turn's own cooperative token, the one the turn itself
+/// selects on. Cancelling is deliberately the only kill mechanism offered here:
+/// a turn that is asked to stop can still finalize (flush its draft, commit its
+/// terminal record, tell the user), which aborting the task would take away.
+#[must_use]
+pub fn register_turn(name: &str, run_id: &str, cancel: Option<CancellationToken>) -> WorkGuard {
+    register(
+        WorkKind::Turn,
+        Arc::from(name),
+        current_work_id(),
+        Some(Arc::from(run_id)),
+        cancel,
+        None,
+        None,
+    )
 }
 
 /// Register one tool invocation.
@@ -706,7 +738,7 @@ fn terminated(slot: &Slot) -> bool {
             || REGISTRY.get(slot.id).is_none(),
             |pid| probe_process(pid) != ProcessLiveness::Running,
         ),
-        WorkKind::ToolCall | WorkKind::SubAgent => REGISTRY.get(slot.id).is_none(),
+        WorkKind::Turn | WorkKind::ToolCall | WorkKind::SubAgent => REGISTRY.get(slot.id).is_none(),
     }
 }
 
@@ -853,6 +885,71 @@ pub fn start_long_task_warner(threshold: Option<Duration>) {
             warn_long_running(threshold);
         }
     });
+}
+
+// ── Hang terminations ───────────────────────────────────────────────────────
+
+/// One agent turn ended by the idle (no-progress) detector.
+///
+/// Recorded here, and nowhere near [`warn_long_running`], because the two are
+/// opposites: the long-task warning reports that work is *long* and is
+/// forbidden from ending it, while this ledger records the only automatic
+/// termination in the runtime — work that produced no observable progress at
+/// all for a full window and was judged hung. Keeping the ledger in the
+/// registry is what makes such a termination visible to an operator alongside
+/// the work items it killed.
+///
+/// The detector itself lives in [`crate::agent::idle`]; the registry only
+/// stores what it reports.
+#[derive(Debug, Clone)]
+pub struct HangTermination {
+    /// Label of the terminated turn.
+    pub label: Arc<str>,
+    /// Which threshold was crossed ([`crate::agent::idle::HangReason::as_str`]).
+    pub reason: &'static str,
+    /// Silence at the moment of the verdict.
+    pub idle_secs: u64,
+    /// Total run time at the moment of the verdict.
+    pub elapsed_secs: u64,
+    /// Work items signalled as part of the termination.
+    pub killed: usize,
+    /// When it happened, milliseconds since the Unix epoch.
+    pub at_unix_ms: u64,
+}
+
+/// How many terminations are retained. A bound is required here for the same
+/// reason the live table is unbounded: this is a log of rare events, not a
+/// mirror of in-flight work, so it must not grow with process uptime.
+const HANG_TERMINATION_HISTORY: usize = 64;
+
+static HANG_TERMINATIONS: LazyLock<RwLock<Vec<HangTermination>>> = LazyLock::new(|| RwLock::new(Vec::new()));
+
+/// Publish a hang termination to the registry's ledger.
+///
+/// Called only by the idle detector. Nothing in this module may call it: no
+/// registry-owned sweeper terminates anything.
+pub fn record_hang_termination(label: &str, reason: &'static str, idle_secs: u64, elapsed_secs: u64, killed: usize) {
+    let at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX));
+    let mut ledger = HANG_TERMINATIONS.write();
+    if ledger.len() >= HANG_TERMINATION_HISTORY {
+        ledger.remove(0);
+    }
+    ledger.push(HangTermination {
+        label: Arc::from(label),
+        reason,
+        idle_secs,
+        elapsed_secs,
+        killed,
+        at_unix_ms,
+    });
+}
+
+/// Recent hang terminations, oldest first.
+#[must_use]
+pub fn hang_terminations() -> Vec<HangTermination> {
+    HANG_TERMINATIONS.read().clone()
 }
 
 // ── Connection-pool metrics ─────────────────────────────────────────────────
@@ -1267,6 +1364,61 @@ mod tests {
         let _ = run.await;
         assert!(find_by_name("cascade_agent_marker").is_none());
         assert!(find_by_name("cascade_tool_marker").is_none());
+    }
+
+    /// A channel turn is registered as a lineage root: killing it with cascade
+    /// must reach the tool call it started and the child process under that
+    /// tool call, which is the whole reason the turn is in the registry at all.
+    #[tokio::test]
+    async fn turn_is_a_lineage_root_that_cascades_to_its_tools_and_processes() {
+        assert_eq!(WorkKind::Turn.as_str(), "turn");
+
+        let turn_token = CancellationToken::new();
+        let turn = register_turn("turn_cascade_marker", "run-turn-cascade", Some(turn_token.clone()));
+        let turn_id = turn.id();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<u32>();
+
+        let run = tokio::spawn(scoped(turn, async move {
+            let tool_token = CancellationToken::new();
+            let tool = register_tool_call("turn_cascade_tool_marker", None, Some(tool_token.clone()));
+            scoped(tool, async move {
+                let mut child = spawn_registered("sleep", &["300.31"]);
+                let pid = find_by_name("sleep 300.31")
+                    .and_then(|snapshot| snapshot.pid)
+                    .expect("test: the turn's grandchild must be registered");
+                let _ = ready_tx.send(pid);
+                tool_token.cancelled().await;
+                let _ = child.wait().await;
+                child.mark_complete();
+            })
+            .await;
+        }));
+
+        let pid = ready_rx.await.expect("test: grandchild pid");
+        let listed = find_by_name("turn_cascade_marker").expect("test: the turn must be listed");
+        assert_eq!(listed.kind, WorkKind::Turn);
+        assert_eq!(
+            listed.run_id.as_deref(),
+            Some("run-turn-cascade"),
+            "the turn row must carry the run id its storage records use"
+        );
+
+        let results = kill(turn_id, true).await;
+        let kinds: Vec<WorkKind> = results.iter().map(|result| result.kind).collect();
+        assert!(kinds.contains(&WorkKind::Turn), "the turn itself must be a target");
+        assert!(kinds.contains(&WorkKind::ToolCall), "its tool call must be a target");
+        assert!(kinds.contains(&WorkKind::Process), "its child process must be a target");
+        assert!(
+            results.iter().all(|result| result.outcome == KillOutcome::Killed),
+            "every member of the turn's lineage must be confirmed dead: {results:?}"
+        );
+        assert!(
+            eventually(|| probe_process(pid) != ProcessLiveness::Running).await,
+            "a killed turn must not leave its grandchild process running"
+        );
+        let _ = run.await;
+        assert!(find_by_name("turn_cascade_marker").is_none());
+        assert!(find_by_name("turn_cascade_tool_marker").is_none());
     }
 
     #[tokio::test]
