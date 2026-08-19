@@ -307,6 +307,15 @@ pub fn spawn_shell_with_origin(
         *pgid_cell.lock() = Some(pid as i32);
     }
 
+    // Publish the child to the process-wide runtime registry, so a background
+    // chat shell is listed by `prx tasks list` and can be ended with
+    // `prx tasks kill` like any other child process. The guard is handed to the
+    // reaper task below: it is the only owner of the `Child`, so the ledger row
+    // lives exactly as long as the process it describes. Registration is by
+    // *group* id, matching the `killpg` semantics this module already uses.
+    let registration =
+        crate::runtime::registry::register_process(&registry_label(command), child.id(), *pgid_cell.lock());
+
     let status = Arc::new(Mutex::new(ShellStatus::Running));
     let finished_at = Arc::new(Mutex::new(None));
     let cancel = CancellationToken::new();
@@ -352,6 +361,7 @@ pub fn spawn_shell_with_origin(
         delta_tx,
         output: Arc::clone(&output_buffer),
         output_truncated: Arc::clone(&output_truncated),
+        registration,
     });
 
     Ok(ShellSession {
@@ -368,6 +378,24 @@ pub fn spawn_shell_with_origin(
         output: output_buffer,
         output_truncated,
     })
+}
+
+/// Bounded, human-readable name for a chat shell's registry row.
+///
+/// `prx tasks list` is a listing rather than an audit log, so an arbitrarily
+/// long one-liner is truncated on a char boundary the same way the runtime
+/// shell-process chokepoint truncates its own labels.
+fn registry_label(command: &str) -> String {
+    const MAX_LABEL_BYTES: usize = 200;
+    let mut label = String::with_capacity(command.len().min(MAX_LABEL_BYTES) + 12);
+    label.push_str("chat-shell ");
+    if command.len() > MAX_LABEL_BYTES {
+        label.push_str(&command[..command.floor_char_boundary(MAX_LABEL_BYTES)]);
+        label.push('…');
+    } else {
+        label.push_str(command);
+    }
+    label
 }
 
 /// Resolve the workspace directory to a canonical cwd, falling back to the
@@ -432,6 +460,11 @@ struct ReaperCtx {
     delta_tx: tokio::sync::mpsc::Sender<String>,
     output: Arc<Mutex<VecDeque<String>>>,
     output_truncated: Arc<Mutex<bool>>,
+    /// Runtime-registry row for the child process. Dropped by the reaper once
+    /// the child has been waited on, which is what retires the row; dropping it
+    /// *without* `mark_reaped` deliberately leaves the row behind as an orphan
+    /// report (see `crate::runtime::registry`).
+    registration: crate::runtime::registry::WorkGuard,
 }
 
 /// Await process exit (or cancellation), perform the kill on cancel, record the
@@ -463,6 +496,7 @@ fn spawn_reaper(ctx: ReaperCtx) -> JoinHandle<()> {
         delta_tx,
         output,
         output_truncated,
+        mut registration,
     } = ctx;
     tokio::spawn(async move {
         let final_line = tokio::select! {
@@ -471,8 +505,12 @@ fn spawn_reaper(ctx: ReaperCtx) -> JoinHandle<()> {
                 // then mark Cancelled only on a successful signal (fix 1③).
                 let signalled = terminate(&pgid, &mut child).await;
                 // Reap the child so it does not linger as a zombie; this also
-                // lets us clear the pgid afterwards (fix 1②).
-                let _ = child.wait().await;
+                // lets us clear the pgid afterwards (fix 1②). A successful
+                // wait is what allows the registry row to be retired rather than
+                // reported as an unreaped child.
+                if child.wait().await.is_ok() {
+                    registration.mark_reaped();
+                }
                 *pgid.lock() = None;
                 if signalled.is_ok() {
                     set_if_running(&status, &finished_at, ShellStatus::Cancelled);
@@ -489,6 +527,9 @@ fn spawn_reaper(ctx: ReaperCtx) -> JoinHandle<()> {
                 // Natural exit: the process is already gone, so clear the pgid
                 // immediately (fix 1②) before any later `kill` can read it.
                 *pgid.lock() = None;
+                if exited.is_ok() {
+                    registration.mark_reaped();
+                }
                 match exited {
                     Ok(es) if es.success() => {
                         set_if_running(&status, &finished_at, ShellStatus::Completed);
@@ -518,6 +559,9 @@ fn spawn_reaper(ctx: ReaperCtx) -> JoinHandle<()> {
         // authoritatively regardless of whether this marker lands.
         push_output_line(&output, &output_truncated, final_line.clone());
         let _ = delta_tx.send(final_line).await;
+        // Explicit so the registry row's lifetime is obvious at a glance: the
+        // process is gone and reaped, so the row goes with it.
+        drop(registration);
     })
 }
 
@@ -764,5 +808,57 @@ mod tests {
             last_idx < marker_idx,
             "output {last_idx} must precede marker {marker_idx}: {order:?}"
         );
+    }
+
+    /// A background chat shell is an OS child like any other, so it must be
+    /// listed by the runtime registry, killable by work id, and retired from the
+    /// ledger once the process is gone.
+    #[tokio::test]
+    async fn shell_child_is_registered_killable_and_retired() {
+        use crate::runtime::registry;
+
+        let (sink, _rx) = SessionEventSink::channel();
+        let sec = auto_security();
+        // A distinctive sleep keeps this row unambiguous while the rest of the
+        // suite runs in parallel.
+        let session = spawn_shell("echo registry-visible-marker; sleep 300.77", &sec, &sink)
+            .expect("test: spawn registered shell");
+
+        let row = registry::snapshot_all()
+            .into_iter()
+            .find(|snapshot| snapshot.name.contains("sleep 300.77"))
+            .expect("a chat shell child must be visible in the runtime registry");
+        assert_eq!(row.kind, registry::WorkKind::Process);
+        assert_eq!(row.state, registry::WorkState::Running);
+        assert!(row.pid.is_some(), "the row must carry the child pid");
+        assert!(
+            row.pgid.is_some(),
+            "the row must carry the process group so a kill reaches forked workers"
+        );
+
+        let results = registry::kill(row.id, false).await;
+        assert_eq!(
+            results.first().map(|result| result.outcome),
+            Some(registry::KillOutcome::Killed),
+            "`prx tasks kill` must end a chat shell: {results:?}"
+        );
+
+        for _ in 0..400 {
+            if session.is_terminal() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(session.is_terminal(), "the killed shell must reach a terminal state");
+
+        let mut retired = false;
+        for _ in 0..400 {
+            if registry::snapshot(row.id).is_none() {
+                retired = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(retired, "the ledger row must be retired once the child is reaped");
     }
 }

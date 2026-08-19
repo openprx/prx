@@ -273,6 +273,7 @@ convenient. Nothing rewrites your config files.
 | `sessions_spawn.max_concurrent` | sub-agent fan-out is uncapped; use `prx tasks` to see and end runs |
 | `sessions_spawn.max_spawn_depth` | nesting is uncapped; depth is still reported |
 | `sessions_spawn.max_children_per_agent` | per-session fan-out is uncapped |
+| `scheduler.max_concurrent` | due cron jobs all start at once; use `prx tasks` to see and end them |
 | `autonomy.max_actions_per_hour` | no hourly action budget |
 | `gateway.request_timeout_secs` | no request deadline on gateway handlers |
 | `[security.resources]` (whole table) | never enforced by any code path |

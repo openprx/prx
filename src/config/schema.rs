@@ -3589,9 +3589,6 @@ pub struct SchedulerConfig {
     /// Maximum number of persisted scheduled tasks.
     #[serde(default = "default_scheduler_max_tasks")]
     pub max_tasks: usize,
-    /// Maximum tasks executed per scheduler polling cycle.
-    #[serde(default = "default_scheduler_max_concurrent")]
-    pub max_concurrent: usize,
     /// Execution claim lease. Active jobs renew this lease every one third of
     /// the interval; expired claims may be recovered by another scheduler.
     #[serde(default = "default_scheduler_claim_lease_secs")]
@@ -3602,10 +3599,6 @@ const fn default_scheduler_max_tasks() -> usize {
     64
 }
 
-const fn default_scheduler_max_concurrent() -> usize {
-    4
-}
-
 const fn default_scheduler_claim_lease_secs() -> u64 {
     90
 }
@@ -3614,7 +3607,6 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             max_tasks: default_scheduler_max_tasks(),
-            max_concurrent: default_scheduler_max_concurrent(),
             claim_lease_secs: default_scheduler_claim_lease_secs(),
         }
     }
@@ -5960,9 +5952,6 @@ impl Config {
         }
 
         // Scheduler
-        if self.scheduler.max_concurrent == 0 {
-            anyhow::bail!("scheduler.max_concurrent must be greater than 0");
-        }
         if self.scheduler.max_tasks == 0 {
             anyhow::bail!("scheduler.max_tasks must be greater than 0");
         }

@@ -720,7 +720,6 @@ fn scheduler_template(spec: Spec) -> String {
 
 # [scheduler]
 # max_tasks = 64
-# max_concurrent = 4
 # claim_lease_secs = 90
 
 # [cron]
@@ -739,7 +738,6 @@ fn scheduler_template(spec: Spec) -> String {
 
 [scheduler]
 max_tasks = 64
-max_concurrent = 4
 claim_lease_secs = 90
 # storage_path = "workspace/cron/scheduler.db"
 

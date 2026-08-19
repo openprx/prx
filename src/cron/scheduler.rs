@@ -12,9 +12,12 @@ use crate::security::SecurityPolicy;
 use crate::security::policy::ApprovalGrant;
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use futures_util::{StreamExt, stream};
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use std::sync::Arc;
+use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
+use tokio_util::sync::CancellationToken;
 
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
@@ -85,7 +88,16 @@ async fn run_loop(config: Config) -> Result<()> {
             }
         };
 
-        process_due_jobs_for_worker(&config, &security, jobs, SCHEDULER_COMPONENT, &identity.worker_id).await;
+        // Start the batch and go back to polling. Awaiting it here is what let
+        // one job that never returns stop the whole scheduler: the next
+        // `due_jobs` query could not run until the slowest job of this cycle
+        // finished, so no other job was ever started again. Outcomes are
+        // reported by a task of their own, so nothing on the poll path waits
+        // for a job to end.
+        let started = spawn_due_jobs(&config, &security, jobs, SCHEDULER_COMPONENT, &identity.worker_id);
+        if !started.is_empty() {
+            tokio::spawn(report_job_outcomes(started));
+        }
     }
 }
 
@@ -179,32 +191,109 @@ async fn execute_job_with_retry_internal(
 #[cfg(test)]
 async fn process_due_jobs(config: &Config, security: &Arc<SecurityPolicy>, jobs: Vec<CronJob>, component: &str) {
     let worker_id = format!("cron-scheduler-{}", uuid::Uuid::new_v4());
-    process_due_jobs_for_worker(config, security, jobs, component, &worker_id).await;
+    let started = spawn_due_jobs(config, security, jobs, component, &worker_id);
+    report_job_outcomes(started).await;
 }
 
-async fn process_due_jobs_for_worker(
+/// How one spawned cron job left its poll cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobCycleOutcome {
+    /// The job ran to completion; the flag carries its success.
+    Finished(bool),
+    /// An operator ended the job through `prx tasks kill`.
+    Killed,
+}
+
+/// Start every due job on a task of its own and hand back the join handles.
+///
+/// Nothing here rations how many jobs run at once, and nothing here waits for
+/// them. Those two used to be one thing: a bounded `buffer_unordered` that the
+/// poll loop awaited as a whole. The `scheduler.max_concurrent` cap on its own
+/// was survivable, because a job queued behind it still started as an earlier
+/// one finished; the await was not, because a job that never finishes kept the
+/// loop from ever asking for due work again and the scheduler stopped
+/// scheduling entirely. A cron job legitimately runs for hours in this runtime,
+/// and with timeouts gone nothing ends that wait on its own, so a cycle now
+/// starts its work and moves on.
+///
+/// Each job is registered before it is spawned, so `prx tasks list` shows it
+/// while it runs and `prx tasks kill` can end exactly that one job without
+/// touching its peers. The guard moves into the task, so the row disappears
+/// when the job does, including when it is killed or panics. Isolation between
+/// jobs is `tokio::spawn`'s: a panicking job unwinds only its own task and is
+/// reported as a `JoinError` by [`report_job_outcomes`], and a job that hangs
+/// holds nothing that another job needs.
+fn spawn_due_jobs(
     config: &Config,
     security: &Arc<SecurityPolicy>,
     jobs: Vec<CronJob>,
     component: &str,
     worker_id: &str,
-) {
+) -> Vec<JoinHandle<(String, JobCycleOutcome)>> {
     // Refresh scheduler health on every successful poll cycle, including idle cycles.
     crate::health::mark_component_ok(component);
 
-    let max_concurrent = config.scheduler.max_concurrent.max(1);
-    let mut in_flight = stream::iter(jobs.into_iter().map(|job| {
+    let mut started = Vec::with_capacity(jobs.len());
+    for job in jobs {
         let config = config.clone();
         let security = Arc::clone(security);
         let component = component.to_owned();
         let worker_id = worker_id.to_owned();
-        async move { execute_and_persist_job(&config, security.as_ref(), &job, &component, &worker_id).await }
-    }))
-    .buffer_unordered(max_concurrent);
+        let job_id = job.id.clone();
+        let label = job.name.as_deref().map_or_else(
+            || format!("cron {}", job.id),
+            |name| format!("cron {name} ({})", job.id),
+        );
+        let cancel = CancellationToken::new();
+        // Registration happens before the spawn so the work id is known
+        // synchronously; the guard itself moves into the task, so the row lives
+        // exactly as long as the job.
+        let guard = crate::runtime::registry::register_sub_agent(
+            &label,
+            &job.id,
+            crate::runtime::registry::current_work_id(),
+            Some(cancel.clone()),
+        );
+        let work_id = guard.id();
+        let task = tokio::spawn(crate::runtime::registry::scoped(guard, async move {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => (job_id, JobCycleOutcome::Killed),
+                (job_id, success) = execute_and_persist_job(&config, security.as_ref(), &job, &component, &worker_id) => {
+                    (job_id, JobCycleOutcome::Finished(success))
+                }
+            }
+        }));
+        crate::runtime::registry::attach_abort_handle(work_id, task.abort_handle());
+        started.push(task);
+    }
+    started
+}
 
-    while let Some((job_id, success)) = in_flight.next().await {
-        if !success {
-            tracing::warn!("Scheduler job '{job_id}' failed");
+/// Log how each started job ended, as it ends.
+///
+/// Reporting is deliberately separate from starting: the poll loop hands this
+/// its handles and forgets about them, so a job that outlives many poll cycles
+/// delays neither the next cycle nor the reporting of its faster peers.
+async fn report_job_outcomes(started: Vec<JoinHandle<(String, JobCycleOutcome)>>) {
+    let mut pending: FuturesUnordered<_> = started.into_iter().collect();
+    while let Some(joined) = pending.next().await {
+        match joined {
+            Ok((_, JobCycleOutcome::Finished(true))) => {}
+            Ok((job_id, JobCycleOutcome::Finished(false))) => {
+                tracing::warn!("Scheduler job '{job_id}' failed");
+            }
+            Ok((job_id, JobCycleOutcome::Killed)) => {
+                tracing::warn!("Scheduler job '{job_id}' was killed; its claim is released when the lease expires");
+            }
+            Err(error) if error.is_cancelled() => {
+                tracing::warn!("A scheduler job task was aborted: {error}");
+            }
+            Err(error) => {
+                // One job panicking is contained by its own task; the rest of
+                // the cycle keeps running, so this is reported and not retried.
+                tracing::error!("A scheduler job task ended abnormally: {error}");
+            }
         }
     }
 }
@@ -292,7 +381,7 @@ async fn run_claimed_job(
     let mut workflow = Box::pin(async move {
         let (success, output) = execute_job_with_retry_internal(config, security, job, Some(&workflow_authority)).await;
         let finished_at = Utc::now();
-        let persisted = persist_job_result(
+        let committed = commit_job_result(
             config,
             job,
             &workflow_claim,
@@ -301,9 +390,8 @@ async fn run_claimed_job(
             started_at,
             finished_at,
             mode,
-        )
-        .await;
-        (persisted, output)
+        );
+        (committed, output)
     });
     renewal.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let drive_result = drive_claimed_workflow(&mut workflow, &claim_state, &mut renewal, |current, now| {
@@ -324,7 +412,32 @@ async fn run_claimed_job(
     })
     .await;
     match drive_result {
-        LeaseDriveResult::Completed(result) => result,
+        LeaseDriveResult::Completed((committed, output)) => {
+            // Delivery is the run's one externally visible act, so it happens
+            // strictly after the fencing compare-and-set above has committed.
+            // Announcing first meant a worker whose lease had already been
+            // stolen still sent the message, and the worker that went on to win
+            // the fence sent it again: one run, two announcements to a channel
+            // or an external API. A lost fence now returns before this point.
+            //
+            // It also runs outside the lease driver on purpose. The commit
+            // releases the claim, so a renewal tick raised during a slow
+            // delivery would find no lease left and cancel the delivery as if
+            // authority had been lost.
+            let CommittedRun { committed, mut success } = committed;
+            if !committed {
+                return (false, output);
+            }
+            if let Err(e) = deliver_if_configured(config, job, &output).await {
+                if job.delivery.best_effort {
+                    tracing::warn!("Cron delivery failed (best_effort): {e}");
+                } else {
+                    success = false;
+                    tracing::warn!("Cron delivery failed: {e}");
+                }
+            }
+            (success, output)
+        }
         LeaseDriveResult::Lost {
             claim,
             detected_at,
@@ -379,6 +492,13 @@ where
 {
     loop {
         tokio::select! {
+            // Completion is checked first on purpose. The workflow returns the
+            // instant its fenced commit lands, and that commit clears the very
+            // lease the renewal branch looks for; a random pick between two
+            // ready branches would sometimes report a committed run as having
+            // lost its authority. A ready workflow cannot starve renewal,
+            // because a ready workflow ends the loop.
+            biased;
             result = workflow.as_mut() => return LeaseDriveResult::Completed(result),
             _ = renewal.tick() => {
                 let now = Utc::now();
@@ -500,27 +620,35 @@ async fn run_agent_job(
     }
 }
 
-async fn persist_job_result(
+/// What the fenced commit did with one run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommittedRun {
+    /// Whether the fencing compare-and-set landed this run. `false` means the
+    /// lease was stolen or expired and the job now belongs to another worker,
+    /// so this run must leave no trace outside the process either.
+    committed: bool,
+    /// Whether the run itself succeeded.
+    success: bool,
+}
+
+/// Record one finished run against the claim it was fenced by.
+///
+/// This is the point at which the run becomes real: the compare-and-set both
+/// writes the result and releases the lease, and it matches nothing if the
+/// lease has since moved on. Delivery deliberately does not happen here — see
+/// [`run_claimed_job`], which announces only after this has committed.
+#[allow(clippy::too_many_arguments)]
+fn commit_job_result(
     config: &Config,
     job: &CronJob,
     claim_state: &parking_lot::Mutex<CronClaim>,
-    mut success: bool,
+    success: bool,
     output: &str,
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
     mode: ClaimedRunMode,
-) -> bool {
+) -> CommittedRun {
     let duration_ms = (finished_at - started_at).num_milliseconds();
-
-    if let Err(e) = deliver_if_configured(config, job, output).await {
-        if job.delivery.best_effort {
-            tracing::warn!("Cron delivery failed (best_effort): {e}");
-        } else {
-            success = false;
-            tracing::warn!("Cron delivery failed: {e}");
-        }
-    }
-
     let disable_after = !success && should_disable_after_deterministic_failure(job, output);
     let claim = claim_state.lock().clone();
     let commit_now = Utc::now();
@@ -564,10 +692,16 @@ async fn persist_job_result(
     };
     if let Err(e) = finish_result {
         tracing::warn!(job_id = %job.id, attempt_id = %claim.attempt_id, "Failed to persist fenced cron result: {e}");
-        return false;
+        return CommittedRun {
+            committed: false,
+            success: false,
+        };
     }
 
-    success
+    CommittedRun {
+        committed: true,
+        success,
+    }
 }
 
 fn should_disable_after_deterministic_failure(job: &CronJob, output: &str) -> bool {
@@ -1269,7 +1403,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_job_result_records_run_and_reschedules_shell_job() {
+    async fn commit_job_result_records_run_and_reschedules_shell_job() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
@@ -1278,7 +1412,7 @@ mod tests {
         let claim = test_claim(&config, &job, started);
         let claim = parking_lot::Mutex::new(claim);
 
-        let success = persist_job_result(
+        let committed = commit_job_result(
             &config,
             &job,
             &claim,
@@ -1287,9 +1421,9 @@ mod tests {
             started,
             finished,
             ClaimedRunMode::AdvanceSchedule,
-        )
-        .await;
-        assert!(success);
+        );
+        assert!(committed.committed);
+        assert!(committed.success);
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
@@ -1351,7 +1485,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_job_result_success_deletes_one_shot() {
+    async fn commit_job_result_success_deletes_one_shot() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
@@ -1371,7 +1505,7 @@ mod tests {
         let claim = parking_lot::Mutex::new(claim);
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(
+        let committed = commit_job_result(
             &config,
             &job,
             &claim,
@@ -1380,15 +1514,15 @@ mod tests {
             started,
             finished,
             ClaimedRunMode::AdvanceSchedule,
-        )
-        .await;
-        assert!(success);
+        );
+        assert!(committed.committed);
+        assert!(committed.success);
         let lookup = cron::get_job(&config, &job.id);
         assert!(lookup.is_err());
     }
 
     #[tokio::test]
-    async fn persist_job_result_failure_retains_auto_delete_one_shot_audit() {
+    async fn commit_job_result_failure_retains_auto_delete_one_shot_audit() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
@@ -1408,7 +1542,7 @@ mod tests {
         let claim = parking_lot::Mutex::new(claim);
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(
+        let committed = commit_job_result(
             &config,
             &job,
             &claim,
@@ -1417,9 +1551,9 @@ mod tests {
             started,
             finished,
             ClaimedRunMode::AdvanceSchedule,
-        )
-        .await;
-        assert!(!success);
+        );
+        assert!(committed.committed);
+        assert!(!committed.success);
         let retained = cron::get_job(&config, &job.id).unwrap();
         assert_eq!(retained.terminal_state, Some(crate::cron::CronJobTerminalState::Failed));
         assert_eq!(cron::list_runs(&config, &job.id, 10).unwrap().len(), 1);
@@ -1447,7 +1581,7 @@ mod tests {
         let finished = started + ChronoDuration::milliseconds(10);
 
         assert!(
-            !persist_job_result(
+            !commit_job_result(
                 &config,
                 &job,
                 &claim,
@@ -1457,7 +1591,7 @@ mod tests {
                 finished,
                 ClaimedRunMode::AdvanceSchedule,
             )
-            .await
+            .success
         );
 
         let stored = cron::get_job(&config, &job.id).unwrap();
@@ -1485,6 +1619,415 @@ mod tests {
             &job,
             "agent job failed: Security policy: read-only mode, cannot perform 'sessions_spawn'"
         ));
+    }
+
+    /// Wait until `condition` holds, or fail with `what` once `limit` elapses.
+    ///
+    /// Polling rather than joining is the point: the assertion has to hold while
+    /// another job of the same cycle is still running, so it must never await
+    /// that job's handle.
+    async fn wait_until(limit: Duration, what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            if condition() {
+                return;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn every_minute() -> Schedule {
+        Schedule::Cron {
+            expr: "* * * * *".into(),
+            tz: None,
+        }
+    }
+
+    /// A schedule whose first run falls due almost immediately, so a poll cycle
+    /// can be exercised without waiting for a wall-clock minute boundary.
+    fn due_almost_immediately() -> Schedule {
+        Schedule::Every { every_ms: 50 }
+    }
+
+    /// A job that never returns is listed, killable on its own, and harmless
+    /// to the jobs sharing its cycle.
+    ///
+    /// The endless job leads the batch and outnumbers nothing by accident:
+    /// there are more jobs than the former `scheduler.max_concurrent` ceiling
+    /// of four, so a runner that admits them in order under a tight cap never
+    /// reaches the last of them. What this pins is per-job isolation and the
+    /// operator surface; the loop-level failure has a test of its own.
+    #[tokio::test]
+    async fn an_endless_job_is_listed_killable_and_leaves_its_peers_alone() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
+
+        let blocker =
+            cron::add_shell_job(&config, Some("blocker".into()), due_almost_immediately(), "sleep 300").unwrap();
+        let quick: Vec<CronJob> = (0..5)
+            .map(|index| {
+                cron::add_shell_job(
+                    &config,
+                    Some(format!("quick-{index}")),
+                    due_almost_immediately(),
+                    &format!("echo quick-{index}"),
+                )
+                .unwrap()
+            })
+            .collect();
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let mut due = cron::due_jobs(&config, Utc::now()).unwrap();
+        assert_eq!(due.len(), 6);
+        // Put the endless job at the head of the batch: a runner that works
+        // through the batch in order never reaches the others at all.
+        due.sort_by_key(|job| job.id != blocker.id);
+
+        let started = spawn_due_jobs(&config, &security, due, &unique_component("endless"), "worker-endless");
+
+        let recorded = {
+            let config = config.clone();
+            let quick_ids: Vec<String> = quick.iter().map(|job| job.id.clone()).collect();
+            move || {
+                quick_ids.iter().all(|id| {
+                    cron::get_job(&config, id)
+                        .ok()
+                        .and_then(|job| job.last_status)
+                        .as_deref()
+                        == Some("ok")
+                })
+            }
+        };
+        wait_until(
+            Duration::from_secs(30),
+            "every quick job to finish while the endless job runs",
+            recorded,
+        )
+        .await;
+
+        // The endless job is still running, and it is visible and killable on
+        // its own: `prx tasks list` reads exactly this snapshot.
+        let listed = crate::runtime::registry::snapshot_all();
+        let entry = listed
+            .iter()
+            .find(|item| item.run_id.as_deref() == Some(blocker.id.as_str()))
+            .expect("the running job must be listed for `prx tasks`");
+        assert_eq!(entry.kind, crate::runtime::registry::WorkKind::SubAgent);
+        assert!(entry.name.contains("blocker"), "got {}", entry.name);
+
+        // A live claim also keeps the running job out of the next poll cycle,
+        // so concurrency cannot make one worker run the same job twice.
+        let next_cycle = cron::due_jobs(&config, Utc::now()).unwrap();
+        assert!(
+            !next_cycle.iter().any(|job| job.id == blocker.id),
+            "a job still running under a live claim must not come back as due"
+        );
+
+        crate::runtime::registry::kill(entry.id, true).await;
+        // Killing one job ends that job and nothing else: the finished runs of
+        // its peers are already durable.
+        report_job_outcomes(started).await;
+        for job in &quick {
+            assert_eq!(cron::list_runs(&config, &job.id, 10).unwrap().len(), 1);
+        }
+    }
+
+    /// The poll loop must keep starting work while an earlier job still runs.
+    ///
+    /// This is the failure the removal of timeouts made permanent. The loop
+    /// used to `await` the whole batch it had just started, so the next
+    /// `due_jobs` query waited on the slowest job of the previous cycle: one
+    /// job that hangs, and the scheduler never starts anything again. Nothing
+    /// expires on its own any more, so there was no longer anything to end that
+    /// wait. The job created below falls due *after* the endless one is already
+    /// running, so only a loop that is free to poll again can execute it.
+    #[tokio::test]
+    async fn the_poll_loop_starts_later_jobs_while_an_endless_job_runs() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+
+        let blocker =
+            cron::add_shell_job(&config, Some("endless".into()), due_almost_immediately(), "sleep 300").unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let scheduler = tokio::spawn(run(config.clone()));
+
+        let running = {
+            let blocker_id = blocker.id.clone();
+            move || {
+                crate::runtime::registry::snapshot_all()
+                    .iter()
+                    .any(|item| item.run_id.as_deref() == Some(blocker_id.as_str()))
+            }
+        };
+        wait_until(
+            Duration::from_secs(30),
+            "the first cycle to start the endless job",
+            running,
+        )
+        .await;
+
+        // Work that becomes due only after the endless job is under way.
+        let later = cron::add_shell_job(&config, Some("later".into()), due_almost_immediately(), "echo later").unwrap();
+        let executed = {
+            let config = config.clone();
+            let later_id = later.id.clone();
+            move || {
+                cron::get_job(&config, &later_id)
+                    .ok()
+                    .and_then(|job| job.last_status)
+                    .as_deref()
+                    == Some("ok")
+            }
+        };
+        wait_until(
+            Duration::from_mins(1),
+            "a later poll cycle to run a job queued behind the endless one",
+            executed,
+        )
+        .await;
+
+        scheduler.abort();
+        for item in crate::runtime::registry::snapshot_all() {
+            if item.run_id.as_deref() == Some(blocker.id.as_str()) {
+                crate::runtime::registry::kill(item.id, true).await;
+            }
+        }
+    }
+
+    /// Two poll cycles that overlap on the same due job must run it once.
+    ///
+    /// Nothing serialises the cycles any more, so the claim is the only thing
+    /// standing between an overlapping batch and a double execution.
+    #[tokio::test]
+    async fn overlapping_cycles_claim_a_job_only_once() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
+        let job = cron::add_shell_job(&config, Some("once".into()), due_almost_immediately(), "echo once").unwrap();
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let due = cron::due_jobs(&config, Utc::now()).unwrap();
+        assert_eq!(due.len(), 1);
+        let first = spawn_due_jobs(
+            &config,
+            &security,
+            due.clone(),
+            &unique_component("overlap-a"),
+            "worker-a",
+        );
+        let second = spawn_due_jobs(&config, &security, due, &unique_component("overlap-b"), "worker-a");
+        report_job_outcomes(first).await;
+        report_job_outcomes(second).await;
+
+        assert_eq!(
+            cron::list_runs(&config, &job.id, 10).unwrap().len(),
+            1,
+            "an overlapping cycle must not re-run a claimed job"
+        );
+    }
+
+    /// The same batch, started twice against a real PostgreSQL store, must run
+    /// each job exactly once.
+    ///
+    /// Fencing is what replaced the batch's former serialisation, so it is the
+    /// only thing keeping an uncapped cycle from executing a job twice. SQLite
+    /// serialises writes on the database file and can therefore hide a fencing
+    /// mistake; PostgreSQL executes the racing claims for real. Gated on
+    /// `OPENPRX_TEST_POSTGRES_URL`, and run with `--test-threads=1` because the
+    /// cron tables are shared across the database.
+    #[tokio::test]
+    async fn postgres_concurrent_cycles_run_each_job_once_from_env() {
+        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.storage.provider.config = crate::config::schema::StorageProviderConfig {
+            provider: "postgres".into(),
+            db_url: Some(db_url),
+            ..Default::default()
+        };
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
+
+        let jobs: Vec<CronJob> = (0..6)
+            .map(|index| {
+                cron::add_shell_job(
+                    &config,
+                    Some(format!("pg-cycle-{index}")),
+                    due_almost_immediately(),
+                    &format!("echo pg-cycle-{index}"),
+                )
+                .expect("test: insert cron job")
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        // Two cycles of two different workers, racing over the same due list.
+        let first = spawn_due_jobs(
+            &config,
+            &security,
+            jobs.clone(),
+            &unique_component("pg-cycle-a"),
+            "pg-worker-a",
+        );
+        let second = spawn_due_jobs(
+            &config,
+            &security,
+            jobs.clone(),
+            &unique_component("pg-cycle-b"),
+            "pg-worker-b",
+        );
+        report_job_outcomes(first).await;
+        report_job_outcomes(second).await;
+
+        for job in &jobs {
+            let runs = cron::list_runs(&config, &job.id, 10).expect("test: run history");
+            assert_eq!(runs.len(), 1, "test: job {} ran {} times", job.id, runs.len());
+            assert_eq!(runs[0].status, "ok");
+            let owners: std::collections::HashSet<Option<String>> =
+                runs.iter().map(|run| run.worker_id.clone()).collect();
+            assert_eq!(owners.len(), 1, "test: two workers recorded the same job");
+        }
+        for job in &jobs {
+            cron::remove_job(&config, &job.id).expect("test: cleanup");
+        }
+    }
+
+    /// Count the delivery posts a job actually sends.
+    ///
+    /// A real HTTP endpoint is used rather than a stub because the duplicate
+    /// this guards against is an externally visible one: the same result posted
+    /// twice to a channel.
+    async fn delivery_counter() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::Router;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let app = Router::new().route(
+            "/api/v4/posts",
+            post(move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    "{}"
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test: bind");
+        let addr = listener.local_addr().expect("test: addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    fn announce_to_mattermost(config: &mut Config, base_url: String) {
+        config.channels_config.mattermost = Some(crate::config::schema::MattermostConfig {
+            url: base_url,
+            bot_token: "test-token".into(),
+            channel_id: None,
+            allowed_users: Vec::new(),
+            thread_replies: Some(false),
+            mention_only: Some(false),
+        });
+    }
+
+    /// A run whose lease was taken over must not announce its result.
+    ///
+    /// Delivery used to happen before the fencing compare-and-set, so a worker
+    /// that had already lost its lease still posted, and the worker that went
+    /// on to win the fence posted the same result again. The commit is the only
+    /// thing that can tell the two apart, so it has to come first.
+    #[tokio::test]
+    async fn a_preempted_run_announces_nothing_and_the_winner_announces_once() {
+        let tmp = TempDir::new().unwrap();
+        let (base_url, hits) = delivery_counter().await;
+        let mut config = test_config(&tmp).await;
+        announce_to_mattermost(&mut config, base_url);
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let mut job = cron::add_shell_job(&config, Some("announced".into()), every_minute(), "echo announced").unwrap();
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("mattermost".into()),
+            to: Some("town-square".into()),
+            best_effort: true,
+        };
+
+        // The stale owner: it claimed the job, its lease then ran out.
+        let now = Utc::now();
+        let stale =
+            cron::claim_job_if_current_for_manual_run(&config, &job, "worker-stale", now, ChronoDuration::seconds(1))
+                .unwrap()
+                .expect("test: stale worker claims first");
+        // The new owner takes the expired lease over while the stale owner is
+        // still working, which is exactly the window the fence exists for.
+        let winner = cron::claim_job_if_current_for_manual_run(
+            &config,
+            &job,
+            "worker-winner",
+            now + ChronoDuration::seconds(2),
+            ChronoDuration::seconds(90),
+        )
+        .unwrap()
+        .expect("test: the expired lease is claimable");
+        assert_ne!(stale.attempt_id, winner.attempt_id);
+
+        let (stale_success, _) =
+            run_claimed_job(&config, &security, &job, stale, ClaimedRunMode::PreserveSchedule).await;
+        assert!(!stale_success, "a run that lost the fence must not report success");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a run that lost the fence must not announce anything"
+        );
+
+        let (winner_success, _) =
+            run_claimed_job(&config, &security, &job, winner, ClaimedRunMode::PreserveSchedule).await;
+        assert!(winner_success, "the fence winner must commit its run");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the committed run must announce exactly once"
+        );
+        assert_eq!(
+            cron::list_runs(&config, &job.id, 10).unwrap().len(),
+            1,
+            "only the fence winner may record a run"
+        );
+    }
+
+    /// The committed run announces, and only after the commit is durable.
+    #[tokio::test]
+    async fn delivery_happens_after_the_run_is_committed() {
+        let tmp = TempDir::new().unwrap();
+        let (base_url, hits) = delivery_counter().await;
+        let mut config = test_config(&tmp).await;
+        announce_to_mattermost(&mut config, base_url);
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let mut job = cron::add_shell_job(&config, Some("ordered".into()), every_minute(), "echo ordered").unwrap();
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("mattermost".into()),
+            to: Some("town-square".into()),
+            best_effort: true,
+        };
+        let claim = test_claim(&config, &job, Utc::now());
+
+        let (success, output) =
+            run_claimed_job(&config, &security, &job, claim, ClaimedRunMode::PreserveSchedule).await;
+
+        assert!(success, "{output}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
     }
 
     #[tokio::test]

@@ -1584,6 +1584,80 @@ fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
     content.chars().count() > MEMORY_CONTEXT_MAX_CHARS
 }
 
+/// The mid-turn record of tool calls that have **already executed** in the
+/// current attempt, ready to be carried into a replayed history.
+///
+/// A replay rebuilds the conversation from `conversation_histories`, and that
+/// cache holds only completed user/assistant turns — `append_sender_turn` is
+/// never called for a mid-turn tool call or tool result. Handing the model a
+/// history with the tool evidence erased is an instruction to run everything
+/// again, and the tools on this path have real side effects: files written,
+/// messages sent, external APIs called. Nothing downstream catches the repeat
+/// either — the durable idempotency ledger keys on the provider-generated
+/// `tool_call_id`, which is freshly minted by the replayed response.
+///
+/// So the replay must re-ask the *model* without re-doing the *work*. The
+/// terminal chat retry (`chat::run`) gets this for free by never rebuilding its
+/// history; this is the channel path's equivalent.
+///
+/// The record is located by the first tool-result message rather than by an
+/// index into the previous history, so a mid-turn trim inside the tool loop
+/// cannot shift it out from under us. Everything from the assistant turn that
+/// requested those tools onwards is carried, which keeps the
+/// `assistant(tool_calls) → tool result` pairing that native-tool providers
+/// require. Mid-turn `system` messages (compaction and corrective-retry
+/// artifacts) are dropped: the rebuilt prefix already carries the real system
+/// prompt.
+fn executed_tool_records(history: &[ChatMessage]) -> Vec<ChatMessage> {
+    let Some(first_result) = history.iter().position(is_tool_result_message) else {
+        return Vec::new();
+    };
+    let start = history
+        .get(..first_result)
+        .and_then(|before| before.iter().rposition(|message| message.role == "assistant"))
+        .unwrap_or(first_result);
+    history
+        .get(start..)
+        .unwrap_or_default()
+        .iter()
+        .filter(|message| message.role != "system")
+        .cloned()
+        .collect()
+}
+
+/// Rebuild the turn history for a replay while keeping the record of whatever
+/// the aborted attempt already executed.
+///
+/// See [`executed_tool_records`] for why the record has to survive: a replay is
+/// meant to re-ask the model, not to re-run the side effects it already caused.
+fn replayed_history(previous: &[ChatMessage], rebuild: &impl Fn() -> Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let carried = executed_tool_records(previous);
+    let mut next = rebuild();
+    if carried.is_empty() {
+        return next;
+    }
+    tracing::warn!(
+        carried_messages = carried.len(),
+        "channel turn replay: carrying already-executed tool records into the rebuilt history so the \
+         replay cannot repeat their side effects"
+    );
+    next.extend(carried);
+    next
+}
+
+/// Whether a history message carries the result of an executed tool call.
+///
+/// Native-tool mode emits a dedicated `tool` role message per call; prompt mode
+/// folds every result of the iteration into one `user` message behind
+/// [`crate::causal_tree::snapshot::TOOL_RESULTS_PREFIX`].
+fn is_tool_result_message(message: &ChatMessage) -> bool {
+    message.role == "tool"
+        || (message.role == "user"
+            && message
+                .content
+                .starts_with(crate::causal_tree::snapshot::TOOL_RESULTS_PREFIX))
+}
+
 pub(crate) fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
     [
@@ -3360,7 +3434,7 @@ async fn process_channel_message(
 
                         if context_overflow_retries < MAX_CONTEXT_OVERFLOW_RETRIES {
                             context_overflow_retries += 1;
-                            history = rebuild_history();
+                            history = replayed_history(&history, &rebuild_history);
                             continue;
                         }
 
@@ -3378,7 +3452,7 @@ async fn process_channel_message(
                             timeout_retries
                         );
                         tokio::time::sleep(Duration::from_secs(2)).await;
-                        history = rebuild_history();
+                        history = replayed_history(&history, &rebuild_history);
                         continue;
                     }
                     break LlmFinalOutcome::Timeout;
@@ -7592,6 +7666,223 @@ BTC is currently around $65,000 based on latest tool output."#
                 .iter()
                 .all(|message| !message.content.starts_with("[Used tools:")),
             "tool provenance must not be injected into assistant history: {assistant_turns:?}"
+        );
+    }
+
+    /// Tool with a side effect that survives the process: one line appended per
+    /// execution, so "was it run twice?" is answered by counting lines rather
+    /// than by trusting a counter in memory.
+    struct AppendingTool {
+        path: std::path::PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for AppendingTool {
+        fn name(&self) -> &str {
+            "append_line"
+        }
+
+        fn description(&self) -> &str {
+            "Append one line to the audit file"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {}, "additionalProperties": false })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
+            writeln!(file, "appended")?;
+            Ok(ToolResult {
+                success: true,
+                output: "appended one line".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    /// Stands in for a real model on the replay path: it asks for the tool while
+    /// the history shows no tool has run, and once the history *does* show the
+    /// result it fails the call with a context-window error, which is what makes
+    /// the channel loop replay the turn.
+    ///
+    /// The error text matches the channel-level classifier but deliberately not
+    /// the tool loop's own overflow classifier, so the failure propagates
+    /// straight to the replay instead of being absorbed by the in-loop
+    /// compaction retry.
+    #[derive(Default)]
+    struct ReplayProbeProvider {
+        /// Whether each `chat_with_history` call saw evidence of an executed tool.
+        saw_tool_evidence: parking_lot::Mutex<Vec<bool>>,
+    }
+
+    fn append_tool_call_payload() -> String {
+        r#"<tool_call>
+{"name":"append_line","arguments":{}}
+</tool_call>"#
+            .to_string()
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ReplayProbeProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(append_tool_call_payload())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let evidence = messages.iter().any(is_tool_result_message);
+            self.saw_tool_evidence.lock().push(evidence);
+            if evidence {
+                Err(anyhow::anyhow!("input is too long"))
+            } else {
+                Ok(append_tool_call_payload())
+            }
+        }
+    }
+
+    /// A replayed channel turn must re-ask the model without re-running the
+    /// tools the aborted attempt already executed.
+    #[tokio::test]
+    async fn channel_turn_replay_does_not_re_execute_already_executed_tools() {
+        let dir = TempDir::new().expect("test: tempdir");
+        let audit = dir.path().join("audit.log");
+
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider = Arc::new(ReplayProbeProvider::default());
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).expect("test: sqlite memory"));
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider) as Arc<dyn Provider>,
+            default_provider: Arc::new("test-provider".to_string()),
+            // A real SQLite backend, because a side-effecting tool is refused
+            // outright without the durable idempotency ledger. Running the tool
+            // *with* the ledger in place is also the point: the ledger keys on
+            // the per-call tool id, which the replayed response mints afresh, so
+            // it cannot be what stops the repeat.
+            memory: Arc::clone(&memory),
+            tools_registry: Arc::new(vec![Box::new(AppendingTool { path: audit.clone() }) as Box<dyn Tool>]),
+            observer: Arc::new(NoopObserver),
+            hooks: Arc::new(HookManager::new(std::env::temp_dir())),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
+            max_tool_iterations: 10,
+            read_only_tool_concurrency_window: 2,
+            priority_scheduling_enabled: false,
+            low_priority_tools: Vec::new(),
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(dir.path().to_path_buf()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            tool_tiering: crate::config::ToolTieringConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
+            bot_names: vec!["prx".to_string()],
+            bot_uuids: vec![],
+            mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+            })),
+            native_tools: false,
+            skill_rag_ctx: None,
+            test_inbound_authorizer: None,
+        });
+
+        process_channel_message(
+            Arc::clone(&runtime_ctx),
+            traits::ChannelMessage {
+                id: "msg-replay-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-replay".to_string(),
+                content: "Append one line please".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
+                mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
+                sender_is_bot: false,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let evidence = provider.saw_tool_evidence.lock().clone();
+        assert!(
+            evidence.len() >= 3,
+            "test: the turn must actually have been replayed: {evidence:?}"
+        );
+        assert!(
+            evidence.iter().skip(1).all(|seen| *seen),
+            "every call after the tool ran must still see the executed-tool record: {evidence:?}"
+        );
+
+        let appended = std::fs::read_to_string(&audit).expect("test: audit file written by the tool");
+        let lines = appended.lines().filter(|line| !line.is_empty()).count();
+        assert_eq!(
+            lines, 1,
+            "the replay must not run the tool a second time; audit file: {appended:?}"
+        );
+    }
+
+    #[test]
+    fn executed_tool_records_carry_the_assistant_turn_and_drop_mid_turn_system_noise() {
+        let history = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("please do it"),
+            ChatMessage::assistant("assistant text without tools"),
+            ChatMessage::assistant("<tool_call>{\"name\":\"append_line\"}</tool_call>"),
+            ChatMessage::system("mid-turn compaction note"),
+            ChatMessage::user(format!(
+                "{}\nappended one line",
+                crate::causal_tree::snapshot::TOOL_RESULTS_PREFIX
+            )),
+        ];
+        let carried = executed_tool_records(&history);
+        let roles: Vec<&str> = carried.iter().map(|message| message.role.as_str()).collect();
+        assert_eq!(roles, vec!["assistant", "user"], "carried: {carried:?}");
+        assert!(carried[0].content.contains("append_line"));
+        assert!(carried[1].content.contains("appended one line"));
+
+        // A history with no executed tool has nothing to carry.
+        assert!(
+            executed_tool_records(&[ChatMessage::system("s"), ChatMessage::user("u")]).is_empty(),
+            "a turn that executed nothing must carry nothing"
         );
     }
 

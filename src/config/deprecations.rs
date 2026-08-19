@@ -140,6 +140,12 @@ pub(crate) const DEPRECATED_CONFIG_KEYS: &[DeprecatedKey] = &[
         shape: DeprecatedShape::Field,
         reason: REASON_UNCAPPED,
     },
+    // ── [scheduler]: the per-cycle cron job ceiling ───────────────────────
+    DeprecatedKey {
+        path: &["scheduler", "max_concurrent"],
+        shape: DeprecatedShape::Field,
+        reason: REASON_UNCAPPED,
+    },
     // ── [autonomy]: the hourly action budget ──────────────────────────────
     DeprecatedKey {
         path: &["autonomy", "max_actions_per_hour"],
@@ -263,8 +269,9 @@ fn candidate_files(config_path: &Path) -> Vec<PathBuf> {
 /// Scan one TOML document for `key`, tracking the current table header.
 ///
 /// Tracking the header is what keeps this honest: leaf names repeat across
-/// sections (`max_concurrent` also exists under `[scheduler]` and `[xin]`), so
-/// matching a bare name would point the operator at a line that is still valid.
+/// sections (`max_concurrent` is retired under both `[scheduler]` and
+/// `[sessions_spawn]`, while `[xin]` keeps a live `max_concurrent_tasks`), so
+/// matching a bare name would point the operator at the wrong line.
 fn locate_in_text(text: &str, key: &DeprecatedKey) -> Option<usize> {
     let (table_path, leaf) = match key.shape {
         DeprecatedShape::Field => key.path.split_last().map(|(leaf, head)| (head, Some(*leaf)))?,
@@ -340,7 +347,7 @@ mod tests {
 
     #[test]
     fn locates_a_field_under_its_own_table() {
-        let text = "[scheduler]\nmax_concurrent = 4\n\n[sessions_spawn]\nmax_concurrent = 64\n";
+        let text = "[xin]\nmax_concurrent = 4\n\n[sessions_spawn]\nmax_concurrent = 64\n";
         let key = DeprecatedKey {
             path: &["sessions_spawn", "max_concurrent"],
             shape: DeprecatedShape::Field,

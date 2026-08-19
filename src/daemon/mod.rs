@@ -7,7 +7,7 @@ use crate::self_system::evolution::{
     PromptEvolutionEngine, StrategyEvolutionEngine, new_shared_evolution_config,
 };
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -17,12 +17,13 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
-const MANUAL_DAEMON_STALE_SECONDS: i64 = 30;
 const CORE_HEALTH_TTL_SECONDS: u64 = 60;
 const OPTIONAL_HEALTH_TTL_SECONDS: u64 = 300;
 
 pub async fn run(config: Config, host: String, port: u16, shutdown: CancellationToken) -> Result<()> {
-    ensure_manual_daemon_start_allowed(&config)?;
+    // Single-instance mutual exclusion. The guard must stay alive for the whole
+    // function: dropping it closes the descriptor and releases the flock.
+    let _instance_lock = acquire_single_instance_lock(&config)?;
 
     crate::health::register_component(
         "daemon",
@@ -398,81 +399,93 @@ const fn xin_runtime_enabled(_config: &Config) -> bool {
     true
 }
 
-fn ensure_manual_daemon_start_allowed(config: &Config) -> Result<()> {
-    if is_systemd_managed_start() {
-        return Ok(());
+/// Path of the advisory lock that guarantees a single live `prx daemon` per
+/// runtime directory. It sits next to `daemon_state.json` so all daemon runtime
+/// artefacts stay in one directory.
+pub fn lock_file_path(config: &Config) -> PathBuf {
+    config
+        .config_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join("daemon.lock")
+}
+
+/// Exclusive `flock` held for the entire lifetime of the daemon process.
+///
+/// The kernel drops the lock when the descriptor is closed, which happens on a
+/// clean exit *and* when the process is killed, so a crashed daemon never
+/// leaves a stale lock that would block the next start.
+#[derive(Debug)]
+struct DaemonInstanceLock {
+    _file: std::fs::File,
+}
+
+/// Take the process-wide single-instance lock, creating the runtime directory
+/// when it does not exist yet.
+fn acquire_single_instance_lock(config: &Config) -> Result<DaemonInstanceLock> {
+    let path = lock_file_path(config);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create daemon runtime directory {}", parent.display()))?;
+        }
+    }
+    lock_daemon_instance_at(&path)
+}
+
+fn lock_daemon_instance_at(path: &Path) -> Result<DaemonInstanceLock> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("Failed to open daemon lock file {}", path.display()))?;
+
+    // Non-blocking: a second daemon must fail loudly instead of queueing behind
+    // the live one.
+    if let Err(error) = fs2::FileExt::try_lock_exclusive(&file) {
+        anyhow::bail!(busy_daemon_message(path, lock_holder_pid(path), &error));
     }
 
-    let state_path = state_file_path(config);
-    let Some(active) = active_daemon_from_state_file(&state_path) else {
-        return Ok(());
-    };
+    // The lock is ours now; publish the owning pid so operators can identify the
+    // holder from the outside. A failure here is not fatal for mutual exclusion,
+    // it only degrades the diagnostics of the *next* start attempt.
+    if let Err(error) = write_lock_owner_pid(&mut file, std::process::id()) {
+        tracing::warn!("failed to record daemon lock owner pid in {}: {error}", path.display());
+    }
 
-    anyhow::bail!(
-        "Refusing to start `prx daemon` outside systemd because an active daemon appears to be running \
-         (pid {}, state file {}). Use `systemctl --user restart prx.service` to restart it, or \
-         `systemctl --user stop prx.service` before manual debugging.",
-        active.pid,
-        state_path.display()
+    Ok(DaemonInstanceLock { _file: file })
+}
+
+fn write_lock_owner_pid(file: &mut std::fs::File, pid: u32) -> std::io::Result<()> {
+    file.set_len(0)?;
+    std::io::Seek::seek(file, std::io::SeekFrom::Start(0))?;
+    std::io::Write::write_all(file, format!("{pid}\n").as_bytes())?;
+    std::io::Write::flush(file)
+}
+
+/// Best-effort read of the pid recorded by the daemon that owns the lock.
+fn lock_holder_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn busy_daemon_message(path: &Path, holder_pid: Option<u32>, error: &std::io::Error) -> String {
+    let holder = holder_pid.map_or_else(
+        || "another prx daemon".to_string(),
+        |pid| format!("another prx daemon (pid {pid})"),
+    );
+    let inspect = holder_pid.map_or_else(
+        || "systemctl --user status prx.service".to_string(),
+        |pid| format!("ps -p {pid} -o pid,lstart,cmd"),
+    );
+    format!(
+        "Refusing to start: {holder} already holds the single-instance lock {lock}. \
+         One runtime directory runs exactly one daemon. Inspect the running one with `{inspect}`, \
+         and restart it with `systemctl --user restart prx.service` instead of starting a second \
+         process (flock: {error})",
+        lock = path.display(),
     )
-}
-
-fn is_systemd_managed_start() -> bool {
-    std::env::var_os("INVOCATION_ID").is_some()
-        || std::env::var_os("JOURNAL_STREAM").is_some()
-        || std::env::var_os("NOTIFY_SOCKET").is_some()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ActiveDaemonState {
-    pid: u32,
-}
-
-fn active_daemon_from_state_file(path: &Path) -> Option<ActiveDaemonState> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    active_daemon_from_state_json(&raw, Utc::now())
-}
-
-fn active_daemon_from_state_json(raw: &str, now: DateTime<Utc>) -> Option<ActiveDaemonState> {
-    let json: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let pid = json.get("pid")?.as_u64().and_then(|value| u32::try_from(value).ok())?;
-
-    let daemon_last_ok = json
-        .get("components")
-        .and_then(|components| components.get("daemon"))
-        .and_then(|daemon| daemon.get("last_ok"))
-        .and_then(serde_json::Value::as_str);
-    let written_at = json.get("written_at").and_then(serde_json::Value::as_str);
-
-    if !is_recent_timestamp(daemon_last_ok, now) && !is_recent_timestamp(written_at, now) {
-        return None;
-    }
-    if !process_appears_alive(pid) {
-        return None;
-    }
-
-    Some(ActiveDaemonState { pid })
-}
-
-fn is_recent_timestamp(raw: Option<&str>, now: DateTime<Utc>) -> bool {
-    let Some(raw) = raw else {
-        return false;
-    };
-    let Ok(parsed) = DateTime::parse_from_rfc3339(raw) else {
-        return false;
-    };
-    let age = now.signed_duration_since(parsed.with_timezone(&Utc));
-    age.num_seconds() >= 0 && age.num_seconds() <= MANUAL_DAEMON_STALE_SECONDS
-}
-
-#[cfg(target_os = "linux")]
-fn process_appears_alive(pid: u32) -> bool {
-    Path::new("/proc").join(pid.to_string()).exists()
-}
-
-#[cfg(not(target_os = "linux"))]
-const fn process_appears_alive(_pid: u32) -> bool {
-    true
 }
 
 fn spawn_component_supervisor<F, Fut>(
@@ -1528,88 +1541,75 @@ mod tests {
     }
 
     #[test]
-    fn active_daemon_state_detects_recent_live_pid() {
-        let now = Utc::now();
-        let raw = serde_json::json!({
-            "pid": std::process::id(),
-            "written_at": now.to_rfc3339(),
-            "components": {
-                "daemon": {
-                    "status": "ok",
-                    "last_ok": now.to_rfc3339()
-                }
-            }
-        })
-        .to_string();
+    fn lock_file_path_uses_config_directory() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
 
-        assert_eq!(
-            active_daemon_from_state_json(&raw, now),
-            Some(ActiveDaemonState {
-                pid: std::process::id()
-            })
+        assert_eq!(lock_file_path(&config), tmp.path().join("daemon.lock"));
+    }
+
+    #[test]
+    fn single_instance_lock_creates_missing_runtime_directory() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.config_path = tmp.path().join("nested").join("deeper").join("config.toml");
+
+        let guard = acquire_single_instance_lock(&config).unwrap();
+        assert!(lock_file_path(&config).exists());
+        drop(guard);
+    }
+
+    #[test]
+    fn single_instance_lock_records_owner_pid() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let guard = acquire_single_instance_lock(&config).unwrap();
+        assert_eq!(lock_holder_pid(&lock_file_path(&config)), Some(std::process::id()));
+        drop(guard);
+    }
+
+    #[test]
+    fn second_lock_attempt_in_same_process_is_rejected() {
+        // flock is per open file description, so two independent `open` calls
+        // contend even inside one process.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("daemon.lock");
+
+        let first = lock_daemon_instance_at(&path).unwrap();
+        let error = lock_daemon_instance_at(&path).unwrap_err().to_string();
+        assert!(error.contains("single-instance lock"), "unexpected message: {error}");
+        assert!(
+            error.contains(&std::process::id().to_string()),
+            "message should name the holder pid: {error}"
         );
+        drop(first);
     }
 
     #[test]
-    fn active_daemon_state_ignores_stale_timestamp() {
-        let now = Utc::now();
-        let stale = now - chrono::Duration::seconds(MANUAL_DAEMON_STALE_SECONDS + 1);
-        let raw = serde_json::json!({
-            "pid": std::process::id(),
-            "written_at": stale.to_rfc3339(),
-            "components": {
-                "daemon": {
-                    "status": "ok",
-                    "last_ok": stale.to_rfc3339()
-                }
-            }
-        })
-        .to_string();
+    fn lock_is_released_when_the_guard_is_dropped() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("daemon.lock");
 
-        assert_eq!(active_daemon_from_state_json(&raw, now), None);
+        drop(lock_daemon_instance_at(&path).unwrap());
+        assert!(lock_daemon_instance_at(&path).is_ok());
     }
 
     #[test]
-    fn active_daemon_state_accepts_fresh_written_at_when_last_ok_is_stale() {
-        let now = Utc::now();
-        let stale = now - chrono::Duration::seconds(MANUAL_DAEMON_STALE_SECONDS + 1);
-        let raw = serde_json::json!({
-            "pid": std::process::id(),
-            "written_at": now.to_rfc3339(),
-            "components": {
-                "daemon": {
-                    "status": "ok",
-                    "last_ok": stale.to_rfc3339()
-                }
-            }
-        })
-        .to_string();
-
-        assert_eq!(
-            active_daemon_from_state_json(&raw, now),
-            Some(ActiveDaemonState {
-                pid: std::process::id()
-            })
-        );
+    fn busy_message_without_recorded_pid_still_explains_the_conflict() {
+        let error = std::io::Error::from(std::io::ErrorKind::WouldBlock);
+        let message = busy_daemon_message(Path::new("/run/prx/daemon.lock"), None, &error);
+        assert!(message.contains("/run/prx/daemon.lock"), "{message}");
+        assert!(message.contains("prx.service"), "{message}");
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn active_daemon_state_ignores_dead_pid() {
-        let now = Utc::now();
-        let raw = serde_json::json!({
-            "pid": u32::MAX,
-            "written_at": now.to_rfc3339(),
-            "components": {
-                "daemon": {
-                    "status": "ok",
-                    "last_ok": now.to_rfc3339()
-                }
-            }
-        })
-        .to_string();
+    fn lock_holder_pid_ignores_garbage_content() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("daemon.lock");
+        std::fs::write(&path, b"not-a-pid").unwrap();
 
-        assert_eq!(active_daemon_from_state_json(&raw, now), None);
+        assert_eq!(lock_holder_pid(&path), None);
     }
 
     #[test]
