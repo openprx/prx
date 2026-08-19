@@ -999,6 +999,10 @@ async fn terminal_input_loop(tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
     // feature.
     let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<()>>();
     crate::runtime::blocking::spawn_detached_thread("prx-terminal-stdin", move || {
+        // Immediately-invoked closure: collects the whole read loop's Result so
+        // the single `done_tx.send` below reports it, instead of threading an
+        // early return through every `?` site.
+        #[allow(clippy::redundant_closure_call)]
         let outcome = (move || -> Result<()> {
             use std::io::BufRead as _;
 

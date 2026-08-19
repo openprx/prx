@@ -60,6 +60,9 @@ pub struct WhatsAppWebChannel {
     allowed_numbers: Vec<String>,
     /// WebSocket URL override (from config)
     ws_url: Option<String>,
+    /// Concurrent read connections for the session database (from config).
+    /// `None` derives the size from the available CPUs.
+    read_pool_size: Option<usize>,
     /// Bot handle for shutdown
     bot_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Client handle for sending messages and typing indicators
@@ -90,6 +93,7 @@ impl WhatsAppWebChannel {
             pair_code,
             allowed_numbers,
             ws_url: None,
+            read_pool_size: None,
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
@@ -100,6 +104,13 @@ impl WhatsAppWebChannel {
     #[cfg(feature = "whatsapp-web")]
     pub fn with_ws_url(mut self, ws_url: Option<String>) -> Self {
         self.ws_url = ws_url;
+        self
+    }
+
+    /// Set the session-database read-pool size (from config `read_pool_size`).
+    #[cfg(feature = "whatsapp-web")]
+    pub const fn with_read_pool_size(mut self, read_pool_size: Option<usize>) -> Self {
+        self.read_pool_size = read_pool_size;
         self
     }
 
@@ -261,8 +272,17 @@ impl Channel for WhatsAppWebChannel {
 
         tracing::info!("WhatsApp Web channel starting (session: {})", self.session_path);
 
-        // Initialize storage backend
-        let storage = RusqliteStore::new(&self.session_path)?;
+        // Initialize storage backend. Opening the database creates
+        // directories, opens a connection and runs the schema DDL, all of it
+        // synchronous filesystem work, so it goes to the blocking pool rather
+        // than parking a tokio worker thread.
+        let session_path = self.session_path.clone();
+        let read_pool_size = self.read_pool_size;
+        let storage = crate::runtime::blocking::spawn_blocking(move || {
+            RusqliteStore::with_read_pool_size(&session_path, read_pool_size)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("WhatsApp session storage initialization did not complete: {e}"))??;
         let backend = Arc::new(storage);
 
         // Check if we have a saved device to load
@@ -500,6 +520,10 @@ impl WhatsAppWebChannel {
     }
 
     pub fn with_ws_url(self, _ws_url: Option<String>) -> Self {
+        self
+    }
+
+    pub fn with_read_pool_size(self, _read_pool_size: Option<usize>) -> Self {
         self
     }
 }

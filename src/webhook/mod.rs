@@ -15,6 +15,7 @@ use axum::{
 };
 use chrono::Utc;
 use parking_lot::Mutex as ParkingMutex;
+#[cfg(test)]
 use postgres::{Client as PostgresClient, NoTls};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -147,44 +148,28 @@ struct SqliteWebhookRepository {
     workspace_id: Arc<str>,
 }
 
+/// Webhook ingestion runs on externally-originated payloads, so every one of
+/// its checkouts stays subject to row-level security.
+///
+/// Before this repository shared the memory backend's pool it opened plain
+/// connections that never set `prx.rls_bypass`, and RLS therefore denied its
+/// writes to `memories`. The pool resets each checkout into the *trusted*
+/// system context, so reusing it would have silently handed webhook ingestion a
+/// bypass it never had. Requesting the restricted context keeps the boundary
+/// exactly where it was; the pool restores the system context for the next
+/// caller of the same connection.
+const WEBHOOK_SESSION_CONTEXT: crate::memory::postgres::PostgresSessionContext =
+    crate::memory::postgres::PostgresSessionContext::Restricted;
+
 #[derive(Clone)]
 struct PostgresWebhookRepository {
-    client: Arc<PostgresWebhookClientSlot>,
+    pool: Arc<crate::memory::postgres::PostgresConnectionPool>,
     workspace_id: Arc<str>,
     qualified_memories: Arc<str>,
     qualified_memory_events: Arc<str>,
     qualified_topics: Arc<str>,
     qualified_topic_participants: Arc<str>,
     qualified_ingestions: Arc<str>,
-}
-
-struct PostgresWebhookClientSlot {
-    client: ParkingMutex<Option<PostgresClient>>,
-}
-
-impl PostgresWebhookClientSlot {
-    const fn new(client: PostgresClient) -> Self {
-        Self {
-            client: ParkingMutex::new(Some(client)),
-        }
-    }
-}
-
-impl Drop for PostgresWebhookClientSlot {
-    fn drop(&mut self) {
-        let Some(client) = self.client.get_mut().take() else {
-            return;
-        };
-
-        // postgres::Client closes through its own synchronous Tokio runtime.
-        // Dropping it on an async runtime worker would try to nest runtimes.
-        let handle = std::thread::Builder::new()
-            .name("postgres-webhook-drop".to_string())
-            .spawn(move || drop(client));
-        if let Ok(handle) = handle {
-            let _ = handle.join();
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -552,6 +537,7 @@ impl PostgresWebhookRepository {
         schema: &str,
         memory_table: &str,
         connect_timeout_secs: Option<u64>,
+        pool_max_size: usize,
         workspace_id: String,
     ) -> Result<Self> {
         crate::memory::postgres::validate_identifier(schema, "storage schema")?;
@@ -636,31 +622,34 @@ impl PostgresWebhookRepository {
                     ON {qualified_ingestions}(source, project, external_id, event_type);
                 "
         );
-        let db_url = db_url.to_string();
+        // Share the memory backend's waiting pool instead of pinning one
+        // connection: webhook ingestion claims are per-request, so a single
+        // connection made concurrent deliveries queue behind each other.
+        let pool = Arc::new(crate::memory::postgres::PostgresConnectionPool::new(
+            db_url.to_string(),
+            connect_timeout_secs,
+            pool_max_size,
+        ));
+        let init_pool = Arc::clone(&pool);
+        // The blocking client cannot open a connection from inside a Tokio
+        // runtime, and this constructor is reachable from one, so the first
+        // checkout (which is what opens the connection) runs on its own thread.
         let init_handle = std::thread::Builder::new()
             .name("postgres-webhook-init".to_string())
-            .spawn(move || -> Result<PostgresClient> {
-                let mut postgres_config: postgres::Config = db_url
-                    .parse()
-                    .context("invalid PostgreSQL connection URL for webhook repository")?;
-                if let Some(timeout_secs) = connect_timeout_secs {
-                    postgres_config.connect_timeout(Duration::from_secs(timeout_secs.min(300)));
-                }
-                let mut client = postgres_config
-                    .connect(NoTls)
-                    .context("failed to connect to PostgreSQL webhook repository")?;
-                client
-                    .batch_execute(&schema_sql)
-                    .context("failed to initialize PostgreSQL webhook repository schema")?;
-                Ok(client)
+            .spawn(move || -> Result<()> {
+                init_pool.with_client_in(WEBHOOK_SESSION_CONTEXT, |client| {
+                    client
+                        .batch_execute(&schema_sql)
+                        .context("failed to initialize PostgreSQL webhook repository schema")
+                })
             })
             .context("failed to spawn PostgreSQL webhook initializer thread")?;
-        let client = init_handle
+        init_handle
             .join()
             .map_err(|_| anyhow::anyhow!("PostgreSQL webhook initializer thread panicked"))??;
 
         Ok(Self {
-            client: Arc::new(PostgresWebhookClientSlot::new(client)),
+            pool,
             workspace_id: Arc::from(workspace_id),
             qualified_memories: Arc::from(qualified_memories),
             qualified_memory_events: Arc::from(qualified_memory_events),
@@ -706,11 +695,8 @@ impl PostgresWebhookRepository {
         request_hash: String,
         event: &WebhookEvent,
     ) -> Result<WebhookClaimOutcome> {
-        let mut client_guard = self.client.client.lock();
-        let client = client_guard
-            .as_mut()
-            .context("PostgreSQL webhook repository client is closed")?;
-        let mut tx = client.transaction()?;
+        let mut checkout = self.pool.checkout_in(WEBHOOK_SESSION_CONTEXT)?;
+        let mut tx = checkout.client_mut()?.transaction()?;
         let now = Utc::now();
         let now_unix = now.timestamp();
         let lease_expires_at = now_unix.saturating_add(WEBHOOK_INGESTION_LEASE_SECS);
@@ -792,11 +778,8 @@ impl PostgresWebhookRepository {
         memory_content: &str,
         memory_saved: bool,
     ) -> Result<String> {
-        let mut client_guard = self.client.client.lock();
-        let client = client_guard
-            .as_mut()
-            .context("PostgreSQL webhook repository client is closed")?;
-        let mut tx = client.transaction()?;
+        let mut checkout = self.pool.checkout_in(WEBHOOK_SESSION_CONTEXT)?;
+        let mut tx = checkout.client_mut()?.transaction()?;
         let now = Utc::now();
         let owns_claim: bool = tx
             .query_one(
@@ -989,11 +972,8 @@ impl PostgresWebhookRepository {
     fn fail_blocking(&self, claim: &WebhookIngestionClaim, error: &str) -> Result<()> {
         let error = error.chars().take(1024).collect::<String>();
         let now = Utc::now();
-        let mut client_guard = self.client.client.lock();
-        let client = client_guard
-            .as_mut()
-            .context("PostgreSQL webhook repository client is closed")?;
-        client.execute(
+        let mut checkout = self.pool.checkout_in(WEBHOOK_SESSION_CONTEXT)?;
+        checkout.client_mut()?.execute(
             &format!(
                 "UPDATE {} SET status = 'failed', lease_expires_at = NULL,
                     last_error = $3, updated_at = $4
@@ -1126,6 +1106,7 @@ pub(crate) fn repository_from_config(config: &Config) -> Result<WebhookRepositor
                     &storage.schema,
                     &storage.table,
                     storage.connect_timeout_secs,
+                    storage.pool_max_size,
                     config.workspace_dir.to_string_lossy().to_string(),
                 )?),
             })
@@ -2462,6 +2443,149 @@ mod tests {
         assert!(webhook_supervisor.contains("run_configured_with_repository_generation("));
     }
 
+    /// Every PostgreSQL checkout this repository makes must ask for the
+    /// restricted session context.
+    ///
+    /// The pool's default is the *trusted* system context, so a checkout that
+    /// forgets to name a context silently gains an RLS bypass -- which is
+    /// exactly the regression this guards. Asserted against the source text
+    /// because the risk is a future checkout site being added without the
+    /// constant, which no runtime assertion on the existing sites would catch.
+    #[test]
+    fn postgres_webhook_checkouts_all_request_the_restricted_context() {
+        assert_eq!(
+            WEBHOOK_SESSION_CONTEXT,
+            crate::memory::postgres::PostgresSessionContext::Restricted,
+            "webhook ingestion handles externally-originated payloads and must stay under RLS"
+        );
+
+        let webhook_source = include_str!("mod.rs");
+        let repository = webhook_source
+            .split_once("impl PostgresWebhookRepository {")
+            .unwrap()
+            .1
+            .split_once("\n#[async_trait]")
+            .unwrap()
+            .0;
+        assert!(
+            !repository.contains(".checkout_in(crate::memory::postgres::PostgresSessionContext::System)"),
+            "webhook must never check out the trusted system context"
+        );
+        for (call, expected) in [
+            ("self.pool.checkout_in(", 3),
+            ("self.pool.checkout_in(WEBHOOK_SESSION_CONTEXT)", 3),
+        ] {
+            assert_eq!(
+                repository.matches(call).count(),
+                expected,
+                "every `{call}` site must carry WEBHOOK_SESSION_CONTEXT"
+            );
+        }
+        // The schema bootstrap is a write path like any other. Scanned inside
+        // `repository` rather than the whole file so this assertion cannot
+        // match the literal in its own source.
+        assert!(
+            repository.contains("init_pool.with_client_in(WEBHOOK_SESSION_CONTEXT,"),
+            "schema initialization must also run under the restricted context"
+        );
+        assert!(
+            !repository.contains("init_pool.with_client(|"),
+            "schema initialization must not fall back to the default system context"
+        );
+    }
+
+    /// The restricted context is actually established on the connection the
+    /// webhook repository hands to its queries, and the trusted context is
+    /// still available to the *next* user of that same pooled connection.
+    ///
+    /// This reads the session GUCs rather than provoking a policy denial, so
+    /// it holds under any role -- including the superuser setups where RLS
+    /// short-circuits and an effect-based assertion would prove nothing.
+    #[tokio::test]
+    async fn postgres_webhook_session_context_does_not_leak_from_env() {
+        let Some(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return;
+        };
+
+        let schema = format!("openprx_whctx_{}", Uuid::new_v4().simple());
+        let repository = PostgresWebhookRepository::new(
+            &db_url,
+            &schema,
+            "memories",
+            Some(5),
+            // One connection, so the "next user" below is necessarily the same
+            // backend the webhook checkout just released.
+            1,
+            "postgres-webhook-session-context".to_string(),
+        )
+        .unwrap();
+
+        let pool = Arc::clone(&repository.pool);
+        crate::runtime::blocking::spawn_blocking(move || {
+            let webhook_backend: i32 = {
+                let mut checkout = pool.checkout_in(WEBHOOK_SESSION_CONTEXT).unwrap();
+                let client = checkout.client_mut().unwrap();
+                let row = client
+                    .query_one(
+                        "SELECT current_setting('prx.rls_bypass', true), \
+                                current_setting('prx.current_workspace', true), \
+                                current_setting('prx.current_owner', true), \
+                                pg_backend_pid()",
+                        &[],
+                    )
+                    .unwrap();
+                assert_eq!(row.get::<_, String>(0), "off", "webhook checkout must not bypass RLS");
+                assert_eq!(
+                    row.get::<_, String>(1),
+                    "",
+                    "webhook checkout must not inherit a workspace"
+                );
+                assert_eq!(
+                    row.get::<_, String>(2),
+                    "",
+                    "webhook checkout must not inherit an owner"
+                );
+                row.get(3)
+            };
+
+            let trusted_backend: i32 = pool
+                .with_client_in(crate::memory::postgres::PostgresSessionContext::System, |client| {
+                    let row =
+                        client.query_one("SELECT current_setting('prx.rls_bypass', true), pg_backend_pid()", &[])?;
+                    assert_eq!(
+                        row.get::<_, String>(0),
+                        "on",
+                        "a webhook checkout must not strip the bypass from the connection it returns"
+                    );
+                    Ok(row.get(1))
+                })
+                .unwrap();
+
+            assert_eq!(
+                webhook_backend, trusted_backend,
+                "the leak check is only meaningful when both checkouts share a backend"
+            );
+        })
+        .await
+        .unwrap();
+
+        drop(repository);
+        crate::runtime::blocking::spawn_blocking(move || {
+            let mut client = PostgresClient::connect(&db_url, NoTls).unwrap();
+            client
+                .batch_execute(&format!(
+                    "DROP SCHEMA {} CASCADE",
+                    crate::memory::postgres::quote_identifier(&schema)
+                ))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn postgres_webhook_repository_conformance_from_env() {
         let Some(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL")
@@ -2477,6 +2601,7 @@ mod tests {
             &schema,
             "memories",
             Some(5),
+            crate::memory::postgres::POSTGRES_DEFAULT_POOL_MAX_SIZE,
             "postgres-webhook-conformance".to_string(),
         )
         .unwrap();

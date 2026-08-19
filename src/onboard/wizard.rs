@@ -363,6 +363,7 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         embedding_cache_size: if profile.uses_sqlite_hygiene { 10000 } else { 0 },
         auto_hydrate: true,
         sqlite_open_timeout_secs: None,
+        sqlite_read_pool_size: None,
         lucid_cmd: None,
         lucid_budget: None,
         lucid_recall_timeout_ms: 5000,
@@ -3278,6 +3279,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         // config.toml to enable model-decided group replies.
                         group_reply_mode: None,
                         ws_url: None,
+                        read_pool_size: None,
                     });
 
                     println!("  {} WhatsApp Web configuration saved.", style("✅").green().bold());
@@ -3370,6 +3372,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     // config.toml to enable model-decided group replies.
                     group_reply_mode: None,
                     ws_url: None,
+                    read_pool_size: None,
                 });
             }
             ChannelMenuChoice::Linq => {

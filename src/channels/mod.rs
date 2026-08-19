@@ -4650,7 +4650,8 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                                 wa.pair_code.clone(),
                                 wa.allowed_numbers.clone(),
                             )
-                            .with_ws_url(wa.ws_url.clone()),
+                            .with_ws_url(wa.ws_url.clone())
+                            .with_read_pool_size(wa.read_pool_size),
                         ),
                     ));
                 } else {
@@ -5134,7 +5135,8 @@ pub async fn start_channels_with_config(
                             wa.pair_code.clone(),
                             wa.allowed_numbers.clone(),
                         )
-                        .with_ws_url(wa.ws_url.clone()),
+                        .with_ws_url(wa.ws_url.clone())
+                        .with_read_pool_size(wa.read_pool_size),
                     ));
                 } else {
                     tracing::warn!("WhatsApp Web configured but session_path not set");

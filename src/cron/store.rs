@@ -36,7 +36,7 @@ pub(crate) fn format_claim_time(value: DateTime<Utc>) -> String {
 
 /// Resolve the Postgres cron backend when configured, else `None` (SQLite path).
 /// Centralizes backend selection so each public dispatcher is a one-line guard.
-fn pg_store(config: &Config) -> Result<Option<crate::cron::postgres::PostgresCronStore>> {
+fn pg_store(config: &Config) -> Result<Option<std::sync::Arc<crate::cron::postgres::PostgresCronStore>>> {
     crate::cron::postgres::resolve(config)
 }
 

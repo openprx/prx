@@ -2969,6 +2969,19 @@ pub struct MemoryConfig {
     #[serde(default)]
     pub sqlite_open_timeout_secs: Option<u64>,
 
+    /// For sqlite backend: how many reader connections may be opened.
+    ///
+    /// SQLite allows one writer but genuinely concurrent readers under WAL, so
+    /// only reads are pooled. The pool is a connection *reuse* mechanism, not a
+    /// concurrency limiter: a caller that finds every reader busy queues for one
+    /// instead of failing. Unset derives the size from the available CPUs (see
+    /// [`crate::runtime::sqlite_pool::default_read_pool_size`]); if set it must
+    /// be greater than 0. Deliberately a separate key from
+    /// `channels_config.whatsapp.read_pool_size`, so the two SQLite databases
+    /// can be sized independently.
+    #[serde(default)]
+    pub sqlite_read_pool_size: Option<usize>,
+
     // ── Lucid memory backend options ─────────────────────────────
     /// Path to lucid binary (replaces ZEROCLAW_LUCID_CMD / OPENPRX_LUCID_CMD)
     #[serde(default)]
@@ -3101,6 +3114,7 @@ impl Default for MemoryConfig {
             embedding_cache_size: default_cache_size(),
             auto_hydrate: true,
             sqlite_open_timeout_secs: None,
+            sqlite_read_pool_size: None,
             lucid_cmd: None,
             lucid_budget: None,
             lucid_recall_timeout_ms: default_lucid_recall_timeout_ms(),
@@ -4565,6 +4579,15 @@ pub struct WhatsAppConfig {
     /// WebSocket URL override (replaces WHATSAPP_WS_URL)
     #[serde(default)]
     pub ws_url: Option<String>,
+
+    /// Concurrent read connections against the Web-mode session database.
+    ///
+    /// The session store is SQLite in WAL mode: readers run in parallel while
+    /// writes stay serialised, so this sizes the read side only. When unset the
+    /// size is derived from the available CPUs. Must be greater than 0 when
+    /// set; a saturated pool makes callers wait, it never fails them.
+    #[serde(default)]
+    pub read_pool_size: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -5994,6 +6017,16 @@ impl Config {
         // Storage
         if self.storage.provider.config.pool_max_size == 0 {
             anyhow::bail!("storage.provider.config.pool_max_size must be greater than 0");
+        }
+
+        // Channels
+        if let Some(whatsapp) = self.channels_config.whatsapp.as_ref() {
+            if whatsapp.read_pool_size == Some(0) {
+                anyhow::bail!("channels_config.whatsapp.read_pool_size must be greater than 0");
+            }
+        }
+        if self.memory.sqlite_read_pool_size == Some(0) {
+            anyhow::bail!("memory.sqlite_read_pool_size must be greater than 0");
         }
 
         // Gateway
@@ -7794,6 +7827,7 @@ channel_id = "C123"
             mention_only: false,
             group_reply_mode: None,
             ws_url: None,
+            read_pool_size: None,
         };
         let json = serde_json::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
@@ -7820,6 +7854,7 @@ channel_id = "C123"
             mention_only: false,
             group_reply_mode: None,
             ws_url: None,
+            read_pool_size: None,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -7851,6 +7886,7 @@ channel_id = "C123"
             mention_only: false,
             group_reply_mode: None,
             ws_url: None,
+            read_pool_size: None,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -7874,6 +7910,7 @@ channel_id = "C123"
             mention_only: false,
             group_reply_mode: None,
             ws_url: None,
+            read_pool_size: None,
         };
         assert!(wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "cloud");
@@ -7896,9 +7933,49 @@ channel_id = "C123"
             mention_only: false,
             group_reply_mode: None,
             ws_url: None,
+            read_pool_size: None,
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
+    }
+
+    #[tokio::test]
+    async fn whatsapp_read_pool_size_zero_is_rejected() {
+        let mut config = Config::default();
+        assert!(config.validate().is_ok());
+
+        let mut wa = WhatsAppConfig {
+            access_token: None,
+            phone_number_id: None,
+            verify_token: None,
+            app_secret: None,
+            session_path: Some("~/.openprx/state/whatsapp-web/session.db".into()),
+            pair_phone: None,
+            pair_code: None,
+            allowed_numbers: vec![],
+            dm_policy: DmPolicy::default(),
+            group_policy: GroupPolicy::default(),
+            group_allow_from: vec![],
+            mention_only: false,
+            group_reply_mode: None,
+            ws_url: None,
+            read_pool_size: Some(0),
+        };
+        config.channels_config.whatsapp = Some(wa.clone());
+        let err = config.validate().expect_err("test: a zero read pool must be rejected");
+        assert!(
+            err.to_string().contains("read_pool_size"),
+            "test: unexpected error: {err}"
+        );
+
+        // Unset means "derive from the machine", which is valid.
+        wa.read_pool_size = None;
+        config.channels_config.whatsapp = Some(wa.clone());
+        assert!(config.validate().is_ok());
+
+        wa.read_pool_size = Some(1);
+        config.channels_config.whatsapp = Some(wa);
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -7928,6 +8005,7 @@ channel_id = "C123"
                 mention_only: false,
                 group_reply_mode: None,
                 ws_url: None,
+                read_pool_size: None,
             }),
             wacli: None,
             linq: None,
@@ -8863,6 +8941,20 @@ allowed_from = ["*"]
         let mut config = Config::default();
         config.memory.min_relevance_score = 9.0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    async fn config_validate_rejects_empty_sqlite_read_pool() {
+        let mut config = Config::default();
+        assert_eq!(
+            config.memory.sqlite_read_pool_size, None,
+            "unset means the size is derived from the available CPUs"
+        );
+        config.memory.sqlite_read_pool_size = Some(0);
+        let error = config
+            .validate()
+            .expect_err("a reader pool with no connections must be rejected");
+        assert!(error.to_string().contains("memory.sqlite_read_pool_size"));
     }
 
     // ---- FIX-P2-10: write_toml_string_atomic file lock -------------------

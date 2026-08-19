@@ -20,12 +20,14 @@ use crate::cron::types::{
     JobType, Schedule, SessionTarget,
 };
 use crate::cron::{next_run_for_schedule, schedule_cron_expression, validate_schedule};
+use crate::memory::postgres::PostgresConnectionPool;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use parking_lot::Mutex;
 use postgres::types::ToSql;
-use postgres::{Client, NoTls, Row};
-use std::time::Duration;
+use postgres::{Client, Row};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 use uuid::Uuid;
 
 /// Cap connect timeouts so a misconfigured value cannot hang startup forever.
@@ -45,21 +47,40 @@ const CLAIM_LEASE_MIGRATION_SQL: &str = "ALTER TABLE cron_jobs ADD COLUMN IF NOT
      CREATE UNIQUE INDEX IF NOT EXISTS idx_cron_runs_job_attempt
         ON cron_runs(job_id, attempt_id) WHERE attempt_id IS NOT NULL;";
 
-/// PostgreSQL-backed cron store. One instance owns a single pooled connection
-/// guarded by a `parking_lot::Mutex` (no poison, no unwrap), matching the
-/// memory backend's `PostgresClientSlot` pattern.
+/// Live cron stores, keyed by the storage settings that produced them.
+///
+/// [`resolve`] runs on *every* cron dispatcher call. Building a store per call
+/// meant opening a fresh PostgreSQL connection and replaying the DDL migrations
+/// each time, so the registry is what makes connection pooling observable at
+/// all: the first call for a given configuration builds and migrates, every
+/// later call reuses the same pool. Entries live for the process because a
+/// store owns nothing but its pool, and the pool is the thing being shared.
+static CRON_STORES: LazyLock<Mutex<HashMap<String, Arc<PostgresCronStore>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// PostgreSQL-backed cron store.
+///
+/// Connections come from the shared [`PostgresConnectionPool`] used by the
+/// memory backend, so concurrent schedulers, tool calls and workers no longer
+/// serialise behind one connection. Every operation opens and finishes its
+/// transaction inside a single checkout, which is what keeps the claim/lease
+/// fencing correct once connections stop being pinned to the store.
 pub struct PostgresCronStore {
-    client: Mutex<Option<Client>>,
+    pool: Arc<PostgresConnectionPool>,
     qualified_memory_events_table: String,
 }
 
 impl PostgresCronStore {
-    /// Connect, ensure the schema, and return a ready store. The connection is
-    /// established on a dedicated thread so a slow/hung TCP connect cannot block
-    /// an async runtime worker (the caller may be inside a Tokio context).
+    /// Connect, ensure the schema, and return a ready store.
     #[cfg(test)]
     pub fn connect(db_url: &str, connect_timeout_secs: Option<u64>) -> Result<Self> {
-        Self::connect_with_memory_storage(db_url, "public", "memories", connect_timeout_secs)
+        Self::connect_with_memory_storage(
+            db_url,
+            "public",
+            "memories",
+            connect_timeout_secs,
+            crate::memory::postgres::POSTGRES_DEFAULT_POOL_MAX_SIZE,
+        )
     }
 
     fn connect_with_memory_storage(
@@ -67,6 +88,7 @@ impl PostgresCronStore {
         memory_schema: &str,
         memory_table: &str,
         connect_timeout_secs: Option<u64>,
+        pool_max_size: usize,
     ) -> Result<Self> {
         crate::memory::postgres::validate_identifier(memory_schema, "storage schema")?;
         crate::memory::postgres::validate_identifier(memory_table, "storage table")?;
@@ -77,35 +99,34 @@ impl PostgresCronStore {
             memory_schema_ident,
             crate::memory::postgres::quote_identifier(&memory_events_table)
         );
-        let db_url = db_url.to_string();
-        let event_table_for_init = qualified_memory_events_table.clone();
-        let event_schema_for_init = memory_schema_ident;
-        let handle = std::thread::Builder::new()
-            .name("cron-postgres-init".to_string())
-            .spawn(move || -> Result<Client> {
-                let mut config: postgres::Config = db_url
-                    .parse()
-                    .context("invalid PostgreSQL connection URL for cron store")?;
-                if let Some(secs) = connect_timeout_secs {
-                    config.connect_timeout(Duration::from_secs(secs.min(CONNECT_TIMEOUT_CAP_SECS)));
-                }
-                let mut client = config
-                    .connect(NoTls)
-                    .context("failed to connect to PostgreSQL cron backend")?;
-                init_schema(&mut client)?;
-                init_memory_event_schema(&mut client, &event_schema_for_init, &event_table_for_init)?;
-                Ok(client)
-            })
-            .context("failed to spawn cron postgres initializer thread")?;
-
-        let client = handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("cron postgres initializer thread panicked"))??;
-
-        Ok(Self {
-            client: Mutex::new(Some(client)),
+        // Keep this backend's own ceiling on the handshake: the pool clamps to a
+        // much larger cap, and a cron poll should give up on a dead endpoint
+        // sooner than a bulk memory query would.
+        let connect_timeout_secs = connect_timeout_secs.map(|secs| secs.min(CONNECT_TIMEOUT_CAP_SECS));
+        let store = Self {
+            pool: Arc::new(PostgresConnectionPool::new(
+                db_url.to_string(),
+                connect_timeout_secs,
+                pool_max_size,
+            )),
             qualified_memory_events_table,
-        })
+        };
+
+        // Migrations run once per store, through the pool, so the first checkout
+        // both proves the endpoint is reachable and leaves the connection in the
+        // idle set for the operation that follows.
+        store.with_client(|client| {
+            init_schema(client)?;
+            init_memory_event_schema(client, &memory_schema_ident, &store.qualified_memory_events_table)
+        })?;
+
+        Ok(store)
+    }
+
+    /// Current connection pool utilisation, for observability surfaces.
+    #[cfg(test)]
+    pub fn pool_stats(&self) -> crate::memory::postgres::PostgresPoolStats {
+        self.pool.stats()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -131,22 +152,18 @@ impl PostgresCronStore {
         )
     }
 
-    fn with_client_direct<T>(&self, f: impl FnOnce(&mut Client) -> Result<T>) -> Result<T> {
-        let mut guard = self.client.lock();
-        let client = guard.as_mut().context("PostgreSQL cron backend client is closed")?;
-        f(client)
-    }
-
+    /// Run one unit of cron SQL on a pooled connection.
+    ///
+    /// The cron API is synchronous but most of its callers (the scheduler loop,
+    /// the cron tool) are async, so the work has to leave the async worker
+    /// before the blocking `postgres` client — which drives a private Tokio
+    /// runtime — is touched. [`crate::runtime::blocking::run_sync_blocking`]
+    /// owns that decision and, on the multi-threaded runtime this daemon runs
+    /// on, hands the worker's queue to a replacement thread instead of parking
+    /// it. The previous `std::thread::scope(..).join()` spawned a thread per
+    /// call and left the calling worker stalled with nothing to take its place.
     fn with_client<T: Send>(&self, f: impl FnOnce(&mut Client) -> Result<T> + Send) -> Result<T> {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return std::thread::scope(|scope| {
-                scope
-                    .spawn(move || self.with_client_direct(f))
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("cron postgres operation thread panicked"))?
-            });
-        }
-        self.with_client_direct(f)
+        crate::runtime::blocking::run_sync_blocking("cron-postgres", || self.pool.with_client(f))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1321,17 +1338,6 @@ impl PostgresCronStore {
     }
 }
 
-impl Drop for PostgresCronStore {
-    fn drop(&mut self) {
-        let Some(client) = self.client.get_mut().take() else {
-            return;
-        };
-        let _ = std::thread::Builder::new()
-            .name("cron-postgres-drop".to_string())
-            .spawn(move || drop(client));
-    }
-}
-
 const SELECT_JOB_COLUMNS: &str = "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
             expression, command, schedule, job_type, prompt, name, session_target, model,
             enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
@@ -1642,7 +1648,7 @@ fn init_schema(client: &mut Client) -> Result<()> {
 
 /// Resolve a [`PostgresCronStore`] when the workspace storage provider is
 /// `postgres` with a usable `db_url`; otherwise `None` (SQLite path is used).
-pub fn resolve(config: &Config) -> Result<Option<PostgresCronStore>> {
+pub fn resolve(config: &Config) -> Result<Option<Arc<PostgresCronStore>>> {
     let provider = &config.storage.provider.config;
     if !provider.provider.trim().eq_ignore_ascii_case("postgres") {
         return Ok(None);
@@ -1655,12 +1661,35 @@ pub fn resolve(config: &Config) -> Result<Option<PostgresCronStore>> {
     else {
         return Ok(None);
     };
-    let store = PostgresCronStore::connect_with_memory_storage(
+
+    // Every field that changes what a store connects to, or what it migrates,
+    // has to be part of the identity; a reload that repoints storage must not
+    // keep serving the previous database from cache.
+    let key = format!(
+        "{db_url}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+        provider.schema,
+        provider.table,
+        provider
+            .connect_timeout_secs
+            .map_or_else(|| "-".to_string(), |secs| secs.to_string()),
+        provider.pool_max_size
+    );
+
+    // The registry lock is held across the (one-time) connect and migration for
+    // a new key so two concurrent first calls cannot both run the DDL. Later
+    // calls take the lock only long enough to clone an `Arc`.
+    let mut stores = CRON_STORES.lock();
+    if let Some(store) = stores.get(&key) {
+        return Ok(Some(Arc::clone(store)));
+    }
+    let store = Arc::new(PostgresCronStore::connect_with_memory_storage(
         db_url,
         &provider.schema,
         &provider.table,
         provider.connect_timeout_secs,
-    )?;
+        provider.pool_max_size,
+    )?);
+    stores.insert(key, Arc::clone(&store));
     Ok(Some(store))
 }
 
@@ -1709,6 +1738,213 @@ mod tests {
             .and_then(|(_, rest)| rest.split_once("fn init_memory_event_schema"))
             .map_or("", |(body, _)| body);
         assert!(!postgres_insert.contains("mirror_cron_job_event("));
+    }
+
+    /// Concurrent workers racing for one job must still be fenced to a single
+    /// winner now that connections are pooled instead of pinned.
+    ///
+    /// This is the regression the pool could plausibly have broken: the claim
+    /// path relies on `FOR UPDATE` plus a compare-and-set `WHERE` clause inside
+    /// one transaction, which stays correct only while a transaction never
+    /// spans two checkouts. Gated on `OPENPRX_TEST_POSTGRES_URL`.
+    #[test]
+    fn postgres_cron_pooled_claim_fencing_is_exclusive_from_env() {
+        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let store = PostgresCronStore::connect(&db_url, Some(5)).expect("test: connect cron postgres");
+        let workspace = "ws-pool-fencing";
+        let job = store
+            .add_shell_job_with_lineage_approval_and_delete(
+                workspace,
+                Some("pool-fencing".to_string()),
+                Schedule::Cron {
+                    expr: "* * * * *".to_string(),
+                    tz: None,
+                },
+                "echo pool-fencing",
+                None,
+                false,
+                CronJobLineage::default(),
+            )
+            .expect("test: insert fencing job");
+        let now = job.next_run + ChronoDuration::seconds(1);
+        let lease = ChronoDuration::seconds(120);
+
+        const RACERS: usize = 8;
+        let winners: Mutex<Vec<CronClaim>> = Mutex::new(Vec::new());
+        let losses = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for index in 0..RACERS {
+                let store = &store;
+                let job = &job;
+                let winners = &winners;
+                let losses = &losses;
+                scope.spawn(move || {
+                    let worker_id = format!("pool-worker-{index}");
+                    match store.claim_job_if_current(workspace, job, &worker_id, now, lease, true) {
+                        Ok(Some(claim)) => winners.lock().push(claim),
+                        Ok(None) => {
+                            losses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Err(error) => panic!("test: claim failed: {error}"),
+                    }
+                });
+            }
+        });
+
+        let winners = winners.into_inner();
+        assert_eq!(winners.len(), 1, "test: fencing admitted {} winners", winners.len());
+        assert_eq!(
+            losses.load(std::sync::atomic::Ordering::Relaxed),
+            RACERS - 1,
+            "test: every non-winner must observe a lost race, not an error"
+        );
+        let claim = winners.into_iter().next().expect("test: one winner");
+
+        // The winner owns the lease; a forged attempt id does not.
+        assert!(
+            store
+                .job_claim_is_current(&job.id, &claim, now)
+                .expect("test: claim currency"),
+            "test: winner lost its own lease"
+        );
+        let forged = CronClaim {
+            attempt_id: format!("{}-forged", claim.attempt_id),
+            ..claim.clone()
+        };
+        assert!(
+            !store
+                .job_claim_is_current(&job.id, &forged, now)
+                .expect("test: forged claim currency"),
+            "test: forged attempt id passed the fence"
+        );
+        assert!(
+            store
+                .renew_job_claim(&job.id, &forged, now, lease)
+                .expect("test: forged renew")
+                .is_none(),
+            "test: forged attempt id renewed a lease it never held"
+        );
+        let renewed = store
+            .renew_job_claim(&job.id, &claim, now, lease)
+            .expect("test: renew")
+            .expect("test: winner renews its own lease");
+
+        // Only the live lease may commit the run, and only once.
+        let finished = now + ChronoDuration::seconds(1);
+        store
+            .finish_claimed_run(
+                workspace, &job, &renewed, now, finished, finished, true, "ok", 1, false, true, 5,
+            )
+            .expect("test: winner finishes its run");
+        assert!(
+            store
+                .finish_claimed_run(
+                    workspace, &job, &renewed, now, finished, finished, true, "ok", 1, false, true, 5,
+                )
+                .is_err(),
+            "test: a spent claim must not be able to commit a second run"
+        );
+
+        // The race really did use more than one connection, and gave them back.
+        let stats = store.pool_stats();
+        assert!(
+            stats.connects > 1,
+            "test: pool never opened a second connection: {stats:?}"
+        );
+        assert_eq!(stats.in_use, 0, "test: pooled connections leaked: {stats:?}");
+        assert!(
+            stats.idle <= stats.max_size,
+            "test: pool holds more live connections than max_size: {stats:?}"
+        );
+
+        store.remove_job(workspace, &job.id).expect("test: cleanup fencing job");
+    }
+
+    /// The same race, but driven from async tasks on the multi-threaded runtime
+    /// the daemon actually uses.
+    ///
+    /// The synchronous `postgres` client drives a private Tokio runtime and
+    /// panics if it is entered while another runtime is entered on the same
+    /// thread, so this is the test that proves the `block_in_place` hand-off in
+    /// `with_client` really leaves the worker's runtime context behind. Gated on
+    /// `OPENPRX_TEST_POSTGRES_URL`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_cron_pooled_claim_from_async_workers_from_env() {
+        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let store = std::sync::Arc::new(
+            tokio::task::spawn_blocking(move || PostgresCronStore::connect(&db_url, Some(5)))
+                .await
+                .expect("test: connect task joins")
+                .expect("test: connect cron postgres"),
+        );
+        let workspace = "ws-pool-async";
+        let job = store
+            .add_shell_job_with_lineage_approval_and_delete(
+                workspace,
+                Some("pool-async".to_string()),
+                Schedule::Cron {
+                    expr: "* * * * *".to_string(),
+                    tz: None,
+                },
+                "echo pool-async",
+                None,
+                false,
+                CronJobLineage::default(),
+            )
+            .expect("test: insert async fencing job");
+        let now = job.next_run + ChronoDuration::seconds(1);
+        let lease = ChronoDuration::seconds(120);
+
+        const RACERS: usize = 8;
+        let mut tasks = Vec::with_capacity(RACERS);
+        for index in 0..RACERS {
+            let store = std::sync::Arc::clone(&store);
+            let job = job.clone();
+            tasks.push(tokio::spawn(async move {
+                let worker_id = format!("async-worker-{index}");
+                store.claim_job_if_current(workspace, &job, &worker_id, now, lease, true)
+            }));
+        }
+
+        let mut winners = 0_usize;
+        for task in tasks {
+            if task
+                .await
+                .expect("test: claim task joins")
+                .expect("test: claim query")
+                .is_some()
+            {
+                winners += 1;
+            }
+        }
+        assert_eq!(winners, 1, "test: async fencing admitted {winners} winners");
+
+        // Reads keep working on the same worker threads afterwards.
+        let listed = store.get_job(&job.id).expect("test: read back claimed job");
+        assert_eq!(listed.last_status.as_deref(), Some("running"));
+
+        store.remove_job(workspace, &job.id).expect("test: cleanup async job");
+    }
+
+    /// The current-thread fallback: `block_in_place` is unavailable there, so
+    /// `with_client` must offload to a scoped thread rather than panic. Gated on
+    /// `OPENPRX_TEST_POSTGRES_URL`.
+    #[tokio::test]
+    async fn postgres_cron_client_works_on_current_thread_runtime_from_env() {
+        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let store = PostgresCronStore::connect(&db_url, Some(5)).expect("test: connect cron postgres");
+        let before = crate::runtime::blocking::sync_snapshot().offloaded;
+        store.list_jobs().expect("test: list jobs on a current-thread runtime");
+        assert!(
+            crate::runtime::blocking::sync_snapshot().offloaded > before,
+            "test: current-thread runtime must take the offload path"
+        );
     }
 
     /// End-to-end cron lifecycle against a real PostgreSQL instance. Gated on

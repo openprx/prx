@@ -49,7 +49,7 @@ const POSTGRES_EMBEDDING_CACHE_MAX_ROWS: i64 = 10_000;
 /// connection instead of failing. Deployments with a different
 /// `max_connections` budget override this via
 /// `[storage.provider.config].pool_max_size`.
-const POSTGRES_DEFAULT_POOL_MAX_SIZE: usize = 32;
+pub(crate) const POSTGRES_DEFAULT_POOL_MAX_SIZE: usize = 32;
 
 /// Default timeout for *establishing* a connection when none is configured.
 ///
@@ -155,6 +155,52 @@ struct PostgresPoolState {
     closed: bool,
 }
 
+/// The row-level-security context a checkout is placed in before any caller
+/// SQL runs.
+///
+/// PostgreSQL RLS settings are session-scoped while pooled connections are
+/// reused across callers, so the context is a property of the *checkout*, not
+/// of the connection: [`PostgresConnectionPool::acquire_reset`] re-establishes
+/// it on every checkout, including recycled ones. That is what keeps one
+/// caller's privileges from surviving into the next caller's work, in either
+/// direction, without the two having to know about each other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PostgresSessionContext {
+    /// Trusted runtime storage (memory, cron). Bypasses row-level security:
+    /// these callers own the isolation contract themselves and bind
+    /// transaction-local workspace/owner scoping wherever a principal is
+    /// involved.
+    System,
+    /// Callers that ingest externally-originated data (webhook). Row-level
+    /// security applies in full, and no workspace/owner context is bound, so
+    /// the `memories` policies deny. This is the same boundary these callers
+    /// had while they opened their own connections, and moving them onto the
+    /// shared pool must not widen it.
+    Restricted,
+}
+
+impl PostgresSessionContext {
+    /// The statement that pins this context onto a freshly checked-out
+    /// connection.
+    ///
+    /// Session-scoped (`set_config` `is_local = false`) rather than
+    /// transaction-local, because callers also issue statements outside an
+    /// explicit transaction, where a transaction-local setting would revert
+    /// before it could take effect. `Restricted` additionally clears the
+    /// owner-scoping GUCs so its denial does not depend on what ran on this
+    /// connection previously.
+    const fn reset_statement(self) -> &'static str {
+        match self {
+            Self::System => "SELECT set_config('prx.rls_bypass', 'on', false)",
+            Self::Restricted => {
+                "SELECT set_config('prx.rls_bypass', 'off', false), \
+                        set_config('prx.current_workspace', '', false), \
+                        set_config('prx.current_owner', '', false)"
+            }
+        }
+    }
+}
+
 /// A bounded pool of synchronous PostgreSQL connections.
 ///
 /// The `postgres` crate ships a blocking client with no pool of its own, and
@@ -167,7 +213,7 @@ struct PostgresPoolState {
 ///
 /// The pool is a connection *reuse* mechanism, not a concurrency limiter.
 /// Connections are opened lazily on first demand.
-struct PostgresConnectionPool {
+pub(crate) struct PostgresConnectionPool {
     state: Mutex<PostgresPoolState>,
     /// Signalled whenever a connection is returned or a reserved slot is freed.
     available: Condvar,
@@ -178,7 +224,7 @@ struct PostgresConnectionPool {
 }
 
 impl PostgresConnectionPool {
-    fn new(db_url: String, connect_timeout_secs: Option<u64>, max_size: usize) -> Self {
+    pub(crate) fn new(db_url: String, connect_timeout_secs: Option<u64>, max_size: usize) -> Self {
         let timeout_secs = connect_timeout_secs
             .unwrap_or(POSTGRES_DEFAULT_CONNECT_TIMEOUT_SECS)
             .clamp(1, POSTGRES_CONNECT_TIMEOUT_CAP_SECS);
@@ -312,7 +358,7 @@ impl PostgresConnectionPool {
         }
     }
 
-    fn stats(&self) -> PostgresPoolStats {
+    pub(crate) fn stats(&self) -> PostgresPoolStats {
         let guard = self.state.lock();
         PostgresPoolStats {
             max_size: self.max_size,
@@ -327,10 +373,10 @@ impl PostgresConnectionPool {
         }
     }
 
-    /// Check out a connection whose session context has been reset to the
-    /// neutral system state, reconnecting once when a recycled connection turns
-    /// out to have been closed by the server (restart, failover, idle reaper).
-    fn acquire_reset(&self) -> Result<PooledConnection<'_>> {
+    /// Check out a connection whose session context has been reset to
+    /// `context`, reconnecting once when a recycled connection turns out to
+    /// have been closed by the server (restart, failover, idle reaper).
+    fn acquire_reset(&self, context: PostgresSessionContext) -> Result<PooledConnection<'_>> {
         // Bounded so a pathological churn cycle cannot spin forever. Every
         // iteration either returns or permanently removes one connection from
         // the pool, and an exhausted pool opens a fresh connection, so the loop
@@ -342,13 +388,15 @@ impl PostgresConnectionPool {
             let recycled = checkout.recycled;
             // Pooled clients are reused across requests, while PostgreSQL RLS
             // settings are session-scoped. Always start a checkout in the
-            // neutral system context; owner-scoped operations override this on
-            // the same checkout before issuing their query. This prevents one
-            // principal's owner setting from leaking into the next operation,
-            // and is why a connection is never shared concurrently.
+            // context its caller asked for; owner-scoped operations override
+            // this on the same checkout before issuing their query. Because the
+            // reset runs unconditionally, a connection returned by a restricted
+            // caller is restored to `System` the moment a trusted caller checks
+            // it out, and vice versa: neither context can leak into the other.
+            // It is also why a connection is never shared concurrently.
             let reset = checkout.client_mut().and_then(|client| {
                 client
-                    .execute("SELECT set_config('prx.rls_bypass', 'on', false)", &[])
+                    .execute(context.reset_statement(), &[])
                     .context("failed to reset PostgreSQL session context")
             });
             match reset {
@@ -371,9 +419,28 @@ impl PostgresConnectionPool {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("failed to obtain a usable PostgreSQL connection")))
     }
 
-    fn with_client<T>(&self, f: impl FnOnce(&mut Client) -> Result<T>) -> Result<T> {
-        let mut checkout = self.acquire_reset()?;
+    pub(crate) fn with_client<T>(&self, f: impl FnOnce(&mut Client) -> Result<T>) -> Result<T> {
+        self.with_client_in(PostgresSessionContext::System, f)
+    }
+
+    /// [`Self::with_client`] for callers that must run under a context other
+    /// than [`PostgresSessionContext::System`].
+    pub(crate) fn with_client_in<T>(
+        &self,
+        context: PostgresSessionContext,
+        f: impl FnOnce(&mut Client) -> Result<T>,
+    ) -> Result<T> {
+        let mut checkout = self.checkout_in(context)?;
         f(checkout.client_mut()?)
+    }
+
+    /// Check out a connection for callers that cannot express their work as a
+    /// single closure (long method bodies with early returns).
+    ///
+    /// The returned guard hands the connection back on drop exactly like
+    /// [`Self::with_client_in`] does, so neither path can leak a slot.
+    pub(crate) fn checkout_in(&self, context: PostgresSessionContext) -> Result<PooledConnection<'_>> {
+        self.acquire_reset(context)
     }
 }
 
@@ -404,7 +471,7 @@ impl Drop for PostgresConnectionPool {
 ///
 /// Returning it to the pool happens in `Drop`, so a caller that fails or
 /// unwinds mid-query can never leak a slot.
-struct PooledConnection<'pool> {
+pub(crate) struct PooledConnection<'pool> {
     pool: &'pool PostgresConnectionPool,
     client: Option<Client>,
     /// `true` when the connection came from the idle list and therefore may
@@ -413,7 +480,7 @@ struct PooledConnection<'pool> {
 }
 
 impl PooledConnection<'_> {
-    fn client_mut(&mut self) -> Result<&mut Client> {
+    pub(crate) fn client_mut(&mut self) -> Result<&mut Client> {
         self.client
             .as_mut()
             .context("pooled PostgreSQL connection is unavailable")
@@ -6860,6 +6927,186 @@ mod tests {
         assert!(evidence.contains(":policy-sha256:"));
 
         drop(mem);
+        tokio::task::spawn_blocking(move || {
+            let mut client = db_url.parse::<postgres::Config>().unwrap().connect(NoTls).unwrap();
+            client
+                .batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_identifier(&schema)))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The security boundary that separates trusted runtime storage from
+    /// callers that ingest externally-originated data, verified against a live
+    /// PostgreSQL instance under a **non-superuser** role.
+    ///
+    /// A superuser (or `BYPASSRLS`) role short-circuits every policy, so this
+    /// test asserts up front that the configured role is neither; running it as
+    /// `postgres` would pass vacuously and prove nothing.
+    ///
+    /// Three properties, in the order they matter:
+    /// 1. the restricted context is denied a write to the RLS-protected
+    ///    `memories` table -- the pre-pool boundary, reproduced;
+    /// 2. the system context on the *same pool* is allowed that write -- so
+    ///    property 1 is a real difference, not a broken fixture;
+    /// 3. a connection released by a restricted checkout comes back with its
+    ///    bypass intact for the next system checkout -- the contexts cannot
+    ///    contaminate each other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_pool_session_contexts_are_isolated_from_env() {
+        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let schema = format!("prx_ctx_{}", Uuid::new_v4().simple());
+
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).unwrap();
+        let qualified = format!("{}.{}", quote_identifier(&schema), quote_identifier("memories"));
+
+        // A pool of exactly one connection, so "the next checkout" is
+        // necessarily the very same backend rather than a fresh one that would
+        // hide a leak behind a clean session.
+        let pool = Arc::new(PostgresConnectionPool::new(db_url.clone(), Some(5), 1));
+
+        let insert_sql = format!(
+            "INSERT INTO {qualified} (id, key, content, category, created_at, updated_at, \
+                                      workspace_id, owner_id, visibility) \
+             VALUES ($1, $2, 'ctx probe', 'conversation', NOW(), NOW(), $3, $4, 'owner')"
+        );
+
+        let probe_pool = Arc::clone(&pool);
+        let probe_sql = insert_sql.clone();
+        let qualified_probe = qualified.clone();
+        tokio::task::spawn_blocking(move || {
+            // Guard: an RLS-exempt role makes every assertion below meaningless.
+            let (is_super, bypasses): (bool, bool) = probe_pool
+                .with_client_in(PostgresSessionContext::System, |client| {
+                    let row = client.query_one(
+                        "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user",
+                        &[],
+                    )?;
+                    Ok((row.get(0), row.get(1)))
+                })
+                .unwrap();
+            assert!(
+                !is_super && !bypasses,
+                "this test only proves anything under a NOSUPERUSER/NOBYPASSRLS role; \
+                 point OPENPRX_TEST_POSTGRES_URL at an unprivileged role"
+            );
+
+            // 1. Restricted context: RLS applies, no owner context is bound, so
+            //    both policy branches are false and the write is rejected.
+            let restricted_backend: i32 = {
+                let mut checkout = probe_pool.checkout_in(PostgresSessionContext::Restricted).unwrap();
+                let client = checkout.client_mut().unwrap();
+
+                let bypass: String = client
+                    .query_one("SELECT current_setting('prx.rls_bypass', true)", &[])
+                    .unwrap()
+                    .get(0);
+                assert_eq!(bypass, "off", "restricted checkout must not carry an RLS bypass");
+
+                let denied = client.execute(
+                    &probe_sql,
+                    &[
+                        &Uuid::new_v4().to_string(),
+                        &format!("restricted:{}", Uuid::new_v4()),
+                        &"ws-probe".to_string(),
+                        &"owner-probe".to_string(),
+                    ],
+                );
+                let error = denied.expect_err("restricted context must be denied by row-level security");
+                // `postgres::Error` renders as a bare "db error", so the
+                // assertion has to reach into the `DbError`. SQLSTATE 42501
+                // alone is not enough: it also covers a plain `permission
+                // denied for table`, which would let a mis-granted fixture
+                // masquerade as a policy denial. The message pins it to RLS.
+                let db_error = error
+                    .as_db_error()
+                    .unwrap_or_else(|| panic!("expected a PostgreSQL error, got: {error}"));
+                assert_eq!(
+                    db_error.code(),
+                    &postgres::error::SqlState::INSUFFICIENT_PRIVILEGE,
+                    "expected SQLSTATE 42501, got: {}",
+                    db_error.message()
+                );
+                assert!(
+                    db_error.message().contains("row-level security"),
+                    "expected a row-level security denial, got: {}",
+                    db_error.message()
+                );
+
+                client
+                    .query_one("SELECT pg_backend_pid()", &[])
+                    .unwrap()
+                    .get::<_, i32>(0)
+            };
+
+            // 2. System context on the same pool: the write succeeds, proving
+            //    the denial above is the context and not the fixture.
+            //
+            // 3. The connection is the one the restricted checkout just
+            //    released, and its bypass is back -- no contamination in
+            //    either direction.
+            let system_backend: i32 = probe_pool
+                .with_client_in(PostgresSessionContext::System, |client| {
+                    let bypass: String = client
+                        .query_one("SELECT current_setting('prx.rls_bypass', true)", &[])?
+                        .get(0);
+                    assert_eq!(
+                        bypass, "on",
+                        "a restricted checkout must not strip the bypass from the recycled connection"
+                    );
+                    client.execute(
+                        &probe_sql,
+                        &[
+                            &Uuid::new_v4().to_string(),
+                            &"system:probe".to_string(),
+                            &"ws-probe".to_string(),
+                            &"owner-probe".to_string(),
+                        ],
+                    )?;
+                    let rows: i64 = client
+                        .query_one(&format!("SELECT COUNT(*) FROM {qualified_probe}"), &[])?
+                        .get(0);
+                    assert_eq!(rows, 1, "only the system write landed");
+                    Ok(client.query_one("SELECT pg_backend_pid()", &[])?.get::<_, i32>(0))
+                })
+                .unwrap();
+
+            assert_eq!(
+                restricted_backend, system_backend,
+                "the cross-contamination check is only meaningful on a reused backend"
+            );
+
+            // Alternating contexts on that same single connection stay stable
+            // rather than degrading after the first hand-back.
+            for _ in 0..3 {
+                let mut restricted = probe_pool.checkout_in(PostgresSessionContext::Restricted).unwrap();
+                let value: String = restricted
+                    .client_mut()
+                    .unwrap()
+                    .query_one("SELECT current_setting('prx.rls_bypass', true)", &[])
+                    .unwrap()
+                    .get(0);
+                assert_eq!(value, "off");
+                drop(restricted);
+
+                let value: String = probe_pool
+                    .with_client_in(PostgresSessionContext::System, |client| {
+                        Ok(client
+                            .query_one("SELECT current_setting('prx.rls_bypass', true)", &[])?
+                            .get::<_, String>(0))
+                    })
+                    .unwrap();
+                assert_eq!(value, "on");
+            }
+        })
+        .await
+        .unwrap();
+
+        drop(mem);
+        drop(pool);
         tokio::task::spawn_blocking(move || {
             let mut client = db_url.parse::<postgres::Config>().unwrap().connect(NoTls).unwrap();
             client

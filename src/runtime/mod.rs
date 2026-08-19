@@ -6,6 +6,7 @@ pub mod envelope;
 pub mod native;
 pub mod shell_process;
 pub mod shutdown;
+pub mod sqlite_pool;
 pub mod traits;
 
 pub use docker::DockerRuntime;

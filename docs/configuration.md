@@ -290,6 +290,49 @@ These files are automatically injected into the agent context at startup.
 | **PostgreSQL** | Scalable, multi-user |
 | **Markdown** | File-based, human-readable |
 
+### SQLite Connection Pool
+
+The SQLite backend is the default. It does **not** use the PostgreSQL pool
+shape, because SQLite allows only one writer per database: N peer connections
+would not raise write throughput, they would only collide and return
+`SQLITE_BUSY`. Instead every write shares one serialized writer connection,
+while reads — which WAL journalling makes genuinely concurrent — are served from
+a pool:
+
+```toml
+[memory]
+backend = "sqlite"
+# Reader connections for the SQLite backend.
+# Unset = 2 per CPU, clamped to 4..32. Must be greater than 0 when set.
+sqlite_read_pool_size = 16
+# Max seconds to wait when opening the database file. Unset = wait forever.
+sqlite_open_timeout_secs = 30
+```
+
+Like the PostgreSQL pool, this is a connection *reuse* mechanism rather than a
+concurrency limiter: when every reader is checked out, callers **queue** for one
+instead of failing, and that wait has no deadline. Writes queue for the writer
+the same way.
+
+This key sizes the memory database only. The WhatsApp session store has its own
+(`channels_config.whatsapp.read_pool_size`) so the two databases can be tuned
+separately, even though both run the same pool implementation.
+
+Two settings are database-level rather than user-facing:
+
+- **WAL journalling** is enabled at startup and is a prerequisite, not a tuning
+  knob — without it readers and the writer would lock each other out and a
+  reader pool would be pointless.
+- **No `busy_timeout`.** If the database file is locked by another process,
+  SQLite retries until the lock clears rather than returning `SQLITE_BUSY`, and
+  logs a warning roughly every two seconds while it waits. A `busy_timeout` is
+  a timeout by another name: after it expires the caller gets an error for a
+  lock that is merely held by someone else.
+
+Reader connections are opened with `PRAGMA query_only`, so a statement that
+tries to mutate the database on a reader fails immediately instead of silently
+contending with the writer.
+
 ### PostgreSQL Connection Pool
 
 The PostgreSQL backend reuses connections through a pool configured under
@@ -319,6 +362,49 @@ queries are normal for agent workloads.
 
 Connections are health-checked on checkout: one closed by the server (restart,
 failover, idle reaper) is discarded and transparently replaced.
+
+Three components build a pool from these settings when the provider resolves to
+`postgres`: the memory backend, the cron store, and the durable webhook
+ingestion repository. They are separate pools, so the process can hold up to
+`3 * pool_max_size` connections. Size the value against the database's
+`max_connections` accordingly — the default of 32 needs a `max_connections` of
+at least ~100 to leave room for other clients.
+
+## WhatsApp Web Session Store
+
+The Web-mode WhatsApp channel (`backend = "web"`) keeps its Signal-protocol
+state — identities, sessions, pre-keys, sender keys, app-state MACs — in the
+SQLite database at `session_path`. Every inbound and outbound message performs
+several lookups against it, so under concurrent chats this store, not the
+network, is the busiest thing in the channel.
+
+It is pooled the same way as the SQLite memory backend, and for the same reason:
+WAL journalling makes reads genuinely concurrent while SQLite still permits only
+one writer, so reads come from a pool and writes share one serialized writer
+connection.
+
+```toml
+[channels_config.whatsapp]
+backend = "web"
+session_path = "~/.openprx/state/whatsapp-web/session.db"
+# Concurrent read connections (default: 2 per CPU, clamped to 4..32).
+# Must be greater than 0 when set.
+read_pool_size = 16
+```
+
+Acquiring a connection has **no deadline**: when every reader is checked out, or
+the writer is busy, callers queue instead of failing. Queueing is counted and
+timed rather than rejected, so a saturated store shows up as latency in the
+pool counters rather than as errors in the message path.
+
+If the database file is locked by another process, SQLite retries until the lock
+clears rather than returning `SQLITE_BUSY`, logging a warning roughly every two
+seconds while it waits. Reader connections are opened with `PRAGMA query_only`,
+so a statement that tries to mutate the database on a reader fails immediately
+instead of silently contending with the writer.
+
+This key sizes the session database only; the memory backend has its own
+(`memory.sqlite_read_pool_size`).
 
 ## Security
 

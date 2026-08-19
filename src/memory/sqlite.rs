@@ -13,24 +13,19 @@ use super::traits::{
     SessionContextQuery, SharedContextQuery, validate_memory_write_target,
 };
 use super::vector;
+use crate::runtime::sqlite_pool::SqliteConnectionPool;
 use crate::self_system::evolution::record::Actor;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Local, Utc};
-use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter, types::Value};
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 use uuid::Uuid;
 
-/// Maximum allowed open timeout (seconds) to avoid unreasonable waits.
-const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
 const DEFAULT_CONVERSATION_LIMIT: usize = 50;
 const MAX_CONVERSATION_QUERY_LIMIT: usize = 500;
 /// Placeholder dialect for D4 read-merge `session_key` predicate fragments.
@@ -104,7 +99,9 @@ pub fn append_task_event_mirror_idempotent(
     }
     let conn =
         Connection::open(&db_path).with_context(|| format!("Failed to open memory DB: {}", db_path.display()))?;
-    conn.busy_timeout(Duration::from_secs(5))?;
+    // Same policy as the pooled connections onto this file: a lock held by
+    // another process makes this call wait (and warn), never fail.
+    crate::runtime::sqlite_pool::install_busy_handler(&conn)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS memory_events (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -266,6 +263,37 @@ pub fn is_approval_grant_revoked(conn: &Connection, grant_id: &str) -> anyhow::R
 const MAX_HYDRATED_SESSIONS: usize = 100;
 const SESSION_PREVIEW_CHARS: usize = 120;
 
+/// Connection-scoped settings replayed on every pooled reader.
+///
+/// PRAGMAs are per-connection state, so a pooled reader is useless unless it is
+/// configured exactly like the writer. `query_only` is not listed here: the
+/// pool always adds it, and it is the safety net for this module's read/write
+/// split — a statement that mutates the database fails loudly on a reader
+/// instead of silently competing with the writer for SQLite's write lock.
+const SQLITE_READER_PRAGMAS: &str = "PRAGMA foreign_keys  = ON;
+     PRAGMA mmap_size     = 8388608;
+     PRAGMA cache_size    = -2000;
+     PRAGMA temp_store    = MEMORY;";
+
+/// Production-grade PRAGMA tuning for the writer.
+///
+/// `journal_mode = WAL` is absent on purpose: the pool sets it itself, because
+/// pooled readers are unsound without it. The rest are per-connection — normal
+/// sync (2x write speed, still durable on WAL), mmap 8 MB (let the OS page
+/// cache serve hot reads), cache 2 MB (~500 hot pages in-process), and temp
+/// tables that never hit disk.
+const SQLITE_WRITER_PRAGMAS: &str = "PRAGMA synchronous   = NORMAL;
+     PRAGMA foreign_keys  = ON;
+     PRAGMA mmap_size     = 8388608;
+     PRAGMA cache_size    = -2000;
+     PRAGMA temp_store    = MEMORY;";
+
+/// Reader-pool and writer-contention counters for this backend.
+///
+/// Re-exported from the shared pool so callers keep reaching it at
+/// `memory::sqlite::SqlitePoolStats`.
+pub use crate::runtime::sqlite_pool::SqlitePoolStats;
+
 /// SQLite-backed persistent memory — the brain
 ///
 /// Full-stack search engine:
@@ -275,7 +303,7 @@ const SESSION_PREVIEW_CHARS: usize = 120;
 /// - **Embedding Cache**: LRU-evicted cache to avoid redundant API calls
 /// - **Safe Reindex**: temp DB → seed → sync → atomic swap → rollback
 pub struct SqliteMemory {
-    conn: Arc<Mutex<Connection>>,
+    pool: Arc<SqliteConnectionPool>,
     db_path: PathBuf,
     acl_enabled: bool,
     embedder: Arc<dyn EmbeddingProvider>,
@@ -312,6 +340,7 @@ impl SqliteMemory {
             10_000,
             None,
             false,
+            None,
         )
     }
 
@@ -327,6 +356,7 @@ impl SqliteMemory {
             10_000,
             None,
             false,
+            None,
         )
     }
 
@@ -340,6 +370,7 @@ impl SqliteMemory {
             10_000,
             None,
             acl_enabled,
+            None,
         )
     }
 
@@ -364,10 +395,17 @@ impl SqliteMemory {
             cache_max,
             open_timeout_secs,
             false,
+            None,
         )
     }
 
-    /// Build SQLite memory with optional open timeout and ACL mode.
+    /// Build SQLite memory with optional open timeout, ACL mode and reader-pool size.
+    ///
+    /// `read_pool_size` bounds how many reader connections may exist, not how
+    /// much work may run: a caller that finds every reader busy queues for one.
+    /// `None` derives it from the available CPUs — see
+    /// [`crate::runtime::sqlite_pool::default_read_pool_size`].
+    #[allow(clippy::too_many_arguments)]
     pub fn with_embedder_with_acl(
         workspace_dir: &Path,
         embedder: Arc<dyn EmbeddingProvider>,
@@ -376,6 +414,7 @@ impl SqliteMemory {
         cache_max: usize,
         open_timeout_secs: Option<u64>,
         acl_enabled: bool,
+        read_pool_size: Option<usize>,
     ) -> anyhow::Result<Self> {
         let db_path = workspace_dir.join("memory").join("brain.db");
         Self::with_embedder_and_path_with_acl(
@@ -386,9 +425,11 @@ impl SqliteMemory {
             cache_max,
             open_timeout_secs,
             acl_enabled,
+            read_pool_size,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn with_embedder_and_path_with_acl(
         db_path: PathBuf,
         embedder: Arc<dyn EmbeddingProvider>,
@@ -397,32 +438,29 @@ impl SqliteMemory {
         cache_max: usize,
         open_timeout_secs: Option<u64>,
         acl_enabled: bool,
+        read_pool_size: Option<usize>,
     ) -> anyhow::Result<Self> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        let conn = Self::open_connection(&db_path, open_timeout_secs)?;
+        // `reset_transactions_on_release` is on because this module issues bare
+        // `BEGIN` through `execute_batch` in places: `rusqlite::Transaction`
+        // would clean up after itself, a bare `BEGIN` would not, and a leftover
+        // transaction stalls every later write (writer) or pins a stale WAL
+        // snapshot for every later caller (reader).
+        let pool = SqliteConnectionPool::builder(db_path.clone())
+            .max_readers(read_pool_size.unwrap_or_else(crate::runtime::sqlite_pool::default_read_pool_size))
+            .open_timeout_secs(open_timeout_secs)
+            .writer_pragmas(SQLITE_WRITER_PRAGMAS)
+            .reader_pragmas(SQLITE_READER_PRAGMAS)
+            .reset_transactions_on_release(true)
+            .build()?;
 
-        // ── Production-grade PRAGMA tuning ──────────────────────
-        // WAL mode: concurrent reads during writes, crash-safe
-        // normal sync: 2× write speed, still durable on WAL
-        // mmap 8 MB: let the OS page-cache serve hot reads
-        // cache 2 MB: keep ~500 hot pages in-process
-        // temp_store memory: temp tables never hit disk
-        conn.execute_batch(
-            "PRAGMA journal_mode  = WAL;
-             PRAGMA synchronous   = NORMAL;
-             PRAGMA foreign_keys  = ON;
-             PRAGMA mmap_size     = 8388608;
-             PRAGMA cache_size    = -2000;
-             PRAGMA temp_store    = MEMORY;",
-        )?;
-
-        Self::init_schema(&conn)?;
+        Self::init_schema(&pool.write())?;
 
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            pool: Arc::new(pool),
             db_path,
             acl_enabled,
             embedder,
@@ -432,35 +470,12 @@ impl SqliteMemory {
         })
     }
 
-    /// Open SQLite connection, optionally with a timeout (for locked/slow storage).
-    fn open_connection(db_path: &Path, open_timeout_secs: Option<u64>) -> anyhow::Result<Connection> {
-        let path_buf = db_path.to_path_buf();
-
-        let conn = if let Some(secs) = open_timeout_secs {
-            let capped = secs.min(SQLITE_OPEN_TIMEOUT_CAP_SECS);
-            let (tx, rx) = mpsc::channel();
-            thread::spawn(move || {
-                let result = Connection::open(&path_buf);
-                let _ = tx.send(result);
-            });
-            match rx.recv_timeout(Duration::from_secs(capped)) {
-                Ok(Ok(c)) => c,
-                Ok(Err(e)) => return Err(e).context("SQLite failed to open database"),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    anyhow::bail!("SQLite connection open timed out after {} seconds", capped);
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    anyhow::bail!("SQLite open thread exited unexpectedly");
-                }
-            }
-        } else {
-            Connection::open(&path_buf).context("SQLite failed to open database")?
-        };
-
-        conn.busy_timeout(Duration::from_secs(5))
-            .context("SQLite failed to configure busy_timeout")?;
-
-        Ok(conn)
+    /// Snapshot of reader-pool and writer contention counters.
+    ///
+    /// Nothing here throttles: the numbers exist so saturation is observable
+    /// rather than enforced.
+    pub fn pool_stats(&self) -> SqlitePoolStats {
+        self.pool.stats()
     }
 
     fn sanitize_conversation_limit(limit: usize) -> i64 {
@@ -2284,7 +2299,7 @@ impl SqliteMemory {
         let embedding_model = embedding_bytes.as_ref().map(|_| self.embedding_model_name());
         let embedding_dimensions = embedding_bytes.as_ref().map(|_| self.embedding_dimensions_i64());
 
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let db_path = self.db_path.clone();
         let acl_enabled = self.acl_enabled;
         let key = key.to_string();
@@ -2294,7 +2309,7 @@ impl SqliteMemory {
         let metadata = metadata.unwrap_or_default();
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = conn.lock();
+            let conn = pool.write();
             let now = Local::now().to_rfc3339();
             let cat = Self::category_to_str(&category);
             let id = Uuid::new_v4().to_string();
@@ -2579,13 +2594,13 @@ impl SqliteMemory {
         let dimensions = self.embedding_dimensions_i64();
 
         // Check cache (offloaded to blocking thread)
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let hash_c = hash.clone();
         let now_c = now.clone();
         let provider_c = provider_name.clone();
         let model_c = model_name.clone();
         let cached = crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<Vec<f32>>> {
-            let conn = conn.lock();
+            let conn = pool.write();
             let mut stmt = conn.prepare(
                 "SELECT embedding FROM embedding_cache
                  WHERE content_hash = ?1
@@ -2631,11 +2646,11 @@ impl SqliteMemory {
         let bytes = vector::vec_to_bytes(&embedding);
 
         // Store in cache + LRU eviction (offloaded to blocking thread)
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         #[allow(clippy::cast_possible_wrap)]
         let cache_max = self.cache_max as i64;
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = conn.lock();
+            let conn = pool.write();
             conn.execute(
                 "INSERT OR REPLACE INTO embedding_cache (
                     content_hash, embedding, provider, model, dimensions, created_at, accessed_at
@@ -2770,9 +2785,9 @@ impl SqliteMemory {
     pub async fn reindex(&self) -> anyhow::Result<usize> {
         // Step 1: Rebuild FTS5
         {
-            let conn = self.conn.clone();
+            let pool = self.pool.clone();
             crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
-                let conn = conn.lock();
+                let conn = pool.write();
                 conn.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('rebuild');")?;
                 Ok(())
             })
@@ -2787,9 +2802,10 @@ impl SqliteMemory {
         let provider_name = self.embedding_provider_name();
         let model_name = self.embedding_model_name();
         let dimensions = self.embedding_dimensions_i64();
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let entries: Vec<(String, String)> = crate::runtime::blocking::spawn_blocking(move || {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             let mut stmt = conn.prepare(
                 "SELECT id, content
                  FROM memories
@@ -2815,13 +2831,13 @@ impl SqliteMemory {
         for (id, content) in &entries {
             if let Ok(Some(emb)) = self.get_or_compute_embedding(content).await {
                 let bytes = vector::vec_to_bytes(&emb);
-                let conn = self.conn.clone();
+                let pool = self.pool.clone();
                 let id = id.clone();
                 let provider_name = self.embedding_provider_name();
                 let model_name = self.embedding_model_name();
                 let dimensions = self.embedding_dimensions_i64();
                 crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
-                    let conn = conn.lock();
+                    let conn = pool.write();
                     conn.execute(
                         "UPDATE memories
                          SET embedding = ?1,
@@ -2841,9 +2857,10 @@ impl SqliteMemory {
         let provider_name = self.embedding_provider_name();
         let model_name = self.embedding_model_name();
         let dimensions = self.embedding_dimensions_i64();
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let chunks: Vec<(String, String)> = crate::runtime::blocking::spawn_blocking(move || {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             let mut stmt = conn.prepare(
                 "SELECT chunk_id, content
                  FROM document_chunks
@@ -2865,13 +2882,13 @@ impl SqliteMemory {
         for (chunk_id, content) in &chunks {
             if let Ok(Some(emb)) = self.get_or_compute_embedding(content).await {
                 let bytes = vector::vec_to_bytes(&emb);
-                let conn = self.conn.clone();
+                let pool = self.pool.clone();
                 let chunk_id = chunk_id.clone();
                 let provider_name = self.embedding_provider_name();
                 let model_name = self.embedding_model_name();
                 let dimensions = self.embedding_dimensions_i64();
                 crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
-                    let conn = conn.lock();
+                    let conn = pool.write();
                     conn.execute(
                         "UPDATE document_chunks
                          SET embedding = ?1,
@@ -2905,7 +2922,7 @@ impl Memory for SqliteMemory {
         chat_kind: &str,
         title: Option<&str>,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let channel = channel.to_string();
         let chat_id = chat_id.to_string();
         let chat_kind = chat_kind.to_string();
@@ -2913,7 +2930,7 @@ impl Memory for SqliteMemory {
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
             let now = Utc::now().to_rfc3339();
             let id = Uuid::new_v4().to_string();
-            let conn = conn.lock();
+            let conn = pool.write();
             conn.execute(
                 "INSERT INTO chat_profiles
                     (id, channel, chat_id, chat_kind, title, purpose, notes, tags, updated_by, created_at, updated_at)
@@ -2942,7 +2959,7 @@ impl Memory for SqliteMemory {
         tags: Option<&[String]>,
         updated_by: &str,
     ) -> anyhow::Result<ChatProfile> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let channel = channel.to_string();
         let chat_id = chat_id.to_string();
         let chat_kind = chat_kind.to_string();
@@ -2953,7 +2970,7 @@ impl Memory for SqliteMemory {
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<ChatProfile> {
             let now = Utc::now().to_rfc3339();
             let id = Uuid::new_v4().to_string();
-            let conn = conn.lock();
+            let conn = pool.write();
             let profile = conn.query_row(
                 "INSERT INTO chat_profiles
                     (id, channel, chat_id, chat_kind, title, purpose, notes, tags, updated_by, created_at, updated_at)
@@ -2975,11 +2992,12 @@ impl Memory for SqliteMemory {
     }
 
     async fn get_chat_profile(&self, channel: &str, chat_id: &str) -> anyhow::Result<Option<ChatProfile>> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let channel = channel.to_string();
         let chat_id = chat_id.to_string();
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<ChatProfile>> {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             let profile = conn
                 .query_row(
                     "SELECT id, channel, chat_id, chat_kind, title, purpose, notes, tags, updated_by, created_at, updated_at
@@ -3050,7 +3068,7 @@ impl Memory for SqliteMemory {
         // Compute query embedding (async, before blocking work)
         let query_embedding = self.get_or_compute_embedding(query).await?;
 
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let query = query.to_string();
         let sid = session_id.map(String::from);
         let vector_weight = self.vector_weight;
@@ -3060,7 +3078,8 @@ impl Memory for SqliteMemory {
         let embedding_dimensions = self.embedder.dimensions();
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             let session_ref = sid.as_deref();
 
             // FTS5 BM25 keyword search
@@ -3260,11 +3279,12 @@ impl Memory for SqliteMemory {
             return Ok(entries);
         }
 
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let capped_limit = limit;
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             let fallback_principal = Principal {
                 user_id: "anonymous:unknown:unknown".to_string(),
                 role: Role::Anonymous,
@@ -3331,7 +3351,7 @@ impl Memory for SqliteMemory {
         let scoped = self
             .recall_with_context(query, limit, session_id, Some(&context))
             .await?;
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let query_owned = query.to_string();
         let query_for_topics = query_owned.clone();
         let mut selected = match mode {
@@ -3344,7 +3364,8 @@ impl Memory for SqliteMemory {
             .collect::<std::collections::HashSet<_>>();
         let topic_rows =
             crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<(Vec<MemoryEntry>, Principal)> {
-                let conn = conn.lock();
+                let reader = pool.read()?;
+                let conn = reader.connection()?;
                 let principal = sqlite_read_principal(&conn, &context);
                 let topic_principal = match mode {
                     MemoryReadMode::Enforce => principal.clone(),
@@ -3393,11 +3414,11 @@ impl Memory for SqliteMemory {
         let would_deny = unrestricted
             .iter()
             .any(|entry| !scoped.iter().any(|allowed| allowed.id == entry.id));
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let principal = topic_rows.1;
         let selected_empty = selected.is_empty();
         crate::runtime::blocking::spawn_blocking(move || {
-            let conn = conn.lock();
+            let conn = pool.write();
             log_access(
                 &conn,
                 &principal,
@@ -3422,11 +3443,12 @@ impl Memory for SqliteMemory {
     }
 
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let key = key.to_string();
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             let mut stmt = conn.prepare(
                 "SELECT id, key, content, category, created_at, session_id, useful_count FROM memories WHERE key = ?1",
             )?;
@@ -3465,10 +3487,11 @@ impl Memory for SqliteMemory {
         context: Option<&MemoryWriteContext>,
     ) -> anyhow::Result<Option<MemoryEntry>> {
         let context = context.cloned().unwrap_or_default();
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let key = key.to_string();
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             let principal = sqlite_read_principal(&conn, &context);
             let (scope_sql, scope_params) = principal.build_sql_scope();
             let mut query_params = Vec::with_capacity(scope_params.len() + 1);
@@ -3522,9 +3545,9 @@ impl Memory for SqliteMemory {
         let memory_id = selected.as_ref().map(|entry| entry.id.clone());
         let selected_is_some = selected.is_some();
         let key = key.to_string();
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         crate::runtime::blocking::spawn_blocking(move || {
-            let conn = conn.lock();
+            let conn = pool.write();
             let principal = sqlite_read_principal(&conn, &context);
             log_access(
                 &conn,
@@ -3556,12 +3579,13 @@ impl Memory for SqliteMemory {
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         const DEFAULT_LIST_LIMIT: i64 = 1000;
 
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let category = category.cloned();
         let sid = session_id.map(String::from);
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             let session_ref = sid.as_deref();
             let mut results = Vec::new();
 
@@ -3624,11 +3648,11 @@ impl Memory for SqliteMemory {
     }
 
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let key = key.to_string();
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<bool> {
-            let conn = conn.lock();
+            let conn = pool.write();
             let affected = conn.execute("DELETE FROM memories WHERE key = ?1", params![key])?;
             Ok(affected > 0)
         })
@@ -3640,11 +3664,11 @@ impl Memory for SqliteMemory {
             return self.forget(key).await;
         };
 
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let key = key.to_string();
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<bool> {
-            let conn = conn.lock();
+            let conn = pool.write();
             let fallback_principal = Principal {
                 user_id: "anonymous:unknown:unknown".to_string(),
                 role: Role::Anonymous,
@@ -3697,11 +3721,11 @@ impl Memory for SqliteMemory {
     }
 
     async fn move_to_trash(&self, key: &str, reason: &str, grace_days: u32) -> anyhow::Result<Option<String>> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let key = key.to_string();
         let reason = reason.to_string();
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<String>> {
-            let conn = conn.lock();
+            let conn = pool.write();
             // FIX-P1-11: snapshot the row's value before soft-deleting it. We DO NOT
             // physically delete from `memories`; we record a trash row so it can be
             // restored within the grace window.
@@ -3755,10 +3779,10 @@ impl Memory for SqliteMemory {
         draft: crate::self_system::evolution::EvolutionProposalDraft,
     ) -> anyhow::Result<String> {
         use crate::self_system::evolution::proposal::ProposalRowValues;
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<String> {
             let values = ProposalRowValues::encode(&draft)?;
-            let conn = conn.lock();
+            let conn = pool.write();
             let now = Utc::now().to_rfc3339();
             conn.execute(
                 "INSERT INTO evolution_proposals (
@@ -3810,11 +3834,12 @@ impl Memory for SqliteMemory {
         principal: &MemoryPrincipal,
         filter: crate::self_system::evolution::ProposalFilter,
     ) -> anyhow::Result<Vec<crate::self_system::evolution::EvolutionProposalDraft>> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let owner_scope = Self::evolution_owner_scope(principal);
         crate::runtime::blocking::spawn_blocking(
             move || -> anyhow::Result<Vec<crate::self_system::evolution::EvolutionProposalDraft>> {
-                let conn = conn.lock();
+                let reader = pool.read()?;
+                let conn = reader.connection()?;
                 // Parameterized dynamic WHERE: every predicate binds a value; no
                 // user text is interpolated into the SQL string.
                 let mut sql = String::from(
@@ -3895,12 +3920,13 @@ impl Memory for SqliteMemory {
         principal: &MemoryPrincipal,
         draft_id: &str,
     ) -> anyhow::Result<Option<crate::self_system::evolution::EvolutionProposalDraft>> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let owner_scope = Self::evolution_owner_scope(principal);
         let draft_id = draft_id.to_string();
         crate::runtime::blocking::spawn_blocking(
             move || -> anyhow::Result<Option<crate::self_system::evolution::EvolutionProposalDraft>> {
-                let conn = conn.lock();
+                let reader = pool.read()?;
+                let conn = reader.connection()?;
                 let proposal = conn
                     .query_row(
                         "SELECT draft_id, owner_id, principal_id, workspace_id, topic_id, task_id,
@@ -3938,7 +3964,7 @@ impl Memory for SqliteMemory {
         update: crate::self_system::evolution::ProposalStatusUpdate,
     ) -> anyhow::Result<()> {
         use crate::self_system::evolution::ProposalStatusUpdate;
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let owner_scope = Self::evolution_owner_scope(principal);
         let draft_id = draft_id.to_string();
         let actor = principal
@@ -3947,7 +3973,7 @@ impl Memory for SqliteMemory {
             .or_else(|| principal.agent_id.clone())
             .unwrap_or_else(|| "self_system".to_string());
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = conn.lock();
+            let conn = pool.write();
             // Fetch the row first to enforce owner ACL and re-judge guard.
             let existing: Option<(String, Option<String>, Option<String>)> = conn
                 .query_row(
@@ -4026,14 +4052,14 @@ impl Memory for SqliteMemory {
         actor: &str,
         payload_json: Option<&str>,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let owner_scope = Self::evolution_owner_scope(principal);
         let draft_id = draft_id.to_string();
         let event_type = event_type.to_string();
         let actor = actor.to_string();
         let payload_json = payload_json.map(str::to_string);
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = conn.lock();
+            let conn = pool.write();
             let owner: Option<String> = conn
                 .query_row(
                     "SELECT owner_id FROM evolution_proposals WHERE draft_id = ?1",
@@ -4061,11 +4087,11 @@ impl Memory for SqliteMemory {
     }
 
     async fn increment_useful_count(&self, id: &str) -> anyhow::Result<()> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let id = id.to_string();
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = conn.lock();
+            let conn = pool.write();
             conn.execute(
                 "UPDATE memories
                  SET useful_count = COALESCE(useful_count, 0) + 1,
@@ -4079,10 +4105,11 @@ impl Memory for SqliteMemory {
     }
 
     async fn count(&self) -> anyhow::Result<usize> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<usize> {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             let count: i64 = conn.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             Ok(count as usize)
@@ -4102,7 +4129,7 @@ impl Memory for SqliteMemory {
         message_id: Option<&str>,
         owner_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let session_key = session_key.to_string();
         let channel = channel.to_string();
         let sender = sender.to_string();
@@ -4116,7 +4143,7 @@ impl Memory for SqliteMemory {
         let preview = Self::conversation_preview(&content);
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = conn.lock();
+            let conn = pool.write();
             let tx = conn.unchecked_transaction()?;
             tx.execute(
                 "INSERT INTO sessions (
@@ -4169,13 +4196,14 @@ impl Memory for SqliteMemory {
         offset: usize,
         channel: Option<&str>,
     ) -> anyhow::Result<Vec<ConversationSessionSummary>> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let limit = Self::sanitize_conversation_limit(limit);
         let offset = Self::sanitize_conversation_offset(offset);
         let channel = channel.map(str::to_string);
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<ConversationSessionSummary>> {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             let mut sessions = Vec::new();
 
             if let Some(channel_filter) = channel {
@@ -4235,11 +4263,12 @@ impl Memory for SqliteMemory {
     }
 
     async fn get_conversation_session(&self, session_key: &str) -> anyhow::Result<Option<ConversationSessionSummary>> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let session_key = session_key.to_string();
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<ConversationSessionSummary>> {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             let mut stmt = conn.prepare(
                 "SELECT session_key, channel, sender, created_at, updated_at, message_count, last_message_preview
                      FROM sessions WHERE session_key = ?1",
@@ -4275,7 +4304,7 @@ impl Memory for SqliteMemory {
         limit: usize,
         offset: usize,
     ) -> anyhow::Result<Vec<ConversationTurn>> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let owner_id = principal
             .owner_id
             .as_deref()
@@ -4304,7 +4333,8 @@ impl Memory for SqliteMemory {
             crate::memory::session_predicate::session_key_match_fragment(SQLITE_DIALECT, &session_indices);
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<ConversationTurn>> {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, session_key, role, content, timestamp, message_id
                  FROM conversation_turns
@@ -4351,7 +4381,7 @@ impl Memory for SqliteMemory {
         max_turns_per_session: usize,
         max_sessions: usize,
     ) -> anyhow::Result<std::collections::HashMap<String, Vec<ConversationTurn>>> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let owner_id = principal
             .owner_id
             .as_deref()
@@ -4363,7 +4393,8 @@ impl Memory for SqliteMemory {
 
         crate::runtime::blocking::spawn_blocking(
             move || -> anyhow::Result<std::collections::HashMap<String, Vec<ConversationTurn>>> {
-                let conn = conn.lock();
+                let reader = pool.read()?;
+                let conn = reader.connection()?;
                 let mut stmt = conn.prepare(
                     "SELECT id, session_key, role, content, timestamp, message_id
                      FROM (
@@ -4421,10 +4452,10 @@ impl Memory for SqliteMemory {
 
     async fn append_message_event(&self, input: MessageEventInput) -> anyhow::Result<MessageEvent> {
         input.validate()?;
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<MessageEvent> {
-            let mut conn = conn.lock();
+            let mut conn = pool.write();
             let tx = conn.transaction()?;
             let now = Utc::now().to_rfc3339();
             let event_id = input.event_id.unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -4545,9 +4576,10 @@ impl Memory for SqliteMemory {
     ) -> anyhow::Result<Option<MessageEvent>> {
         let workspace_id = workspace_id.to_string();
         let idempotency_key = idempotency_key.to_string();
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         crate::runtime::blocking::spawn_blocking(move || {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             conn.query_row(
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                         parent_session_key, run_id, parent_run_id, agent_id, persona_id,
@@ -4572,7 +4604,7 @@ impl Memory for SqliteMemory {
         after_id: i64,
         limit: usize,
     ) -> anyhow::Result<Vec<MessageEvent>> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let principal = principal.clone();
         let limit = Self::sanitize_conversation_limit(limit);
         let system_allowed = Self::is_system_principal(&principal);
@@ -4585,7 +4617,8 @@ impl Memory for SqliteMemory {
             crate::memory::session_predicate::session_visibility_or_fragment(SQLITE_DIALECT, &session_indices);
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                         parent_session_key, run_id, parent_run_id, agent_id, persona_id,
@@ -4643,7 +4676,7 @@ impl Memory for SqliteMemory {
         principal: &MemoryPrincipal,
         limit: usize,
     ) -> anyhow::Result<Vec<MessageEvent>> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let principal = principal.clone();
         let limit = Self::sanitize_conversation_limit(limit);
         let system_allowed = Self::is_system_principal(&principal);
@@ -4656,7 +4689,8 @@ impl Memory for SqliteMemory {
             crate::memory::session_predicate::session_visibility_or_fragment(SQLITE_DIALECT, &session_indices);
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                         parent_session_key, run_id, parent_run_id, agent_id, persona_id,
@@ -4708,7 +4742,7 @@ impl Memory for SqliteMemory {
     }
 
     async fn load_recent_shared_context(&self, query: SharedContextQuery) -> anyhow::Result<Vec<MessageEvent>> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let principal = query.principal;
         let limit = Self::sanitize_conversation_limit(query.limit);
         let after_id = query.since_event_id.unwrap_or(0);
@@ -4728,7 +4762,8 @@ impl Memory for SqliteMemory {
             crate::memory::session_predicate::session_visibility_or_fragment(SQLITE_DIALECT, &session_indices);
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                         parent_session_key, run_id, parent_run_id, agent_id, persona_id,
@@ -4793,7 +4828,7 @@ impl Memory for SqliteMemory {
         let Some(session_key) = query.principal.session_key.clone() else {
             return Ok(Vec::new());
         };
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let principal = query.principal;
         let limit = Self::sanitize_conversation_limit(query.limit);
         let after_id = query.since_event_id.unwrap_or(0);
@@ -4817,7 +4852,8 @@ impl Memory for SqliteMemory {
             crate::memory::session_predicate::session_key_match_fragment(SQLITE_DIALECT, &session_indices);
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                         parent_session_key, run_id, parent_run_id, agent_id, persona_id,
@@ -4875,10 +4911,10 @@ impl Memory for SqliteMemory {
     }
 
     async fn append_memory_event(&self, input: MemoryEventInput) -> anyhow::Result<MemoryEvent> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<MemoryEvent> {
-            let conn = conn.lock();
+            let conn = pool.write();
             let now = Utc::now().to_rfc3339();
             let event_id = input.event_id.unwrap_or_else(|| Uuid::new_v4().to_string());
             conn.execute(
@@ -4924,12 +4960,13 @@ impl Memory for SqliteMemory {
         after_id: i64,
         limit: usize,
     ) -> anyhow::Result<Vec<MemoryEvent>> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let principal = principal.clone();
         let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEvent>> {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             let system_allowed =
                 principal.agent_id.as_deref() == Some("system") || principal.persona_id.as_deref() == Some("system");
             let mut stmt = conn.prepare(
@@ -4981,12 +5018,13 @@ impl Memory for SqliteMemory {
         principal: &MemoryPrincipal,
         limit: usize,
     ) -> anyhow::Result<Vec<MemoryEvent>> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let principal = principal.clone();
         let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEvent>> {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             let system_allowed =
                 principal.agent_id.as_deref() == Some("system") || principal.persona_id.as_deref() == Some("system");
             let mut stmt = conn.prepare(
@@ -5032,10 +5070,10 @@ impl Memory for SqliteMemory {
     }
 
     async fn create_memory_draft(&self, input: MemoryDraftInput) -> anyhow::Result<MemoryDraft> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<MemoryDraft> {
-            let mut conn = conn.lock();
+            let mut conn = pool.write();
             let tx = conn.transaction()?;
             let now = Utc::now().to_rfc3339();
             let draft_id = input.draft_id.unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -5115,7 +5153,7 @@ impl Memory for SqliteMemory {
         principal: &MemoryPrincipal,
         worker_run_id: &str,
     ) -> anyhow::Result<Vec<MemoryDraft>> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let worker_run_id = worker_run_id.to_string();
         // Owner ACL: a caller may only see drafts it owns, plus drafts with no
         // owner (legacy / system-created). System principals bypass the filter.
@@ -5130,7 +5168,8 @@ impl Memory for SqliteMemory {
         };
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MemoryDraft>> {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             if let Some(owner) = owner {
                 let mut stmt = conn.prepare(
                     "SELECT id, draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
@@ -5163,7 +5202,7 @@ impl Memory for SqliteMemory {
         principal: &MemoryPrincipal,
         draft_id: &str,
     ) -> anyhow::Result<Option<MemoryDraft>> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let draft_id = draft_id.to_string();
         let owner = if Self::is_system_principal(principal) {
             None
@@ -5176,7 +5215,7 @@ impl Memory for SqliteMemory {
         };
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<MemoryDraft>> {
-            let mut conn = conn.lock();
+            let mut conn = pool.write();
             let tx = conn.transaction()?;
             let mut draft = match tx.query_row(
                 "SELECT id, draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
@@ -5295,7 +5334,7 @@ impl Memory for SqliteMemory {
         draft_id: &str,
         reason: Option<&str>,
     ) -> anyhow::Result<Option<MemoryDraft>> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let draft_id = draft_id.to_string();
         let reason = reason.map(str::to_string);
         let owner = if Self::is_system_principal(principal) {
@@ -5309,7 +5348,7 @@ impl Memory for SqliteMemory {
         };
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<MemoryDraft>> {
-            let mut conn = conn.lock();
+            let mut conn = pool.write();
             let tx = conn.transaction()?;
             let mut draft = match tx.query_row(
                 "SELECT id, draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
@@ -5381,7 +5420,7 @@ impl Memory for SqliteMemory {
     }
 
     async fn ingest_document(&self, input: DocumentIngestInput) -> anyhow::Result<DocumentRecord> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let embedding_provider = self.embedding_provider_name();
         let embedding_model = self.embedding_model_name();
         let embedding_dimensions = self.embedding_dimensions_i64();
@@ -5408,7 +5447,7 @@ impl Memory for SqliteMemory {
         }
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<DocumentRecord> {
-            let mut conn = conn.lock();
+            let mut conn = pool.write();
             let tx = conn.transaction()?;
             let now = Utc::now().to_rfc3339();
             let document_id = input.document_id.unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -5546,7 +5585,7 @@ impl Memory for SqliteMemory {
         query: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<DocumentSearchResult>> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let principal = principal.clone();
         let query = query.to_string();
         let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
@@ -5558,7 +5597,8 @@ impl Memory for SqliteMemory {
         let embedding_dimensions_i64 = self.embedding_dimensions_i64();
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<DocumentSearchResult>> {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             let fts_query = super::topic::build_safe_fts_query(&query);
             let mut results = Vec::new();
             let mut seen = std::collections::HashSet::new();
@@ -5670,11 +5710,12 @@ impl Memory for SqliteMemory {
     }
 
     async fn get_document_chunk(&self, chunk_id: &str) -> anyhow::Result<Option<DocumentChunkRecord>> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
         let chunk_id = chunk_id.to_string();
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<DocumentChunkRecord>> {
-            let conn = conn.lock();
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
             conn.query_row(
                 "SELECT id, chunk_id, document_id, workspace_id, owner_id, topic_id, task_id,
                         chunk_index, heading, content, content_sha256, source_anchor,
@@ -5692,10 +5733,10 @@ impl Memory for SqliteMemory {
     }
 
     async fn link_memory_source(&self, input: MemoryLinkInput) -> anyhow::Result<MemoryLink> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<MemoryLink> {
-            let conn = conn.lock();
+            let conn = pool.write();
             let now = Utc::now().to_rfc3339();
             let link_id = input.link_id.unwrap_or_else(|| Uuid::new_v4().to_string());
             conn.execute(
@@ -5733,10 +5774,10 @@ impl Memory for SqliteMemory {
     }
 
     async fn append_retrieval_trace(&self, input: RetrievalTraceInput) -> anyhow::Result<RetrievalTrace> {
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<RetrievalTrace> {
-            let conn = conn.lock();
+            let conn = pool.write();
             let now = Utc::now().to_rfc3339();
             let trace_id = input.trace_id.unwrap_or_else(|| Uuid::new_v4().to_string());
             let candidate_count = i64::try_from(input.candidate_count).unwrap_or(i64::MAX);
@@ -5804,10 +5845,10 @@ impl Memory for SqliteMemory {
 
     async fn append_compaction_run(&self, input: CompactionRunInput) -> anyhow::Result<CompactionRun> {
         input.validate_source_event_provenance()?;
-        let conn = self.conn.clone();
+        let pool = self.pool.clone();
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<CompactionRun> {
-            let conn = conn.lock();
+            let conn = pool.write();
             let now = Utc::now().to_rfc3339();
             let run_id = input.run_id.unwrap_or_else(|| Uuid::new_v4().to_string());
             let source_message_count = i64::try_from(input.source_message_count).unwrap_or(i64::MAX);
@@ -5877,10 +5918,17 @@ impl Memory for SqliteMemory {
     }
 
     async fn health_check(&self) -> bool {
-        let conn = self.conn.clone();
-        crate::runtime::blocking::spawn_blocking(move || conn.lock().execute_batch("SELECT 1").is_ok())
-            .await
-            .unwrap_or(false)
+        let pool = self.pool.clone();
+        crate::runtime::blocking::spawn_blocking(move || {
+            // Probed on a reader: readers are opened lazily, so this is the
+            // first place a database that read traffic can no longer open
+            // becomes visible.
+            pool.read()
+                .and_then(|reader| reader.connection().map(|conn| conn.execute_batch("SELECT 1").is_ok()))
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
     }
 
     async fn reindex(&self) -> anyhow::Result<usize> {
@@ -5903,6 +5951,9 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn temp_sqlite() -> (TempDir, SqliteMemory) {
@@ -6087,7 +6138,7 @@ mod tests {
     #[tokio::test]
     async fn message_events_schema_is_created() {
         let (_tmp, mem) = temp_sqlite();
-        let conn = mem.conn.lock();
+        let conn = mem.pool.write();
 
         let message_events: i64 = conn
             .query_row(
@@ -6328,7 +6379,7 @@ mod tests {
         assert_eq!(second_workspace_event.workspace_id, "workspace-b");
         assert_ne!(second_workspace_event.event_id, "legacy-event-1");
 
-        let conn = mem.conn.lock();
+        let conn = mem.pool.write();
         for column in [
             "source_ref_json",
             "subject_ref_json",
@@ -6392,7 +6443,7 @@ mod tests {
         }
 
         let mem = SqliteMemory::new_with_path(db_path).unwrap();
-        let conn = mem.conn.lock();
+        let conn = mem.pool.write();
         let column_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('compaction_runs') WHERE name = 'source_event_range_json'",
@@ -6457,7 +6508,7 @@ mod tests {
         }
 
         let mem = SqliteMemory::new_with_path(db_path).unwrap();
-        let conn = mem.conn.lock();
+        let conn = mem.pool.write();
         for (table, column) in [("sessions", "owner_id"), ("conversation_turns", "owner_id")] {
             let count: i64 = conn
                 .query_row(
@@ -6568,7 +6619,7 @@ mod tests {
     #[tokio::test]
     async fn fabric_semantic_memory_records_memory_link_for_ingest_ref() {
         let (tmp, mem) = temp_sqlite();
-        let conn = mem.conn.clone();
+        let pool = mem.pool.clone();
         let fabric = crate::memory::fabric::MemoryFabric::new(Arc::new(mem), "workspace-a");
 
         let content = "Promoted fact.\n\n[document_ingest_ref]\n\
@@ -6580,8 +6631,8 @@ source: tool_output\n\
             .await
             .expect("test: record_semantic_memory should succeed");
 
-        let (document_id, link_type, memory_key): (String, String, Option<String>) = conn
-            .lock()
+        let (document_id, link_type, memory_key): (String, String, Option<String>) = pool
+            .write()
             .query_row(
                 "SELECT document_id, link_type, memory_key FROM memory_links WHERE memory_key = 'prov-key'",
                 [],
@@ -6625,8 +6676,8 @@ source: tool_output\n\
             Option<String>,
             Option<String>,
         ) = mem
-            .conn
-            .lock()
+            .pool
+            .write()
             .query_row(
                 "SELECT workspace_id, owner_id, agent_id, persona_id, source_event_id, source
                  FROM memories WHERE key = 'semantic-key'",
@@ -6679,8 +6730,8 @@ source: tool_output\n\
         .expect("test: store_with_metadata should succeed");
 
         let row_channel: Option<String> = mem
-            .conn
-            .lock()
+            .pool
+            .write()
             .query_row("SELECT channel FROM memories WHERE key = 'compaction-key'", [], |row| {
                 row.get(0)
             })
@@ -6821,7 +6872,7 @@ source: tool_output\n\
         assert_eq!(vector_results[0].chunk.document_id, "doc-vector-1");
 
         {
-            let conn = mem.conn.lock();
+            let conn = mem.pool.write();
             let (provider, model, dimensions): (String, String, i64) = conn
                 .query_row(
                     "SELECT embedding_provider, embedding_model, embedding_dimensions
@@ -6885,7 +6936,7 @@ source: tool_output\n\
         .unwrap();
         calls.store(0, Ordering::SeqCst);
         {
-            let conn = mem.conn.lock();
+            let conn = mem.pool.write();
             conn.execute(
                 "UPDATE document_chunks
                  SET embedding = NULL,
@@ -6918,7 +6969,7 @@ source: tool_output\n\
         assert_eq!(vector_results.len(), 1);
         assert_eq!(vector_results[0].chunk.document_id, "doc-reindex-1");
 
-        let conn = mem.conn.lock();
+        let conn = mem.pool.write();
         let (provider, model, dimensions): (String, String, i64) = conn
             .query_row(
                 "SELECT embedding_provider, embedding_model, embedding_dimensions
@@ -7013,8 +7064,8 @@ source: tool_output\n\
         assert!(mem.get("rejected-key").await.unwrap().is_none());
 
         let event_types: Vec<String> = mem
-            .conn
-            .lock()
+            .pool
+            .write()
             .prepare("SELECT event_type FROM memory_events ORDER BY id ASC")
             .unwrap()
             .query_map([], |row| row.get::<_, String>(0))
@@ -7051,8 +7102,8 @@ source: tool_output\n\
         assert_eq!(event.config_source_revision.as_deref(), Some("sha256:test-revision"));
 
         let outbox_count: i64 = mem
-            .conn
-            .lock()
+            .pool
+            .write()
             .query_row(
                 "SELECT COUNT(*) FROM memory_events WHERE event_type = 'message.created' AND subject_id = ?1",
                 [event.event_id.as_str()],
@@ -7094,7 +7145,7 @@ source: tool_output\n\
         assert_eq!(event.correlation_id.as_deref(), Some("correlation-1"));
         assert_eq!(event.attempt_id.as_deref(), Some("attempt-2"));
         assert_eq!(event.lease_epoch, Some(3));
-        let conn = mem.conn.lock();
+        let conn = mem.pool.write();
         let event_type: String = conn
             .query_row(
                 "SELECT event_type FROM message_events WHERE event_id = ?1",
@@ -7129,8 +7180,8 @@ source: tool_output\n\
         let error = mem.append_message_event(input).await.unwrap_err();
         assert!(error.to_string().contains("event type must not be empty"));
         let count: i64 = mem
-            .conn
-            .lock()
+            .pool
+            .write()
             .query_row("SELECT COUNT(*) FROM message_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
@@ -7165,7 +7216,7 @@ source: tool_output\n\
         assert_eq!(first_event.id, second_event.id);
         assert_eq!(second_event.content, "first content");
 
-        let conn = mem.conn.lock();
+        let conn = mem.pool.write();
         let message_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM message_events", [], |row| row.get(0))
             .unwrap();
@@ -7209,7 +7260,7 @@ source: tool_output\n\
         assert_eq!(replay_a.event_id, first_a.event_id);
         assert_eq!(replay_a.content, "workspace a content");
 
-        let conn = mem.conn.lock();
+        let conn = mem.pool.write();
         let message_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM message_events", [], |row| row.get(0))
             .unwrap();
@@ -8144,7 +8195,7 @@ source: tool_output\n\
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
 
-        let conn = mem.conn.lock();
+        let conn = mem.pool.write();
         let core_emb: Option<Vec<u8>> = conn
             .query_row("SELECT embedding FROM memories WHERE key = ?1", ["core_key"], |row| {
                 row.get(0)
@@ -8219,7 +8270,7 @@ source: tool_output\n\
 
         calls.store(0, Ordering::SeqCst);
         {
-            let conn = mem.conn.lock();
+            let conn = mem.pool.write();
             conn.execute("UPDATE memories SET embedding = NULL", []).unwrap();
         }
 
@@ -8227,7 +8278,7 @@ source: tool_output\n\
         assert_eq!(reindexed, 2);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
 
-        let conn = mem.conn.lock();
+        let conn = mem.pool.write();
         let core_emb: Option<Vec<u8>> = conn
             .query_row("SELECT embedding FROM memories WHERE key = ?1", ["core_key"], |row| {
                 row.get(0)
@@ -8275,7 +8326,7 @@ source: tool_output\n\
             .await
             .unwrap();
         {
-            let conn = mem.conn.lock();
+            let conn = mem.pool.write();
             conn.execute(
                 "UPDATE memories
                  SET embedding_provider = 'stale-provider',
@@ -8297,7 +8348,7 @@ source: tool_output\n\
         assert_eq!(fresh_results.len(), 1);
         assert_eq!(fresh_results[0].key, "vector_key");
 
-        let conn = mem.conn.lock();
+        let conn = mem.pool.write();
         let (provider, model, dimensions): (String, String, i64) = conn
             .query_row(
                 "SELECT embedding_provider, embedding_model, embedding_dimensions
@@ -8316,7 +8367,7 @@ source: tool_output\n\
     #[tokio::test]
     async fn schema_has_fts5_table() {
         let (_tmp, mem) = temp_sqlite();
-        let conn = mem.conn.lock();
+        let conn = mem.pool.write();
         // FTS5 table should exist
         let count: i64 = conn
             .query_row(
@@ -8331,7 +8382,7 @@ source: tool_output\n\
     #[tokio::test]
     async fn schema_has_embedding_cache() {
         let (_tmp, mem) = temp_sqlite();
-        let conn = mem.conn.lock();
+        let conn = mem.pool.write();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='embedding_cache'",
@@ -8345,7 +8396,7 @@ source: tool_output\n\
     #[tokio::test]
     async fn schema_memories_has_embedding_column() {
         let (_tmp, mem) = temp_sqlite();
-        let conn = mem.conn.lock();
+        let conn = mem.pool.write();
         // Check that embedding column exists by querying it
         let result = conn.execute_batch("SELECT embedding FROM memories LIMIT 0");
         assert!(result.is_ok());
@@ -8360,7 +8411,7 @@ source: tool_output\n\
             .await
             .unwrap();
 
-        let conn = mem.conn.lock();
+        let conn = mem.pool.write();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH '\"unique_searchterm_xyz\"'",
@@ -8379,7 +8430,7 @@ source: tool_output\n\
             .unwrap();
         mem.forget("del_key").await.unwrap();
 
-        let conn = mem.conn.lock();
+        let conn = mem.pool.write();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH '\"deletable_content_abc\"'",
@@ -8400,7 +8451,7 @@ source: tool_output\n\
             .await
             .unwrap();
 
-        let conn = mem.conn.lock();
+        let conn = mem.pool.write();
         // Old content should not be findable
         let old: i64 = conn
             .query_row(
@@ -9161,7 +9212,7 @@ source: tool_output\n\
     #[tokio::test]
     async fn conversation_turns_phase1_owner_columns_exist() {
         let (_tmp, mem) = temp_sqlite();
-        let conn = mem.conn.lock();
+        let conn = mem.pool.write();
 
         let session_cols: Vec<String> = conn
             .prepare("PRAGMA table_info(sessions)")
@@ -9199,7 +9250,7 @@ source: tool_output\n\
         .await
         .unwrap();
 
-        let conn = mem.conn.lock();
+        let conn = mem.pool.write();
         let session_owner: Option<String> = conn
             .query_row(
                 "SELECT owner_id FROM sessions WHERE session_key = 'signal_owned'",
@@ -9453,7 +9504,7 @@ source: tool_output\n\
     #[tokio::test]
     async fn g1_schema_migrations_recorded_on_init() {
         let (_tmp, mem) = temp_sqlite();
-        let conn = mem.conn.lock();
+        let conn = mem.pool.write();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM memory_schema_migrations", [], |row| row.get(0))
             .expect("count migrations");
@@ -9464,7 +9515,7 @@ source: tool_output\n\
     async fn g1_schema_migration_checksum_mismatch_bails() {
         let (_tmp, mem) = temp_sqlite();
         {
-            let conn = mem.conn.lock();
+            let conn = mem.pool.write();
             conn.execute(
                 "UPDATE memory_schema_migrations SET checksum = 'tampered' WHERE version = 1",
                 [],
@@ -9483,7 +9534,7 @@ source: tool_output\n\
     async fn g1_schema_migrations_idempotent_no_duplicate_rows() {
         let (_tmp, mem) = temp_sqlite();
         {
-            let conn = mem.conn.lock();
+            let conn = mem.pool.write();
             // Re-running must be a no-op and never duplicate rows.
             SqliteMemory::run_memory_schema_migrations(&conn).expect("rerun ok");
             let count: i64 = conn
@@ -9842,7 +9893,7 @@ source: tool_output\n\
         );
 
         let (count, grace_in_future): (i64, bool) = {
-            let conn = mem.conn.lock();
+            let conn = mem.pool.write();
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM memory_trash WHERE memory_key = ?1 AND restored_at IS NULL",
@@ -9925,7 +9976,7 @@ source: tool_output\n\
         );
 
         let by_parent: i64 = {
-            let conn = mem.conn.lock();
+            let conn = mem.pool.write();
             conn.query_row(
                 "SELECT COUNT(*) FROM memory_events WHERE parent_run_id = ?1",
                 params!["parent-run-1"],
@@ -9934,5 +9985,246 @@ source: tool_output\n\
             .expect("count by parent_run_id")
         };
         assert_eq!(by_parent, 1, "exactly one child queryable by parent_run_id");
+    }
+
+    // ── Connection pool: WAL, real concurrency, saturation, isolation ─────
+
+    fn temp_sqlite_with_read_pool(read_pool_size: usize) -> (TempDir, SqliteMemory) {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder_with_acl(
+            tmp.path(),
+            Arc::new(crate::memory::embeddings::NoopEmbedding),
+            0.7,
+            0.3,
+            10_000,
+            None,
+            false,
+            Some(read_pool_size),
+        )
+        .unwrap();
+        (tmp, mem)
+    }
+
+    #[tokio::test]
+    async fn pool_runs_in_wal_mode_and_readers_reject_writes() {
+        let (_tmp, mem) = temp_sqlite_with_read_pool(2);
+
+        let writer_mode: String = mem
+            .pool
+            .write()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("test: writer journal_mode");
+        assert_eq!(
+            writer_mode.to_lowercase(),
+            "wal",
+            "the reader pool is only sound under WAL journalling"
+        );
+
+        let reader = mem.pool.read().expect("test: reader checkout");
+        let conn = reader.connection().expect("test: reader connection");
+        let reader_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("test: reader journal_mode");
+        assert_eq!(reader_mode.to_lowercase(), "wal");
+
+        let error = conn
+            .execute("DELETE FROM memories", [])
+            .expect_err("test: a reader must refuse to mutate the database");
+        assert!(
+            error.to_string().to_lowercase().contains("readonly"),
+            "misrouted writes must fail loudly on a reader, got: {error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pooled_reads_are_actually_concurrent() {
+        const READERS: usize = 6;
+        let (_tmp, mem) = temp_sqlite_with_read_pool(READERS);
+        mem.store("pool-read-key", "pool read content", MemoryCategory::Core, None)
+            .await
+            .expect("test: seed row");
+
+        let (acquired_tx, acquired_rx) = mpsc::channel::<i64>();
+        let mut releases = Vec::with_capacity(READERS);
+        let mut handles = Vec::with_capacity(READERS);
+        for _ in 0..READERS {
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            releases.push(release_tx);
+            let pool = Arc::clone(&mem.pool);
+            let acquired = acquired_tx.clone();
+            handles.push(thread::spawn(move || {
+                let reader = pool.read().expect("test: reader checkout");
+                let count: i64 = reader
+                    .connection()
+                    .expect("test: reader connection")
+                    .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+                    .expect("test: count query");
+                acquired.send(count).expect("test: report acquisition");
+                // Keep holding the reader: if reads were serialized behind one
+                // connection the main thread could never collect every signal.
+                let _ = release_rx.recv();
+            }));
+        }
+        drop(acquired_tx);
+
+        for _ in 0..READERS {
+            let count = acquired_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("test: all readers must be held at the same time");
+            assert_eq!(count, 1);
+        }
+        let stats = mem.pool_stats();
+        assert_eq!(stats.max_readers, READERS);
+        assert_eq!(
+            stats.readers_in_use, READERS,
+            "every reader is checked out simultaneously"
+        );
+        assert_eq!(stats.saturated_reader_acquisitions, 0, "nobody had to queue");
+
+        for release in releases {
+            let _ = release.send(());
+        }
+        for handle in handles {
+            handle.join().expect("test: reader thread");
+        }
+        let stats = mem.pool_stats();
+        assert_eq!(stats.readers_in_use, 0);
+        assert_eq!(stats.readers_idle, READERS, "readers are recycled, not discarded");
+        assert_eq!(stats.reader_discards, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn saturated_read_pool_queues_instead_of_failing() {
+        let (_tmp, mem) = temp_sqlite_with_read_pool(1);
+        let held = mem.pool.read().expect("test: hold the only reader");
+
+        let pool = Arc::clone(&mem.pool);
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let waiter = thread::spawn(move || {
+            let reader = pool.read().expect("test: a queued checkout must not fail");
+            reader.connection().expect("test: queued reader connection");
+            done_tx.send(()).expect("test: report completion");
+        });
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a saturated pool must make the caller wait"
+        );
+        assert_eq!(mem.pool_stats().reader_waiters, 1, "the waiting caller is observable");
+
+        drop(held);
+        done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("test: the queued checkout completes once a reader is returned");
+        waiter.join().expect("test: waiter thread");
+
+        let stats = mem.pool_stats();
+        assert_eq!(stats.max_readers, 1);
+        assert!(stats.saturated_reader_acquisitions >= 1, "saturation is counted");
+        assert!(
+            stats.total_reader_wait >= Duration::from_millis(300),
+            "the wait is measured, not bounded: {:?}",
+            stats.total_reader_wait
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writes_and_reads_never_report_busy() {
+        const WRITERS: usize = 16;
+        let (_tmp, mem) = temp_sqlite_with_read_pool(8);
+        let mem = Arc::new(mem);
+
+        let mut writes = Vec::with_capacity(WRITERS);
+        let mut reads = Vec::with_capacity(WRITERS);
+        for index in 0..WRITERS {
+            let writer = Arc::clone(&mem);
+            writes.push(tokio::spawn(async move {
+                writer
+                    .store(
+                        &format!("busy-key-{index}"),
+                        &format!("busy content {index}"),
+                        MemoryCategory::Core,
+                        None,
+                    )
+                    .await
+            }));
+            let reader = Arc::clone(&mem);
+            reads.push(tokio::spawn(async move { reader.count().await }));
+        }
+
+        for task in writes {
+            let result = task.await.expect("test: writer task");
+            assert!(result.is_ok(), "concurrent write failed: {:?}", result.err());
+        }
+        for task in reads {
+            let result = task.await.expect("test: reader task");
+            assert!(result.is_ok(), "concurrent read failed: {:?}", result.err());
+        }
+
+        assert_eq!(mem.count().await.expect("test: final count"), WRITERS);
+        let stats = mem.pool_stats();
+        assert!(stats.write_acquisitions >= u64::try_from(WRITERS).unwrap_or(u64::MAX));
+        assert_eq!(stats.reader_discards, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn uncommitted_writes_stay_invisible_to_pooled_readers() {
+        let (_tmp, mem) = temp_sqlite_with_read_pool(2);
+        let count_iso = |mem: &SqliteMemory| -> i64 {
+            let reader = mem.pool.read().expect("test: reader checkout");
+            reader
+                .connection()
+                .expect("test: reader connection")
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE key = ?1",
+                    params!["isolation-key"],
+                    |row| row.get(0),
+                )
+                .expect("test: isolation count")
+        };
+
+        let mut writer = mem.pool.write();
+        let tx = writer.transaction().expect("test: begin transaction");
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO memories (id, key, content, category, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params!["isolation-id", "isolation-key", "isolation content", "core", now],
+        )
+        .expect("test: insert inside transaction");
+
+        assert_eq!(
+            count_iso(&mem),
+            0,
+            "a pooled reader is a separate connection and must not see an uncommitted write"
+        );
+
+        tx.commit().expect("test: commit");
+        drop(writer);
+
+        assert_eq!(count_iso(&mem), 1, "a committed write is visible to pooled readers");
+    }
+
+    #[tokio::test]
+    async fn reader_left_in_a_transaction_is_reset_before_reuse() {
+        let (_tmp, mem) = temp_sqlite_with_read_pool(1);
+        {
+            let reader = mem.pool.read().expect("test: reader checkout");
+            reader
+                .connection()
+                .expect("test: reader connection")
+                .execute_batch("BEGIN")
+                .expect("test: open a read transaction");
+        }
+        let reader = mem.pool.read().expect("test: reuse the only reader");
+        assert!(
+            reader.connection().expect("test: reader connection").is_autocommit(),
+            "a recycled reader must not carry an open transaction into the next caller"
+        );
+        assert_eq!(
+            mem.pool_stats().reader_discards,
+            0,
+            "the reader was reset, not thrown away"
+        );
     }
 }
