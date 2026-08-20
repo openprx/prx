@@ -96,6 +96,10 @@ const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
     // Test-only: the orphan-reclaim test must create a child that deliberately
     // bypasses the managed path, otherwise there is no orphan to detect.
     "src/runtime/registry.rs::unreaped_child_is_reported_as_an_orphan_then_reclaimed::let mut child = command.spawn().expect(\"test: spawn detached child\");",
+    // Test-only: proving the hang detector cleans up through `killpg` requires a
+    // child that no RAII path can reclaim, so the managed spawn (which kills on
+    // drop) would hide the very thing under test.
+    "src/agent/idle.rs::hung_turn_is_terminated_and_its_child_process_group_is_killed::let child = command.spawn().unwrap();",
     "src/runtime/shell_process.rs::spawn_managed_shell_child::let child = cmd.spawn()?;",
     "src/tunnel/cloudflare.rs::start::.spawn()?;",
     "src/tunnel/custom.rs::start::.spawn()?;",

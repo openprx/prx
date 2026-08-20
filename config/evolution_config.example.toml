@@ -8,8 +8,6 @@ mode = "shadow"
 storage_dir = "self/evolution"
 # JSONL batch write threshold (auto-flush when reached)
 batch_size = 64
-# Config hot-reload poll interval (seconds)
-poll_interval_secs = 3
 
 [runtime.retention]
 # Hot data retention (days)

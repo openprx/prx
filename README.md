@@ -15,7 +15,7 @@ Forked from [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) and extended w
 - **Web Console** — browser-based management interface (`console/`)
 - **Remote Nodes** — control macOS/Linux/Pi devices via `prx-node` agent
 - **Self-Evolution** — autonomous prompt/memory/strategy improvement with xin-managed scheduling
-- **Subagent Governance** — concurrency limits, depth control, config inheritance
+- **Subagent Spawning** — uncapped concurrency and nesting, config inheritance, live runs listed and ended with `prx tasks`
 - **Extensive automated test suite** — unit, integration, PTY, gateway, migration, and security coverage
 
 ### LLM Router Flags
