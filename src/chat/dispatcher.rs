@@ -2094,6 +2094,7 @@ fn chat_tool_execution_service(
     cancellation: CancellationToken,
     task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
 ) -> ToolExecutionService {
+    let workspace_dir = policy.workspace_dir.clone();
     let service = ToolExecutionService::from_shared_boxed_registry(
         registry,
         Arc::new(SecurityEffectPolicy::new(Arc::clone(&policy))),
@@ -2107,28 +2108,13 @@ fn chat_tool_execution_service(
         Arc::new(ChatToolExecutionPreparation { task_id, action_tx }),
         Arc::new(TracingToolExecutionAudit),
     );
-    #[cfg(test)]
-    let idempotency_memory = idempotency_memory.map(|memory| {
-        if matches!(memory.name(), "sqlite" | "postgres" | "lucid") {
-            memory
-        } else {
-            chat_test_idempotency_memory()
-        }
-    });
-    match idempotency_memory {
+    // The chat memory backend is whatever the operator configured; the ledger is
+    // resolved from it so a non-ledger backend still gets a durable ledger
+    // instead of refusing every side-effecting tool.
+    match idempotency_memory.and_then(|memory| crate::memory::tool_execution_ledger(&memory, &workspace_dir)) {
         Some(memory) => service.with_idempotency_memory(memory),
         None => service,
     }
-}
-
-#[cfg(test)]
-fn chat_test_idempotency_memory() -> Arc<dyn Memory> {
-    static MEMORY: std::sync::OnceLock<Arc<crate::memory::SqliteMemory>> = std::sync::OnceLock::new();
-    let memory = MEMORY.get_or_init(|| {
-        let path = std::env::temp_dir().join(format!("openprx-chat-test-ledger-{}", std::process::id()));
-        Arc::new(crate::memory::SqliteMemory::new(&path).expect("chat test idempotency ledger"))
-    });
-    Arc::clone(memory) as Arc<dyn Memory>
 }
 
 struct ReduxToolLoopEventSink {
@@ -2375,7 +2361,8 @@ async fn drive_start_turn_stream(
         None,
         None,
         None,
-        None,
+        // The adapter's ToolExecutionService already carries the resolved ledger.
+        crate::agent::loop_::ToolLoopMemory::none(),
         chat_mode,
         None,
         false,
@@ -3891,11 +3878,30 @@ impl StreamChunkCoalescer {
     }
 }
 
+/// Workspace for the chat tool tests, unique per process run.
+///
+/// The tool-execution ledger lives inside the workspace and is durable on
+/// purpose, so a fixed path would let one run's terminal records replay into the
+/// next run and skip the tool the tests are there to observe.
+#[cfg(test)]
+fn chat_test_workspace() -> std::path::PathBuf {
+    static WORKSPACE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    WORKSPACE
+        .get_or_init(|| {
+            std::env::temp_dir().join(format!(
+                "prx-chat-tool-tests-{}-{}",
+                std::process::id(),
+                uuid::Uuid::now_v7()
+            ))
+        })
+        .clone()
+}
+
 #[cfg(test)]
 fn tool_security_policy(level: crate::security::AutonomyLevel) -> Arc<crate::security::SecurityPolicy> {
     Arc::new(crate::security::SecurityPolicy {
         autonomy: level,
-        workspace_dir: std::path::PathBuf::from("/tmp/prx-chat-tool-tests"),
+        workspace_dir: chat_test_workspace(),
         ..crate::security::SecurityPolicy::default()
     })
 }

@@ -826,9 +826,14 @@ impl ToolExecutionService {
 
     /// Attach the durable MessageEvent ledger used to reserve and replay
     /// idempotent tool executions.
+    ///
+    /// Callers resolve the ledger through `crate::memory::tool_execution_ledger`,
+    /// which already guarantees a ledger-capable backend. The check here stays as
+    /// a last line of defence: a backend without a durable event log would
+    /// otherwise record reservations that never survive a crash.
     #[must_use]
     pub fn with_idempotency_memory(mut self, memory: Arc<dyn Memory>) -> Self {
-        if matches!(memory.name(), "sqlite" | "postgres" | "lucid") {
+        if crate::memory::serves_tool_execution_ledger(memory.name()) {
             self.idempotency_memory = Some(memory);
         } else {
             tracing::warn!(

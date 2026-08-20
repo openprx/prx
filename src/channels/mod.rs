@@ -3469,7 +3469,11 @@ async fn run_channel_turn(
                     Some(&scope_ctx),
                     Some(tool_event_tx.clone()),
                     Some(&message_runtime.tool_tiering),
-                    Some(DocumentIngestRuntime::from_scope(ctx.memory.clone(), &scope_ctx)),
+                    crate::agent::loop_::ToolLoopMemory::new(
+                        &ctx.memory,
+                        &ctx.workspace_dir,
+                        Some(DocumentIngestRuntime::from_scope(ctx.memory.clone(), &scope_ctx)),
+                    ),
                     crate::agent::loop_::ChatMode::default(),
                     None,
                     // expose_stay_silent: ONLY on smart group turns. DMs / non-smart
@@ -7534,7 +7538,12 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
-    struct MockPriceTool;
+    /// Counts its own executions, so a test can tell "the tool ran" from "the
+    /// tool was refused and the model was handed the refusal as tool output".
+    #[derive(Default)]
+    struct MockPriceTool {
+        executions: Arc<AtomicUsize>,
+    }
 
     #[derive(Default)]
     struct ModelCaptureProvider {
@@ -7587,6 +7596,7 @@ BTC is currently around $65,000 based on latest tool output."#
         }
 
         async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
             let symbol = args.get("symbol").and_then(serde_json::Value::as_str);
             if symbol != Some("BTC") {
                 return Ok(ToolResult {
@@ -7606,12 +7616,17 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[tokio::test]
     async fn process_channel_message_executes_tool_calls_instead_of_sending_raw_json() {
+        let dir = TempDir::new().expect("test: tempdir");
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
+        // The mock provider answers the same canned sentence for any `[Tool
+        // results]` block, refusal text included, so the reply alone cannot tell
+        // a run tool from a refused one. Count the executions instead.
+        let executions = Arc::new(AtomicUsize::new(0));
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             config: crate::config::new_shared(Config::default()),
             config_generation: crate::config::new_shared(Config::default()).pin(),
@@ -7619,9 +7634,11 @@ BTC is currently around $65,000 based on latest tool output."#
             provider: Arc::new(ToolCallingProvider),
             default_provider: Arc::new("test-provider".to_string()),
             memory: Arc::new(NoopMemory),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool {
+                executions: Arc::clone(&executions),
+            })]),
             observer: Arc::new(NoopObserver),
-            hooks: Arc::new(HookManager::new(std::env::temp_dir())),
+            hooks: Arc::new(HookManager::new(dir.path().to_path_buf())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
@@ -7639,7 +7656,7 @@ BTC is currently around $65,000 based on latest tool output."#
             api_url: None,
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
+            workspace_dir: Arc::new(dir.path().to_path_buf()),
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -7681,6 +7698,12 @@ BTC is currently around $65,000 based on latest tool output."#
             CancellationToken::new(),
         )
         .await;
+
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "the tool must actually have run; a refusal would also have produced a [Tool results] block"
+        );
 
         let sent_messages = channel_impl.sent_messages.lock().await;
         let responses = response_messages(&sent_messages);
@@ -7899,6 +7922,289 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(
             lines, 1,
             "the replay must not run the tool a second time; audit file: {appended:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Tool outcome fidelity: a channel turn must tell "the tool ran", "the tool
+    // was refused" and "the tool failed" apart.
+    //
+    // A mock provider that answers the same canned sentence whenever the history
+    // shows *any* `[Tool results]` block passes all three ways, because a refusal
+    // and a failure are both delivered to the model as tool result text. These
+    // tests assert the side effect on disk and the exact text the model saw.
+    // ---------------------------------------------------------------------
+
+    /// Writes a file when it runs. The name is deliberately absent from
+    /// `READ_ONLY_TOOLS`, so its descriptor effect is `ToolEffect::Act` and the
+    /// idempotency ledger is mandatory for it.
+    struct OutcomeProbeTool {
+        path: std::path::PathBuf,
+        /// When set, the tool reports failure instead of writing.
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for OutcomeProbeTool {
+        fn name(&self) -> &str {
+            "outcome_probe_write"
+        }
+
+        fn description(&self) -> &str {
+            "Write a marker file"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {}, "additionalProperties": false })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            if self.fail {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("outcome probe was told to fail".to_string()),
+                });
+            }
+            std::fs::write(&self.path, "written by the tool")?;
+            Ok(ToolResult {
+                success: true,
+                output: "outcome probe wrote the marker".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    /// Asks for the side-effecting tool once, then records verbatim every
+    /// `[Tool results]` block it is shown so a test can assert on the text the
+    /// model actually received rather than on "the turn did not crash".
+    #[derive(Default)]
+    struct OutcomeRecordingProvider {
+        observed_tool_results: parking_lot::Mutex<Vec<String>>,
+    }
+
+    fn outcome_probe_call_payload() -> String {
+        r#"<tool_call>
+{"name":"outcome_probe_write","arguments":{}}
+</tool_call>"#
+            .to_string()
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for OutcomeRecordingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(outcome_probe_call_payload())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let tool_results = messages
+                .iter()
+                .filter(|message| message.content.contains("[Tool results]"))
+                .map(|message| message.content.clone())
+                .collect::<Vec<_>>();
+            if tool_results.is_empty() {
+                return Ok(outcome_probe_call_payload());
+            }
+            self.observed_tool_results.lock().extend(tool_results);
+            Ok("acknowledged".to_string())
+        }
+    }
+
+    /// Runtime context for the outcome-fidelity tests: an explicit memory backend
+    /// and workspace, because both decide whether a durable ledger is reachable.
+    fn outcome_runtime_ctx(
+        workspace_dir: &std::path::Path,
+        memory: Arc<dyn Memory>,
+        provider: Arc<dyn Provider>,
+        tools: Vec<Box<dyn Tool>>,
+        channel: Arc<dyn Channel>,
+    ) -> Arc<ChannelRuntimeContext> {
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+        Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
+            channels_by_name: Arc::new(channels_by_name),
+            provider,
+            default_provider: Arc::new("test-provider".to_string()),
+            memory,
+            tools_registry: Arc::new(tools),
+            observer: Arc::new(NoopObserver),
+            hooks: Arc::new(HookManager::new(workspace_dir.to_path_buf())),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
+            max_tool_iterations: 10,
+            read_only_tool_concurrency_window: 2,
+            priority_scheduling_enabled: false,
+            low_priority_tools: Vec::new(),
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(workspace_dir.to_path_buf()),
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            tool_tiering: crate::config::ToolTieringConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
+            bot_names: vec!["prx".to_string()],
+            bot_uuids: vec![],
+            mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+            })),
+            native_tools: false,
+            skill_rag_ctx: None,
+            test_inbound_authorizer: None,
+        })
+    }
+
+    /// Drive one channel turn and return the `[Tool results]` text the model saw.
+    async fn run_outcome_turn(
+        workspace_dir: &std::path::Path,
+        memory: Arc<dyn Memory>,
+        tool: OutcomeProbeTool,
+    ) -> Vec<String> {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider = Arc::new(OutcomeRecordingProvider::default());
+        let runtime_ctx = outcome_runtime_ctx(
+            workspace_dir,
+            memory,
+            Arc::clone(&provider) as Arc<dyn Provider>,
+            vec![Box::new(tool) as Box<dyn Tool>],
+            channel,
+        );
+        process_channel_message(
+            Arc::clone(&runtime_ctx),
+            evidence_message("outcome-1", "please run the probe"),
+            CancellationToken::new(),
+        )
+        .await;
+        provider.observed_tool_results.lock().clone()
+    }
+
+    /// The load-bearing assertion: with a ledger reachable, a side-effecting tool
+    /// invoked by a real channel turn leaves its side effect on disk.
+    ///
+    /// The memory backend here is `markdown`, which keeps no durable
+    /// `MessageEvent` log of its own. The ledger must still be there, resolved as
+    /// runtime infrastructure rather than borrowed from the memory backend.
+    #[tokio::test]
+    async fn channel_turn_side_effect_tool_actually_writes_its_file() {
+        let dir = TempDir::new().expect("test: tempdir");
+        let marker = dir.path().join("marker.txt");
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::MarkdownMemory::new(dir.path()));
+
+        let observed = run_outcome_turn(
+            dir.path(),
+            memory,
+            OutcomeProbeTool {
+                path: marker.clone(),
+                fail: false,
+            },
+        )
+        .await;
+
+        let written = std::fs::read_to_string(&marker)
+            .expect("test: the side-effecting tool must actually have written its file");
+        assert_eq!(written, "written by the tool");
+        assert!(
+            observed
+                .iter()
+                .any(|text| text.contains("outcome probe wrote the marker")),
+            "the model must be shown the tool's own success output: {observed:?}"
+        );
+        assert!(
+            !observed.iter().any(|text| text.contains("refusing side effect")),
+            "a reachable ledger must not produce a refusal: {observed:?}"
+        );
+    }
+
+    /// A tool that reports failure is distinguishable from one that was refused:
+    /// no side effect, and the tool's own error text reaches the model.
+    #[tokio::test]
+    async fn channel_turn_failing_tool_reports_its_own_error_and_writes_nothing() {
+        let dir = TempDir::new().expect("test: tempdir");
+        let marker = dir.path().join("marker.txt");
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::MarkdownMemory::new(dir.path()));
+
+        let observed = run_outcome_turn(
+            dir.path(),
+            memory,
+            OutcomeProbeTool {
+                path: marker.clone(),
+                fail: true,
+            },
+        )
+        .await;
+
+        assert!(!marker.exists(), "a failing tool must not leave the side effect behind");
+        assert!(
+            observed
+                .iter()
+                .any(|text| text.contains("outcome probe was told to fail")),
+            "the model must be shown the tool's own error: {observed:?}"
+        );
+        assert!(
+            !observed.iter().any(|text| text.contains("refusing side effect")),
+            "a tool failure must not be reported as a ledger refusal: {observed:?}"
+        );
+    }
+
+    /// The fail-closed half of the contract: when no ledger can be opened at all,
+    /// the side-effecting tool is refused, nothing is written, and the model is
+    /// told so in as many words.
+    ///
+    /// The workspace is a regular file, so the dedicated ledger cannot be created
+    /// under it and no ledger is reachable by any route.
+    #[tokio::test]
+    async fn channel_turn_without_any_reachable_ledger_refuses_the_side_effect() {
+        let dir = TempDir::new().expect("test: tempdir");
+        let marker = dir.path().join("marker.txt");
+        let blocked_workspace = dir.path().join("workspace-is-a-file");
+        std::fs::write(&blocked_workspace, "not a directory").expect("test: block the workspace");
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::MarkdownMemory::new(dir.path()));
+
+        let observed = run_outcome_turn(
+            &blocked_workspace,
+            memory,
+            OutcomeProbeTool {
+                path: marker.clone(),
+                fail: false,
+            },
+        )
+        .await;
+
+        assert!(
+            !marker.exists(),
+            "a refused tool must not have produced its side effect"
+        );
+        assert!(
+            observed.iter().any(|text| text.contains("refusing side effect")),
+            "the model must be told the side effect was refused: {observed:?}"
         );
     }
 
@@ -8488,7 +8794,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider: Arc::new(RawToolArtifactProvider),
             default_provider: Arc::new("test-provider".to_string()),
             memory: Arc::new(NoopMemory),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool::default())]),
             observer: Arc::new(NoopObserver),
             hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -8563,12 +8869,16 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[tokio::test]
     async fn process_channel_message_executes_tool_calls_with_alias_tags() {
+        let dir = TempDir::new().expect("test: tempdir");
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
+        // A refusal reaches the model as a [Tool results] block too, so count
+        // the executions rather than trusting the canned reply.
+        let executions = Arc::new(AtomicUsize::new(0));
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             config: crate::config::new_shared(Config::default()),
             config_generation: crate::config::new_shared(Config::default()).pin(),
@@ -8576,9 +8886,11 @@ BTC is currently around $65,000 based on latest tool output."#
             provider: Arc::new(ToolCallingAliasProvider),
             default_provider: Arc::new("test-provider".to_string()),
             memory: Arc::new(NoopMemory),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool {
+                executions: Arc::clone(&executions),
+            })]),
             observer: Arc::new(NoopObserver),
-            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
+            hooks: Arc::new(crate::hooks::HookManager::new(dir.path().to_path_buf())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
@@ -8596,7 +8908,7 @@ BTC is currently around $65,000 based on latest tool output."#
             api_url: None,
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
+            workspace_dir: Arc::new(dir.path().to_path_buf()),
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
             signal_inbound_policy: None,
@@ -8647,6 +8959,12 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(response.contains("alias-tag flow resolved"));
         assert!(!response.contains("<toolcall>"));
         assert!(!response.contains("mock_price"));
+        drop(sent_messages);
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "the alias-tagged call must actually have executed the tool, not been refused"
+        );
     }
 
     #[tokio::test]
@@ -9249,7 +9567,7 @@ BTC is currently around $65,000 based on latest tool output."#
             }),
             default_provider: Arc::new("test-provider".to_string()),
             memory: Arc::new(NoopMemory),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool::default())]),
             observer: Arc::new(NoopObserver),
             hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -9338,7 +9656,7 @@ BTC is currently around $65,000 based on latest tool output."#
             }),
             default_provider: Arc::new("test-provider".to_string()),
             memory: Arc::new(NoopMemory),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool::default())]),
             observer: Arc::new(NoopObserver),
             hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -11730,7 +12048,7 @@ After"#;
 
     #[test]
     fn sanitize_channel_response_removes_isolated_tool_tag_artifacts() {
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool::default())];
         let input = r#"<tool_call name="mock_price">
 {"name":"mock_price","arguments":{"symbol":"BTC"}}
 </tool_call>"#;

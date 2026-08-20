@@ -21,7 +21,7 @@ pub mod vector;
 
 pub use backend::{
     MemoryBackendKind, classify_memory_backend, default_memory_backend_key, memory_backend_profile,
-    selectable_memory_backends,
+    selectable_memory_backends, serves_tool_execution_ledger,
 };
 #[allow(unused_imports)]
 pub use fabric::{MemoryEventRecording, MemoryEventWatcher, MemoryFabric, MessageEventScope, RuntimeAuthorityGuard};
@@ -50,7 +50,7 @@ use crate::config::{
 use anyhow::Context;
 use chrono::Local;
 use rusqlite::{Connection, params};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -189,6 +189,65 @@ pub fn create_embedder_from_config(
         &resolved.model,
         resolved.dimensions,
     ))
+}
+
+/// File name of the dedicated tool-execution ledger, opened inside the
+/// workspace `memory/` directory when the configured backend cannot serve as
+/// one itself.
+const TOOL_LEDGER_DB_FILE: &str = "tool-ledger.db";
+
+/// Process-wide cache of dedicated ledgers, keyed by ledger file path.
+///
+/// One `SqliteMemory` per path keeps a single connection pool per ledger file
+/// instead of reopening it for every turn.
+static TOOL_LEDGERS: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<PathBuf, Arc<SqliteMemory>>>> =
+    std::sync::OnceLock::new();
+
+/// Resolve the durable ledger that backs tool-execution idempotency.
+///
+/// The ledger is execution infrastructure rather than a memory feature: without
+/// one, every side-effecting tool is refused. A configured backend that already
+/// keeps a durable `MessageEvent` log serves as its own ledger; every other
+/// backend (`markdown`, `none`, custom) gets a dedicated workspace-local SQLite
+/// ledger so idempotency is preserved instead of silently disabling every
+/// side-effecting tool.
+///
+/// Returns `None` only when the dedicated ledger cannot be opened. Callers then
+/// run without a ledger, which keeps the fail-closed refusal intact.
+pub fn tool_execution_ledger(memory: &Arc<dyn Memory>, workspace_dir: &Path) -> Option<Arc<dyn Memory>> {
+    if backend::serves_tool_execution_ledger(memory.name()) {
+        return Some(Arc::clone(memory));
+    }
+    dedicated_tool_execution_ledger(workspace_dir)
+}
+
+/// Open the workspace-local tool-execution ledger without consulting a memory
+/// backend.
+///
+/// For runtimes that hold no memory handle at all. They still run
+/// side-effecting tools, so they still need a ledger.
+pub fn dedicated_tool_execution_ledger(workspace_dir: &Path) -> Option<Arc<dyn Memory>> {
+    let path = workspace_dir.join("memory").join(TOOL_LEDGER_DB_FILE);
+    let cache = TOOL_LEDGERS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = cache.lock();
+    if let Some(existing) = guard.get(&path) {
+        return Some(Arc::clone(existing) as Arc<dyn Memory>);
+    }
+    match SqliteMemory::new_with_path(path.clone()) {
+        Ok(ledger) => {
+            let ledger = Arc::new(ledger);
+            guard.insert(path, Arc::clone(&ledger));
+            Some(ledger as Arc<dyn Memory>)
+        }
+        Err(error) => {
+            tracing::error!(
+                path = %path.display(),
+                error = %error,
+                "unable to open the dedicated tool-execution ledger; side-effecting tools will be refused"
+            );
+            None
+        }
+    }
 }
 
 /// Factory: create the right memory backend from config
@@ -658,6 +717,45 @@ mod tests {
                 dimensions: 1536,
                 api_key: Some("base-key".into()),
             }
+        );
+    }
+    #[test]
+    fn tool_execution_ledger_reuses_a_backend_that_already_keeps_an_event_log() {
+        let dir = tempfile::TempDir::new().expect("test: tempdir");
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).expect("test: sqlite memory"));
+        let ledger = tool_execution_ledger(&memory, dir.path()).expect("test: ledger");
+        assert!(
+            Arc::ptr_eq(&memory, &ledger),
+            "a ledger-capable backend must serve as its own ledger"
+        );
+    }
+
+    #[test]
+    fn tool_execution_ledger_opens_a_dedicated_store_for_a_backend_without_an_event_log() {
+        let dir = tempfile::TempDir::new().expect("test: tempdir");
+        let memory: Arc<dyn Memory> = Arc::new(MarkdownMemory::new(dir.path()));
+        let ledger = tool_execution_ledger(&memory, dir.path()).expect("test: ledger");
+        assert_eq!(ledger.name(), "sqlite");
+        assert!(
+            dir.path().join("memory").join(TOOL_LEDGER_DB_FILE).exists(),
+            "the dedicated ledger must be a real file in the workspace"
+        );
+        let again = tool_execution_ledger(&memory, dir.path()).expect("test: ledger");
+        assert!(
+            Arc::ptr_eq(&ledger, &again),
+            "the dedicated ledger must be opened once per workspace"
+        );
+    }
+
+    #[test]
+    fn tool_execution_ledger_is_absent_when_the_dedicated_store_cannot_be_opened() {
+        let dir = tempfile::TempDir::new().expect("test: tempdir");
+        let blocked = dir.path().join("workspace-is-a-file");
+        std::fs::write(&blocked, "not a directory").expect("test: block the workspace");
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        assert!(
+            tool_execution_ledger(&memory, &blocked).is_none(),
+            "an unopenable ledger must stay absent so side effects keep being refused"
         );
     }
 }

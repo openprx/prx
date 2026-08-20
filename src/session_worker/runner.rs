@@ -669,9 +669,15 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
             scope_ctx.as_ref(),
             None,
             Some(&config.tool_tiering),
-            scope_ctx
-                .as_ref()
-                .map(|ctx| DocumentIngestRuntime::from_scope(memory.clone(), ctx)),
+            // The ledger comes from `memory` directly: a session worker without a
+            // resolved ingest scope must still be able to run side-effecting tools.
+            crate::agent::loop_::ToolLoopMemory::new(
+                &memory,
+                &manifest.workspace_dir,
+                scope_ctx
+                    .as_ref()
+                    .map(|ctx| DocumentIngestRuntime::from_scope(memory.clone(), ctx)),
+            ),
             crate::agent::loop_::ChatMode::default(),
         )
         .await;

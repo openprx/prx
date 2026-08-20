@@ -2034,10 +2034,14 @@ async fn run_gateway_chat_with_multimodal(
         Some(&gateway_scope_ctx), // P1-a: gateway turns now route through decide()
         None,                     // no tool call notifications
         Some(&config_snapshot.tool_tiering),
-        Some(DocumentIngestRuntime::from_envelope(
-            state.mem.clone(),
-            &runtime_envelope,
-        )),
+        crate::agent::loop_::ToolLoopMemory::new(
+            &state.mem,
+            &config_snapshot.workspace_dir,
+            Some(DocumentIngestRuntime::from_envelope(
+                state.mem.clone(),
+                &runtime_envelope,
+            )),
+        ),
         crate::agent::loop_::ChatMode::default(),
     )
     .await;

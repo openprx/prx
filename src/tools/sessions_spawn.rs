@@ -3035,7 +3035,7 @@ async fn run_sub_agent_task(
         let spawner_beat = crate::agent::idle::current_beat();
         let mut loop_handle = tokio::spawn(crate::agent::idle::scope_beat(spawner_beat, async move {
             let observer = NoopObserver;
-            let hooks = HookManager::new(workspace_dir_owned);
+            let hooks = HookManager::new(workspace_dir_owned.clone());
             let scope_ctx = scope_owned.as_ref().map(|scope| ScopeContext {
                 policy: &security,
                 sender: scope.sender.as_str(),
@@ -3081,11 +3081,20 @@ async fn run_sub_agent_task(
                 scope_ctx.as_ref(),
                 on_tool_call_iter, // chat event bridge: tool-call notifications (v1.1a)
                 None,              // spawned sessions do not use tool tiering
-                scope_ctx.as_ref().and_then(|ctx| {
-                    memory_owned
-                        .as_ref()
-                        .map(|memory| DocumentIngestRuntime::from_scope(memory.clone(), ctx))
-                }),
+                // The ledger is keyed off the shared memory alone: a spawned
+                // session without an ingest scope must still run write tools.
+                memory_owned.as_ref().map_or_else(
+                    || crate::agent::loop_::ToolLoopMemory::ledger_only(&workspace_dir_owned),
+                    |memory| {
+                        crate::agent::loop_::ToolLoopMemory::new(
+                            memory,
+                            &workspace_dir_owned,
+                            scope_ctx
+                                .as_ref()
+                                .map(|ctx| DocumentIngestRuntime::from_scope(memory.clone(), ctx)),
+                        )
+                    },
+                ),
                 crate::agent::loop_::ChatMode::default(),
                 approval_resolver_iter,
                 false,

@@ -364,9 +364,13 @@ async fn run_console_runtime_turn(
         Some(&scope_ctx),
         None,
         Some(&config_snapshot.tool_tiering),
-        Some(
-            DocumentIngestRuntime::from_envelope(state.mem.clone(), &turn_envelope)
-                .with_source_message_event_id(source_message_event_id),
+        crate::agent::loop_::ToolLoopMemory::new(
+            &state.mem,
+            &config_snapshot.workspace_dir,
+            Some(
+                DocumentIngestRuntime::from_envelope(state.mem.clone(), &turn_envelope)
+                    .with_source_message_event_id(source_message_event_id),
+            ),
         ),
         crate::agent::loop_::ChatMode::default(),
     )

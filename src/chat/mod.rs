@@ -6691,9 +6691,13 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // Inject memory context
         let runtime_envelope = chat_runtime_envelope(memory_fabric.workspace_id(), &chat_session_key)
             .with_config_generation(&ctx.config_generation);
-        let document_ingest = Some(
-            DocumentIngestRuntime::from_envelope(mem.clone(), &runtime_envelope)
-                .with_source_message_event_id(chat_user_event.as_ref().map(|event| event.event_id.clone())),
+        let memory_runtime = crate::agent::loop_::ToolLoopMemory::new(
+            &mem,
+            &config.workspace_dir,
+            Some(
+                DocumentIngestRuntime::from_envelope(mem.clone(), &runtime_envelope)
+                    .with_source_message_event_id(chat_user_event.as_ref().map(|event| event.event_id.clone())),
+            ),
         );
         let semantic_scope = chat_runtime_write_context(&runtime_envelope);
         let mem_context = build_context_with_shared_events_and_scope(
@@ -7664,7 +7668,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 provider.as_ref(),
                 model_name,
                 &effective_compaction.config,
-                document_ingest.as_ref(),
+                memory_runtime.ingest(),
                 "chat_preflight",
                 Duration::from_secs(crate::agent::loop_::COMPACTION_TIMEOUT_SECS),
             )
@@ -7757,7 +7761,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             Some(&scope_ctx),
                             Some(tool_event_tx.clone()),
                             Some(&config.tool_tiering),
-                            document_ingest.clone(),
+                            memory_runtime.clone(),
                             chat_session.mode,
                         ),
                     ),
@@ -7793,7 +7797,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         provider.as_ref(),
                         model_name,
                         &effective_compaction.config,
-                        document_ingest.as_ref(),
+                        memory_runtime.ingest(),
                         "chat_context_overflow",
                         Duration::from_secs(crate::agent::loop_::COMPACTION_TIMEOUT_SECS),
                     )

@@ -375,7 +375,7 @@ async fn run_agent_fixture(
         None,
         on_tool_call,
         None,
-        Some(document_ingest),
+        crate::agent::loop_::ToolLoopMemory::from_ingest_for_test(document_ingest),
         crate::agent::loop_::ChatMode::Edit,
         None,
         false,

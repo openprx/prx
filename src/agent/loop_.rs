@@ -245,6 +245,65 @@ pub(crate) struct ScopeContext<'a> {
     pub config_source_revision: Option<&'a str>,
 }
 
+/// The two memory handles a tool loop needs, kept apart on purpose.
+///
+/// `ledger` is the durable tool-execution idempotency ledger: without it every
+/// side-effecting tool is refused, so it must be present on every entry point
+/// that can run one. `ingest` is the optional document-ingest runtime used to
+/// page oversized tool output into memory, and it needs a resolved scope that
+/// some entry points simply do not have.
+///
+/// They used to travel as a single `Option<DocumentIngestRuntime>`, which tied
+/// the ledger to whether document ingest happened to be configured. Any entry
+/// point without an ingest scope silently lost every side-effecting tool.
+#[derive(Clone, Default)]
+pub(crate) struct ToolLoopMemory {
+    ledger: Option<Arc<dyn Memory>>,
+    ingest: Option<DocumentIngestRuntime>,
+}
+
+impl ToolLoopMemory {
+    /// Resolve the ledger for `memory` and pair it with an optional ingest runtime.
+    pub(crate) fn new(memory: &Arc<dyn Memory>, workspace_dir: &Path, ingest: Option<DocumentIngestRuntime>) -> Self {
+        Self {
+            ledger: crate::memory::tool_execution_ledger(memory, workspace_dir),
+            ingest,
+        }
+    }
+
+    /// The document-ingest runtime, when this entry point resolved a scope for it.
+    pub(crate) const fn ingest(&self) -> Option<&DocumentIngestRuntime> {
+        self.ingest.as_ref()
+    }
+
+    /// Test helper: derive the ledger from the ingest runtime's own memory.
+    #[cfg(test)]
+    pub(crate) fn from_ingest_for_test(ingest: DocumentIngestRuntime) -> Self {
+        let memory = Arc::clone(&ingest.memory);
+        Self {
+            ledger: crate::memory::serves_tool_execution_ledger(memory.name()).then_some(memory),
+            ingest: Some(ingest),
+        }
+    }
+
+    /// A ledger resolved from the workspace alone, for runtimes that hold no
+    /// memory handle but still run side-effecting tools.
+    pub(crate) fn ledger_only(workspace_dir: &Path) -> Self {
+        Self {
+            ledger: crate::memory::dedicated_tool_execution_ledger(workspace_dir),
+            ingest: None,
+        }
+    }
+
+    /// No ledger and no ingest runtime.
+    ///
+    /// Only for callers that supply their own [`ToolLoopRuntimeAdapter`], whose
+    /// `ToolExecutionService` already carries a ledger.
+    pub(crate) fn none() -> Self {
+        Self::default()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct DocumentIngestRuntime {
     memory: Arc<dyn Memory>,
@@ -3554,7 +3613,7 @@ pub(crate) async fn agent_turn(
     read_only_tool_concurrency_window: usize,
     priority_scheduling_enabled: bool,
     low_priority_tool_names: Vec<String>,
-    document_ingest: Option<DocumentIngestRuntime>,
+    memory_runtime: ToolLoopMemory,
 ) -> Result<(String, ToolLoopTrace)> {
     run_tool_call_loop_traced(
         provider,
@@ -3579,7 +3638,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         None,
-        document_ingest,
+        memory_runtime,
         ChatMode::default(),
     )
     .await
@@ -5564,7 +5623,7 @@ pub(crate) async fn run_tool_call_loop(
     scope_ctx: Option<&ScopeContext<'_>>,
     on_tool_call: Option<tokio::sync::mpsc::Sender<ToolCallNotification>>,
     tool_tiering: Option<&crate::config::ToolTieringConfig>,
-    document_ingest: Option<DocumentIngestRuntime>,
+    memory_runtime: ToolLoopMemory,
     chat_mode: ChatMode,
 ) -> Result<String> {
     let (text, trace) = run_tool_call_loop_traced(
@@ -5590,7 +5649,7 @@ pub(crate) async fn run_tool_call_loop(
         scope_ctx,
         on_tool_call,
         tool_tiering,
-        document_ingest,
+        memory_runtime,
         chat_mode,
     )
     .await?;
@@ -5640,7 +5699,7 @@ pub(crate) async fn run_tool_call_loop_traced(
     scope_ctx: Option<&ScopeContext<'_>>,
     on_tool_call: Option<tokio::sync::mpsc::Sender<ToolCallNotification>>,
     tool_tiering: Option<&crate::config::ToolTieringConfig>,
-    document_ingest: Option<DocumentIngestRuntime>,
+    memory_runtime: ToolLoopMemory,
     chat_mode: ChatMode,
 ) -> Result<(String, ToolLoopTrace)> {
     let (outcome, trace) = run_tool_call_loop_outcome(
@@ -5666,7 +5725,7 @@ pub(crate) async fn run_tool_call_loop_traced(
         scope_ctx,
         on_tool_call,
         tool_tiering,
-        document_ingest,
+        memory_runtime,
         chat_mode,
         None,
         false,
@@ -5727,7 +5786,7 @@ pub(crate) async fn run_tool_call_loop_outcome(
     scope_ctx: Option<&ScopeContext<'_>>,
     on_tool_call: Option<tokio::sync::mpsc::Sender<ToolCallNotification>>,
     tool_tiering: Option<&crate::config::ToolTieringConfig>,
-    document_ingest: Option<DocumentIngestRuntime>,
+    memory_runtime: ToolLoopMemory,
     chat_mode: ChatMode,
     approval_resolver: Option<Arc<dyn ApprovalResolver>>,
     expose_stay_silent: bool,
@@ -5762,7 +5821,7 @@ pub(crate) async fn run_tool_call_loop_outcome(
         scope_ctx,
         on_tool_call,
         tool_tiering,
-        document_ingest,
+        memory_runtime,
         chat_mode,
         approval_resolver,
         expose_stay_silent,
@@ -5805,7 +5864,7 @@ async fn run_tool_call_loop_outcome_unguarded(
     scope_ctx: Option<&ScopeContext<'_>>,
     on_tool_call: Option<tokio::sync::mpsc::Sender<ToolCallNotification>>,
     tool_tiering: Option<&crate::config::ToolTieringConfig>,
-    document_ingest: Option<DocumentIngestRuntime>,
+    memory_runtime: ToolLoopMemory,
     chat_mode: ChatMode,
     approval_resolver: Option<Arc<dyn ApprovalResolver>>,
     expose_stay_silent: bool,
@@ -5816,6 +5875,10 @@ async fn run_tool_call_loop_outcome_unguarded(
     } else {
         max_tool_iterations.min(MAX_TOOL_ITERATIONS_CAP)
     };
+    let ToolLoopMemory {
+        ledger,
+        ingest: document_ingest,
+    } = memory_runtime;
     let runtime_adapter = runtime_adapter.unwrap_or_else(|| {
         let (policy, tool_execution_context) = agent_tool_execution_context(scope_ctx, channel_name);
         let approval_strategy = AgentToolApprovalStrategy {
@@ -5832,8 +5895,8 @@ async fn run_tool_call_loop_outcome_unguarded(
             Arc::new(crate::tools::AdapterOwnedPreparation),
             Arc::new(crate::tools::TracingToolExecutionAudit),
         );
-        if let Some(document_ingest) = document_ingest.as_ref() {
-            service = service.with_idempotency_memory(Arc::clone(&document_ingest.memory));
+        if let Some(ledger) = ledger.as_ref() {
+            service = service.with_idempotency_memory(Arc::clone(ledger));
         }
         ToolLoopRuntimeAdapter {
             events: None,
@@ -7129,9 +7192,13 @@ pub(crate) async fn run_with_runtime_envelope(
             }
 
             // Inject memory context into user message
-            let document_ingest = Some(
-                DocumentIngestRuntime::from_envelope(mem.clone(), &runtime_envelope)
-                    .with_source_message_event_id(agent_user_event.as_ref().map(|event| event.event_id.clone())),
+            let memory_runtime = ToolLoopMemory::new(
+                &mem,
+                &config.workspace_dir,
+                Some(
+                    DocumentIngestRuntime::from_envelope(mem.clone(), &runtime_envelope)
+                        .with_source_message_event_id(agent_user_event.as_ref().map(|event| event.event_id.clone())),
+                ),
             );
             let semantic_scope = runtime_envelope.memory_write_context("private");
             let mem_context = build_context_with_shared_events_and_scope(
@@ -7241,7 +7308,7 @@ pub(crate) async fn run_with_runtime_envelope(
                         None,
                         None,
                         Some(&config.tool_tiering),
-                        document_ingest,
+                        memory_runtime,
                         ChatMode::default(),
                     ),
                 )
@@ -7504,9 +7571,13 @@ pub(crate) async fn run_with_runtime_envelope(
             }
 
             // Inject memory context into user message
-            let document_ingest = Some(
-                DocumentIngestRuntime::from_envelope(mem.clone(), &runtime_envelope)
-                    .with_source_message_event_id(agent_user_event.as_ref().map(|event| event.event_id.clone())),
+            let memory_runtime = ToolLoopMemory::new(
+                &mem,
+                &config.workspace_dir,
+                Some(
+                    DocumentIngestRuntime::from_envelope(mem.clone(), &runtime_envelope)
+                        .with_source_message_event_id(agent_user_event.as_ref().map(|event| event.event_id.clone())),
+                ),
             );
             let semantic_scope = runtime_envelope.memory_write_context("private");
             let mem_context = build_context_with_shared_events_and_scope(
@@ -7648,7 +7719,7 @@ pub(crate) async fn run_with_runtime_envelope(
                         None,
                         None,
                         Some(&config.tool_tiering),
-                        document_ingest,
+                        memory_runtime,
                         ChatMode::default(),
                     ),
                 )
@@ -7977,7 +8048,11 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         config.agent.read_only_tool_concurrency_window,
         config.agent.priority_scheduling_enabled,
         config.agent.low_priority_tools.clone(),
-        Some(DocumentIngestRuntime::from_envelope(mem.clone(), &runtime_envelope)),
+        ToolLoopMemory::new(
+            &mem,
+            &config.workspace_dir,
+            Some(DocumentIngestRuntime::from_envelope(mem.clone(), &runtime_envelope)),
+        ),
     )
     .await;
     let (response, turn_trace) = match turn_result {
@@ -8840,7 +8915,7 @@ mod tests {
             None,
             None,
             None,
-            Some(document_ingest),
+            ToolLoopMemory::from_ingest_for_test(document_ingest),
             ChatMode::default(),
         )
         .await
@@ -9048,7 +9123,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            ToolLoopMemory::none(),
             ChatMode::default(),
         )
         .await
@@ -9087,6 +9162,33 @@ mod tests {
             "earlier-turn fallback must make the whole user turn a FallbackSuccess"
         );
         assert_eq!(outcome.fallback_reason.as_deref(), Some("earlier_turn_fallback"));
+    }
+
+    /// The ledger is runtime infrastructure, not a document-ingest side benefit:
+    /// entry points that never resolve an ingest scope (session workers, delegated
+    /// sub-agents, spawned sessions) must still get one, or every side-effecting
+    /// tool they try to run is refused.
+    #[test]
+    fn tool_loop_memory_carries_a_ledger_even_without_a_document_ingest_scope() {
+        let dir = tempfile::TempDir::new().expect("test: tempdir");
+        let memory: Arc<dyn Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(dir.path()).expect("test: sqlite memory"));
+        let runtime = ToolLoopMemory::new(&memory, dir.path(), None);
+        assert!(runtime.ingest().is_none(), "this entry point has no ingest scope");
+        assert!(
+            runtime.ledger.is_some(),
+            "the ledger must not depend on whether document ingest is configured"
+        );
+    }
+
+    /// The same holds for a memory backend that keeps no event log of its own.
+    #[test]
+    fn tool_loop_memory_resolves_a_ledger_for_a_backend_without_an_event_log() {
+        let dir = tempfile::TempDir::new().expect("test: tempdir");
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::MarkdownMemory::new(dir.path()));
+        let runtime = ToolLoopMemory::new(&memory, dir.path(), None);
+        let ledger = runtime.ledger.as_ref().expect("test: ledger");
+        assert_eq!(ledger.name(), "sqlite");
     }
 
     #[test]
@@ -9147,8 +9249,8 @@ mod tests {
             None,
             None, // no scope context
             None,
-            None, // no tool tiering
-            None, // no document ingest
+            None,                   // no tool tiering
+            ToolLoopMemory::none(), // no document ingest
             ChatMode::default(),
         )
         .await
@@ -9202,8 +9304,8 @@ mod tests {
             None,
             None, // no scope context
             None,
-            None, // no tool tiering
-            None, // no document ingest
+            None,                   // no tool tiering
+            ToolLoopMemory::none(), // no document ingest
             ChatMode::default(),
         )
         .await
@@ -9249,8 +9351,8 @@ mod tests {
             None,
             None, // no scope context
             None,
-            None, // no tool tiering
-            None, // no document ingest
+            None,                   // no tool tiering
+            ToolLoopMemory::none(), // no document ingest
             ChatMode::default(),
         )
         .await
@@ -9298,8 +9400,8 @@ mod tests {
             None,
             None, // no scope context
             None,
-            None, // no tool tiering
-            None, // no document ingest
+            None,                   // no tool tiering
+            ToolLoopMemory::none(), // no document ingest
             ChatMode::default(),
         )
         .await
@@ -9450,7 +9552,7 @@ mod tests {
             None, // no scope context
             None,
             None, // no tool tiering
-            None,
+            ToolLoopMemory::none(),
             ChatMode::default(),
         )
         .await
@@ -9532,7 +9634,7 @@ mod tests {
             None,
             None,
             None,
-            Some(document_ingest),
+            ToolLoopMemory::from_ingest_for_test(document_ingest),
             ChatMode::default(),
         )
         .await
@@ -9621,7 +9723,7 @@ mod tests {
             None, // no scope context
             None,
             None, // no tool tiering
-            Some(document_ingest),
+            ToolLoopMemory::from_ingest_for_test(document_ingest),
             ChatMode::default(),
         )
         .await
@@ -9740,8 +9842,8 @@ mod tests {
                 None,
                 None, // no scope context
                 None,
-                None, // no tool tiering
-                None, // no document ingest
+                None,                   // no tool tiering
+                ToolLoopMemory::none(), // no document ingest
                 ChatMode::default(),
             ),
         )
@@ -9824,7 +9926,7 @@ mod tests {
                 None, // no scope context
                 None,
                 None, // no tool tiering
-                Some(document_ingest),
+                ToolLoopMemory::from_ingest_for_test(document_ingest),
                 ChatMode::default(),
             ),
         )
@@ -9933,7 +10035,7 @@ mod tests {
                 None, // no scope context
                 None,
                 None, // no tool tiering
-                Some(document_ingest),
+                ToolLoopMemory::from_ingest_for_test(document_ingest),
                 ChatMode::default(),
             ),
         )
@@ -10416,7 +10518,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                ToolLoopMemory::none(),
                 ChatMode::default(),
                 None,
                 false,
@@ -13166,7 +13268,7 @@ Let me check the result."#;
             None,
             None,
             None,
-            None,
+            ToolLoopMemory::none(),
             ChatMode::default(),
         )
         .await
@@ -13230,7 +13332,7 @@ Let me check the result."#;
             None,
             None,
             None,
-            None,
+            ToolLoopMemory::none(),
             ChatMode::default(),
         )
         .await
@@ -13304,7 +13406,7 @@ Let me check the result."#;
             None,
             None,
             None,
-            None,
+            ToolLoopMemory::none(),
             ChatMode::default(),
         )
         .await
@@ -13996,7 +14098,7 @@ Let me check the result."#;
                 None,
                 None,
                 None,
-                None,
+                ToolLoopMemory::none(),
                 ChatMode::default(),
                 None,
                 false,
@@ -14096,7 +14198,7 @@ Let me check the result."#;
                 None,
                 None,
                 None,
-                None,
+                ToolLoopMemory::none(),
                 ChatMode::default(),
                 None,
                 expose,
@@ -14172,7 +14274,7 @@ Let me check the result."#;
                 None,
                 None,
                 None,
-                None,
+                ToolLoopMemory::none(),
                 ChatMode::default(),
                 None,
                 false, // not exposed

@@ -1069,11 +1069,20 @@ impl DelegateTool {
                 scope_ctx.as_ref(),
                 None,
                 None, // delegate sub-agents do not use tool tiering
-                scope_ctx.as_ref().and_then(|ctx| {
-                    self.memory
-                        .as_ref()
-                        .map(|memory| DocumentIngestRuntime::from_scope(memory.clone(), ctx))
-                }),
+                // The ledger is keyed off the shared memory alone: a delegated
+                // sub-agent without an ingest scope must still run write tools.
+                self.memory.as_ref().map_or_else(
+                    || crate::agent::loop_::ToolLoopMemory::ledger_only(&self.security.workspace_dir),
+                    |memory| {
+                        crate::agent::loop_::ToolLoopMemory::new(
+                            memory,
+                            &self.security.workspace_dir,
+                            scope_ctx
+                                .as_ref()
+                                .map(|ctx| DocumentIngestRuntime::from_scope(memory.clone(), ctx)),
+                        )
+                    },
+                ),
                 crate::agent::loop_::ChatMode::default(),
             ),
         )
@@ -1178,9 +1187,31 @@ mod tests {
     use crate::providers::{ChatRequest, ChatResponse, ToolCall};
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use anyhow::anyhow;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Workspace for the delegate tests, unique per process run.
+    ///
+    /// The tool-execution ledger lives inside the workspace and is durable on
+    /// purpose, so the default `.` workspace would both write into the source
+    /// tree and let one run's records replay into the next.
+    fn test_workspace() -> std::path::PathBuf {
+        static WORKSPACE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        WORKSPACE
+            .get_or_init(|| {
+                std::env::temp_dir().join(format!(
+                    "prx-delegate-tests-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::now_v7()
+                ))
+            })
+            .clone()
+    }
 
     fn test_security() -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy::default())
+        Arc::new(SecurityPolicy {
+            workspace_dir: test_workspace(),
+            ..SecurityPolicy::default()
+        })
     }
 
     fn sample_agents() -> HashMap<String, DelegateAgentConfig> {
@@ -1222,8 +1253,13 @@ mod tests {
         agents
     }
 
+    /// Counts its own executions, so a test can tell "the delegated sub-agent ran
+    /// the tool" from "the tool was refused and the refusal was handed back as
+    /// tool output".
     #[derive(Default)]
-    struct EchoTool;
+    struct EchoTool {
+        executions: Arc<AtomicUsize>,
+    }
 
     #[async_trait]
     impl Tool for EchoTool {
@@ -1246,6 +1282,7 @@ mod tests {
         }
 
         async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
             let value = args
                 .get("value")
                 .and_then(serde_json::Value::as_str)
@@ -1855,8 +1892,8 @@ mod tests {
             agentic_config(vec!["missing_tool".to_string()], 10),
         );
 
-        let tool =
-            DelegateTool::new(agents, None, test_security()).with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
+        let tool = DelegateTool::new(agents, None, test_security())
+            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool::default())]));
         let result = tool
             .execute(json!({"agent": "agentic", "prompt": "test"}))
             .await
@@ -1875,8 +1912,14 @@ mod tests {
     #[tokio::test]
     async fn agentic_mode_inherits_parent_tools_only_with_explicit_wildcard() {
         let config = agentic_config(vec!["*".to_string()], 10);
+        // The mock provider answers "done" as soon as any tool message is in the
+        // history, and a refusal is appended as a tool message too. Count the
+        // executions so the assertion cannot be satisfied by a refused call.
+        let executions = Arc::new(AtomicUsize::new(0));
         let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(Arc::new(vec![
-            Arc::new(EchoTool),
+            Arc::new(EchoTool {
+                executions: Arc::clone(&executions),
+            }),
             Arc::new(DelegateTool::new(HashMap::new(), None, test_security())),
         ]));
         let provider = OneToolThenFinalProvider;
@@ -1896,13 +1939,18 @@ mod tests {
             .unwrap();
 
         assert!(result.result.success);
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "the wildcard-inherited tool must actually have run, not been refused"
+        );
     }
 
     #[tokio::test]
     async fn agentic_mode_rejects_wildcard_mixed_with_named_tools() {
         let config = agentic_config(vec!["*".to_string(), "echo_tool".to_string()], 10);
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
+            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool::default())]));
         let provider = OneToolThenFinalProvider;
 
         let result = tool
@@ -1933,8 +1981,12 @@ mod tests {
     #[tokio::test]
     async fn execute_agentic_runs_tool_call_loop_with_filtered_tools() {
         let config = agentic_config(vec!["echo_tool".to_string()], 10);
+        // Same trap as above: "done" proves only that some tool message exists.
+        let executions = Arc::new(AtomicUsize::new(0));
         let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(Arc::new(vec![
-            Arc::new(EchoTool),
+            Arc::new(EchoTool {
+                executions: Arc::clone(&executions),
+            }),
             Arc::new(DelegateTool::new(HashMap::new(), None, test_security())),
         ]));
 
@@ -1956,6 +2008,11 @@ mod tests {
         assert!(result.result.success);
         assert!(result.result.output.contains("(openrouter/model-test, agentic)"));
         assert!(result.result.output.contains("done"));
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "the delegated sub-agent must actually have run the filtered tool, not been refused"
+        );
     }
 
     #[test]
@@ -2015,7 +2072,7 @@ mod tests {
     async fn execute_agentic_respects_max_iterations() {
         let config = agentic_config(vec!["echo_tool".to_string()], 2);
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
+            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool::default())]));
 
         let provider = InfiniteToolCallProvider;
         let result = tool
@@ -2047,7 +2104,7 @@ mod tests {
     async fn execute_agentic_propagates_provider_errors() {
         let config = agentic_config(vec!["echo_tool".to_string()], 10);
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
+            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool::default())]));
 
         let provider = FailingProvider;
         let result = tool

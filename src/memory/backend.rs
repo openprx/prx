@@ -95,6 +95,21 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
     }
 }
 
+/// Whether a memory backend keeps a durable `MessageEvent` log and can therefore
+/// serve as the tool-execution idempotency ledger.
+///
+/// The ledger is execution infrastructure, not a memory feature: a
+/// side-effecting tool is refused outright when no ledger is available. Backends
+/// that answer `false` here get a dedicated workspace-local SQLite ledger
+/// instead (see `crate::memory::tool_execution_ledger`).
+#[must_use]
+pub fn serves_tool_execution_ledger(backend: &str) -> bool {
+    matches!(
+        classify_memory_backend(backend),
+        MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid | MemoryBackendKind::Postgres
+    )
+}
+
 pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
     match classify_memory_backend(backend) {
         MemoryBackendKind::Sqlite => SQLITE_PROFILE,
