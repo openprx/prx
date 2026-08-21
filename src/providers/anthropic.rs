@@ -6,6 +6,7 @@ use crate::providers::traits::{
     StreamChunk, StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall, ToolCallChunk,
     ToolCallChunkStatus,
 };
+use crate::providers::utf8_stream::SseTextDecoder;
 use crate::tools::ToolSpec;
 use crate::tools::schema::SchemaCleanr;
 use async_trait::async_trait;
@@ -14,6 +15,10 @@ use futures::stream::{self, BoxStream, StreamExt};
 use parking_lot::Mutex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+
+/// Provider name attached to byte-level UTF-8 decode failures on the
+/// streaming path.
+const STREAM_DECODER_LABEL: &str = "Anthropic";
 
 /// OAuth state for Claude Code token auto-refresh.
 struct OAuthState {
@@ -1435,6 +1440,8 @@ impl Provider for AnthropicProvider {
             let mut usage_seen = false;
             let mut byte_stream = response.bytes_stream();
             let mut buf = String::new();
+            // Byte-level decoder; `buf` above stays the SSE record accumulator.
+            let mut decoder = SseTextDecoder::new(STREAM_DECODER_LABEL);
             let mut completion_chars: usize = 0;
             let mut sent_final = false;
 
@@ -1446,18 +1453,12 @@ impl Provider for AnthropicProvider {
                         return;
                     }
                 };
-                let text = match std::str::from_utf8(&bytes) {
-                    Ok(t) => t.to_string(),
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(StreamError::InvalidSse(format!(
-                                "non-utf8 byte in Anthropic SSE: {e}"
-                            ))))
-                            .await;
-                        return;
-                    }
-                };
-                buf.push_str(&text);
+                // A character split across chunk boundaries is carried over,
+                // not treated as corruption.
+                if let Err(e) = decoder.push(&bytes, &mut buf) {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
 
                 // SSE records are separated by blank lines (`\n\n`).
                 while let Some(end) = buf.find("\n\n") {
@@ -1575,6 +1576,13 @@ impl Provider for AnthropicProvider {
             }
 
             if !sent_final {
+                // No `message_stop` arrived, so the body simply stopped. A
+                // character left half-decoded at that point is real truncation.
+                if let Err(e) = decoder.finish() {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+
                 // Defensive tail flush: if the upstream closed the byte stream
                 // without ever sending `content_block_stop` (and `message_stop`)
                 // for in-flight tool_use blocks, drain them now so the driver
@@ -1629,6 +1637,42 @@ mod tests {
         clippy::unreadable_literal
     )]
     use super::*;
+
+    /// **UTF-8 streaming regression** — the byte-level decoder used by this
+    /// provider's stream loop must carry a character that the transport split
+    /// across two chunks, while still rejecting genuinely malformed bytes.
+    #[test]
+    fn stream_decoder_survives_split_multibyte_characters() {
+        let mut decoder = SseTextDecoder::new(STREAM_DECODER_LABEL);
+        let mut buf = String::new();
+        let bytes = "\u{4e2d}".as_bytes();
+        assert_eq!(bytes.len(), 3);
+
+        decoder
+            .push(&bytes[..2], &mut buf)
+            .expect("test: an incomplete character is not a stream error");
+        assert!(buf.is_empty(), "test: nothing decodable yet");
+        assert_eq!(decoder.pending_len(), 2, "test: the split tail is carried, not dropped");
+
+        decoder.push(&bytes[2..], &mut buf).expect("test: character completes");
+        assert_eq!(buf, "\u{4e2d}");
+        decoder.finish().expect("test: stream ends on a character boundary");
+
+        // Genuinely invalid input must still fail, tagged with this provider.
+        let mut decoder = SseTextDecoder::new(STREAM_DECODER_LABEL);
+        let err = decoder
+            .push(&[0x80], &mut buf)
+            .expect_err("test: a stray continuation byte must be reported");
+        assert!(err.to_string().contains(STREAM_DECODER_LABEL), "got {err}");
+
+        // A body that stops mid-character is truncation, not success.
+        let mut decoder = SseTextDecoder::new(STREAM_DECODER_LABEL);
+        let mut sink = String::new();
+        decoder
+            .push(&bytes[..1], &mut sink)
+            .expect("test: partial tail buffered");
+        assert!(decoder.finish().is_err(), "test: truncated tail must surface");
+    }
     use crate::auth::anthropic_token::{AnthropicAuthKind, detect_auth_kind};
 
     #[test]

@@ -28,6 +28,7 @@ pub mod openrouter;
 pub mod reliable;
 pub mod router;
 pub mod traits;
+pub mod utf8_stream;
 
 #[allow(unused_imports)]
 pub use traits::{

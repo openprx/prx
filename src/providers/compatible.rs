@@ -9,6 +9,7 @@ use crate::providers::traits::{
     StreamChunk, StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall, ToolCallChunk,
     ToolCallChunkStatus,
 };
+use crate::providers::utf8_stream::SseTextDecoder;
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use reqwest::{
@@ -16,6 +17,10 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
+
+/// Provider name attached to byte-level UTF-8 decode failures on the
+/// streaming path.
+const STREAM_DECODER_LABEL: &str = "OpenAI-compatible";
 
 /// A provider that speaks the OpenAI-compatible chat completions API.
 ///
@@ -927,6 +932,10 @@ pub(crate) fn sse_bytes_to_chunks(
     tokio::spawn(async move {
         // Buffer for incomplete lines
         let mut buffer = String::new();
+        // Byte-level decoder: HTTP chunk boundaries do not respect UTF-8
+        // character boundaries, so a split character is carried over instead of
+        // aborting the stream. `buffer` above stays the SSE *line* accumulator.
+        let mut decoder = SseTextDecoder::new(STREAM_DECODER_LABEL);
         let mut saw_sse_event = false;
         let mut saw_non_sse_line = false;
         let mut saw_usage = false;
@@ -950,18 +959,12 @@ pub(crate) fn sse_bytes_to_chunks(
         while let Some(item) = bytes_stream.next().await {
             match item {
                 Ok(bytes) => {
-                    // Convert bytes to string and process line by line
-                    let text = match String::from_utf8(bytes.to_vec()) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(StreamError::InvalidSse(format!("Invalid UTF-8: {}", e))))
-                                .await;
-                            break;
-                        }
-                    };
-
-                    buffer.push_str(&text);
+                    // Decode bytes into the line buffer, carrying any character
+                    // that straddles this chunk and the next.
+                    if let Err(e) = decoder.push(&bytes, &mut buffer) {
+                        let _ = tx.send(Err(e)).await;
+                        break;
+                    }
 
                     // Process complete lines. `drain(..=pos)` already removes the
                     // terminator from `buffer`; the previous re-slice into
@@ -1044,6 +1047,12 @@ pub(crate) fn sse_bytes_to_chunks(
                     break;
                 }
             }
+        }
+
+        // A character left half-decoded when the body ended is real truncation.
+        if let Err(e) = decoder.finish() {
+            let _ = tx.send(Err(e)).await;
+            return;
         }
 
         let trailing = buffer.trim();
@@ -2374,6 +2383,42 @@ mod tests {
         clippy::unreadable_literal
     )]
     use super::*;
+
+    /// **UTF-8 streaming regression** — the byte-level decoder used by this
+    /// provider's stream loop must carry a character that the transport split
+    /// across two chunks, while still rejecting genuinely malformed bytes.
+    #[test]
+    fn stream_decoder_survives_split_multibyte_characters() {
+        let mut decoder = SseTextDecoder::new(STREAM_DECODER_LABEL);
+        let mut buf = String::new();
+        let bytes = "\u{4e2d}".as_bytes();
+        assert_eq!(bytes.len(), 3);
+
+        decoder
+            .push(&bytes[..2], &mut buf)
+            .expect("test: an incomplete character is not a stream error");
+        assert!(buf.is_empty(), "test: nothing decodable yet");
+        assert_eq!(decoder.pending_len(), 2, "test: the split tail is carried, not dropped");
+
+        decoder.push(&bytes[2..], &mut buf).expect("test: character completes");
+        assert_eq!(buf, "\u{4e2d}");
+        decoder.finish().expect("test: stream ends on a character boundary");
+
+        // Genuinely invalid input must still fail, tagged with this provider.
+        let mut decoder = SseTextDecoder::new(STREAM_DECODER_LABEL);
+        let err = decoder
+            .push(&[0x80], &mut buf)
+            .expect_err("test: a stray continuation byte must be reported");
+        assert!(err.to_string().contains(STREAM_DECODER_LABEL), "got {err}");
+
+        // A body that stops mid-character is truncation, not success.
+        let mut decoder = SseTextDecoder::new(STREAM_DECODER_LABEL);
+        let mut sink = String::new();
+        decoder
+            .push(&bytes[..1], &mut sink)
+            .expect("test: partial tail buffered");
+        assert!(decoder.finish().is_err(), "test: truncated tail must surface");
+    }
 
     fn make_provider(name: &str, url: &str, key: Option<&str>) -> OpenAiCompatibleProvider {
         OpenAiCompatibleProvider::new(name, url, key, AuthStyle::Bearer)

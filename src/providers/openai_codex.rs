@@ -5,6 +5,7 @@ use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider, StreamChunk,
     StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall, ToolCallChunk,
 };
+use crate::providers::utf8_stream::SseTextDecoder;
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
@@ -14,6 +15,10 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// Provider name attached to byte-level UTF-8 decode failures on the
+/// streaming path.
+const STREAM_DECODER_LABEL: &str = "OpenAI Codex";
 
 const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const DEFAULT_CODEX_INSTRUCTIONS: &str = "You are OpenPRX, a concise and helpful coding assistant.";
@@ -745,6 +750,8 @@ fn responses_stream_to_chunks(
         );
         let mut bytes_stream = response.bytes_stream();
         let mut buffer = String::new();
+        // Byte-level decoder; `buffer` above stays the SSE record accumulator.
+        let mut decoder = SseTextDecoder::new(STREAM_DECODER_LABEL);
         let mut saw_delta = false;
         let mut sent_final = false;
 
@@ -772,16 +779,12 @@ fn responses_stream_to_chunks(
                     return;
                 }
             };
-            let text = match String::from_utf8(bytes.to_vec()) {
-                Ok(text) => text,
-                Err(err) => {
-                    let _ = tx
-                        .send(Err(StreamError::InvalidSse(format!("Invalid UTF-8: {err}"))))
-                        .await;
-                    return;
-                }
-            };
-            buffer.push_str(&text);
+            // A character split across chunk boundaries is carried over,
+            // not treated as corruption.
+            if let Err(err) = decoder.push(&bytes, &mut buffer) {
+                let _ = tx.send(Err(err)).await;
+                return;
+            }
 
             while let Some(idx) = buffer.find("\n\n") {
                 let block = buffer.drain(..idx + 2).collect::<String>();
@@ -791,6 +794,12 @@ fn responses_stream_to_chunks(
                     return;
                 }
             }
+        }
+
+        // A character left half-decoded when the body ended is real truncation.
+        if let Err(err) = decoder.finish() {
+            let _ = tx.send(Err(err)).await;
+            return;
         }
 
         if !buffer.trim().is_empty() {
@@ -1256,6 +1265,42 @@ impl Provider for OpenAiCodexProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **UTF-8 streaming regression** — the byte-level decoder used by this
+    /// provider's stream loop must carry a character that the transport split
+    /// across two chunks, while still rejecting genuinely malformed bytes.
+    #[test]
+    fn stream_decoder_survives_split_multibyte_characters() {
+        let mut decoder = SseTextDecoder::new(STREAM_DECODER_LABEL);
+        let mut buf = String::new();
+        let bytes = "\u{4e2d}".as_bytes();
+        assert_eq!(bytes.len(), 3);
+
+        decoder
+            .push(&bytes[..2], &mut buf)
+            .expect("test: an incomplete character is not a stream error");
+        assert!(buf.is_empty(), "test: nothing decodable yet");
+        assert_eq!(decoder.pending_len(), 2, "test: the split tail is carried, not dropped");
+
+        decoder.push(&bytes[2..], &mut buf).expect("test: character completes");
+        assert_eq!(buf, "\u{4e2d}");
+        decoder.finish().expect("test: stream ends on a character boundary");
+
+        // Genuinely invalid input must still fail, tagged with this provider.
+        let mut decoder = SseTextDecoder::new(STREAM_DECODER_LABEL);
+        let err = decoder
+            .push(&[0x80], &mut buf)
+            .expect_err("test: a stray continuation byte must be reported");
+        assert!(err.to_string().contains(STREAM_DECODER_LABEL), "got {err}");
+
+        // A body that stops mid-character is truncation, not success.
+        let mut decoder = SseTextDecoder::new(STREAM_DECODER_LABEL);
+        let mut sink = String::new();
+        decoder
+            .push(&bytes[..1], &mut sink)
+            .expect("test: partial tail buffered");
+        assert!(decoder.finish().is_err(), "test: truncated tail must surface");
+    }
 
     #[test]
     fn extracts_output_text_first() {
