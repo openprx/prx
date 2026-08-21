@@ -123,6 +123,60 @@ impl Utf8StreamDecoder {
         self.decode_rest(rest, out)
     }
 
+    /// Decode `chunk`, substituting [`char::REPLACEMENT_CHARACTER`] for each
+    /// malformed sequence instead of stopping, and return how many
+    /// substitutions were made.
+    ///
+    /// This is for consumers that must keep parsing the *rest* of the chunk
+    /// after a bad byte — a framed protocol such as SSE, where abandoning the
+    /// chunk would tear a record in half and lose every well-formed event that
+    /// followed. A split character is still carried across the boundary
+    /// exactly as in [`push`](Self::push); only genuinely malformed bytes are
+    /// replaced. A non-zero return value means data was corrupt and the caller
+    /// is expected to say so — the marker in `out` keeps the damage visible in
+    /// the payload as well, so a silently shortened message is impossible.
+    ///
+    /// Recovery resynchronises on the next byte that can start a character, so
+    /// a malformed run spanning a chunk boundary may yield more than one
+    /// marker where a single-pass decoder would emit one. The count is a
+    /// corruption signal, not a byte-exact damage measure.
+    pub fn push_lossy(&mut self, chunk: &[u8], out: &mut String) -> usize {
+        let mut rest = chunk;
+        let mut replacements = 0usize;
+        loop {
+            let pos_before = self.stream_pos;
+            let carried = self.pending_len;
+            let Err(err) = self.push(rest, out) else {
+                return replacements;
+            };
+            let Utf8StreamError::InvalidSequence { len, .. } = err else {
+                // `push` never ends a stream, so it never truncates one.
+                return replacements;
+            };
+            out.push(char::REPLACEMENT_CHARACTER);
+            replacements = replacements.saturating_add(1);
+
+            let decoded = self.stream_pos.saturating_sub(pos_before);
+            // `decoded == 0` with a non-empty carry means the malformed unit
+            // started in the bytes held over from an earlier chunk, which
+            // `push` has already discarded: `rest` must be re-examined from
+            // the top rather than skipped into. The now-empty carry is what
+            // guarantees the retry cannot take this branch twice.
+            let skip = if carried > 0 && decoded == 0 {
+                0
+            } else {
+                // Everything `push` decoded came from `rest` except the bytes
+                // it inherited as carry; the malformed unit follows.
+                decoded.saturating_sub(carried).saturating_add(len).max(1)
+            };
+            let Some(tail) = rest.get(skip..) else {
+                // A skip past the end means the whole remainder was rejected.
+                return replacements;
+            };
+            rest = tail;
+        }
+    }
+
     /// Signal end of stream.
     ///
     /// Returns [`Utf8StreamError::TruncatedAtEnd`] when bytes are still
@@ -526,6 +580,101 @@ mod tests {
                 .unwrap_or_else(|e| panic!("split at {split} failed: {e}"));
             assert_eq!(decoded, text, "split at {split}");
         }
+    }
+
+    // --- lossy recovery for framed consumers ----------------------------
+
+    /// Decode `chunks` with `push_lossy` and return the text plus the total
+    /// number of replacement characters substituted.
+    fn decode_all_lossy(chunks: &[&[u8]]) -> (String, usize) {
+        let mut decoder = Utf8StreamDecoder::new();
+        let mut out = String::new();
+        let mut replaced = 0;
+        for chunk in chunks {
+            replaced += decoder.push_lossy(chunk, &mut out);
+        }
+        (out, replaced)
+    }
+
+    #[test]
+    fn lossy_carries_split_characters_without_replacing_anything() {
+        let bytes = "中文内容".as_bytes();
+        for split in 0..=bytes.len() {
+            let (text, replaced) = decode_all_lossy(&[&bytes[..split], &bytes[split..]]);
+            assert_eq!(text, "中文内容", "split at {split}");
+            assert_eq!(replaced, 0, "a split character is not corruption (split at {split})");
+        }
+    }
+
+    #[test]
+    fn lossy_replaces_only_the_bad_bytes_and_keeps_the_rest_of_the_chunk() {
+        // The whole point: a bad byte must not take the surrounding framing
+        // with it. Everything before *and after* it still has to arrive.
+        let mut chunk = b"before".to_vec();
+        chunk.push(0x80);
+        chunk.extend_from_slice("after中文".as_bytes());
+        let (text, replaced) = decode_all_lossy(&[&chunk]);
+        assert_eq!(text, "before\u{fffd}after中文");
+        assert_eq!(replaced, 1, "corruption must be counted, not hidden");
+    }
+
+    #[test]
+    fn lossy_reports_a_bad_byte_that_only_shows_up_after_a_boundary() {
+        // A valid lead byte carried over, then a byte that cannot continue it.
+        // Buffering must not turn this into silence.
+        let (text, replaced) = decode_all_lossy(&[b"ok", &[0xE4], &[0x41], b"end"]);
+        assert!(replaced >= 1, "cross-chunk corruption must be reported");
+        assert!(
+            text.contains('\u{fffd}'),
+            "damage must be visible in the payload: {text:?}"
+        );
+        assert!(text.starts_with("ok"), "text before the damage must survive: {text:?}");
+        assert!(text.ends_with("Aend"), "text after the damage must survive: {text:?}");
+    }
+
+    #[test]
+    fn lossy_never_shortens_a_message_silently() {
+        // Every byte of legitimate text on both sides of the damage is kept, so
+        // a reader can never see a plausible-but-shorter message.
+        let mut chunk = "流式".as_bytes().to_vec();
+        chunk.extend_from_slice(&[0xC0, 0xAF]); // overlong '/'
+        chunk.extend_from_slice("解码".as_bytes());
+        let (text, replaced) = decode_all_lossy(&[&chunk]);
+        assert!(replaced >= 1);
+        assert!(text.contains("流式") && text.contains("解码"), "got {text:?}");
+    }
+
+    #[test]
+    fn lossy_terminates_on_input_that_is_entirely_garbage() {
+        // Guards the recovery loop: no byte pattern may make it spin.
+        let garbage: Vec<u8> = (0x80u8..=0xFF).collect();
+        let (text, replaced) = decode_all_lossy(&[&garbage]);
+        assert!(replaced > 0);
+        assert!(text.chars().all(|c| c == char::REPLACEMENT_CHARACTER), "got {text:?}");
+    }
+
+    #[test]
+    fn lossy_terminates_when_every_byte_arrives_alone() {
+        let mut mixed = "a中b".as_bytes().to_vec();
+        mixed.push(0xF8);
+        mixed.extend_from_slice("文c".as_bytes());
+        let chunks: Vec<&[u8]> = mixed.chunks(1).collect();
+        let (text, replaced) = decode_all_lossy(&chunks);
+        assert!(replaced >= 1);
+        assert!(text.starts_with("a中b"), "got {text:?}");
+        assert!(text.ends_with("文c"), "got {text:?}");
+    }
+
+    #[test]
+    fn lossy_still_reports_a_truncated_tail_at_end_of_stream() {
+        let mut decoder = Utf8StreamDecoder::new();
+        let mut out = String::new();
+        let bytes = "界".as_bytes();
+        assert_eq!(decoder.push_lossy(&bytes[..2], &mut out), 0);
+        assert!(
+            decoder.finish().is_err(),
+            "a tail lost at end of stream must be reported"
+        );
     }
 
     #[test]

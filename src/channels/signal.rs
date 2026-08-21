@@ -1964,6 +1964,11 @@ impl SignalChannel {
             let mut bytes_stream = resp.bytes_stream();
             let mut buffer = String::new();
             let mut current_data = String::new();
+            // HTTP chunk boundaries are not character boundaries: a 3-byte CJK
+            // character routinely straddles two chunks. Decoding each chunk on
+            // its own therefore rejects perfectly good text, so the incomplete
+            // tail is carried over here instead.
+            let mut decoder = crate::providers::utf8_stream::Utf8StreamDecoder::new();
 
             while let Some(chunk) = bytes_stream.next().await {
                 let chunk = match chunk {
@@ -1974,17 +1979,22 @@ impl SignalChannel {
                     }
                 };
 
-                let text = match String::from_utf8(chunk.to_vec()) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::debug!("Signal SSE invalid UTF-8, skipping chunk: {}", e);
-                        continue;
-                    }
-                };
+                // Bytes that are genuinely malformed are replaced by U+FFFD and
+                // reported, never dropped: discarding them would shorten a
+                // message with nobody the wiser, and discarding the whole chunk
+                // would additionally cut the SSE framing in half and lose every
+                // well-formed event behind the bad byte.
+                let replaced = decoder.push_lossy(&chunk, &mut buffer);
+                if replaced > 0 {
+                    tracing::warn!(
+                        replacements = replaced,
+                        "Signal SSE carried {replaced} malformed byte sequence(s); \
+                         substituted U+FFFD — message content is corrupt upstream"
+                    );
+                }
 
                 // A stream chunk arrived — event or `:` keepalive comment alike.
                 crate::channels::activity::record_upstream(self.name());
-                buffer.push_str(&text);
 
                 while let Some(newline_pos) = buffer.find('\n') {
                     let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
@@ -2024,6 +2034,12 @@ impl SignalChannel {
                         current_data.push_str(data.trim_start());
                     }
                 }
+            }
+
+            // The peer stopped mid-character: those bytes are lost for good, so
+            // say so rather than let the tail vanish on reconnect.
+            if let Err(e) = decoder.finish() {
+                tracing::warn!("Signal SSE ended mid-character, trailing bytes lost: {e}");
             }
 
             if !current_data.is_empty() {
@@ -3443,5 +3459,227 @@ mod tests {
         assert!(env.sync_message.is_none());
         assert!(env.story_message.is_none());
         assert!(env.timestamp.is_none());
+    }
+
+    // ── SSE byte-stream decoding ─────────────────────────────────────────
+
+    /// `tracing` writer that captures formatted output for assertions.
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Serve `body` once over HTTP/1.1 chunked transfer encoding, cut into two
+    /// separate HTTP chunks at `split`.
+    ///
+    /// The halves are written with a pause between them so they land in
+    /// different reads on the client: the boundary the decoder sees is a real
+    /// network boundary, not a hoped-for one. Returns the URL to listen on.
+    async fn serve_split_sse(body: Vec<u8>, split: usize, terminate: bool) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test: bind sse listener");
+        let addr = listener.local_addr().expect("test: sse listener addr");
+
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0u8; 2048];
+            let _ = sock.read(&mut request).await;
+            let head = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            if sock.write_all(head).await.is_err() {
+                return;
+            }
+            let split = split.min(body.len());
+            let head_part = body.get(..split).unwrap_or_default();
+            let tail_part = body.get(split..).unwrap_or_default();
+            let parts = [head_part, tail_part];
+            for (index, part) in parts.into_iter().enumerate() {
+                if part.is_empty() {
+                    continue;
+                }
+                if index > 0 {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+                let frame = format!("{:x}\r\n", part.len());
+                if sock.write_all(frame.as_bytes()).await.is_err() {
+                    return;
+                }
+                if sock.write_all(part).await.is_err() {
+                    return;
+                }
+                if sock.write_all(b"\r\n").await.is_err() {
+                    return;
+                }
+                let _ = sock.flush().await;
+            }
+            if terminate {
+                let _ = sock.write_all(b"0\r\n\r\n").await;
+                let _ = sock.flush().await;
+            }
+            // Hold the socket open so the client stays in its read loop rather
+            // than racing into a reconnect while the test is still asserting.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        format!("http://{addr}/api/v1/events")
+    }
+
+    /// One complete SSE record carrying `message` as a Signal data message.
+    fn sse_record(message: &str) -> Vec<u8> {
+        let envelope = serde_json::json!({
+            "envelope": {
+                "source": "+1111111111",
+                "sourceNumber": "+1111111111",
+                "timestamp": 1_700_000_000_000_u64,
+                "dataMessage": { "message": message, "timestamp": 1_700_000_000_000_u64 },
+            }
+        });
+        format!("data: {envelope}\n\n").into_bytes()
+    }
+
+    /// Run `listen_sse` on the current task until it yields a message.
+    ///
+    /// Driving it inline rather than in a spawned task keeps it on the thread
+    /// that installed the test subscriber, so its warnings are captured.
+    async fn first_sse_message(channel: &SignalChannel, url: &str) -> Option<ChannelMessage> {
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(4);
+        tokio::select! {
+            _ = channel.listen_sse(url, tx) => None,
+            msg = rx.recv() => msg,
+            () = tokio::time::sleep(Duration::from_secs(10)) => None,
+        }
+    }
+
+    /// The bug this guards: signal-cli's SSE body arrives in HTTP chunks whose
+    /// boundaries fall wherever the network puts them. Decoding each chunk on
+    /// its own rejects both halves of a split CJK character, and the rejected
+    /// chunk used to be dropped with only a `debug!` line — the message lost
+    /// text, or never arrived at all, with nothing to alert anyone.
+    #[tokio::test]
+    async fn sse_chunk_boundary_inside_a_chinese_character_keeps_the_message_intact() {
+        let message = "你好，请帮我看一下这段流式传输的中文内容是否完整无缺失";
+        let body = sse_record(message);
+        let text = String::from_utf8(body.clone()).expect("test: body is utf-8");
+
+        // Cut one byte into a 3-byte character, and prove the cut really is
+        // mid-character instead of trusting the arithmetic.
+        let split = text.find("中文内容").expect("test: marker present") + 1;
+        assert!(
+            !text.is_char_boundary(split),
+            "test setup: byte {split} must fall inside a character"
+        );
+
+        let url = serve_split_sse(body, split, false).await;
+        let channel = make_channel();
+
+        let received = first_sse_message(&channel, &url)
+            .await
+            .expect("a message split across chunks must still be delivered");
+        // The channel appends its own `[signal-meta ...]` trailer; the message
+        // itself is the first line and must match byte for byte.
+        assert_eq!(
+            received.content.lines().next(),
+            Some(message),
+            "content must survive a chunk boundary inside a character, got {:?}",
+            received.content
+        );
+        assert!(
+            !received.content.contains(char::REPLACEMENT_CHARACTER),
+            "a split character is not corruption and must not be marked as one"
+        );
+    }
+
+    /// Genuinely malformed bytes must stay visible: they are replaced with
+    /// U+FFFD and counted in a `warn!`. What must never happen again is the old
+    /// behaviour of discarding the whole chunk, which took the SSE framing and
+    /// every well-formed event behind the bad byte along with it.
+    #[tokio::test]
+    async fn sse_malformed_bytes_are_reported_and_never_swallow_the_record() {
+        let head = r#"data: {"envelope":{"source":"+1111111111","sourceNumber":"+1111111111","timestamp":1700000000000,"dataMessage":{"message":"前半段"#;
+        let mut body = head.as_bytes().to_vec();
+        // A stray continuation byte: no amount of waiting can make this valid.
+        body.push(0x80);
+        body.extend_from_slice(r#"后半段中文内容","timestamp":1700000000000}}}"#.as_bytes());
+        body.extend_from_slice(b"\n\n");
+
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer({
+                let logs = Arc::clone(&logs);
+                move || CapturedLogs(Arc::clone(&logs))
+            })
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let url = serve_split_sse(body, usize::MAX, false).await;
+        let channel = make_channel();
+
+        let received = first_sse_message(&channel, &url)
+            .await
+            .expect("one bad byte must not cost the whole record");
+        assert_eq!(
+            received.content.lines().next(),
+            Some(format!("前半段{}后半段中文内容", char::REPLACEMENT_CHARACTER).as_str()),
+            "damage must be marked in place, with every good byte around it kept, got {:?}",
+            received.content
+        );
+
+        let captured = String::from_utf8(logs.lock().clone()).expect("test: log bytes are utf-8");
+        assert!(
+            captured.contains("WARN"),
+            "corruption must be logged above debug level: {captured}"
+        );
+        assert!(
+            captured.contains("malformed byte sequence"),
+            "the warning must name the problem: {captured}"
+        );
+    }
+
+    /// A stream that stops in the middle of a character loses those bytes for
+    /// good. Reconnecting without a word would hide it, so it is reported.
+    #[tokio::test]
+    async fn sse_stream_ending_mid_character_is_reported() {
+        let mut body = sse_record("完整的一条消息");
+        // Trailing half of a 3-byte character, then a clean end of body.
+        let half = "界".as_bytes().get(..2).expect("test: 界 is three bytes wide");
+        body.extend_from_slice(half);
+
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer({
+                let logs = Arc::clone(&logs);
+                move || CapturedLogs(Arc::clone(&logs))
+            })
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let url = serve_split_sse(body, usize::MAX, true).await;
+        let channel = make_channel();
+        let (tx, rx) = mpsc::channel::<ChannelMessage>(4);
+        // Let the listener run past the end of the body and into its reconnect
+        // backoff, which is where the end-of-stream check lives.
+        let _ = tokio::time::timeout(Duration::from_millis(1_500), channel.listen_sse(&url, tx)).await;
+        drop(rx);
+
+        let captured = String::from_utf8(logs.lock().clone()).expect("test: log bytes are utf-8");
+        assert!(
+            captured.contains("WARN") && captured.contains("ended mid-character"),
+            "a truncated tail must be reported, not silently dropped: {captured}"
+        );
     }
 }
