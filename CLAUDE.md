@@ -187,7 +187,7 @@ Add to `Cargo.toml` or `clippy.toml`:
 - See `AGENTS.md` for full architecture protocol
 - Extend via trait implementation + factory registration
 - One concern per module, one concern per PR
-- Branch workflow: never push directly to `main`
+- Branch workflow: develop on a feature branch, then merge locally and push `main` directly once the full gate (fmt, clippy -D warnings, check --all-features, machete, audit, deny, tests) and a real-machine check both pass. Repos we own do not go through PRs.
 
 ## Commit Style
 
