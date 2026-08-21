@@ -39,6 +39,7 @@ use axum::{
 use parking_lot::Mutex;
 use rusqlite::{OpenFlags, OptionalExtension};
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -68,6 +69,10 @@ const MEDIA_RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Poll interval for the read-only media lookup while wacli finishes download.
 const MEDIA_RESOLVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// whatsmeow session store filename inside the wacli store directory. It owns
+/// the only offline LID <-> phone-number mapping wacli keeps.
+const WACLI_SESSION_DB_FILE: &str = "session.db";
 
 /// Used only when a channel is constructed without the runtime multimodal
 /// limit (primarily unit tests). Runtime construction overrides this value.
@@ -183,49 +188,240 @@ async fn resolve_chat_title(msg: &WacliParsedMessage, cfg: &WacliChannelConfig, 
     }
 }
 
-fn query_local_media_path(conn: &rusqlite::Connection, chat_id: &str, message_id: &str) -> Result<Option<String>> {
+/// Split a WhatsApp JID into its user part (device suffix removed) and server.
+fn split_jid(jid: &str) -> Option<(&str, &str)> {
+    let (user, server) = jid.split_once('@')?;
+    let user = user.split_once(':').map_or(user, |(base, _)| base);
+    (!user.is_empty() && !server.is_empty()).then_some((user, server))
+}
+
+/// Whether the wacli store exposes `table`. Every table this module reads apart
+/// from `messages` is optional and version-dependent, so callers degrade
+/// instead of failing when one is missing.
+fn store_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = ?1
+         )",
+        [table],
+        |row| row.get::<_, bool>(0),
+    )
+    .with_context(|| format!("inspect wacli store schema for table {table}"))
+}
+
+/// Alternate chat JIDs for `chat_id` taken from whatsmeow's LID map.
+///
+/// wacli's webhook addresses one-to-one chats by LID (`<id>@lid`) while its own
+/// metadata database stores the very same conversation under the phone-number
+/// JID (`<number>@s.whatsapp.net`), so a media lookup keyed on the webhook's
+/// JID never matches. The only offline mapping between the two forms lives in
+/// the whatsmeow session store that sits beside `wacli.db`; it is optional and
+/// its schema belongs to an external program, so every step degrades to "no
+/// alias" rather than failing the lookup.
+fn lid_alias_chat_ids(store_root: &Path, chat_id: &str) -> Vec<String> {
+    let Some((user, server)) = split_jid(chat_id) else {
+        return Vec::new();
+    };
+    // Fixed statements per direction: the mapped column is a schema identifier
+    // and can never be bound as a parameter, so it is never interpolated.
+    let (query, alias_server) = match server {
+        "lid" => (
+            "SELECT pn FROM whatsmeow_lid_map WHERE lid = ?1 LIMIT 1",
+            "s.whatsapp.net",
+        ),
+        "s.whatsapp.net" => ("SELECT lid FROM whatsmeow_lid_map WHERE pn = ?1 LIMIT 1", "lid"),
+        _ => return Vec::new(),
+    };
+
+    let db_path = store_root.join(WACLI_SESSION_DB_FILE);
+    if !db_path.is_file() {
+        return Vec::new();
+    }
+    let conn = match rusqlite::Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(conn) => conn,
+        Err(error) => {
+            tracing::debug!("wacli: cannot open the whatsmeow session store read-only: {error}");
+            return Vec::new();
+        }
+    };
+    if let Err(error) = crate::runtime::sqlite_pool::install_busy_handler(&conn) {
+        tracing::debug!("wacli: cannot install a busy handler on the whatsmeow session store: {error}");
+        return Vec::new();
+    }
+    match store_table_exists(&conn, "whatsmeow_lid_map") {
+        Ok(true) => {}
+        Ok(false) => return Vec::new(),
+        Err(error) => {
+            tracing::debug!("wacli: cannot inspect the whatsmeow LID map schema: {error}");
+            return Vec::new();
+        }
+    }
+
+    let mapped = match conn.query_row(query, [user], |row| row.get::<_, String>(0)).optional() {
+        Ok(mapped) => mapped,
+        Err(error) => {
+            tracing::debug!("wacli: whatsmeow LID map lookup failed: {error}");
+            return Vec::new();
+        }
+    };
+    let Some(mapped) = mapped else {
+        return Vec::new();
+    };
+
+    // The column holds a bare number in current stores, but treat a fully
+    // qualified JID as valid input too, and accept only digits so a malformed
+    // external row can never be spliced into a JID.
+    let mapped = mapped.trim();
+    let mapped_user = mapped.split_once('@').map_or(mapped, |(user, _)| user);
+    let mapped_user = mapped_user.split_once(':').map_or(mapped_user, |(base, _)| base);
+    if mapped_user.is_empty() || !mapped_user.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Vec::new();
+    }
+    vec![format!("{mapped_user}@{alias_server}")]
+}
+
+/// Every chat JID under which the wacli store may hold `chat_id`'s messages,
+/// most specific first.
+fn media_lookup_chat_ids<'a>(store_root: &Path, chat_id: &'a str) -> Vec<Cow<'a, str>> {
+    let mut candidates: Vec<Cow<'a, str>> = vec![Cow::Borrowed(chat_id)];
+    // A device-qualified JID (`<user>:<device>@server`) never matches the bare
+    // chat row wacli writes, so try the bare form too.
+    if let Some((user, server)) = split_jid(chat_id) {
+        let bare = format!("{user}@{server}");
+        if bare != chat_id {
+            candidates.push(Cow::Owned(bare));
+        }
+    }
+    for alias in lid_alias_chat_ids(store_root, chat_id) {
+        if !candidates.iter().any(|candidate| candidate.as_ref() == alias) {
+            candidates.push(Cow::Owned(alias));
+        }
+    }
+    candidates
+}
+
+/// Resolve media by message id alone, used only when the store holds no row at
+/// all for the addressed chat (i.e. the webhook and the store disagree about
+/// the chat's JID form and no LID mapping was available).
+///
+/// A WhatsApp message id addresses one conversation, so this refuses to answer
+/// as soon as more than one chat carries the id: a colliding id yields "not
+/// found", never another conversation's media.
+fn query_unique_message_media_path(
+    conn: &rusqlite::Connection,
+    message_id: &str,
+    aliases_exist: bool,
+) -> Result<Option<String>> {
+    let chats_with_id: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT chat_jid) FROM messages WHERE msg_id = ?1",
+            [message_id],
+            |row| row.get(0),
+        )
+        .context("count wacli chats carrying a message id")?;
+    if chats_with_id != 1 {
+        return Ok(None);
+    }
+
     let primary = conn
         .query_row(
             "SELECT local_path FROM messages
-             WHERE chat_jid = ?1 AND msg_id = ?2 AND COALESCE(local_path, '') <> ''
+             WHERE msg_id = ?1 AND COALESCE(local_path, '') <> ''
              LIMIT 1",
-            rusqlite::params![chat_id, message_id],
+            [message_id],
             |row| row.get::<_, String>(0),
         )
         .optional()
-        .context("query wacli message local media path")?;
-    if primary.is_some() {
+        .context("query wacli message local media path by message id")?;
+    if primary.is_some() || !aliases_exist {
         return Ok(primary);
+    }
+
+    let alias_chats_with_id: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT chat_jid) FROM message_local_media_aliases WHERE msg_id = ?1",
+            [message_id],
+            |row| row.get(0),
+        )
+        .context("count wacli media alias chats carrying a message id")?;
+    if alias_chats_with_id != 1 {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT local_path FROM message_local_media_aliases
+         WHERE msg_id = ?1 AND COALESCE(local_path, '') <> ''
+         ORDER BY local_path
+         LIMIT 1",
+        [message_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .context("query wacli media alias path by message id")
+}
+
+fn query_local_media_path(
+    conn: &rusqlite::Connection,
+    chat_ids: &[Cow<'_, str>],
+    message_id: &str,
+) -> Result<Option<String>> {
+    for chat_id in chat_ids {
+        let primary = conn
+            .query_row(
+                "SELECT local_path FROM messages
+                 WHERE chat_jid = ?1 AND msg_id = ?2 AND COALESCE(local_path, '') <> ''
+                 LIMIT 1",
+                rusqlite::params![chat_id.as_ref(), message_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .context("query wacli message local media path")?;
+        if primary.is_some() {
+            return Ok(primary);
+        }
     }
 
     // `message_local_media_aliases` was added in wacli schema migration 22.
     // Existing stores can legitimately predate that migration even when the
     // running CLI already supports media downloads. Do not let the optional
     // compatibility table make the stable `messages.local_path` lookup fail.
-    let aliases_exist = conn
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM sqlite_master
-                 WHERE type = 'table' AND name = 'message_local_media_aliases'
-             )",
-            [],
-            |row| row.get::<_, bool>(0),
-        )
-        .context("inspect wacli media alias schema")?;
-    if !aliases_exist {
-        return Ok(None);
+    let aliases_exist = store_table_exists(conn, "message_local_media_aliases")?;
+    if aliases_exist {
+        for chat_id in chat_ids {
+            let aliased = conn
+                .query_row(
+                    "SELECT local_path FROM message_local_media_aliases
+                     WHERE chat_jid = ?1 AND msg_id = ?2 AND COALESCE(local_path, '') <> ''
+                     ORDER BY local_path
+                     LIMIT 1",
+                    rusqlite::params![chat_id.as_ref(), message_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .context("query wacli media alias path")?;
+            if aliased.is_some() {
+                return Ok(aliased);
+            }
+        }
     }
 
-    conn.query_row(
-        "SELECT local_path FROM message_local_media_aliases
-         WHERE chat_jid = ?1 AND msg_id = ?2 AND COALESCE(local_path, '') <> ''
-         ORDER BY local_path
-         LIMIT 1",
-        rusqlite::params![chat_id, message_id],
-        |row| row.get::<_, String>(0),
-    )
-    .optional()
-    .context("query wacli media alias path")
+    // The store knows this message under one of the addressed JIDs, so an empty
+    // `local_path` means "not downloaded yet", not "wrong JID form". Never
+    // widen the search in that case.
+    for chat_id in chat_ids {
+        let known: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE chat_jid = ?1 AND msg_id = ?2)",
+                rusqlite::params![chat_id.as_ref(), message_id],
+                |row| row.get(0),
+            )
+            .context("probe wacli message row for the addressed chat")?;
+        if known {
+            return Ok(None);
+        }
+    }
+
+    query_unique_message_media_path(conn, message_id, aliases_exist)
 }
 
 fn wait_for_local_media_path(
@@ -246,9 +442,14 @@ fn wait_for_local_media_path(
     // deadline it used to give up after.
     crate::runtime::sqlite_pool::install_busy_handler(&conn).context("install wacli media lookup busy handler")?;
 
+    // wacli's webhook and its own database can address the same one-to-one chat
+    // by different JID forms, so resolve the alternates once up front: the LID
+    // map does not change while a single message is being downloaded.
+    let chat_ids = media_lookup_chat_ids(&store_root, chat_id);
+
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(raw_path) = query_local_media_path(&conn, chat_id, message_id)? {
+        if let Some(raw_path) = query_local_media_path(&conn, &chat_ids, message_id)? {
             let candidate = PathBuf::from(raw_path.trim());
             let candidate = if candidate.is_absolute() {
                 candidate
@@ -1254,6 +1455,225 @@ mod tests {
         assert_eq!(
             resolved,
             media_path.canonicalize().expect("test: canonical legacy media path")
+        );
+    }
+
+    /// Seed the sibling whatsmeow session store with a LID <-> phone-number row,
+    /// matching the real `session.db` layout wacli keeps beside `wacli.db`.
+    fn create_lid_map_store(store: &Path, lid: &str, phone: &str) {
+        let conn = rusqlite::Connection::open(store.join(WACLI_SESSION_DB_FILE)).expect("test: create session store");
+        conn.execute_batch(
+            "CREATE TABLE whatsmeow_lid_map (
+                lid TEXT PRIMARY KEY,
+                pn  TEXT UNIQUE NOT NULL
+             );",
+        )
+        .expect("test: create lid map table");
+        conn.execute(
+            "INSERT INTO whatsmeow_lid_map (lid, pn) VALUES (?1, ?2)",
+            rusqlite::params![lid, phone],
+        )
+        .expect("test: seed lid map");
+    }
+
+    fn seed_downloaded_media(store: &Path, chat_jid: &str, msg_id: &str) -> PathBuf {
+        let media_dir = store
+            .join("media")
+            .join(chat_jid.replace('@', "_"))
+            .join(msg_id)
+            .join("image");
+        std::fs::create_dir_all(&media_dir).expect("test: create media directory");
+        let media_path = media_dir.join(format!("message-{msg_id}.jfif"));
+        std::fs::write(&media_path, b"downloaded-image").expect("test: write downloaded media");
+        let conn = rusqlite::Connection::open(store.join("wacli.db")).expect("test: open wacli database");
+        conn.execute(
+            "INSERT INTO messages (chat_jid, msg_id, local_path) VALUES (?1, ?2, ?3)",
+            rusqlite::params![chat_jid, msg_id, media_path.display().to_string()],
+        )
+        .expect("test: seed downloaded media row");
+        media_path
+    }
+
+    /// Real-store shape: the webhook addresses the DM by LID while wacli stores
+    /// the inbound row under the phone-number JID. Before the LID-aware lookup
+    /// this returned `None` and every one-to-one image was dropped.
+    #[test]
+    fn local_media_lookup_resolves_dm_addressed_by_lid() {
+        let store = tempfile::tempdir().expect("test: create wacli store");
+        create_media_store(store.path());
+        create_lid_map_store(store.path(), "212017185054924", "995599060775");
+        let media_path = seed_downloaded_media(store.path(), "995599060775@s.whatsapp.net", "3AEC71ECFFE39A29C26D");
+        // A decoy chat reusing the id disarms the id-only fallback, so only the
+        // LID mapping can answer here.
+        seed_downloaded_media(store.path(), "642902222712@s.whatsapp.net", "3AEC71ECFFE39A29C26D");
+
+        let resolved = wait_for_local_media_path(
+            store.path().to_str().expect("test: utf8 store path"),
+            "212017185054924@lid",
+            "3AEC71ECFFE39A29C26D",
+            Duration::ZERO,
+        )
+        .expect("test: query media by lid")
+        .expect("test: lid-addressed dm media should resolve");
+
+        assert_eq!(resolved, media_path.canonicalize().expect("test: canonical media path"));
+    }
+
+    /// Same mismatch, but on a store whose whatsmeow session database is absent
+    /// or predates the LID map. The message id addresses exactly one chat, so
+    /// the guarded id-only fallback still finds the download.
+    #[test]
+    fn local_media_lookup_resolves_dm_addressed_by_lid_without_session_store() {
+        let store = tempfile::tempdir().expect("test: create wacli store");
+        create_media_store(store.path());
+        let media_path = seed_downloaded_media(store.path(), "995599060775@s.whatsapp.net", "3AE3C082C891A1AEFF41");
+
+        let resolved = wait_for_local_media_path(
+            store.path().to_str().expect("test: utf8 store path"),
+            "212017185054924@lid",
+            "3AE3C082C891A1AEFF41",
+            Duration::ZERO,
+        )
+        .expect("test: query media by lid without session store")
+        .expect("test: lid-addressed dm media should resolve without a lid map");
+
+        assert_eq!(resolved, media_path.canonicalize().expect("test: canonical media path"));
+    }
+
+    /// Group chats already agree on the JID form between webhook and store; the
+    /// widened lookup must keep hitting the exact row.
+    #[test]
+    fn local_media_lookup_keeps_resolving_group_media_by_exact_jid() {
+        let store = tempfile::tempdir().expect("test: create wacli store");
+        create_media_store(store.path());
+        create_lid_map_store(store.path(), "212017185054924", "995599060775");
+        let media_path = seed_downloaded_media(store.path(), "120363409895005261@g.us", "3A69FF01F67626B3B57C");
+        // A second, unrelated conversation must never be preferred.
+        seed_downloaded_media(store.path(), "995599060775@s.whatsapp.net", "3AEC71ECFFE39A29C26D");
+
+        let resolved = wait_for_local_media_path(
+            store.path().to_str().expect("test: utf8 store path"),
+            "120363409895005261@g.us",
+            "3A69FF01F67626B3B57C",
+            Duration::ZERO,
+        )
+        .expect("test: query group media")
+        .expect("test: group media should resolve");
+
+        assert_eq!(resolved, media_path.canonicalize().expect("test: canonical media path"));
+    }
+
+    /// A message id shared by two conversations must resolve to neither.
+    #[test]
+    fn local_media_lookup_refuses_message_id_shared_by_two_chats() {
+        let store = tempfile::tempdir().expect("test: create wacli store");
+        create_media_store(store.path());
+        seed_downloaded_media(store.path(), "995599060775@s.whatsapp.net", "3ACOLLIDINGMESSAGEID");
+        seed_downloaded_media(store.path(), "642902222712@s.whatsapp.net", "3ACOLLIDINGMESSAGEID");
+
+        let resolved = wait_for_local_media_path(
+            store.path().to_str().expect("test: utf8 store path"),
+            "212017185054924@lid",
+            "3ACOLLIDINGMESSAGEID",
+            Duration::ZERO,
+        )
+        .expect("test: query colliding message id");
+
+        assert!(
+            resolved.is_none(),
+            "an ambiguous message id must not resolve to another conversation's media"
+        );
+    }
+
+    /// The addressed chat is known to the store, so an empty `local_path` means
+    /// "still downloading" and must not widen into another conversation.
+    #[test]
+    fn local_media_lookup_does_not_widen_when_the_addressed_chat_is_known() {
+        let store = tempfile::tempdir().expect("test: create wacli store");
+        create_media_store(store.path());
+        seed_downloaded_media(store.path(), "995599060775@s.whatsapp.net", "3ASHAREDPENDINGID");
+        let conn = rusqlite::Connection::open(store.path().join("wacli.db")).expect("test: open wacli database");
+        conn.execute(
+            "INSERT INTO messages (chat_jid, msg_id, local_path) VALUES (?1, ?2, NULL)",
+            rusqlite::params!["120363409895005261@g.us", "3ASHAREDPENDINGID"],
+        )
+        .expect("test: seed pending group media");
+        drop(conn);
+
+        let resolved = wait_for_local_media_path(
+            store.path().to_str().expect("test: utf8 store path"),
+            "120363409895005261@g.us",
+            "3ASHAREDPENDINGID",
+            Duration::ZERO,
+        )
+        .expect("test: query pending group media");
+
+        assert!(
+            resolved.is_none(),
+            "a pending download must not fall through to another conversation"
+        );
+    }
+
+    #[test]
+    fn lid_alias_lookup_rejects_a_malformed_session_store_row() {
+        let store = tempfile::tempdir().expect("test: create wacli store");
+        create_media_store(store.path());
+        create_lid_map_store(
+            store.path(),
+            "212017185054924",
+            "995599060775'; DROP TABLE messages; --",
+        );
+
+        assert!(
+            lid_alias_chat_ids(store.path(), "212017185054924@lid").is_empty(),
+            "a non-numeric mapping must never be spliced into a chat JID"
+        );
+    }
+
+    /// Stores that already qualify the mapped value are normalized rather than
+    /// rejected, and never carry a foreign domain into the candidate JID.
+    #[test]
+    fn lid_alias_lookup_normalizes_an_already_qualified_mapping() {
+        let store = tempfile::tempdir().expect("test: create wacli store");
+        create_media_store(store.path());
+        create_lid_map_store(store.path(), "212017185054924", "995599060775:7@s.whatsapp.net");
+
+        assert_eq!(
+            lid_alias_chat_ids(store.path(), "212017185054924@lid"),
+            vec!["995599060775@s.whatsapp.net".to_string()]
+        );
+    }
+
+    #[test]
+    fn lid_alias_lookup_maps_both_directions_and_ignores_groups() {
+        let store = tempfile::tempdir().expect("test: create wacli store");
+        create_media_store(store.path());
+        create_lid_map_store(store.path(), "212017185054924", "995599060775");
+
+        assert_eq!(
+            lid_alias_chat_ids(store.path(), "212017185054924@lid"),
+            vec!["995599060775@s.whatsapp.net".to_string()]
+        );
+        assert_eq!(
+            lid_alias_chat_ids(store.path(), "995599060775@s.whatsapp.net"),
+            vec!["212017185054924@lid".to_string()]
+        );
+        assert!(lid_alias_chat_ids(store.path(), "120363409895005261@g.us").is_empty());
+        assert!(lid_alias_chat_ids(store.path(), "not-a-jid").is_empty());
+    }
+
+    /// A device-qualified JID must still find the bare chat row.
+    #[test]
+    fn media_lookup_chat_ids_includes_the_bare_jid_form() {
+        let store = tempfile::tempdir().expect("test: create wacli store");
+        create_media_store(store.path());
+        let candidates = media_lookup_chat_ids(store.path(), "995599060775:12@s.whatsapp.net");
+        assert_eq!(
+            candidates,
+            vec![
+                Cow::Borrowed("995599060775:12@s.whatsapp.net"),
+                Cow::Borrowed("995599060775@s.whatsapp.net"),
+            ]
         );
     }
 
