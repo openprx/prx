@@ -52,7 +52,10 @@ impl LinqChannel {
             .unwrap_or_default()
             .to_ascii_lowercase();
 
-        if !mime_type.starts_with("image/") {
+        // Linq hands over a remote URL rather than bytes, so the declared MIME is
+        // the only signal available; classify it through the shared table so
+        // subtypes such as `image/heic` are recognised the same way everywhere.
+        if crate::media::type_id::category_for_mime(&mime_type) != Some(crate::media::MediaCategory::Image) {
             return None;
         }
 
@@ -377,6 +380,44 @@ pub fn verify_linq_signature(secret: &str, body: &str, timestamp: &str, signatur
 #[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
+
+    /// Linq only ever has the declared MIME, so its image gate must go through
+    /// the shared classifier rather than an ad-hoc prefix test.
+    #[test]
+    fn image_gate_uses_the_shared_media_classifier() {
+        let image_part =
+            |mime: &str| serde_json::json!({"type": "media", "url": "https://example.com/a", "mime_type": mime});
+        for mime in [
+            "image/jpeg",
+            "IMAGE/JPEG",
+            "image/png",
+            "image/heic",
+            "image/avif",
+            "image/webp",
+            "image/tiff",
+            // Not in the table, but its top-level type still classifies it.
+            "image/x-unusual",
+        ] {
+            assert_eq!(
+                LinqChannel::media_part_to_image_marker(&image_part(mime)),
+                Some("[IMAGE:https://example.com/a]".to_string()),
+                "{mime} must be accepted as an image"
+            );
+        }
+        for mime in [
+            "video/mp4",
+            "audio/ogg",
+            "application/pdf",
+            "application/octet-stream",
+            "",
+        ] {
+            assert_eq!(
+                LinqChannel::media_part_to_image_marker(&image_part(mime)),
+                None,
+                "{mime} must not be treated as an image"
+            );
+        }
+    }
     use super::*;
 
     fn make_channel() -> LinqChannel {

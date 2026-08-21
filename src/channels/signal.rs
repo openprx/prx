@@ -1,6 +1,7 @@
 use crate::channels::traits::{
-    Channel, ChannelMessage, ChatKind, SendMessage, extract_outgoing_media, guess_audio_mime, guess_mime_from_path,
+    Channel, ChannelMessage, ChatKind, SendMessage, extract_outgoing_media, outgoing_marker_category,
 };
+use crate::media::TypeHint;
 use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::StreamExt;
@@ -13,41 +14,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
-
-/// Map a MIME type to a simple file extension for temp files.
-fn mime_to_extension(mime: &str) -> &str {
-    // Strip codec parameters (e.g. "audio/ogg; codecs=opus" → "audio/ogg")
-    let base = mime.split(';').next().unwrap_or(mime).trim();
-    match base {
-        "image/jpeg" => "jpg",
-        "image/png" => "png",
-        "image/webp" => "webp",
-        "image/gif" => "gif",
-        "audio/ogg" => "ogg",
-        "audio/mpeg" => "mp3",
-        "audio/mp4" | "audio/aac" => "m4a",
-        "video/mp4" => "mp4",
-        "video/quicktime" => "mov",
-        // Documents
-        "application/pdf" => "pdf",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
-        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => "pptx",
-        "application/msword" => "doc",
-        "application/vnd.ms-excel" => "xls",
-        "application/vnd.ms-powerpoint" => "ppt",
-        "application/rtf" | "text/rtf" => "rtf",
-        "application/epub+zip" => "epub",
-        "text/plain" => "txt",
-        "text/csv" => "csv",
-        "text/html" => "html",
-        "text/xml" | "application/xml" => "xml",
-        "application/json" => "json",
-        "application/toml" => "toml",
-        "text/markdown" => "md",
-        _ => "bin",
-    }
-}
 
 fn attachment_max_bytes(content_type: &str, config: &crate::config::MediaConfig) -> usize {
     let mebibytes = if content_type.starts_with("audio/") {
@@ -1624,9 +1590,9 @@ impl SignalChannel {
                 tracing::error!("Signal attachment rejected: no workspace media artifact owner configured");
                 None
             })?;
-            let ext = mime_to_extension(content_type);
+            let hint = TypeHint::new().with_mime(content_type).with_file_name(filename);
             let max_bytes = attachment_max_bytes(content_type, &self.media_config);
-            let artifact = match owner.import_channel_file(&path, ext, max_bytes).await {
+            let artifact = match owner.import_channel_file(&path, &hint, max_bytes).await {
                 Ok(artifact) => artifact,
                 Err(error) => {
                     tracing::warn!(path = %path.display(), error = %error, "Signal attachment admission rejected");
@@ -1635,18 +1601,13 @@ impl SignalChannel {
             };
 
             tracing::info!(
+                extension = %artifact.extension,
+                category = %artifact.category.as_str(),
                 "Signal native: attachment {file_path} ({} bytes) admitted",
                 artifact.size_bytes
             );
 
-            return Self::make_attachment_marker(
-                &artifact.path,
-                content_type,
-                filename,
-                &self.media_config,
-                owner.as_ref(),
-            )
-            .await;
+            return Self::make_attachment_marker(&artifact, filename, &self.media_config, owner.as_ref()).await;
         }
 
         // ── REST mode: download via signal-cli-rest-api ───────────────────────
@@ -1669,10 +1630,10 @@ impl SignalChannel {
             tracing::error!("Signal attachment rejected: no workspace media artifact owner configured");
             None
         })?;
-        let ext = mime_to_extension(content_type);
+        let hint = TypeHint::new().with_mime(content_type).with_file_name(filename);
         let max_bytes = attachment_max_bytes(content_type, &self.media_config);
         let artifact = match owner
-            .import_channel_response(response, &format!("Signal attachment {id}"), ext, max_bytes)
+            .import_channel_response(response, &format!("Signal attachment {id}"), &hint, max_bytes)
             .await
         {
             Ok(artifact) => artifact,
@@ -1683,36 +1644,39 @@ impl SignalChannel {
         };
 
         tracing::info!(
+            extension = %artifact.extension,
+            category = %artifact.category.as_str(),
             "Signal: downloaded attachment {id} ({} bytes) admitted",
             artifact.size_bytes
         );
 
-        Self::make_attachment_marker(
-            &artifact.path,
-            content_type,
-            filename,
-            &self.media_config,
-            owner.as_ref(),
-        )
-        .await
+        Self::make_attachment_marker(&artifact, filename, &self.media_config, owner.as_ref()).await
     }
 
     /// Convert a locally-stored attachment file into the appropriate content marker.
+    ///
+    /// Dispatch follows the class the shared identifier derived from the stored
+    /// bytes, not the class signal-cli declared: attachments routinely arrive as
+    /// `application/octet-stream`, and routing those to the document branch used
+    /// to strip real photos out of the vision pipeline.
     async fn make_attachment_marker(
-        artifact_path: &std::path::Path,
-        content_type: &str,
+        artifact: &crate::media::ManagedArtifact,
         filename: &str,
         media_config: &crate::config::MediaConfig,
         artifacts: &crate::media::MediaArtifactOwner,
     ) -> Option<String> {
-        let path = artifact_path.to_string_lossy();
+        use crate::media::MediaCategory;
+
+        let path = artifact.path.to_string_lossy();
+        let content_type = artifact.mime.unwrap_or("application/octet-stream");
+
         // Images: keep raw [IMAGE:] marker for the existing multimodal pipeline
-        if content_type.starts_with("image/") {
+        if artifact.category == MediaCategory::Image {
             return Some(format!("[IMAGE:{path}]"));
         }
 
         // Audio: attempt STT transcription via media engine
-        if content_type.starts_with("audio/") {
+        if artifact.category == MediaCategory::Audio {
             match crate::media::process_media_attachment(&path, content_type, media_config, artifacts).await {
                 crate::media::MediaProcessingOutcome::AudioTranscription { text } => {
                     return Some(format!("[Voice message transcription: \"{text}\"]"));
@@ -1731,7 +1695,7 @@ impl SignalChannel {
         }
 
         // Video: attempt frame extraction via media engine
-        if content_type.starts_with("video/") {
+        if artifact.category == MediaCategory::Video {
             match crate::media::process_media_attachment(&path, content_type, media_config, artifacts).await {
                 crate::media::MediaProcessingOutcome::VideoFrames { markers, .. } => return Some(markers),
                 crate::media::MediaProcessingOutcome::Rejected { reason } => {
@@ -1807,6 +1771,10 @@ impl SignalChannel {
             }
         }
 
+        // An attachment whose declared type was missing or generic can still turn
+        // out to be an image once its bytes are read; the preflight metric has to
+        // account for those or a resolved [IMAGE:] marker gets no vision pass.
+        let image_attachment_count = image_attachment_count.max(image_marker_count);
         if image_attachment_count > 0 {
             msg.content.push('\n');
             msg.content.push_str(&format!(
@@ -2147,12 +2115,21 @@ impl Channel for SignalChannel {
         for (kind, path) in &media_items {
             match tokio::fs::read(path).await {
                 Ok(bytes) => {
-                    let mime: &str = match kind.as_str() {
-                        "IMAGE" => guess_mime_from_path(path),
-                        "VOICE" | "AUDIO" => guess_audio_mime(path),
-                        "VIDEO" => "video/mp4",
-                        _ => "application/octet-stream",
-                    };
+                    // The file is already in hand, so its own bytes decide the
+                    // MIME type; the marker kind is only a consistency check.
+                    let hint = TypeHint::new().with_file_name(path);
+                    let resolved = crate::media::type_id::resolve(&hint, &bytes);
+                    if let Some(expected) = outgoing_marker_category(kind)
+                        && expected != resolved.category
+                    {
+                        tracing::warn!(
+                            marker = %kind,
+                            detected = %resolved.category.as_str(),
+                            path = %path,
+                            "Signal: outgoing media marker disagrees with the file content"
+                        );
+                    }
+                    let mime = resolved.mime.unwrap_or("application/octet-stream");
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                     base64_attachments.push(format!("data:{mime};base64,{b64}"));
                 }
@@ -2410,6 +2387,76 @@ impl Channel for SignalChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Signal used to derive the stored extension from `mime_to_extension`, a
+    /// private table that answered `bin` for everything it did not list. The
+    /// import now goes through the shared identifier, so a missing or generic
+    /// content type still yields a correctly typed artifact.
+    #[tokio::test]
+    async fn native_attachment_import_types_from_content_not_the_declared_mime() {
+        let data_dir = tempfile::tempdir().expect("test: signal data dir");
+        let workspace = tempfile::tempdir().expect("test: workspace");
+        let attachments = data_dir.path().join("attachments");
+        std::fs::create_dir_all(&attachments).expect("test: attachments dir");
+        // A JFIF JPEG stored under an id with no extension, announced only as a
+        // generic octet-stream — every hint except the bytes is useless.
+        let jfif: [u8; 12] = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01];
+        std::fs::write(attachments.join("att-1"), jfif).expect("test: write attachment");
+
+        let owner = crate::media::MediaArtifactOwner::for_workspace(workspace.path());
+        let channel = SignalChannel::new_with_mode(
+            "http://127.0.0.1:16866".to_string(),
+            "+1234567890".to_string(),
+            None,
+            vec!["*".to_string()],
+            false,
+            false,
+            crate::config::MediaConfig::default(),
+            true,
+            Some(data_dir.path().display().to_string()),
+            crate::config::schema::SignalStormProtectionConfig::default(),
+        )
+        .with_artifact_owner(owner.clone());
+
+        let attachment = serde_json::json!({
+            "id": "att-1",
+            "contentType": "application/octet-stream",
+            "filename": "attachment",
+        });
+        let marker = channel
+            .download_attachment_as_marker(&attachment)
+            .await
+            .expect("test: attachment must produce a marker");
+
+        let (_, image_refs) = crate::multimodal::parse_image_markers(&marker);
+        let stored = image_refs.first().expect("test: one image marker");
+        assert!(
+            stored.ends_with(".jpg"),
+            "content sniffing must store the JPEG as .jpg, got {stored}"
+        );
+        assert_eq!(
+            std::fs::read(stored).expect("test: read stored artifact"),
+            jfif.to_vec()
+        );
+    }
+
+    /// The outgoing marker kind is advisory only; the shared classifier decides
+    /// the real class, and the two are compared so a mismatch is visible.
+    #[test]
+    fn outgoing_marker_categories_match_the_shared_classes() {
+        use crate::media::MediaCategory;
+        assert_eq!(outgoing_marker_category("IMAGE"), Some(MediaCategory::Image));
+        assert_eq!(outgoing_marker_category("VIDEO"), Some(MediaCategory::Video));
+        assert_eq!(outgoing_marker_category("VOICE"), Some(MediaCategory::Audio));
+        assert_eq!(outgoing_marker_category("AUDIO"), Some(MediaCategory::Audio));
+        assert_eq!(outgoing_marker_category("DOCUMENT"), None);
+
+        // The data-URL MIME Signal sends now comes from the file's own bytes.
+        let hint = crate::media::TypeHint::new().with_file_name("note.bin");
+        let resolved = crate::media::type_id::resolve(&hint, b"OggS\x00\x02......................OpusHead");
+        assert_eq!(resolved.mime, Some("audio/opus"));
+        assert_eq!(resolved.category, MediaCategory::Audio);
+    }
 
     fn make_channel() -> SignalChannel {
         SignalChannel::new(

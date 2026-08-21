@@ -308,34 +308,20 @@ pub fn extract_outgoing_media(text: &str) -> (String, Vec<(String, String)>) {
     (clean, media)
 }
 
-/// Guess an image MIME type from a file path extension.
-pub fn guess_mime_from_path(path: &str) -> &'static str {
-    if path.ends_with(".jpg") || path.ends_with(".jpeg") {
-        "image/jpeg"
-    } else if path.ends_with(".png") {
-        "image/png"
-    } else if path.ends_with(".webp") {
-        "image/webp"
-    } else if path.ends_with(".gif") {
-        "image/gif"
-    } else {
-        "image/jpeg"
-    }
-}
-
-/// Guess an audio MIME type from a file path extension.
-pub fn guess_audio_mime(path: &str) -> &'static str {
-    if path.ends_with(".m4a") {
-        "audio/mp4"
-    } else if path.ends_with(".mp3") {
-        "audio/mpeg"
-    } else if path.ends_with(".ogg") || path.ends_with(".oga") {
-        "audio/ogg"
-    } else if path.ends_with(".wav") {
-        "audio/wav"
-    } else {
-        "audio/mpeg"
-    }
+/// Coarse media class an outgoing `[KIND:path]` marker claims.
+///
+/// The marker records what the model *intended* to send. The actual type is
+/// always decided from the file's own bytes by [`crate::media::type_id`]; this
+/// mapping exists so a channel can notice, and log, a disagreement between the
+/// two instead of shipping a video labelled as a photo.
+pub fn outgoing_marker_category(marker: &str) -> Option<crate::media::MediaCategory> {
+    use crate::media::MediaCategory;
+    Some(match marker.trim().to_ascii_uppercase().as_str() {
+        "IMAGE" | "PHOTO" => MediaCategory::Image,
+        "VIDEO" => MediaCategory::Video,
+        "VOICE" | "AUDIO" => MediaCategory::Audio,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]

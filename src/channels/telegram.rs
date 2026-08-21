@@ -88,6 +88,39 @@ struct TelegramAttachment {
 }
 
 impl TelegramAttachmentKind {
+    /// Map a resolved media format onto the Bot API method that fits it.
+    ///
+    /// Telegram's `sendVoice` documents ".OGG file encoded with OPUS, or in
+    /// .MP3 format, or in .M4A format", so OGG/Opus is routed to voice while the
+    /// rest of the audio class stays on `sendAudio`.
+    fn from_media_type(media_type: crate::media::type_id::MediaType) -> Option<Self> {
+        match media_type.extension {
+            "ogg" | "opus" => Some(Self::Voice),
+            _ => Self::from_category(media_type.category),
+        }
+    }
+
+    const fn from_category(category: crate::media::MediaCategory) -> Option<Self> {
+        use crate::media::MediaCategory;
+        Some(match category {
+            MediaCategory::Image => Self::Image,
+            MediaCategory::Video => Self::Video,
+            MediaCategory::Audio => Self::Audio,
+            MediaCategory::Document | MediaCategory::Archive => Self::Document,
+            MediaCategory::Other => return None,
+        })
+    }
+
+    const fn category(self) -> crate::media::MediaCategory {
+        use crate::media::MediaCategory;
+        match self {
+            Self::Image => MediaCategory::Image,
+            Self::Video => MediaCategory::Video,
+            Self::Audio | Self::Voice => MediaCategory::Audio,
+            Self::Document => MediaCategory::Document,
+        }
+    }
+
     fn from_marker(marker: &str) -> Option<Self> {
         match marker.trim().to_ascii_uppercase().as_str() {
             "IMAGE" | "PHOTO" => Some(Self::Image),
@@ -104,29 +137,42 @@ fn is_http_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
 }
 
-fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentKind> {
-    let normalized = target
-        .split('?')
-        .next()
-        .unwrap_or(target)
-        .split('#')
-        .next()
-        .unwrap_or(target);
+/// Number of leading bytes read to identify a local attachment's real type.
+/// Every magic number the shared table knows lives well inside this window.
+const ATTACHMENT_HEADER_BYTES: usize = 4096;
 
-    let extension = Path::new(normalized)
-        .extension()
-        .and_then(|ext| ext.to_str())?
-        .to_ascii_lowercase();
+/// Read the leading bytes of a local attachment, or `None` when it cannot be read.
+async fn read_attachment_header(path: &Path) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
 
-    match extension.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => Some(TelegramAttachmentKind::Image),
-        "mp4" | "mov" | "mkv" | "avi" | "webm" => Some(TelegramAttachmentKind::Video),
-        "mp3" | "m4a" | "wav" | "flac" => Some(TelegramAttachmentKind::Audio),
-        "ogg" | "oga" | "opus" => Some(TelegramAttachmentKind::Voice),
-        "pdf" | "txt" | "md" | "csv" | "json" | "zip" | "tar" | "gz" | "doc" | "docx" | "xls" | "xlsx" | "ppt"
-        | "pptx" => Some(TelegramAttachmentKind::Document),
-        _ => None,
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::debug!(path = %path.display(), %error, "Telegram: cannot read attachment header");
+            return None;
+        }
+    };
+    let mut header = Vec::with_capacity(ATTACHMENT_HEADER_BYTES);
+    match (&mut file)
+        .take(ATTACHMENT_HEADER_BYTES as u64)
+        .read_to_end(&mut header)
+        .await
+    {
+        Ok(_) => Some(header),
+        Err(error) => {
+            tracing::debug!(path = %path.display(), %error, "Telegram: cannot read attachment header");
+            None
+        }
     }
+}
+
+/// Infer the Bot API send method from a target's name alone.
+///
+/// Used for `https://` targets and for path-only messages before the file is
+/// opened; local files are re-checked against their real content in
+/// [`TelegramChannel::send_attachment`].
+fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentKind> {
+    TelegramAttachmentKind::from_media_type(crate::media::type_id::from_file_name(target)?)
 }
 
 fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
@@ -1044,6 +1090,40 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Ok(())
     }
 
+    /// Re-check a local attachment's kind against its actual bytes.
+    ///
+    /// A file name is a weak signal — `.jfif` photos, extension-less downloads
+    /// and outright wrong suffixes all occur — so the header decides. An
+    /// explicit `Document` choice is honoured: asking for a file to be sent
+    /// uncompressed is intent, not a mistake.
+    async fn refine_kind_from_content(path: &Path, declared: TelegramAttachmentKind) -> TelegramAttachmentKind {
+        if declared == TelegramAttachmentKind::Document {
+            return declared;
+        }
+        let header = match read_attachment_header(path).await {
+            Some(header) => header,
+            None => return declared,
+        };
+        let hint = crate::media::TypeHint::new().with_optional_file_name(path.to_str());
+        let resolved = crate::media::type_id::resolve(&hint, &header);
+        if resolved.category == declared.category() {
+            return declared;
+        }
+        match TelegramAttachmentKind::from_category(resolved.category) {
+            Some(detected) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    declared = ?declared,
+                    detected = ?detected,
+                    extension = %resolved.extension,
+                    "Telegram: attachment content does not match its name, sending it as the detected kind"
+                );
+                detected
+            }
+            None => declared,
+        }
+    }
+
     async fn send_attachment(
         &self,
         chat_id: &str,
@@ -1067,7 +1147,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             anyhow::bail!("Telegram attachment path not found: {target}");
         }
 
-        match attachment.kind {
+        let kind = Self::refine_kind_from_content(path, attachment.kind).await;
+
+        match kind {
             TelegramAttachmentKind::Image => self.send_photo(chat_id, thread_id, path, None).await,
             TelegramAttachmentKind::Document => self.send_document(chat_id, thread_id, path, None).await,
             TelegramAttachmentKind::Video => self.send_video(chat_id, thread_id, path, None).await,
@@ -1914,6 +1996,84 @@ mod tests {
         clippy::needless_collect,
         clippy::unreadable_literal
     )]
+
+    /// Telegram's send method must follow the shared media table, including the
+    /// JPEG aliases WhatsApp-sourced files arrive with.
+    #[test]
+    fn attachment_kind_follows_the_shared_media_table() {
+        let cases = [
+            ("photo.jfif", TelegramAttachmentKind::Image),
+            ("photo.jpe", TelegramAttachmentKind::Image),
+            ("photo.heic", TelegramAttachmentKind::Image),
+            ("photo.avif", TelegramAttachmentKind::Image),
+            ("photo.tif", TelegramAttachmentKind::Image),
+            ("photo.svg", TelegramAttachmentKind::Image),
+            ("clip.mp4", TelegramAttachmentKind::Video),
+            ("clip.mov", TelegramAttachmentKind::Video),
+            ("clip.3gp", TelegramAttachmentKind::Video),
+            ("clip.m4v", TelegramAttachmentKind::Video),
+            ("clip.flv", TelegramAttachmentKind::Video),
+            ("clip.wmv", TelegramAttachmentKind::Video),
+            ("clip.mpg", TelegramAttachmentKind::Video),
+            ("song.mp3", TelegramAttachmentKind::Audio),
+            ("song.flac", TelegramAttachmentKind::Audio),
+            ("song.m4a", TelegramAttachmentKind::Audio),
+            ("note.ogg", TelegramAttachmentKind::Voice),
+            ("note.oga", TelegramAttachmentKind::Voice),
+            ("note.opus", TelegramAttachmentKind::Voice),
+            ("note.amr", TelegramAttachmentKind::Audio),
+            ("report.pdf", TelegramAttachmentKind::Document),
+            ("report.docx", TelegramAttachmentKind::Document),
+            ("bundle.zip", TelegramAttachmentKind::Document),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(
+                infer_attachment_kind_from_target(name),
+                Some(expected),
+                "{name} must map to {expected:?}"
+            );
+        }
+        assert_eq!(infer_attachment_kind_from_target("no-extension"), None);
+        assert_eq!(infer_attachment_kind_from_target("thing.unknownfmt"), None);
+    }
+
+    /// A local file whose name lies about its type is sent by what it really is.
+    #[tokio::test]
+    async fn local_attachment_kind_is_refined_from_file_content() {
+        let temp = tempfile::tempdir().expect("test: temp dir");
+
+        let mislabeled_video = temp.path().join("holiday.jpg");
+        let mut mp4 = vec![0x00, 0x00, 0x00, 0x18];
+        mp4.extend_from_slice(b"ftypisom");
+        mp4.extend_from_slice(&[0u8; 16]);
+        std::fs::write(&mislabeled_video, &mp4).expect("test: write mp4");
+        assert_eq!(
+            TelegramChannel::refine_kind_from_content(&mislabeled_video, TelegramAttachmentKind::Image).await,
+            TelegramAttachmentKind::Video
+        );
+
+        // A `.jfif` JPEG is already an image, so nothing changes.
+        let jfif = temp.path().join("photo.jfif");
+        std::fs::write(&jfif, [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]).expect("test: write jfif");
+        assert_eq!(
+            TelegramChannel::refine_kind_from_content(&jfif, TelegramAttachmentKind::Image).await,
+            TelegramAttachmentKind::Image
+        );
+
+        // An explicit DOCUMENT marker is intent, not a mistake: never overridden.
+        assert_eq!(
+            TelegramChannel::refine_kind_from_content(&mislabeled_video, TelegramAttachmentKind::Document).await,
+            TelegramAttachmentKind::Document
+        );
+
+        // An unreadable path degrades to the declared kind instead of failing.
+        assert_eq!(
+            TelegramChannel::refine_kind_from_content(&temp.path().join("missing.mp4"), TelegramAttachmentKind::Video)
+                .await,
+            TelegramAttachmentKind::Video
+        );
+    }
+
     use super::*;
 
     #[test]

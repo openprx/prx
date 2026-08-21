@@ -26,7 +26,7 @@
 //! is explicitly set and the server binds a loopback address.
 
 use super::traits::{Channel, ChannelCapabilities, ChannelMessage, ChatKind, SendMessage};
-use crate::media::MediaArtifactOwner;
+use crate::media::{MediaArtifactOwner, MediaCategory, TypeHint};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use axum::{
@@ -280,39 +280,7 @@ fn wait_for_local_media_path(
 
 fn is_image_media(media: &WacliMedia) -> bool {
     media.media_type.trim().eq_ignore_ascii_case("image")
-        || media.mime_type.trim().to_ascii_lowercase().starts_with("image/")
-}
-
-fn image_extension(media: &WacliMedia, source: &Path) -> &'static str {
-    match media
-        .mime_type
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "image/jpeg" => "jpg",
-        "image/png" => "png",
-        "image/webp" => "webp",
-        "image/gif" => "gif",
-        "image/bmp" => "bmp",
-        _ => match source
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "jpg" | "jpeg" => "jpg",
-            "png" => "png",
-            "webp" => "webp",
-            "gif" => "gif",
-            "bmp" => "bmp",
-            _ => "bin",
-        },
-    }
+        || crate::media::type_id::category_for_mime(&media.mime_type) == Some(MediaCategory::Image)
 }
 
 async fn resolve_inbound_image_marker(
@@ -352,11 +320,26 @@ async fn resolve_inbound_image_marker(
         }
     };
 
-    let extension = image_extension(media, &source);
-    match owner.import_channel_file(&source, extension, max_image_bytes).await {
+    // The wacli helper names every inbound JPEG `.jfif` and can omit `MimeType`
+    // entirely, so the file's own bytes decide the type; the declared MIME and
+    // the on-disk name are only hints.
+    let hint = TypeHint::new()
+        .with_mime(&media.mime_type)
+        .with_optional_file_name(source.to_str());
+    match owner.import_channel_file(&source, &hint, max_image_bytes).await {
         Ok(artifact) => {
+            if artifact.category != MediaCategory::Image {
+                tracing::warn!(
+                    declared_mime = %media.mime_type,
+                    detected = %artifact.category.as_str(),
+                    extension = %artifact.extension,
+                    "wacli: inbound attachment announced as an image is not image content, dropping the marker"
+                );
+                return None;
+            }
             tracing::info!(
                 size_bytes = artifact.size_bytes,
+                extension = %artifact.extension,
                 "wacli: admitted inbound image into workspace media store"
             );
             Some(format!("[IMAGE:{}]", artifact.path.display()))
@@ -1069,6 +1052,23 @@ mod tests {
         .to_vec()
     }
 
+    /// The same media payload with no `MimeType` key at all, which is what the
+    /// official wacli webhook emits for some builds.
+    fn media_payload_without_mime() -> Vec<u8> {
+        r#"{
+            "Chat": "10001@s.whatsapp.net",
+            "ID": "image-message-1",
+            "SenderJID": "10001@s.whatsapp.net",
+            "Timestamp": "2026-06-17T04:39:01Z",
+            "FromMe": false,
+            "Text": "inspect",
+            "Media": {"Type": "image", "Caption": "screen"},
+            "PushName": "PRXOperator"
+        }"#
+        .as_bytes()
+        .to_vec()
+    }
+
     fn sign(secret: &str, body: &[u8]) -> String {
         use hmac::{Hmac, Mac};
         let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("test: hmac key");
@@ -1375,6 +1375,113 @@ mod tests {
         assert!(msg.content.contains("[WhatsApp Group]"));
         assert!(msg.content.contains("Alice"));
         assert!(msg.content.contains("hello world"));
+    }
+
+    /// The wacli helper writes inbound JPEGs as `.jfif` and can omit `MimeType`
+    /// from the webhook payload entirely. Neither hint may decide the type: the
+    /// bytes must, or the artifact lands as an unusable `.bin`.
+    #[tokio::test]
+    async fn handler_types_a_jfif_image_from_its_content_when_the_mime_is_missing() {
+        let store = tempfile::tempdir().expect("test: create wacli store");
+        let workspace = tempfile::tempdir().expect("test: create workspace");
+        create_media_store(store.path());
+        let source_dir = store.path().join("media/10001/image-message-1/image");
+        std::fs::create_dir_all(&source_dir).expect("test: create media directory");
+        // Exactly the header the real wacli store holds for WhatsApp photos.
+        let source = source_dir.join("message-image-message-1.jfif");
+        let jfif_bytes: Vec<u8> = vec![
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01,
+            0x00, 0x00, 0xFF, 0xDB, 0x00, 0x84,
+        ];
+        std::fs::write(&source, &jfif_bytes).expect("test: write jfif image");
+        let conn = rusqlite::Connection::open(store.path().join("wacli.db")).expect("test: open wacli database");
+        conn.execute(
+            "INSERT INTO messages (chat_jid, msg_id, local_path) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["10001@s.whatsapp.net", "image-message-1", source.display().to_string()],
+        )
+        .expect("test: seed downloaded media");
+        drop(conn);
+
+        let mut cfg = cfg_with_secret();
+        cfg.store_dir = Some(store.path().display().to_string());
+        let owner = MediaArtifactOwner::for_workspace(workspace.path());
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut state = state_for(cfg, tx);
+        state.artifact_owner = Some(owner.clone());
+        state.max_image_bytes = 1024;
+        let app = router_for(state);
+        // No `MimeType` key at all — serde(default) leaves it an empty string.
+        let body = media_payload_without_mime();
+        let sig = sign("topsecret", &body);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/wacli")
+            .header("X-Wacli-Signature", sig)
+            .body(Body::from(body))
+            .expect("test: build request");
+
+        let resp = app.oneshot(req).await.expect("test: response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let msg = rx.try_recv().expect("test: forwarded message");
+        let (_, image_refs) = crate::multimodal::parse_image_markers(&msg.content);
+        assert_eq!(image_refs.len(), 1, "the image must survive a missing MimeType");
+        let managed_path = PathBuf::from(image_refs.first().expect("test: one image reference"));
+        assert_eq!(
+            managed_path.extension().and_then(|value| value.to_str()),
+            Some("jpg"),
+            "a .jfif JPEG must be stored as .jpg, not .bin"
+        );
+        assert_eq!(
+            std::fs::read(&managed_path).expect("test: read managed image"),
+            jfif_bytes
+        );
+        assert!(msg.content.contains("resolved_image_markers=1"));
+    }
+
+    /// A payload that lies about the media type must not push non-image bytes
+    /// into the vision path.
+    #[tokio::test]
+    async fn handler_drops_an_attachment_whose_content_is_not_an_image() {
+        let store = tempfile::tempdir().expect("test: create wacli store");
+        let workspace = tempfile::tempdir().expect("test: create workspace");
+        create_media_store(store.path());
+        let source_dir = store.path().join("media/10001/image-message-1/image");
+        std::fs::create_dir_all(&source_dir).expect("test: create media directory");
+        let source = source_dir.join("message.jpg");
+        // An ISO-BMFF MP4 body announced by the platform as `image/jpeg`.
+        let mut mp4 = vec![0x00, 0x00, 0x00, 0x18];
+        mp4.extend_from_slice(b"ftypisom");
+        mp4.extend_from_slice(&[0u8; 16]);
+        std::fs::write(&source, &mp4).expect("test: write mp4 body");
+        let conn = rusqlite::Connection::open(store.path().join("wacli.db")).expect("test: open wacli database");
+        conn.execute(
+            "INSERT INTO messages (chat_jid, msg_id, local_path) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["10001@s.whatsapp.net", "image-message-1", source.display().to_string()],
+        )
+        .expect("test: seed downloaded media");
+        drop(conn);
+
+        let mut cfg = cfg_with_secret();
+        cfg.store_dir = Some(store.path().display().to_string());
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut state = state_for(cfg, tx);
+        state.artifact_owner = Some(MediaArtifactOwner::for_workspace(workspace.path()));
+        state.max_image_bytes = 1024;
+        let app = router_for(state);
+        let body = media_payload();
+        let sig = sign("topsecret", &body);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/wacli")
+            .header("X-Wacli-Signature", sig)
+            .body(Body::from(body))
+            .expect("test: build request");
+
+        let resp = app.oneshot(req).await.expect("test: response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let msg = rx.try_recv().expect("test: forwarded message");
+        assert!(crate::multimodal::parse_image_markers(&msg.content).1.is_empty());
+        assert!(msg.content.contains("resolved_image_markers=0"));
     }
 
     #[tokio::test]

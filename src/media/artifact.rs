@@ -10,6 +10,8 @@ use futures_util::StreamExt;
 use parking_lot::Mutex as RegistryMutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::media::type_id::{MediaCategory, TypeHint};
+
 const MAX_REMOTE_REDIRECTS: usize = 5;
 const MAX_URL_BYTES: usize = 2048;
 const MAX_MANAGED_ARTIFACTS: usize = 256;
@@ -35,6 +37,13 @@ pub struct LoadedArtifact {
 pub struct ManagedArtifact {
     pub path: PathBuf,
     pub size_bytes: u64,
+    /// Media class decided by [`crate::media::type_id::resolve`] from the stored
+    /// bytes plus whatever hints the channel supplied.
+    pub category: MediaCategory,
+    /// Canonical extension the artifact was stored under, without the dot.
+    pub extension: String,
+    /// Canonical MIME type for the stored content, when the format is known.
+    pub mime: Option<&'static str>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -123,8 +132,9 @@ impl MediaArtifactOwner {
     /// workspace traversal into the owner-managed artifact store.
     pub async fn admit_workspace_file(&self, source: &str, max_bytes: usize) -> Result<PathBuf, ArtifactError> {
         let (bytes, resolved) = read_workspace_source_bounded(&self.workspace_dir, source, max_bytes).await?;
-        let extension = resolved.extension().and_then(|value| value.to_str()).unwrap_or("bin");
-        Ok(self.store_bytes(&bytes, extension).await?.path)
+        let resolved_name = resolved.to_string_lossy();
+        let hint = TypeHint::new().with_file_name(&resolved_name);
+        Ok(self.store_bytes(&bytes, &hint).await?.path)
     }
 
     pub async fn load(
@@ -257,42 +267,52 @@ impl MediaArtifactOwner {
     }
 
     /// Copy a trusted channel-managed local attachment into the workspace-owned store.
+    ///
+    /// The stored extension is decided by [`crate::media::type_id::resolve`] from
+    /// the file's own bytes plus `hint`; the source path is folded in as the
+    /// weakest signal so an unrecognised format keeps its original suffix.
     pub async fn import_channel_file(
         &self,
         source: &Path,
-        extension: &str,
+        hint: &TypeHint<'_>,
         max_bytes: usize,
     ) -> Result<ManagedArtifact, ArtifactError> {
-        let source = source.to_path_buf();
-        let bytes =
-            crate::runtime::blocking::spawn_blocking(move || read_local_file_no_follow_bounded(&source, max_bytes))
-                .await
-                .map_err(|error| ArtifactError::Io {
-                    path: "channel attachment".to_string(),
-                    reason: error.to_string(),
-                })??;
-        self.store_bytes(&bytes, extension).await
+        let source_path = source.to_path_buf();
+        let bytes = crate::runtime::blocking::spawn_blocking(move || {
+            read_local_file_no_follow_bounded(&source_path, max_bytes)
+        })
+        .await
+        .map_err(|error| ArtifactError::Io {
+            path: "channel attachment".to_string(),
+            reason: error.to_string(),
+        })??;
+        let source_name = source.to_string_lossy();
+        let hint = fill_file_name(hint, &source_name);
+        self.store_bytes(&bytes, &hint).await
     }
 
+    /// Stream a channel download into the workspace-owned store, typing it the
+    /// same way [`MediaArtifactOwner::import_channel_file`] does.
     pub async fn import_channel_response(
         &self,
         response: reqwest::Response,
         source_label: &str,
-        extension: &str,
+        hint: &TypeHint<'_>,
         max_bytes: usize,
     ) -> Result<ManagedArtifact, ArtifactError> {
         if let Some(length) = response.content_length() {
             enforce_size(source_label, length, max_bytes)?;
         }
         let bytes = read_response_bounded(response, source_label, max_bytes).await?;
-        self.store_bytes(&bytes, extension).await
+        self.store_bytes(&bytes, hint).await
     }
 
-    async fn store_bytes(&self, bytes: &[u8], extension: &str) -> Result<ManagedArtifact, ArtifactError> {
+    async fn store_bytes(&self, bytes: &[u8], hint: &TypeHint<'_>) -> Result<ManagedArtifact, ArtifactError> {
         tokio::fs::create_dir_all(&self.artifact_dir)
             .await
             .map_err(|error| io_error(&self.artifact_dir, error))?;
-        let extension = sanitize_extension(extension);
+        let resolved = crate::media::type_id::resolve(hint, bytes);
+        let extension = sanitize_extension(&resolved.extension);
         let path = self
             .artifact_dir
             .join(format!("{}.{}", uuid::Uuid::new_v4(), extension));
@@ -324,7 +344,22 @@ impl MediaArtifactOwner {
         Ok(ManagedArtifact {
             path,
             size_bytes: bytes.len() as u64,
+            category: resolved.category,
+            extension,
+            mime: resolved.mime,
         })
+    }
+}
+
+/// Add `file_name` to a hint that does not already carry one.
+///
+/// Channels pass the platform-supplied file name when they have one; otherwise
+/// the local path is the only naming signal available.
+fn fill_file_name<'a>(hint: &TypeHint<'a>, file_name: &'a str) -> TypeHint<'a> {
+    if hint.has_file_name() {
+        *hint
+    } else {
+        hint.with_file_name(file_name)
     }
 }
 
@@ -680,11 +715,34 @@ mod tests {
     async fn managed_import_is_workspace_owned_and_bounded() {
         let temp = tempfile::tempdir().unwrap();
         let owner = MediaArtifactOwner::for_workspace(temp.path());
-        let source = temp.path().join("channel.bin");
+        let source = temp.path().join("channel.dat");
         std::fs::write(&source, [7_u8; 16]).unwrap();
-        let artifact = owner.import_channel_file(&source, "dat", 16).await.unwrap();
+        let hint = TypeHint::new();
+        let artifact = owner.import_channel_file(&source, &hint, 16).await.unwrap();
         assert!(artifact.path.starts_with(temp.path()));
         assert_eq!(artifact.size_bytes, 16);
         assert_eq!(std::fs::read(&artifact.path).unwrap(), [7_u8; 16]);
+        // Unrecognised bytes keep the source file's own suffix rather than
+        // being rewritten to `bin`.
+        assert_eq!(artifact.extension, "dat");
+        assert_eq!(artifact.category, MediaCategory::Other);
+    }
+
+    /// A channel that supplies no MIME and a misleading `.jfif` name still gets
+    /// a `.jpg` artifact, because the stored bytes decide the extension.
+    #[tokio::test]
+    async fn managed_import_types_the_file_from_its_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let owner = MediaArtifactOwner::for_workspace(temp.path());
+        let source = temp.path().join("message-3AE3C082.jfif");
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        jpeg.extend_from_slice(b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0");
+        std::fs::write(&source, &jpeg).unwrap();
+
+        let hint = TypeHint::new().with_mime("");
+        let artifact = owner.import_channel_file(&source, &hint, 4096).await.unwrap();
+        assert_eq!(artifact.path.extension().and_then(|value| value.to_str()), Some("jpg"));
+        assert_eq!(artifact.extension, "jpg");
+        assert_eq!(artifact.category, MediaCategory::Image);
     }
 }

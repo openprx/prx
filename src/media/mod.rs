@@ -10,7 +10,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::config::MediaConfig;
 
 pub mod artifact;
+pub mod type_id;
 pub use artifact::{ArtifactError, LoadedArtifact, ManagedArtifact, MediaArtifactOwner};
+pub use type_id::{MediaCategory, ResolvedType, TypeHint, TypeSource};
 
 const AUDIO_TIMEOUT: Duration = Duration::from_mins(1);
 const VIDEO_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
