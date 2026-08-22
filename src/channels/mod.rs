@@ -1302,7 +1302,14 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, key: &ConversationKey) ->
 
     for turn in &mut compacted {
         if turn.content.chars().count() > CHANNEL_HISTORY_COMPACT_CONTENT_CHARS {
-            turn.content = truncate_with_ellipsis(&turn.content, CHANNEL_HISTORY_COMPACT_CONTENT_CHARS);
+            // These turns are replayed to the provider verbatim, so the cut must
+            // not slice a media marker in half: a half marker either loses the
+            // attachment or forges a reference to a path that never existed.
+            turn.content = crate::multimodal::truncate_preserving_media_markers(
+                &turn.content,
+                CHANNEL_HISTORY_COMPACT_CONTENT_CHARS,
+            )
+            .into_owned();
         }
     }
 
@@ -1653,20 +1660,297 @@ fn is_tool_result_message(message: &ChatMessage) -> bool {
                 .starts_with(crate::causal_tree::snapshot::TOOL_RESULTS_PREFIX))
 }
 
+/// Wordings upstreams use to say "the prompt no longer fits". Shared by the
+/// overflow retry predicate and the user-facing failure classifier so the two
+/// cannot drift apart.
+const CONTEXT_WINDOW_OVERFLOW_HINTS: [&str; 8] = [
+    "exceeds the context window",
+    "context window of this model",
+    "maximum context length",
+    "context length exceeded",
+    "too many tokens",
+    "token limit exceeded",
+    "prompt is too long",
+    "input is too long",
+];
+
 pub(crate) fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
-    [
-        "exceeds the context window",
-        "context window of this model",
-        "maximum context length",
-        "context length exceeded",
-        "too many tokens",
-        "token limit exceeded",
-        "prompt is too long",
-        "input is too long",
-    ]
-    .iter()
-    .any(|hint| lower.contains(hint))
+    CONTEXT_WINDOW_OVERFLOW_HINTS.iter().any(|hint| lower.contains(hint))
+}
+
+/// Number of hex digits in the short failure code shown to the user.
+const TURN_ERROR_ID_LEN: usize = 8;
+
+/// Short, user-quotable code identifying one failed turn.
+///
+/// It is derived deterministically from the turn's run id, which is the value
+/// the failure is logged under (`turn_run_id`) and the id the durable terminal
+/// event is committed with. A user who quotes the code therefore pins an
+/// operator to exactly one turn instead of "somewhere in the last few hours".
+/// The run id is a UUIDv4, so its leading hex digits carry the same
+/// randomness; a run id that is not hex-shaped (not produced today, but the
+/// field is a plain `String`) is hashed instead so the function stays total.
+pub(crate) fn turn_error_id(turn_run_id: &str) -> String {
+    let hex: String = turn_run_id
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .map(|c| c.to_ascii_lowercase())
+        .take(TURN_ERROR_ID_LEN)
+        .collect();
+    if hex.len() == TURN_ERROR_ID_LEN {
+        return hex;
+    }
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(turn_run_id.as_bytes());
+    digest
+        .iter()
+        .take(TURN_ERROR_ID_LEN / 2)
+        .fold(String::with_capacity(TURN_ERROR_ID_LEN), |mut acc, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{byte:02x}");
+            acc
+        })
+}
+
+/// What went wrong on a channel turn, at the coarse granularity a chat user can
+/// actually act on.
+///
+/// Every variant maps to a fixed sentence. Error text is never interpolated
+/// into what the user sees, so no upstream message can carry a filesystem path,
+/// a credential, an internal hostname or a stack out into the chat — the worst
+/// a misclassification can do is give slightly wrong advice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnFailureKind {
+    /// An image or file the conversation refers to could not be loaded.
+    Attachment,
+    /// The conversation no longer fits in the model's context window.
+    ContextTooLong,
+    /// Upstream asked us to slow down; waiting helps.
+    RateLimited,
+    /// Upstream refused on billing/entitlement grounds; waiting does not help.
+    QuotaExhausted,
+    /// We cannot authenticate to the model service.
+    ServiceCredentials,
+    /// The model service answered, but is failing or overloaded.
+    ServiceUnavailable,
+    /// The model service could not be reached at all.
+    Network,
+    /// The agent hit its tool-iteration ceiling before producing an answer.
+    ToolLoopExhausted,
+    /// Nothing matched. Deliberately says as little as possible.
+    Unclassified,
+}
+
+impl TurnFailureKind {
+    /// Stable machine token logged beside the full error, so a reported error
+    /// id can be cross-checked against the class the classifier picked.
+    pub(crate) const fn log_label(self) -> &'static str {
+        match self {
+            Self::Attachment => "attachment",
+            Self::ContextTooLong => "context_too_long",
+            Self::RateLimited => "rate_limited",
+            Self::QuotaExhausted => "quota_exhausted",
+            Self::ServiceCredentials => "service_credentials",
+            Self::ServiceUnavailable => "service_unavailable",
+            Self::Network => "network",
+            Self::ToolLoopExhausted => "tool_loop_exhausted",
+            Self::Unclassified => "unclassified",
+        }
+    }
+
+    /// The user-visible sentence for this class.
+    ///
+    /// Every arm is a compile-time constant written for a non-engineer and says
+    /// what the reader can do next. Nothing derived from the error is allowed
+    /// in here.
+    pub(crate) const fn advice(self) -> &'static str {
+        match self {
+            Self::Attachment => {
+                "⚠️ I could not open an image or file that this conversation refers to — it looks like it has expired or been removed. Please send it again, or start a new conversation to clear it."
+            }
+            Self::ContextTooLong => {
+                "⚠️ This conversation has grown too long for me to work through in one go. Please start a new conversation, or ask a shorter question."
+            }
+            Self::RateLimited => {
+                "⚠️ There are too many requests going through right now, so I was asked to slow down. Please wait a minute and send your message again."
+            }
+            Self::QuotaExhausted => {
+                "⚠️ My AI service account has run out of allowance, so I cannot answer right now. Trying again will not help — please let an administrator know."
+            }
+            Self::ServiceCredentials => {
+                "⚠️ I cannot sign in to the AI service, so I cannot answer right now. An administrator needs to fix this — please pass on the error ID below."
+            }
+            Self::ServiceUnavailable => {
+                "⚠️ The AI service is having trouble at the moment. Please try again in a few minutes."
+            }
+            Self::Network => "⚠️ I could not reach the AI service — the connection failed. Please try again.",
+            Self::ToolLoopExhausted => {
+                "⚠️ I worked on that for a while and had to stop before finishing. Please try rephrasing it, or splitting it into smaller steps."
+            }
+            Self::Unclassified => "⚠️ Something went wrong. Please try again later.",
+        }
+    }
+}
+
+/// Build the user-visible failure notice: fixed advice plus the code that ties
+/// this message to one log record.
+pub(crate) fn turn_failure_notice(kind: TurnFailureKind, error_id: &str) -> String {
+    format!("{}\n(Error ID: {error_id})", kind.advice())
+}
+
+/// Classify a failed turn by scanning the whole `anyhow` cause chain.
+///
+/// The chain, not just the outermost message: a multimodal read failure or an
+/// upstream 429 routinely arrives wrapped in a generic context line, and
+/// matching only the head would classify all of those as unknown.
+pub(crate) fn classify_turn_failure(err: &anyhow::Error) -> TurnFailureKind {
+    let mut chain_text = String::new();
+    for cause in err.chain() {
+        use std::fmt::Write as _;
+        let _ = writeln!(chain_text, "{cause}");
+    }
+    chain_text.make_ascii_lowercase();
+    classify_turn_failure_text(&chain_text)
+}
+
+/// Classifier core, split out so it can be exercised on literal error text.
+///
+/// `lower` must already be lowercased. The hint strings were taken from the
+/// error shapes this branch has actually produced in production plus the
+/// `Display` impls that can reach it (`MultimodalError`, `StreamError`, the
+/// per-provider `"{provider} API error ({status}): …"` renderings and the
+/// reliability layer's aggregate). Order is deliberate: narrow, unambiguous
+/// markers first, and a billing refusal is recognised before the generic 429
+/// wording it arrives with. Anything matching nothing stays `Unclassified` —
+/// saying too little is recoverable, telling a user the wrong thing is not.
+fn classify_turn_failure_text(lower: &str) -> TurnFailureKind {
+    /// Emitted only by the agent's own iteration ceiling.
+    const TOOL_LOOP_HINTS: [&str; 1] = ["exceeded maximum tool iterations"];
+    /// Emitted only by the multimodal / media-artifact preparation stage. The
+    /// production incident this classifier exists for lands on the first entry.
+    const ATTACHMENT_HINTS: [&str; 8] = [
+        "failed to read local image",
+        "failed to download remote image",
+        "invalid multimodal image marker",
+        "multimodal remote image",
+        "multimodal image",
+        "image url targets a private/local address",
+        "media artifact i/o failed",
+        "media source is not a regular readable file",
+    ];
+    /// Extra overflow wordings that the retry predicate does not look for.
+    /// Kept separate so the predicate's behaviour is untouched.
+    const CONTEXT_EXTRA_HINTS: [&str; 4] = [
+        "context_length_exceeded",
+        "input token count",
+        "exceeds maximum context",
+        "exceed the maximum context",
+    ];
+    /// Billing / entitlement refusals: retrying cannot clear these.
+    const QUOTA_HINTS: [&str; 9] = [
+        "insufficient balance",
+        "insufficient_balance",
+        "insufficient quota",
+        "insufficient_quota",
+        "quota exhausted",
+        "exceeded your current quota",
+        "credit balance is too low",
+        "plan does not include",
+        "billing",
+    ];
+    /// Authentication and credential-configuration failures. `reqwest` renders
+    /// a status as `401 Unauthorized`, so the reason phrase is the reliable
+    /// marker; a bare `401` is not matched, because it also occurs inside
+    /// request ids and token counts.
+    const CREDENTIAL_HINTS: [&str; 12] = [
+        "unauthorized",
+        "403 forbidden",
+        "http 403",
+        "invalid authentication",
+        "invalid_authentication",
+        "authentication_error",
+        "api key appears to be invalid",
+        "invalid api key",
+        "incorrect api key",
+        "invalid_api_key",
+        "api key not set",
+        "oauth refresh failed",
+    ];
+    /// Explicit 5xx statuses. Checked before the rate-limit hints because the
+    /// streaming layer reports a 503 through a variant whose `Display` still
+    /// begins with "Rate limited".
+    const SERVER_STATUS_HINTS: [&str; 9] = [
+        "500 internal server error",
+        "502 bad gateway",
+        "503 service unavailable",
+        "504 gateway timeout",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+        "http 529",
+    ];
+    /// Throttling that clears on its own.
+    const RATE_LIMIT_HINTS: [&str; 6] = [
+        "too many requests",
+        "http 429",
+        "rate limited",
+        "rate limit",
+        "rate_limit",
+        "slow down",
+    ];
+    /// Upstream capacity problems stated in prose rather than as a status
+    /// (Anthropic `overloaded_error`, Kimi `engine_overloaded_error`). Checked
+    /// after the rate-limit hints so a 429 that merely explains itself as
+    /// "overloaded" still gets the "wait a minute" advice.
+    const OVERLOAD_TEXT_HINTS: [&str; 6] = [
+        "overloaded",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "internal server error",
+        "temporarily unavailable",
+    ];
+    /// Transport-level failures: nothing upstream was reached at all.
+    const NETWORK_HINTS: [&str; 12] = [
+        "error sending request",
+        "error decoding response body",
+        "network retries exhausted",
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "timed out",
+        "timeout",
+        "dns error",
+        "failed to lookup address",
+        "network is unreachable",
+        "broken pipe",
+    ];
+
+    let hit = |hints: &[&str]| hints.iter().any(|hint| lower.contains(hint));
+
+    if hit(&TOOL_LOOP_HINTS) {
+        TurnFailureKind::ToolLoopExhausted
+    } else if hit(&ATTACHMENT_HINTS) {
+        TurnFailureKind::Attachment
+    } else if hit(&CONTEXT_WINDOW_OVERFLOW_HINTS) || hit(&CONTEXT_EXTRA_HINTS) {
+        TurnFailureKind::ContextTooLong
+    } else if hit(&QUOTA_HINTS) {
+        TurnFailureKind::QuotaExhausted
+    } else if hit(&CREDENTIAL_HINTS) {
+        TurnFailureKind::ServiceCredentials
+    } else if hit(&SERVER_STATUS_HINTS) {
+        TurnFailureKind::ServiceUnavailable
+    } else if hit(&RATE_LIMIT_HINTS) {
+        TurnFailureKind::RateLimited
+    } else if hit(&OVERLOAD_TEXT_HINTS) {
+        TurnFailureKind::ServiceUnavailable
+    } else if hit(&NETWORK_HINTS) {
+        TurnFailureKind::Network
+    } else {
+        TurnFailureKind::Unclassified
+    }
 }
 
 fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<String> {
@@ -1875,10 +2159,11 @@ async fn build_memory_context(mem: &dyn Memory, user_msg: &str, min_relevance_sc
                 continue;
             }
 
-            let content = if entry.content.chars().count() > MEMORY_CONTEXT_ENTRY_MAX_CHARS {
-                truncate_with_ellipsis(&entry.content, MEMORY_CONTEXT_ENTRY_MAX_CHARS)
+            let quoted = crate::multimodal::neutralize_media_markers(&entry.content);
+            let content = if quoted.chars().count() > MEMORY_CONTEXT_ENTRY_MAX_CHARS {
+                truncate_with_ellipsis(&quoted, MEMORY_CONTEXT_ENTRY_MAX_CHARS)
             } else {
-                entry.content.clone()
+                quoted.into_owned()
             };
 
             let line = format!("- {}: {}\n", entry.key, content);
@@ -3814,21 +4099,39 @@ async fn run_channel_turn(
             {
                 tracing::warn!(error = %error, "Failed to commit shared failed channel terminal event");
             }
-            eprintln!("  ❌ LLM error after {}ms: {e}", started_at.elapsed().as_millis());
+            // What the user is told is chosen from a closed set of fixed
+            // sentences keyed on the failure class; the error's own text never
+            // reaches the chat. That is what keeps a leaked filesystem path,
+            // API key, internal hostname or stack out of an outbound message
+            // while still saying something the reader can act on.
+            let failure_kind = classify_turn_failure(&e);
+            let error_id = turn_error_id(&turn_run_id);
+            // The operator-facing side keeps the error verbatim, and now also
+            // carries the code the user will quote plus the class that was
+            // picked, so a reported id resolves to exactly one turn.
+            eprintln!(
+                "  ❌ LLM error after {}ms [error_id={error_id} class={}]: {e}",
+                started_at.elapsed().as_millis(),
+                failure_kind.log_label()
+            );
+            tracing::error!(
+                error_id = %error_id,
+                turn_run_id = %turn_run_id,
+                failure_class = failure_kind.log_label(),
+                channel = %msg.channel,
+                error = ?e,
+                "channel turn failed"
+            );
             if let Some(channel) = target_channel.as_ref() {
+                let error_text = turn_failure_notice(failure_kind, &error_id);
                 if let Some(ref draft_id) = draft_message_id {
-                    let _ = finalize_draft_recording_activity(
-                        channel.as_ref(),
-                        &msg.reply_target,
-                        draft_id,
-                        "⚠️ Something went wrong. Please try again later.",
-                    )
-                    .await;
+                    let _ =
+                        finalize_draft_recording_activity(channel.as_ref(), &msg.reply_target, draft_id, &error_text)
+                            .await;
                 } else {
                     let _ = send_recording_activity(
                         channel.as_ref(),
-                        &SendMessage::new("⚠️ Something went wrong. Please try again later.", &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
+                        &SendMessage::new(error_text.as_str(), &msg.reply_target).in_thread(msg.thread_ts.clone()),
                     )
                     .await;
                 }
@@ -5546,6 +5849,7 @@ pub async fn start_channels_with_config(
             config.router.clone(),
             config.model_routes.clone(),
         ))
+        .with_reliability(config.reliability.clone())
         .with_channels(spawn_channels_by_name)
         .with_shared_memory(Arc::clone(&mem));
         let spawn_tool = spawn_tool.with_event_recording(config.memory.event_recording_config());
@@ -9724,7 +10028,419 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(responses.len(), 1);
         let response = responses.first().unwrap();
         assert!(response.starts_with("chat-iter-fail:"));
-        assert!(response.contains("⚠️ Something went wrong. Please try again later."));
+        // Hitting the iteration ceiling is a recognised failure class now, so the
+        // reader is told what actually happened and what to do instead of the
+        // catch-all sentence.
+        assert!(
+            response.contains(TurnFailureKind::ToolLoopExhausted.advice()),
+            "iteration-ceiling turns must carry the tool-loop advice, got: {response}"
+        );
+        assert!(
+            response.contains("(Error ID: "),
+            "every failure notice must carry a quotable error id, got: {response}"
+        );
+        assert!(
+            !response.contains("⚠️ Something went wrong. Please try again later."),
+            "a classified failure must not fall back to the generic sentence"
+        );
+    }
+
+    // --- User-facing failure classification -------------------------------
+    //
+    // The sentence a chat user reads when a turn fails used to be one
+    // zero-information line for every cause. These tests pin the two things
+    // that matter: the advice is right for the class, and no error text ever
+    // reaches the chat.
+
+    /// Wrap literal error text the way the runtime hands it to the classifier.
+    fn failure_of(text: &str) -> anyhow::Error {
+        anyhow::anyhow!(text.to_string())
+    }
+
+    /// The 2026-08-21 production incident, verbatim from journald: a stale
+    /// image marker in replayed history made every turn in one chat fail for
+    /// hours while the user only ever read "Something went wrong".
+    #[test]
+    fn turn_failure_maps_unreadable_image_to_attachment_advice() {
+        let err = failure_of(
+            "failed to read local image '/home/ck/.openprx/workspace/media/img_9f31.jpg': No such file or directory (os error 2)",
+        );
+        assert_eq!(classify_turn_failure(&err), TurnFailureKind::Attachment);
+
+        let notice = turn_failure_notice(TurnFailureKind::Attachment, "0badc0de");
+        assert!(notice.contains("image or file"), "notice must name the attachment");
+        assert!(
+            notice.contains("send it again") && notice.contains("start a new conversation"),
+            "notice must tell the reader what to do: {notice}"
+        );
+        assert!(!notice.contains("/home/ck"), "notice must not leak the path");
+    }
+
+    #[test]
+    fn turn_failure_maps_context_window_overflow() {
+        for text in [
+            "Anthropic API error (400 Bad Request): prompt is too long: 251234 tokens > 200000",
+            "context_length_exceeded",
+            "This model's maximum context length is 128000 tokens",
+        ] {
+            assert_eq!(
+                classify_turn_failure(&failure_of(text)),
+                TurnFailureKind::ContextTooLong,
+                "expected an overflow classification for {text}"
+            );
+        }
+        let notice = turn_failure_notice(TurnFailureKind::ContextTooLong, "0badc0de");
+        assert!(notice.contains("too long"));
+        assert!(notice.contains("start a new conversation") && notice.contains("shorter question"));
+    }
+
+    #[test]
+    fn turn_failure_maps_upstream_rate_limit() {
+        // Both shapes seen in the logs: the streaming wrapper and a raw body.
+        for text in [
+            "Rate limited (HTTP 429): Kimi Code streaming HTTP 429 Too Many Requests: {\"error\":{\"message\":\"The engine is currently overloaded, please try again later\",\"type\":\"engine_overloaded_error\"}}",
+            "Provider error: Anthropic streaming HTTP 429 Too Many Requests: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Error\"}}",
+        ] {
+            assert_eq!(
+                classify_turn_failure(&failure_of(text)),
+                TurnFailureKind::RateLimited,
+                "expected a rate-limit classification for {text}"
+            );
+        }
+        let notice = turn_failure_notice(TurnFailureKind::RateLimited, "0badc0de");
+        assert!(
+            notice.contains("wait a minute"),
+            "notice must give a wait-and-retry action"
+        );
+    }
+
+    #[test]
+    fn turn_failure_maps_billing_quota_exhaustion() {
+        // Arrives on a 429 too, but retrying is futile, so it must not be told
+        // to the user as "wait a minute".
+        let err = failure_of(
+            "GLM API error (429 Too Many Requests): {\"error\":{\"code\":1113,\"message\":\"insufficient balance\"}}",
+        );
+        assert_eq!(classify_turn_failure(&err), TurnFailureKind::QuotaExhausted);
+        let notice = turn_failure_notice(TurnFailureKind::QuotaExhausted, "0badc0de");
+        assert!(notice.contains("will not help") && notice.contains("administrator"));
+        assert!(
+            !notice.contains("wait a minute"),
+            "a billing refusal must not advise waiting"
+        );
+    }
+
+    #[test]
+    fn turn_failure_maps_credential_failure() {
+        for text in [
+            "Provider error: 401 Unauthorized: {\"error\":{\"message\":\"The API Key appears to be invalid or may have expired.\",\"type\":\"invalid_authentication_error\"}}",
+            "OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.",
+        ] {
+            assert_eq!(
+                classify_turn_failure(&failure_of(text)),
+                TurnFailureKind::ServiceCredentials,
+                "expected a credential classification for {text}"
+            );
+        }
+        let notice = turn_failure_notice(TurnFailureKind::ServiceCredentials, "0badc0de");
+        assert!(notice.contains("administrator") && notice.contains("error ID"));
+        assert!(
+            !notice.contains("OPENAI_API_KEY") && !notice.contains("config.toml"),
+            "notice must not name internal configuration"
+        );
+    }
+
+    #[test]
+    fn turn_failure_maps_upstream_server_failure() {
+        for text in [
+            "Kimi Code API error (503 Service Unavailable): upstream is down",
+            "Provider error: Anthropic streaming HTTP 529: {\"type\":\"overloaded_error\"}",
+        ] {
+            assert_eq!(
+                classify_turn_failure(&failure_of(text)),
+                TurnFailureKind::ServiceUnavailable,
+                "expected an unavailability classification for {text}"
+            );
+        }
+        let notice = turn_failure_notice(TurnFailureKind::ServiceUnavailable, "0badc0de");
+        assert!(notice.contains("try again in a few minutes"));
+    }
+
+    #[test]
+    fn turn_failure_maps_transport_failure() {
+        for text in [
+            "HTTP error: error sending request for url (https://llm-gw.internal.corp:8443/v1/messages)",
+            "network retries exhausted (3): HTTP error: error decoding response body",
+        ] {
+            assert_eq!(
+                classify_turn_failure(&failure_of(text)),
+                TurnFailureKind::Network,
+                "expected a transport classification for {text}"
+            );
+        }
+        let notice = turn_failure_notice(TurnFailureKind::Network, "0badc0de");
+        assert!(notice.contains("Please try again"));
+        assert!(
+            !notice.contains("internal.corp"),
+            "notice must not leak the upstream host"
+        );
+    }
+
+    #[test]
+    fn turn_failure_maps_tool_iteration_ceiling() {
+        let err = failure_of("Agent exceeded maximum tool iterations (200)");
+        assert_eq!(classify_turn_failure(&err), TurnFailureKind::ToolLoopExhausted);
+        let notice = turn_failure_notice(TurnFailureKind::ToolLoopExhausted, "0badc0de");
+        assert!(notice.contains("rephrasing") && notice.contains("smaller steps"));
+    }
+
+    #[test]
+    fn turn_failure_classification_walks_the_whole_cause_chain() {
+        // Real failures reach this branch wrapped in generic context lines;
+        // reading only the outermost message would classify them as unknown.
+        let err = failure_of("failed to read local image '/srv/data/x.png': No such file or directory")
+            .context("preparing messages for provider")
+            .context("channel turn failed");
+        assert_eq!(classify_turn_failure(&err), TurnFailureKind::Attachment);
+    }
+
+    /// SECURITY: the notice is assembled only from compile-time prose plus the
+    /// error id, so nothing an upstream puts in an error message can be carried
+    /// out to a chat. This asserts that end to end over the leak shapes that
+    /// really occur: absolute paths, API keys, internal hostnames, stacks and
+    /// SQL.
+    #[test]
+    fn turn_failure_notice_never_leaks_sensitive_error_details() {
+        let secrets = [
+            "/home/ck/.openprx/workspace/media/img_9f31.jpg",
+            "sk-ant-api03-7Yq2Nn0ZzL8pVw4RtGh1JkMbXcAeDfSuIoPlQwErTyUi",
+            "AKIAIOSFODNN7EXAMPLE",
+            "llm-gw.internal.corp:8443",
+            "postgres://prx:hunter2@10.0.3.14:5432/prx",
+            "SELECT api_key FROM provider_credentials WHERE id = 7",
+            "at openprx::providers::anthropic::stream (src/providers/anthropic.rs:1421)",
+        ];
+        let leaky = failure_of(&format!(
+            "failed to read local image '{}': auth to {} with key {} failed; {}; {}; {}; {}",
+            secrets[0], secrets[3], secrets[1], secrets[2], secrets[4], secrets[5], secrets[6]
+        ));
+
+        let kind = classify_turn_failure(&leaky);
+        let notice = turn_failure_notice(kind, &turn_error_id("11112222-3333-4444-5555-666677778888"));
+
+        for secret in secrets {
+            assert!(
+                !notice.contains(secret),
+                "user-visible notice leaked {secret}: {notice}"
+            );
+        }
+        // Structural guards, so a future edit that starts interpolating the
+        // error is caught even for a payload not listed above.
+        for fragment in ["/", "sk-", "AKIA", "SELECT ", "::", "src/", "@"] {
+            assert!(
+                !notice.contains(fragment),
+                "user-visible notice contains raw-error marker {fragment:?}: {notice}"
+            );
+        }
+        // Same guarantee for every class, not just the one this error mapped to.
+        for kind in [
+            TurnFailureKind::Attachment,
+            TurnFailureKind::ContextTooLong,
+            TurnFailureKind::RateLimited,
+            TurnFailureKind::QuotaExhausted,
+            TurnFailureKind::ServiceCredentials,
+            TurnFailureKind::ServiceUnavailable,
+            TurnFailureKind::Network,
+            TurnFailureKind::ToolLoopExhausted,
+            TurnFailureKind::Unclassified,
+        ] {
+            let text = turn_failure_notice(kind, "0badc0de");
+            for fragment in ["/", "sk-", "SELECT ", "::", "src/", "@"] {
+                assert!(
+                    !text.contains(fragment),
+                    "{} advice contains raw-error marker {fragment:?}: {text}",
+                    kind.log_label()
+                );
+            }
+        }
+    }
+
+    /// Conservative fallback: an error nobody taught the classifier about still
+    /// gets the old wording — but now with a code an operator can grep for.
+    #[test]
+    fn unclassified_turn_failure_falls_back_to_generic_notice_with_error_id() {
+        for text in [
+            "Invalid SSE format: Invalid UTF-8: incomplete utf-8 byte sequence from index 1748",
+            "Kimi Code API error (400 Bad Request): {\"error\":{\"message\":\"an assistant message with 'tool_calls' must be followed by tool messages\"}}",
+            "wibble",
+        ] {
+            assert_eq!(
+                classify_turn_failure(&failure_of(text)),
+                TurnFailureKind::Unclassified,
+                "unfamiliar error must not be guessed at: {text}"
+            );
+        }
+
+        let notice = turn_failure_notice(TurnFailureKind::Unclassified, "0badc0de");
+        assert!(notice.starts_with("⚠️ Something went wrong. Please try again later."));
+        assert!(notice.contains("(Error ID: 0badc0de)"), "fallback still needs an id");
+    }
+
+    #[test]
+    fn turn_error_id_is_derived_from_the_turn_run_id() {
+        let run_id = "3f9a1c02-8b4d-4e21-9f0a-1c2d3e4f5061";
+        let id = turn_error_id(run_id);
+        assert_eq!(id, "3f9a1c02", "the id must be the run id's leading hex digits");
+        assert_eq!(id, turn_error_id(run_id), "the same turn must always yield the same id");
+        assert_ne!(
+            id,
+            turn_error_id("a0000000-8b4d-4e21-9f0a-1c2d3e4f5061"),
+            "different turns must not collide on the visible id"
+        );
+
+        // Total on a run id that is not UUID-shaped: hashed, still 8 hex digits.
+        let hashed = turn_error_id("run/2026-08-22");
+        assert_eq!(hashed.len(), 8);
+        assert!(hashed.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(hashed, turn_error_id("run/2026-08-22"));
+    }
+
+    struct LeakyFailingProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for LeakyFailingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Err(anyhow::anyhow!(
+                "failed to read local image '/home/ck/.openprx/workspace/media/img_9f31.jpg': No such file or directory (os error 2)"
+            ))
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Err(anyhow::anyhow!(
+                "failed to read local image '/home/ck/.openprx/workspace/media/img_9f31.jpg': No such file or directory (os error 2)"
+            ))
+        }
+    }
+
+    /// End to end over a real channel turn: the reader gets actionable advice
+    /// with no path in it, and the code they can quote is the one derived from
+    /// this turn's run id — the same value the failure is logged under.
+    #[tokio::test]
+    async fn failed_channel_turn_sends_classified_advice_carrying_the_turn_error_id() {
+        let tmp = TempDir::new().expect("test: tempdir");
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).expect("test: sqlite memory"));
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+        let mut runtime_config = Config::default();
+        runtime_config.default_provider = Some("test-provider".to_string());
+        runtime_config.default_model = Some("test-model".to_string());
+        let config_manager = crate::config::new_shared(runtime_config);
+        let ctx = Arc::new(ChannelRuntimeContext {
+            config: Arc::clone(&config_manager),
+            config_generation: config_manager.pin(),
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(LeakyFailingProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::clone(&memory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            hooks: Arc::new(HookManager::new(tmp.path().to_path_buf())),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
+            max_tool_iterations: 3,
+            read_only_tool_concurrency_window: 2,
+            priority_scheduling_enabled: false,
+            low_priority_tools: Vec::new(),
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(tmp.path().to_path_buf()),
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            tool_tiering: crate::config::ToolTieringConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
+            bot_names: vec!["prx".to_string()],
+            bot_uuids: vec![],
+            mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+            })),
+            native_tools: false,
+            skill_rag_ctx: None,
+            test_inbound_authorizer: None,
+        });
+
+        process_channel_message(ctx, gate_test_message(), CancellationToken::new()).await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        let responses = response_messages(&sent_messages);
+        assert_eq!(responses.len(), 1, "a failed turn must still answer once");
+        let response = responses.first().expect("test: one response");
+
+        assert!(
+            response.contains(TurnFailureKind::Attachment.advice()),
+            "the reader must be told the attachment is the problem: {response}"
+        );
+        assert!(
+            !response.contains("/home/ck") && !response.contains("img_9f31") && !response.contains("os error"),
+            "the outbound message leaked internal error detail: {response}"
+        );
+
+        // The user-visible code must resolve to this turn's run id, which is
+        // what `tracing` records the failure under and what the durable
+        // terminal event is keyed on.
+        let events = memory
+            .list_message_events_since(
+                &MemoryPrincipal {
+                    workspace_id: tmp.path().to_string_lossy().to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: None,
+                    channel: Some("test-channel".to_string()),
+                    sender: None,
+                    owner_id: None,
+                    legacy_session_key: None,
+                },
+                0,
+                20,
+            )
+            .await
+            .expect("test: list message events");
+        let run_id = events
+            .iter()
+            .find(|event| event.role == "user")
+            .and_then(|event| event.run_id.clone())
+            .expect("test: the inbound event carries the turn run id");
+        assert!(
+            response.contains(&format!("(Error ID: {})", turn_error_id(&run_id))),
+            "the quoted code must match the id logged for run {run_id}: {response}"
+        );
     }
 
     struct NoopMemory;
