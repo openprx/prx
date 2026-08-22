@@ -39,6 +39,35 @@ copies the image into its workspace-owned media store with the configured
 `[multimodal].max_image_size_mb` limit, and then sends it through the normal
 multimodal provider path. Source paths outside `store_dir` are rejected.
 
+### Outbound media (wacli)
+
+An agent reply may embed `[IMAGE:…]`, `[VIDEO:…]`, `[AUDIO:…]`, `[VOICE:…]` or
+`[DOCUMENT:…]` markers. On the wacli channel each marker becomes a real
+WhatsApp attachment (`wacli send file`, or `wacli send voice` for an OGG/Opus
+voice note); the surrounding text rides along as the `--caption` of the first
+caption-capable attachment, or is sent as its own message when it cannot.
+
+* **Source** — either a path inside the workspace or an `http(s)` URL. Local
+  paths are read through the workspace-confined, `O_NOFOLLOW` loader used by
+  every other media path, so `/etc/shadow`, `~/.ssh/id_rsa`, `../` escapes and
+  symlinks pointing out of the workspace are refused. URLs go through the shared
+  SSRF policy (loopback, link-local and private ranges blocked).
+* **Type** — decided from the file's own bytes by the media type identifier, not
+  from the marker or the extension, so a JPEG named `photo.jfif` is sent as
+  `photo.jpg` with `--mime image/jpeg`. A marker whose declared class disagrees
+  with the content is logged and sent as the detected class.
+* **Size** — 16 MiB for images and audio, 64 MiB for video and anything else.
+* **Staging** — the admitted bytes are copied into a private (0600) temp file
+  that is unlinked when the send finishes, fails, or unwinds; wacli never opens
+  the model-supplied path itself.
+* **Fallback** — a rejected or failed attachment is put back into a trailing
+  text message in its original `[KIND:source]` form, which is exactly what the
+  channel did before media send existed. Nothing is dropped and nothing is sent
+  twice.
+
+These limits are fixed constants; the wacli channel adds no configuration keys
+for outbound media.
+
 ## Turn Duration
 
 A channel turn has no wall-clock budget. It runs until it finishes, until it is

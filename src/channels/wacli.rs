@@ -9,6 +9,18 @@
 //!   message as JSON, signed with `X-Wacli-Signature: sha256=<hex>`.
 //! - **Outbound**: shelling out to `wacli send text --to <jid> --message <text>`
 //!   via [`tokio::process::Command`] (argument array, never a shell string).
+//!   Media markers (`[IMAGE:…]`, `[VIDEO:…]`, `[AUDIO:…]`, `[VOICE:…]`,
+//!   `[DOCUMENT:…]`) become `wacli send file` / `wacli send voice` uploads.
+//!
+//! ## Outbound media security model
+//!
+//! A marker source is model output, i.e. untrusted. Every source is admitted
+//! through [`crate::media::MediaArtifactOwner::load`], which confines local
+//! paths to the workspace with an `O_NOFOLLOW` traversal and runs remote URLs
+//! through the shared SSRF policy. The admitted bytes are then staged into a
+//! private temp file (`tempfile::TempPath`, unlinked on drop) so wacli never
+//! opens the model-supplied path itself, and the attachment type is decided by
+//! [`crate::media::type_id`] from the bytes rather than from the marker.
 //!
 //! This replaces the previous self-maintained JSON-RPC TCP daemon client
 //! (the forked `openprx/wacli daemon`), which is no longer supported.
@@ -25,7 +37,7 @@
 //! mandatory; unsigned requests are only honored when `allow_unsigned_loopback`
 //! is explicitly set and the server binds a loopback address.
 
-use super::traits::{Channel, ChannelCapabilities, ChannelMessage, ChatKind, SendMessage};
+use super::traits::{Channel, ChannelCapabilities, ChannelMessage, ChatKind, SendMessage, extract_outgoing_media};
 use crate::media::{MediaArtifactOwner, MediaCategory, TypeHint};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -758,6 +770,362 @@ impl WacliChannel {
         }
         Ok(())
     }
+
+    /// Stage one `[KIND:source]` marker into a temp file wacli can upload.
+    ///
+    /// `source` is model output and therefore untrusted. Local paths are read
+    /// through [`MediaArtifactOwner::load`], the same workspace-confined,
+    /// `O_NOFOLLOW` traversal the inbound/multimodal paths use, so anything
+    /// outside the workspace (`/etc/shadow`, `~/.ssh/id_rsa`, `../` escapes,
+    /// symlinks pointing out) is rejected before a single byte is read. URLs go
+    /// through the same loader's SSRF-checked fetch. The declared marker kind is
+    /// only a hint: the attachment is classified from its own bytes.
+    async fn prepare_outbound_media(&self, marker: &str, source: &str) -> Result<PreparedMedia> {
+        let owner = self
+            .artifact_owner
+            .as_deref()
+            .context("outbound media requires the workspace media artifact owner")?;
+        let source = source.trim();
+        if source.is_empty() {
+            anyhow::bail!("empty media source");
+        }
+
+        let marker_category = super::traits::outgoing_marker_category(marker);
+        let load_cap = marker_category.map_or(MAX_OUTBOUND_DOCUMENT_BYTES, outbound_category_cap);
+        let loaded = owner
+            .load(source, load_cap, ALLOW_OUTBOUND_REMOTE_FETCH)
+            .await
+            .with_context(|| format!("refused outbound media source '{source}'"))?;
+
+        let name_hint = outbound_source_basename(source);
+        let hint = TypeHint::new()
+            .with_file_name(name_hint)
+            .with_optional_mime(loaded.content_type_hint.as_deref());
+        let resolved = crate::media::type_id::resolve(&hint, &loaded.bytes);
+        let category = resolved.category;
+        let mime = resolved.mime;
+        let extension = if resolved.extension.trim().is_empty() {
+            "bin".to_string()
+        } else {
+            resolved.extension.to_string()
+        };
+
+        if let Some(expected) = marker_category
+            && expected != category
+        {
+            tracing::warn!(
+                channel = "wacli",
+                marker = %marker,
+                detected = %category.as_str(),
+                source = %source,
+                "outbound media marker disagrees with the file content; sending it as the detected type"
+            );
+        }
+
+        let size_bytes = loaded.bytes.len();
+        let cap = outbound_category_cap(category);
+        if size_bytes > cap {
+            anyhow::bail!(
+                "outbound {} attachment is {size_bytes} bytes, over the {cap} byte limit",
+                category.as_str()
+            );
+        }
+
+        // A voice note has to be an OGG/Opus stream; any other audio the model
+        // labelled `[VOICE:…]` degrades to a regular audio attachment.
+        let command = if marker.eq_ignore_ascii_case("VOICE") {
+            if matches!(mime, Some("audio/ogg" | "audio/opus")) {
+                WacliMediaCommand::Voice
+            } else {
+                tracing::info!(
+                    channel = "wacli",
+                    detected = %category.as_str(),
+                    "voice marker is not OGG/Opus; sending it as a regular attachment"
+                );
+                WacliMediaCommand::File
+            }
+        } else {
+            WacliMediaCommand::File
+        };
+
+        let filename = outbound_display_name(source, &extension);
+        let temp = stage_outbound_media(loaded.bytes, &extension).await?;
+        Ok(PreparedMedia {
+            temp,
+            command,
+            filename,
+            mime,
+            category,
+            size_bytes,
+        })
+    }
+
+    /// Invoke `wacli send file|voice` for one staged attachment.
+    async fn send_prepared_media(
+        &self,
+        recipient: &str,
+        prepared: &PreparedMedia,
+        caption: Option<&str>,
+    ) -> Result<()> {
+        let mut cmd = tokio::process::Command::new(self.cli_binary());
+        cmd.arg("send")
+            .arg(prepared.command.as_str())
+            .arg("--to")
+            .arg(recipient)
+            .arg("--file")
+            .arg(prepared.temp.as_os_str());
+        if matches!(prepared.command, WacliMediaCommand::File) {
+            cmd.arg("--filename").arg(&prepared.filename);
+        }
+        if let Some(mime) = prepared.mime {
+            cmd.arg("--mime").arg(mime);
+        }
+        if let Some(caption) = caption {
+            cmd.arg("--caption").arg(caption);
+        }
+        if let Some(store) = self.config.store_dir.as_deref()
+            && !store.trim().is_empty()
+        {
+            cmd.arg("--store").arg(store);
+        }
+        cmd.kill_on_drop(true);
+
+        let subcommand = prepared.command.as_str();
+        let output = tokio::time::timeout(MEDIA_SEND_TIMEOUT, cmd.output())
+            .await
+            .with_context(|| format!("timeout running '{} send {subcommand}'", self.cli_binary()))?
+            .with_context(|| format!("failed to spawn '{}'", self.cli_binary()))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "wacli send {subcommand} failed (status {}): {}",
+                output.status.code().unwrap_or(-1),
+                stderr.trim()
+            );
+        }
+        Ok(())
+    }
+
+    /// Send a message whose content carried at least one media marker.
+    ///
+    /// Every attachment that can be staged and uploaded is sent as real media.
+    /// Anything that cannot — denied path, oversized file, failed upload — is
+    /// put back into a trailing text message in its original `[KIND:source]`
+    /// form, which is exactly what this channel did before media send existed.
+    /// Nothing is dropped silently and nothing is sent twice.
+    async fn send_with_media(&self, message: &SendMessage, clean_text: &str, media: &[(String, String)]) -> Result<()> {
+        if message.recipient.trim().is_empty() {
+            anyhow::bail!("wacli send: empty recipient");
+        }
+
+        let caption_eligible = !clean_text.is_empty() && clean_text.chars().count() <= MAX_OUTBOUND_CAPTION_CHARS;
+        let mut caption_used = false;
+        let mut leftover: Vec<String> = Vec::new();
+
+        for (marker, source) in media {
+            match self.prepare_outbound_media(marker, source).await {
+                Ok(prepared) => {
+                    let caption =
+                        (caption_eligible && !caption_used && prepared.supports_caption()).then_some(clean_text);
+                    match self.send_prepared_media(&message.recipient, &prepared, caption).await {
+                        Ok(()) => {
+                            caption_used |= caption.is_some();
+                            tracing::info!(
+                                channel = "wacli",
+                                marker = %marker,
+                                subcommand = prepared.command.as_str(),
+                                category = %prepared.category.as_str(),
+                                bytes = prepared.size_bytes,
+                                "sent outbound media attachment"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                channel = "wacli",
+                                marker = %marker,
+                                error = %error,
+                                "outbound media upload failed; falling back to the literal marker text"
+                            );
+                            leftover.push(format!("[{marker}:{source}]"));
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        channel = "wacli",
+                        marker = %marker,
+                        error = %error,
+                        "outbound media rejected; falling back to the literal marker text"
+                    );
+                    leftover.push(format!("[{marker}:{source}]"));
+                }
+            }
+        }
+
+        let mut trailing = String::new();
+        if !clean_text.is_empty() && !caption_used {
+            trailing.push_str(clean_text);
+        }
+        for marker in &leftover {
+            if !trailing.is_empty() {
+                trailing.push(' ');
+            }
+            trailing.push_str(marker);
+        }
+        if !trailing.is_empty() {
+            self.send_text(&message.recipient, &trailing).await?;
+        }
+        Ok(())
+    }
+}
+
+// ── Outbound media ───────────────────────────────────────────────────────────
+
+/// Per-attachment ceiling for an outbound image, in bytes.
+///
+/// WhatsApp itself refuses larger photos, and the bytes are held in memory once
+/// while they are staged, so the cap is enforced before the read completes.
+const MAX_OUTBOUND_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Per-attachment ceiling for outbound audio (including voice notes), in bytes.
+const MAX_OUTBOUND_AUDIO_BYTES: usize = 16 * 1024 * 1024;
+
+/// Per-attachment ceiling for an outbound video, in bytes.
+const MAX_OUTBOUND_VIDEO_BYTES: usize = 64 * 1024 * 1024;
+
+/// Per-attachment ceiling for any other outbound attachment, in bytes.
+const MAX_OUTBOUND_DOCUMENT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Longest text that may ride along as a `--caption`. Anything longer is sent
+/// as its own text message instead of being truncated into the caption.
+const MAX_OUTBOUND_CAPTION_CHARS: usize = 1024;
+
+/// Longest display-name stem passed to `wacli send file --filename`.
+const MAX_OUTBOUND_FILENAME_STEM_CHARS: usize = 96;
+
+/// Timeout for one `wacli send file|voice` invocation. Media has to be uploaded
+/// to WhatsApp first, so this matches wacli's own default `--timeout` (5m)
+/// rather than the much tighter text-send budget.
+const MEDIA_SEND_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// Outbound `[KIND:url]` markers are fetched through
+/// [`MediaArtifactOwner::load`], which applies the same SSRF policy as every
+/// other remote media fetch in the process. The `multimodal.allow_remote_fetch`
+/// switch is deliberately not consulted here: it governs what may be pulled
+/// *into* the model's context, while this path only pushes bytes back out to
+/// the recipient the agent is already talking to.
+const ALLOW_OUTBOUND_REMOTE_FETCH: bool = true;
+
+/// The wacli subcommand chosen for one prepared attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WacliMediaCommand {
+    /// `wacli send file` — images, video, documents, non-PTT audio.
+    File,
+    /// `wacli send voice` — an OGG/Opus voice note.
+    Voice,
+}
+
+impl WacliMediaCommand {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Voice => "voice",
+        }
+    }
+}
+
+/// An outbound attachment staged in a private temp file, ready for `wacli send`.
+///
+/// The bytes are always copied into a fresh temp file rather than handing wacli
+/// the model-supplied path directly: the workspace check and the send would
+/// otherwise be two separate `open()` calls on a path an attacker could swap in
+/// between. `temp` is a [`tempfile::TempPath`], so the staged copy is removed
+/// when this value drops — on the success path, on the error path, and while
+/// unwinding from a panic.
+struct PreparedMedia {
+    temp: tempfile::TempPath,
+    command: WacliMediaCommand,
+    /// Display name the recipient sees; always carries the extension implied by
+    /// the file's own bytes.
+    filename: String,
+    mime: Option<&'static str>,
+    category: MediaCategory,
+    size_bytes: usize,
+}
+
+impl PreparedMedia {
+    /// Only `wacli send file` takes `--caption`, and WhatsApp drops captions on
+    /// plain audio attachments.
+    const fn supports_caption(&self) -> bool {
+        matches!(self.command, WacliMediaCommand::File) && !matches!(self.category, MediaCategory::Audio)
+    }
+}
+
+/// Byte ceiling for an attachment of `category`.
+const fn outbound_category_cap(category: MediaCategory) -> usize {
+    match category {
+        MediaCategory::Image => MAX_OUTBOUND_IMAGE_BYTES,
+        MediaCategory::Audio => MAX_OUTBOUND_AUDIO_BYTES,
+        MediaCategory::Video => MAX_OUTBOUND_VIDEO_BYTES,
+        MediaCategory::Document | MediaCategory::Archive | MediaCategory::Other => MAX_OUTBOUND_DOCUMENT_BYTES,
+    }
+}
+
+/// Last path segment of a marker source, with any query string or fragment cut
+/// off so URLs yield a usable name.
+fn outbound_source_basename(source: &str) -> &str {
+    let path_part = source.split(['?', '#']).next().unwrap_or(source);
+    path_part.rsplit(['/', '\\']).next().unwrap_or(path_part)
+}
+
+/// Build the `--filename` display name from the marker source.
+///
+/// The stem is sanitised to a conservative ASCII set (the value crosses a
+/// process boundary and is rendered on the recipient's device) and the
+/// extension always comes from [`crate::media::type_id`], never from the
+/// caller-supplied name — a JPEG announced as `photo.jfif` is sent as
+/// `photo.jpg`.
+fn outbound_display_name(source: &str, extension: &str) -> String {
+    let base = outbound_source_basename(source);
+    let stem = base.rsplit_once('.').map_or(base, |(stem, _)| stem);
+    let cleaned: String = stem
+        .chars()
+        .take(MAX_OUTBOUND_FILENAME_STEM_CHARS)
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ' ') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches([' ', '-', '_']);
+    if cleaned.is_empty() {
+        format!("attachment.{extension}")
+    } else {
+        format!("{cleaned}.{extension}")
+    }
+}
+
+/// Write `bytes` into a fresh 0600 temp file whose name ends in `extension`.
+///
+/// The returned [`tempfile::TempPath`] owns the file and unlinks it on drop.
+async fn stage_outbound_media(bytes: Vec<u8>, extension: &str) -> Result<tempfile::TempPath> {
+    let suffix = format!(".{extension}");
+    crate::runtime::blocking::spawn_blocking(move || -> std::io::Result<tempfile::TempPath> {
+        use std::io::Write as _;
+        let mut file = tempfile::Builder::new()
+            .prefix("prx-wacli-")
+            .suffix(&suffix)
+            .tempfile()?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        Ok(file.into_temp_path())
+    })
+    .await
+    .context("wacli: outbound media staging task failed")?
+    .context("wacli: failed to stage outbound media in a temp file")
 }
 
 // ── Inbound webhook handler ──────────────────────────────────────────────────
@@ -1149,12 +1517,16 @@ impl Channel for WacliChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
-        // Outbound is text-only for the official interface. Media markers
-        // (`[IMAGE:...]` etc.) are not mapped to `wacli send file` in this
-        // revision; the full content (including any markers) is sent as text so
-        // information is not silently lost. Media send is a deliberate
-        // follow-up (see migration doc P2).
-        self.send_text(&message.recipient, &message.content).await
+        // Media markers (`[IMAGE:...]`, `[VOICE:...]`, …) become real WhatsApp
+        // attachments via `wacli send file` / `wacli send voice`. A message
+        // without markers keeps the plain `wacli send text` path, and anything
+        // that cannot be attached falls back to the literal marker text so no
+        // information is lost.
+        let (clean_text, media) = extract_outgoing_media(&message.content);
+        if media.is_empty() {
+            return self.send_text(&message.recipient, &message.content).await;
+        }
+        self.send_with_media(message, &clean_text, &media).await
     }
 
     async fn health_check(&self) -> bool {
@@ -2375,5 +2747,730 @@ mod tests {
         assert_eq!(normalize_jid_local("263767598346470"), "263767598346470");
         assert_eq!(normalize_jid_local(""), "");
         assert_eq!(normalize_jid_local("  995551518602@s.whatsapp.net  "), "995551518602");
+    }
+}
+
+/// Outbound media send: marker → `wacli send file|voice` argv, workspace
+/// confinement, text fallback, and temp-file lifetime.
+///
+/// Every case drives a fake `wacli` binary that records the real `argv` it was
+/// spawned with, so the assertions cover the process boundary rather than a
+/// string built in Rust.
+#[cfg(all(test, unix))]
+mod outbound_media_tests {
+    #![allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::panic)]
+
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// A stand-in `wacli` that appends its `argv` to a log and never talks to
+    /// WhatsApp.
+    struct FakeCli {
+        _dir: tempfile::TempDir,
+        bin: PathBuf,
+        argv_log: PathBuf,
+        staged_log: PathBuf,
+    }
+
+    impl FakeCli {
+        /// `media_exit` is the status returned for `send file` / `send voice`;
+        /// `send text` always succeeds so the fallback path is observable.
+        fn new(media_exit: i32) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let argv_log = dir.path().join("argv.log");
+            let staged_log = dir.path().join("staged.log");
+            let bin = dir.path().join("fake-wacli");
+            let script = format!(
+                "#!/bin/sh\n\
+                 for a in \"$@\"; do printf '%s\\n' \"$a\" >> '{argv}'; done\n\
+                 printf 'END\\n' >> '{argv}'\n\
+                 if [ \"$2\" != text ] && [ -f \"$6\" ]; then printf '%s\\n' \"$6\" >> '{staged}'; fi\n\
+                 if [ \"$2\" = text ]; then exit 0; fi\n\
+                 exit {media_exit}\n",
+                argv = argv_log.display(),
+                staged = staged_log.display(),
+            );
+            std::fs::write(&bin, script).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Self {
+                _dir: dir,
+                bin,
+                argv_log,
+                staged_log,
+            }
+        }
+
+        /// One `Vec<String>` per invocation, in call order.
+        fn invocations(&self) -> Vec<Vec<String>> {
+            let raw = std::fs::read_to_string(&self.argv_log).unwrap_or_default();
+            let mut all = Vec::new();
+            let mut current = Vec::new();
+            for line in raw.lines() {
+                if line == "END" {
+                    all.push(std::mem::take(&mut current));
+                } else {
+                    current.push(line.to_string());
+                }
+            }
+            all
+        }
+
+        /// Paths the fake CLI confirmed were readable at spawn time.
+        fn staged_paths(&self) -> Vec<PathBuf> {
+            std::fs::read_to_string(&self.staged_log)
+                .unwrap_or_default()
+                .lines()
+                .map(PathBuf::from)
+                .collect()
+        }
+    }
+
+    struct Fixture {
+        workspace: tempfile::TempDir,
+        cli: FakeCli,
+        channel: WacliChannel,
+    }
+
+    impl Fixture {
+        fn new(media_exit: i32) -> Self {
+            Self::build(media_exit, true)
+        }
+
+        fn build(media_exit: i32, with_owner: bool) -> Self {
+            let workspace = tempfile::tempdir().unwrap();
+            let root = workspace.path().canonicalize().unwrap();
+            let cli = FakeCli::new(media_exit);
+            let cfg = WacliChannelConfig {
+                cli_path: Some(cli.bin.to_string_lossy().into_owned()),
+                ..WacliChannelConfig::default()
+            };
+            let channel = if with_owner {
+                WacliChannel::new(cfg).with_media_artifacts(MediaArtifactOwner::for_workspace(&root), 5 * 1024 * 1024)
+            } else {
+                WacliChannel::new(cfg)
+            };
+            Self {
+                workspace,
+                cli,
+                channel,
+            }
+        }
+
+        fn write(&self, name: &str, bytes: &[u8]) {
+            let path = self.workspace.path().join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, bytes).unwrap();
+        }
+
+        async fn send(&self, content: &str) -> Result<()> {
+            self.channel
+                .send(&SendMessage::new(content, "99551234567@s.whatsapp.net"))
+                .await
+        }
+    }
+
+    fn png_bytes() -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1A\n".to_vec();
+        bytes.extend_from_slice(&[0u8; 32]);
+        bytes
+    }
+
+    fn jpeg_bytes() -> Vec<u8> {
+        let mut bytes = vec![
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01,
+            0x00, 0x00, 0xFF, 0xDB, 0x00, 0x84,
+        ];
+        bytes.extend_from_slice(&[0u8; 16]);
+        bytes
+    }
+
+    fn ogg_bytes() -> Vec<u8> {
+        let mut bytes = b"OggS".to_vec();
+        bytes.extend_from_slice(&[0u8; 60]);
+        bytes
+    }
+
+    fn mp4_bytes() -> Vec<u8> {
+        let mut bytes = vec![0x00, 0x00, 0x00, 0x18];
+        bytes.extend_from_slice(b"ftypisom");
+        bytes.extend_from_slice(&[0u8; 16]);
+        bytes
+    }
+
+    fn pdf_bytes() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        bytes.extend_from_slice(&[0u8; 32]);
+        bytes
+    }
+
+    /// `argv` with the (random) staged temp path replaced by `<TEMP>`.
+    fn masked(argv: &[String], temp: &str) -> Vec<String> {
+        argv.iter()
+            .map(|arg| if arg == temp { "<TEMP>".to_string() } else { arg.clone() })
+            .collect()
+    }
+
+    fn flag<'a>(argv: &'a [String], name: &str) -> Option<&'a str> {
+        argv.iter()
+            .position(|arg| arg == name)
+            .and_then(|index| argv.get(index + 1))
+            .map(String::as_str)
+    }
+
+    fn expect_argv(expected: &[&str]) -> Vec<String> {
+        expected.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    // ── Evidence 1: every supported marker maps to the right wacli argv ──────
+
+    #[tokio::test]
+    async fn image_marker_sends_a_file_with_the_detected_mime_and_caption() {
+        let fixture = Fixture::new(0);
+        fixture.write("pic.png", &png_bytes());
+
+        fixture.send("look at this [IMAGE:pic.png]").await.unwrap();
+
+        let invocations = fixture.cli.invocations();
+        assert_eq!(invocations.len(), 1, "media send must not also send the text");
+        let argv = &invocations[0];
+        let temp = flag(argv, "--file").unwrap().to_string();
+        assert!(
+            temp.contains("prx-wacli-") && temp.ends_with(".png"),
+            "staged as {temp}"
+        );
+        assert_eq!(
+            masked(argv, &temp),
+            expect_argv(&[
+                "send",
+                "file",
+                "--to",
+                "99551234567@s.whatsapp.net",
+                "--file",
+                "<TEMP>",
+                "--filename",
+                "pic.png",
+                "--mime",
+                "image/png",
+                "--caption",
+                "look at this",
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn video_marker_sends_a_file_typed_from_its_bytes() {
+        let fixture = Fixture::new(0);
+        fixture.write("clip.mp4", &mp4_bytes());
+
+        fixture.send("[VIDEO:clip.mp4]").await.unwrap();
+
+        let invocations = fixture.cli.invocations();
+        assert_eq!(invocations.len(), 1);
+        let argv = &invocations[0];
+        let temp = flag(argv, "--file").unwrap().to_string();
+        assert!(temp.ends_with(".mp4"));
+        assert_eq!(
+            masked(argv, &temp),
+            expect_argv(&[
+                "send",
+                "file",
+                "--to",
+                "99551234567@s.whatsapp.net",
+                "--file",
+                "<TEMP>",
+                "--filename",
+                "clip.mp4",
+                "--mime",
+                "video/mp4",
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn document_marker_sends_a_file_with_the_document_mime() {
+        let fixture = Fixture::new(0);
+        fixture.write("report.pdf", &pdf_bytes());
+
+        fixture.send("[DOCUMENT:report.pdf]").await.unwrap();
+
+        let invocations = fixture.cli.invocations();
+        assert_eq!(invocations.len(), 1);
+        let argv = &invocations[0];
+        let temp = flag(argv, "--file").unwrap().to_string();
+        assert_eq!(
+            masked(argv, &temp),
+            expect_argv(&[
+                "send",
+                "file",
+                "--to",
+                "99551234567@s.whatsapp.net",
+                "--file",
+                "<TEMP>",
+                "--filename",
+                "report.pdf",
+                "--mime",
+                "application/pdf",
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_marker_with_ogg_uses_send_voice_and_keeps_the_text_separate() {
+        let fixture = Fixture::new(0);
+        fixture.write("note.ogg", &ogg_bytes());
+
+        fixture.send("listen [VOICE:note.ogg]").await.unwrap();
+
+        let invocations = fixture.cli.invocations();
+        assert_eq!(invocations.len(), 2, "a voice note cannot carry a caption");
+        let argv = &invocations[0];
+        let temp = flag(argv, "--file").unwrap().to_string();
+        assert!(temp.ends_with(".ogg"));
+        assert_eq!(
+            masked(argv, &temp),
+            expect_argv(&[
+                "send",
+                "voice",
+                "--to",
+                "99551234567@s.whatsapp.net",
+                "--file",
+                "<TEMP>",
+                "--mime",
+                "audio/ogg",
+            ])
+        );
+        assert_eq!(
+            invocations[1],
+            expect_argv(&[
+                "send",
+                "text",
+                "--to",
+                "99551234567@s.whatsapp.net",
+                "--message",
+                "listen",
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn audio_marker_that_is_not_opus_degrades_to_a_plain_attachment() {
+        let fixture = Fixture::new(0);
+        fixture.write("song.mp3", b"ID3\x03\x00\x00\x00\x00\x00\x00");
+
+        fixture.send("[AUDIO:song.mp3]").await.unwrap();
+
+        let invocations = fixture.cli.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].get(1).map(String::as_str), Some("file"));
+        assert_eq!(flag(&invocations[0], "--mime"), Some("audio/mpeg"));
+    }
+
+    #[tokio::test]
+    async fn voice_marker_that_is_not_opus_falls_back_to_send_file() {
+        let fixture = Fixture::new(0);
+        fixture.write("note.mp3", b"ID3\x03\x00\x00\x00\x00\x00\x00");
+
+        fixture.send("[VOICE:note.mp3]").await.unwrap();
+
+        let invocations = fixture.cli.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].get(1).map(String::as_str), Some("file"));
+    }
+
+    #[tokio::test]
+    async fn several_markers_are_sent_as_separate_attachments_with_one_caption() {
+        let fixture = Fixture::new(0);
+        fixture.write("a.png", &png_bytes());
+        fixture.write("b.pdf", &pdf_bytes());
+
+        fixture.send("two files [IMAGE:a.png] [DOCUMENT:b.pdf]").await.unwrap();
+
+        let invocations = fixture.cli.invocations();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(flag(&invocations[0], "--caption"), Some("two files"));
+        assert_eq!(flag(&invocations[1], "--caption"), None, "caption must not repeat");
+    }
+
+    #[tokio::test]
+    async fn the_file_content_decides_the_type_when_the_marker_disagrees() {
+        let fixture = Fixture::new(0);
+        fixture.write("shot.png", &pdf_bytes());
+
+        fixture.send("[IMAGE:shot.png]").await.unwrap();
+
+        let invocations = fixture.cli.invocations();
+        assert_eq!(flag(&invocations[0], "--mime"), Some("application/pdf"));
+        assert_eq!(flag(&invocations[0], "--filename"), Some("shot.pdf"));
+    }
+
+    #[tokio::test]
+    async fn a_jpeg_named_jfif_is_announced_as_jpg() {
+        let fixture = Fixture::new(0);
+        fixture.write("photo.jfif", &jpeg_bytes());
+
+        fixture.send("[IMAGE:photo.jfif]").await.unwrap();
+
+        let invocations = fixture.cli.invocations();
+        assert_eq!(flag(&invocations[0], "--filename"), Some("photo.jpg"));
+        assert_eq!(flag(&invocations[0], "--mime"), Some("image/jpeg"));
+    }
+
+    #[tokio::test]
+    async fn the_store_directory_is_forwarded_to_media_sends() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().canonicalize().unwrap();
+        let cli = FakeCli::new(0);
+        let channel = WacliChannel::new(WacliChannelConfig {
+            cli_path: Some(cli.bin.to_string_lossy().into_owned()),
+            store_dir: Some("/var/lib/wacli".to_string()),
+            ..WacliChannelConfig::default()
+        })
+        .with_media_artifacts(MediaArtifactOwner::for_workspace(&root), 5 * 1024 * 1024);
+        std::fs::write(workspace.path().join("pic.png"), png_bytes()).unwrap();
+
+        channel
+            .send(&SendMessage::new("[IMAGE:pic.png]", "99551234567@s.whatsapp.net"))
+            .await
+            .unwrap();
+
+        let invocations = cli.invocations();
+        assert_eq!(flag(&invocations[0], "--store"), Some("/var/lib/wacli"));
+    }
+
+    #[tokio::test]
+    async fn a_message_without_markers_still_takes_the_plain_text_path() {
+        let fixture = Fixture::new(0);
+
+        fixture.send("just words").await.unwrap();
+
+        assert_eq!(
+            fixture.cli.invocations(),
+            vec![expect_argv(&[
+                "send",
+                "text",
+                "--to",
+                "99551234567@s.whatsapp.net",
+                "--message",
+                "just words",
+            ])]
+        );
+    }
+
+    // ── Evidence 2: untrusted paths never leave the workspace ────────────────
+
+    async fn assert_source_is_refused(source: &str) {
+        let fixture = Fixture::new(0);
+        let content = format!("here [IMAGE:{source}]");
+
+        fixture.send(&content).await.unwrap();
+
+        let invocations = fixture.cli.invocations();
+        assert_eq!(invocations.len(), 1, "{source} must not produce a media send");
+        assert_eq!(
+            invocations[0],
+            expect_argv(&[
+                "send",
+                "text",
+                "--to",
+                "99551234567@s.whatsapp.net",
+                "--message",
+                &format!("here [IMAGE:{source}]"),
+            ]),
+            "{source} must degrade to the literal marker text"
+        );
+        assert!(
+            fixture.cli.staged_paths().is_empty(),
+            "{source} must never be staged for upload"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_absolute_system_path_is_refused() {
+        assert_source_is_refused("/etc/passwd").await;
+    }
+
+    #[tokio::test]
+    async fn a_shadow_file_path_is_refused() {
+        assert_source_is_refused("/etc/shadow").await;
+    }
+
+    #[tokio::test]
+    async fn a_home_relative_ssh_key_is_refused() {
+        assert_source_is_refused("~/.ssh/id_rsa").await;
+    }
+
+    #[tokio::test]
+    async fn a_parent_traversal_is_refused() {
+        assert_source_is_refused("../../etc/passwd").await;
+    }
+
+    #[tokio::test]
+    async fn an_embedded_parent_traversal_is_refused() {
+        assert_source_is_refused("uploads/../../../etc/passwd").await;
+    }
+
+    #[tokio::test]
+    async fn a_symlink_pointing_out_of_the_workspace_is_refused() {
+        let fixture = Fixture::new(0);
+        std::os::unix::fs::symlink("/etc/passwd", fixture.workspace.path().join("leak.png")).unwrap();
+
+        fixture.send("here [IMAGE:leak.png]").await.unwrap();
+
+        let invocations = fixture.cli.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].get(1).map(String::as_str), Some("text"));
+        assert!(fixture.cli.staged_paths().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_symlinked_directory_component_is_refused() {
+        let fixture = Fixture::new(0);
+        std::os::unix::fs::symlink("/etc", fixture.workspace.path().join("etc")).unwrap();
+
+        fixture.send("[IMAGE:etc/passwd]").await.unwrap();
+
+        let invocations = fixture.cli.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].get(1).map(String::as_str), Some("text"));
+        assert!(fixture.cli.staged_paths().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_workspace_file_that_does_not_exist_is_refused() {
+        assert_source_is_refused("missing.png").await;
+    }
+
+    #[tokio::test]
+    async fn a_loopback_url_is_blocked_by_the_ssrf_policy() {
+        assert_source_is_refused("http://127.0.0.1:9/secret.png").await;
+    }
+
+    #[tokio::test]
+    async fn a_private_network_url_is_blocked_by_the_ssrf_policy() {
+        assert_source_is_refused("http://169.254.169.254/latest/meta-data/iam").await;
+    }
+
+    #[tokio::test]
+    async fn media_is_refused_when_the_channel_has_no_workspace_owner() {
+        let fixture = Fixture::build(0, false);
+        fixture.write("pic.png", &png_bytes());
+
+        fixture.send("[IMAGE:pic.png]").await.unwrap();
+
+        let invocations = fixture.cli.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].get(1).map(String::as_str), Some("text"));
+        assert!(fixture.cli.staged_paths().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_image_is_refused_and_reported_as_text() {
+        let fixture = Fixture::new(0);
+        let mut oversized = png_bytes();
+        oversized.resize(16 * 1024 * 1024 + 1, 0);
+        fixture.write("huge.png", &oversized);
+
+        fixture.send("[IMAGE:huge.png]").await.unwrap();
+
+        let invocations = fixture.cli.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(
+            invocations[0],
+            expect_argv(&[
+                "send",
+                "text",
+                "--to",
+                "99551234567@s.whatsapp.net",
+                "--message",
+                "[IMAGE:huge.png]",
+            ])
+        );
+        assert!(fixture.cli.staged_paths().is_empty());
+    }
+
+    // ── Evidence 3: a failed upload falls back to text without losing text ───
+
+    #[tokio::test]
+    async fn a_failed_upload_falls_back_to_the_original_marker_text() {
+        let fixture = Fixture::new(1);
+        fixture.write("pic.png", &png_bytes());
+
+        fixture.send("look at this [IMAGE:pic.png]").await.unwrap();
+
+        let invocations = fixture.cli.invocations();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations[0].get(1).map(String::as_str), Some("file"));
+        assert_eq!(
+            invocations[1],
+            expect_argv(&[
+                "send",
+                "text",
+                "--to",
+                "99551234567@s.whatsapp.net",
+                "--message",
+                "look at this [IMAGE:pic.png]",
+            ]),
+            "the fallback must reproduce the pre-media behaviour verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partial_failure_only_replays_the_attachment_that_failed() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().canonicalize().unwrap();
+        let cli = FakeCli::new(0);
+        // Fail only the second upload: the fake CLI keys off the display name.
+        let script = format!(
+            "#!/bin/sh\n\
+             for a in \"$@\"; do printf '%s\\n' \"$a\" >> '{argv}'; done\n\
+             printf 'END\\n' >> '{argv}'\n\
+             case \"$8\" in b.pdf) exit 1;; esac\n\
+             exit 0\n",
+            argv = cli.argv_log.display(),
+        );
+        std::fs::write(&cli.bin, script).unwrap();
+        std::fs::set_permissions(&cli.bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let channel = WacliChannel::new(WacliChannelConfig {
+            cli_path: Some(cli.bin.to_string_lossy().into_owned()),
+            ..WacliChannelConfig::default()
+        })
+        .with_media_artifacts(MediaArtifactOwner::for_workspace(&root), 5 * 1024 * 1024);
+        std::fs::write(workspace.path().join("a.png"), png_bytes()).unwrap();
+        std::fs::write(workspace.path().join("b.pdf"), pdf_bytes()).unwrap();
+
+        channel
+            .send(&SendMessage::new(
+                "two [IMAGE:a.png] [DOCUMENT:b.pdf]",
+                "99551234567@s.whatsapp.net",
+            ))
+            .await
+            .unwrap();
+
+        let invocations = cli.invocations();
+        assert_eq!(invocations.len(), 3);
+        assert_eq!(
+            invocations[2],
+            expect_argv(&[
+                "send",
+                "text",
+                "--to",
+                "99551234567@s.whatsapp.net",
+                "--message",
+                "[DOCUMENT:b.pdf]",
+            ]),
+            "only the failed marker is replayed; the caption already went out"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caption_too_long_for_whatsapp_is_sent_as_its_own_message() {
+        let fixture = Fixture::new(0);
+        fixture.write("pic.png", &png_bytes());
+        let long_text = "x".repeat(MAX_OUTBOUND_CAPTION_CHARS + 1);
+
+        fixture.send(&format!("{long_text} [IMAGE:pic.png]")).await.unwrap();
+
+        let invocations = fixture.cli.invocations();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(flag(&invocations[0], "--caption"), None);
+        assert_eq!(flag(&invocations[1], "--message"), Some(long_text.as_str()));
+    }
+
+    #[tokio::test]
+    async fn an_empty_recipient_is_rejected_before_anything_is_staged() {
+        let fixture = Fixture::new(0);
+        fixture.write("pic.png", &png_bytes());
+
+        let error = fixture
+            .channel
+            .send(&SendMessage::new("[IMAGE:pic.png]", "   "))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("empty recipient"));
+        assert!(fixture.cli.invocations().is_empty());
+    }
+
+    // ── Evidence 4: the staged temp file never outlives the send ─────────────
+
+    #[tokio::test]
+    async fn the_staged_temp_file_is_removed_after_a_successful_send() {
+        let fixture = Fixture::new(0);
+        fixture.write("pic.png", &png_bytes());
+
+        fixture.send("[IMAGE:pic.png]").await.unwrap();
+
+        let staged = fixture.cli.staged_paths();
+        assert_eq!(staged.len(), 1, "the file must exist while wacli runs");
+        assert!(!staged[0].exists(), "the staged copy must be unlinked afterwards");
+    }
+
+    #[tokio::test]
+    async fn the_staged_temp_file_is_removed_after_a_failed_send() {
+        let fixture = Fixture::new(1);
+        fixture.write("pic.png", &png_bytes());
+
+        fixture.send("[IMAGE:pic.png]").await.unwrap();
+
+        let staged = fixture.cli.staged_paths();
+        assert_eq!(staged.len(), 1);
+        assert!(!staged[0].exists());
+    }
+
+    #[tokio::test]
+    async fn the_staged_temp_file_is_removed_while_a_panic_unwinds() {
+        let staged = stage_outbound_media(png_bytes(), "png").await.unwrap();
+        let path = staged.to_path_buf();
+        assert!(path.exists());
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _owned = staged;
+            panic!("simulated failure while the attachment is staged");
+        }));
+        std::panic::set_hook(previous);
+
+        assert!(result.is_err());
+        assert!(!path.exists(), "unwinding must still unlink the staged copy");
+    }
+
+    #[tokio::test]
+    async fn the_staged_temp_file_is_created_private() {
+        let staged = stage_outbound_media(png_bytes(), "png").await.unwrap();
+        let mode = std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    // ── Display-name sanitising ──────────────────────────────────────────────
+
+    #[test]
+    fn display_names_are_sanitised_and_re_extended_from_the_content() {
+        assert_eq!(outbound_display_name("/ws/report.jfif", "jpg"), "report.jpg");
+        assert_eq!(
+            outbound_display_name("https://host/path/photo.png?token=abc#frag", "png"),
+            "photo.png"
+        );
+        assert_eq!(outbound_display_name("a;b|c$(id).png", "png"), "a_b_c__id.png");
+        assert_eq!(outbound_display_name("--rm.png", "png"), "rm.png");
+        assert_eq!(outbound_display_name("....png", "png"), "attachment.png");
+        assert_eq!(outbound_display_name("", "bin"), "attachment.bin");
+        assert_eq!(
+            outbound_display_name(&format!("{}.png", "n".repeat(400)), "png"),
+            format!("{}.png", "n".repeat(MAX_OUTBOUND_FILENAME_STEM_CHARS))
+        );
+    }
+
+    #[test]
+    fn category_caps_match_the_documented_limits() {
+        assert_eq!(outbound_category_cap(MediaCategory::Image), MAX_OUTBOUND_IMAGE_BYTES);
+        assert_eq!(outbound_category_cap(MediaCategory::Audio), MAX_OUTBOUND_AUDIO_BYTES);
+        assert_eq!(outbound_category_cap(MediaCategory::Video), MAX_OUTBOUND_VIDEO_BYTES);
+        assert_eq!(
+            outbound_category_cap(MediaCategory::Document),
+            MAX_OUTBOUND_DOCUMENT_BYTES
+        );
     }
 }

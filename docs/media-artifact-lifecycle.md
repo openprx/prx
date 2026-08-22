@@ -28,6 +28,15 @@ Unrecognised content is never silently rewritten to `bin`. The caller's own exte
 
 The owner keeps a bounded inventory of managed channel artifacts: at most 256 files, 512 MiB, and one hour of age. Admission evicts expired or excess records. Dropping the process owner removes the files still in its inventory.
 
+Outbound attachments are not part of that inventory. When a channel turns a
+`[KIND:source]` marker into a real upload (currently wacli), the source is
+admitted through the same `MediaArtifactOwner::load` gate — workspace
+confinement for paths, SSRF policy for URLs, `max + 1` streaming caps — and the
+admitted bytes are then staged into a private `0600` temp file owned by a
+`tempfile::TempPath`. The staged copy is unlinked as soon as the send finishes,
+whether it succeeded, failed, or unwound from a panic, and the external CLI
+never opens the model-supplied path itself.
+
 ## Audio and video processing
 
 Configured audio and video size limits are enforced before any processor starts. Audio is capped at 100 MiB and video at 500 MiB even if configuration is larger. `ffmpeg`, `ffprobe`, and whisper-family commands have wall-clock timeouts plus bounded stdout and stderr. Converted audio uses an RAII random temporary directory. Extracted video frames are limited to 5 MiB each and 20 MiB total.
