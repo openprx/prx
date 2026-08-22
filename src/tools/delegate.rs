@@ -37,6 +37,8 @@ pub struct DelegateTool {
     fallback_credential: Option<String>,
     /// Provider runtime options inherited from root config.
     provider_runtime_options: providers::ProviderRuntimeOptions,
+    /// Reliability settings for the per-agent provider chain.
+    reliability: crate::config::ReliabilityConfig,
     /// Depth at which this tool instance lives in the delegation chain.
     depth: u32,
     /// Parent tool registry for agentic sub-agents.
@@ -165,6 +167,7 @@ impl DelegateTool {
             security,
             fallback_credential,
             provider_runtime_options,
+            reliability: crate::config::ReliabilityConfig::default(),
             depth: 0,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
@@ -172,6 +175,13 @@ impl DelegateTool {
             memory: None,
             event_recording: MemoryEventRecording::default(),
         }
+    }
+
+    /// Supply the deployment's reliability settings for the per-agent chain.
+    #[must_use]
+    pub fn with_reliability(mut self, reliability: crate::config::ReliabilityConfig) -> Self {
+        self.reliability = reliability;
+        self
     }
 
     /// Create a DelegateTool for a sub-agent (with incremented depth).
@@ -204,6 +214,7 @@ impl DelegateTool {
             security,
             fallback_credential,
             provider_runtime_options,
+            reliability: crate::config::ReliabilityConfig::default(),
             depth,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
@@ -455,9 +466,21 @@ impl Tool for DelegateTool {
         #[allow(clippy::option_as_ref_deref)]
         let provider_credential = provider_credential_owned.as_ref().map(String::as_str);
 
-        let provider: Box<dyn Provider> = match providers::create_provider_with_options(
+        // Resilient chain, not a bare provider: a delegated agent must get the
+        // same retry / backoff / Retry-After / rate-limit-gate treatment as the
+        // gateway's own provider. `fallback_providers` and the rotation
+        // `api_keys` are stripped because the agent pinned this vendor on
+        // purpose and those credentials belong to a different one.
+        let delegate_reliability = crate::config::ReliabilityConfig {
+            fallback_providers: Vec::new(),
+            api_keys: Vec::new(),
+            ..self.reliability.clone()
+        };
+        let provider: Box<dyn Provider> = match providers::create_resilient_provider_with_options(
             &effective_provider,
             provider_credential,
+            None,
+            &delegate_reliability,
             &self.provider_runtime_options,
         ) {
             Ok(p) => p,

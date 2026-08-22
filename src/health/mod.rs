@@ -387,13 +387,26 @@ pub async fn wait_until_ready() {
     }
 }
 
+/// Health snapshot as JSON, with provider rate-limit telemetry attached.
+///
+/// The `rate_limits` block answers "how often did upstreams throttle us, on
+/// which model, did we recover" from `/health` and the daemon state file —
+/// without it no 429 strategy change can be evaluated after the fact, because
+/// the only other trace is unaggregated log lines.
 pub fn snapshot_json() -> serde_json::Value {
-    serde_json::to_value(snapshot()).unwrap_or_else(|_| {
+    let mut value = serde_json::to_value(snapshot()).unwrap_or_else(|_| {
         serde_json::json!({
             "status": "error",
             "message": "failed to serialize health snapshot"
         })
-    })
+    });
+    if let (Some(object), Ok(rate_limits)) = (
+        value.as_object_mut(),
+        serde_json::to_value(crate::providers::rate_limit::snapshot()),
+    ) {
+        object.insert("rate_limits".to_string(), rate_limits);
+    }
+    value
 }
 
 #[allow(clippy::indexing_slicing)]

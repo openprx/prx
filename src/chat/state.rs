@@ -1887,8 +1887,11 @@ impl ChatState {
     ///
     /// Phase F：与旧路径在 chat::run 主循环里 `hooks.emit(HookEvent::Error, payload_error(...))`
     /// 的语义保持一致 — failed turn 必须触发 Error hook，否则外部审计 / webhook 会漏报。
-    /// retryable 字段由 EffectExecutor 上层（chat::run 主循环重试逻辑）观察决定是否重发；
     /// hook 一律触发，因为对外可见的"本轮失败"是确定事件。
+    ///
+    /// `retryable` 是**诊断字段**，不触发任何自动重发：重试职责在 provider 层
+    /// (退避 / `Retry-After` / failover)，到这一层时该轮的工具副作用可能已落地。
+    /// 它进 trace 日志与 `HookEvent::Error` 载荷，供外部审计区分瞬时故障与硬失败。
     fn reduce_stream_failed(&mut self, draft_id: &str, err: String, retryable: bool) -> Vec<Effect> {
         let Some(removed_draft) = self.stream.remove_visible_draft(draft_id) else {
             return vec![];

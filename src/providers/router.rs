@@ -312,6 +312,11 @@ pub(crate) struct MockEnvProvider {
     delay_ms_per_chunk: u64,
     /// Prompt-substring keyed initial stream delay for visible-turn concurrency demos.
     delay_ms_by_prompt: Vec<(String, u64)>,
+    /// `OPENPRX_MOCK_ERROR`: when set, every non-streaming call fails with this
+    /// message instead of returning `response`. Lets a test drive the provider
+    /// *failure* paths (retry / backoff / rate-limit handling) through the real
+    /// factory, which is otherwise unreachable without a live upstream.
+    error: Option<String>,
 }
 
 #[cfg(any(test, feature = "test-mock"))]
@@ -486,6 +491,10 @@ impl MockEnvProvider {
             .ok()
             .map(|raw| parse_mock_delay_ms_by_prompt(&raw))
             .unwrap_or_default();
+        let error = std::env::var("OPENPRX_MOCK_ERROR")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         Self {
             response,
             tool_call_spec,
@@ -494,7 +503,20 @@ impl MockEnvProvider {
             flavor,
             delay_ms_per_chunk,
             delay_ms_by_prompt,
+            error,
         }
+    }
+
+    /// Outcome of one non-streaming call: the configured error when
+    /// `OPENPRX_MOCK_ERROR` is set, otherwise the response sentinel.
+    ///
+    /// Deliberately does **not** touch `call_counter`: that counter drives the
+    /// streaming tool-call script and must keep counting stream calls only.
+    fn non_streaming_outcome(&self) -> anyhow::Result<String> {
+        self.error.as_ref().map_or_else(
+            || Ok(self.response.clone()),
+            |message| Err(anyhow::anyhow!("{message}")),
+        )
     }
 }
 
@@ -508,7 +530,7 @@ impl Provider for MockEnvProvider {
         _model: &str,
         _temperature: f64,
     ) -> anyhow::Result<String> {
-        Ok(self.response.clone())
+        self.non_streaming_outcome()
     }
 
     async fn chat_with_history(
@@ -517,7 +539,7 @@ impl Provider for MockEnvProvider {
         _model: &str,
         _temperature: f64,
     ) -> anyhow::Result<String> {
-        Ok(self.response.clone())
+        self.non_streaming_outcome()
     }
 
     // Native-tools = true so the agent loop calls Provider::chat directly and
@@ -529,7 +551,7 @@ impl Provider for MockEnvProvider {
 
     async fn chat(&self, _request: ChatRequest<'_>, _model: &str, _temperature: f64) -> anyhow::Result<ChatResponse> {
         Ok(ChatResponse {
-            text: Some(self.response.clone()),
+            text: Some(self.non_streaming_outcome()?),
             tool_calls: Vec::new(),
             reasoning_content: None,
         })
@@ -543,7 +565,7 @@ impl Provider for MockEnvProvider {
         _temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
         Ok(ChatResponse {
-            text: Some(self.response.clone()),
+            text: Some(self.non_streaming_outcome()?),
             tool_calls: Vec::new(),
             reasoning_content: None,
         })

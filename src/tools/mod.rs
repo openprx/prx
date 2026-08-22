@@ -446,6 +446,7 @@ pub fn all_tools_with_runtime_ext(
             crate::providers::provider_runtime_options_from_config(root_config),
         )
         .with_parent_tools(parent_tools)
+        .with_reliability(root_config.reliability.clone())
         .with_multimodal_config(root_config.multimodal.clone())
         .with_compaction_resolver(crate::router::CompactionResolver::new(
             root_config.agent.compaction.clone(),

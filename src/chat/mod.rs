@@ -3787,6 +3787,7 @@ pub async fn run(
         config.model_routes.clone(),
     ))
     .with_cost_config(config.cost.clone())
+    .with_reliability(config.reliability.clone())
     .with_shared_memory(Arc::clone(&mem))
     .with_event_recording(config.memory.event_recording_config())
     .with_event_sink(session_event_sink.into_spawn_sink())

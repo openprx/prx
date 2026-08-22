@@ -70,6 +70,47 @@ OpenRouter and proxy pricing remains dynamic.
 The canonical routing, usage, and cost settlement boundary is described in
 `provider-routing-cost-lifecycle.md`.
 
+## Rate limiting (HTTP 429)
+
+Rate-limit handling is entirely *reactive*. PRX never paces requests on its own
+and never caps in-flight provider calls; everything below is triggered by an
+explicit signal from the upstream.
+
+- **`Retry-After` is honored on both paths.** Streaming carries it in the
+  structured `StreamError::RateLimited` variant; non-streaming attaches it to
+  the provider error as a `RetryAfterHint` source read from the real response
+  header. When present it decides the wait; the local exponential backoff is
+  only the floor.
+- **Honored ceiling: 120 s.** Organization-level throttling commonly answers
+  `Retry-After: 60`, so the previous 30 s cap truncated the delay and guaranteed
+  a second 429. A hint above the ceiling is *not* truncated — the candidate is
+  abandoned and the requested delay is reported in the aggregated error.
+- **Retries never depend on the header.** A 429/503 without `Retry-After` is
+  still retried on the same provider/model up to `reliability.provider_retries`,
+  on both the streaming and the non-streaming path, before any failover.
+- **Backoff is jittered.** Local exponential waits are spread over
+  `[nominal/2, nominal]`; an honored `Retry-After` gets a small additive spread
+  (never shorter than the server asked). Without this, requests throttled in the
+  same instant retry in lock-step and re-create the burst that caused the 429.
+- **Business 429s still fail fast.** Plan/quota/balance responses (including the
+  Z.AI `code` values `1113` / `1311`) skip the retry budget on both paths. The
+  code match requires a `code`-like key, so digits inside a `request_id` or a
+  token counter can no longer condemn an ordinary 429.
+- **One 429 defers the others.** A per-provider cool-down deadline is shared by
+  every provider chain in the process, so concurrent requests (including
+  in-process `mode = "task"` sub-agents) wait out a throttle learned by any one
+  of them. It stores a time, not a permit count — concurrency stays unbounded.
+  Sub-agents started with `mode = "process"` are separate OS processes and do
+  not observe this gate.
+- **Sub-agents and delegated agents get the full chain.** A `sessions_spawn`
+  provider override or a `delegate` agent builds a resilient provider, not a
+  bare one. The pinned vendor is respected: `reliability.fallback_providers` and
+  the rotation `reliability.api_keys` are dropped for those chains, while the
+  retry budget, backoff and `model_fallbacks` carry over.
+- **Telemetry.** `/health` and the daemon state file expose a `rate_limits`
+  block with per-provider counters (total, streaming, `Retry-After` honored,
+  recovered, exhausted, gate deferrals) and a per-model breakdown.
+
 ## OpenAI Codex notes
 
 - Malformed/unexpected response payloads fail fast with

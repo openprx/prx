@@ -533,6 +533,11 @@ pub struct SessionsSpawnTool {
     fallback_api_key: Option<String>,
     /// Provider runtime options (auth profile, state dir, etc.).
     provider_runtime_options: providers::ProviderRuntimeOptions,
+    /// Reliability settings applied when a sub-agent overrides the provider.
+    ///
+    /// Without this the override path built a bare provider with no retry,
+    /// backoff or rate-limit handling at all — see [`Self::build_override_provider`].
+    reliability: crate::config::ReliabilityConfig,
     /// Process-mode controls for workspace lifecycle.
     spawn_config: SessionsSpawnConfig,
     /// Pricing table used only for recording/displaying child-agent token cost.
@@ -651,6 +656,7 @@ impl SessionsSpawnTool {
             agents: Arc::new(agents),
             fallback_api_key,
             provider_runtime_options,
+            reliability: crate::config::ReliabilityConfig::default(),
             spawn_config,
             cost_config: crate::config::schema::CostConfig::default(),
             memory: None,
@@ -669,6 +675,60 @@ impl SessionsSpawnTool {
     pub fn with_cost_config(mut self, cost_config: crate::config::schema::CostConfig) -> Self {
         self.cost_config = cost_config;
         self
+    }
+
+    /// Supply the deployment's reliability settings.
+    ///
+    /// Only consumed when a sub-agent overrides the provider and this tool has
+    /// to build a fresh chain; without it the retry budget falls back to
+    /// [`ReliabilityConfig::default`](crate::config::ReliabilityConfig::default)
+    /// rather than to "no retries at all".
+    #[must_use]
+    pub fn with_reliability(mut self, reliability: crate::config::ReliabilityConfig) -> Self {
+        self.reliability = reliability;
+        self
+    }
+
+    /// Reliability settings for a sub-agent that pinned its own provider.
+    ///
+    /// Retry budget, backoff and per-model fallbacks carry over unchanged; the
+    /// two chain-widening knobs are deliberately dropped:
+    ///
+    /// * `fallback_providers` — the caller named a provider on purpose (the
+    ///   canonical use is "audit this with a second, different model"), so
+    ///   silently serving the request from another vendor would defeat the
+    ///   request while looking like success.
+    /// * `api_keys` — those rotation credentials belong to the *gateway's*
+    ///   provider. Replaying them against a different vendor only buys a run of
+    ///   guaranteed 401s inside the retry budget.
+    fn override_reliability(base: &crate::config::ReliabilityConfig) -> crate::config::ReliabilityConfig {
+        crate::config::ReliabilityConfig {
+            fallback_providers: Vec::new(),
+            api_keys: Vec::new(),
+            ..base.clone()
+        }
+    }
+
+    /// Build the provider for a sub-agent that overrides the gateway provider.
+    ///
+    /// Goes through `create_resilient_provider_with_options` so the sub-agent
+    /// gets the retry loop, the exponential backoff, `Retry-After` handling, the
+    /// shared rate-limit gate and the aggregated `All providers/models failed`
+    /// diagnostics. The previous `create_provider_with_options` call returned a
+    /// **bare** provider: a single 429 killed the sub-agent in under a second,
+    /// with zero retries and an error message that carried no attempt trail.
+    fn build_override_provider(
+        provider_name: &str,
+        api_key: Option<&str>,
+        reliability: &crate::config::ReliabilityConfig,
+        options: &providers::ProviderRuntimeOptions,
+    ) -> anyhow::Result<Arc<dyn Provider>> {
+        let reliability = Self::override_reliability(reliability);
+        // `api_url` stays `None`: the gateway's base URL belongs to the gateway's
+        // provider, and pointing an overridden vendor at it would be wrong.
+        let provider =
+            providers::create_resilient_provider_with_options(provider_name, api_key, None, &reliability, options)?;
+        Ok(Arc::from(provider))
     }
 
     fn resolve_child_compaction(
@@ -1751,12 +1811,13 @@ impl Tool for SessionsSpawnTool {
         // from the gateway provider. This covers a named agent provider AND an
         // inline `provider` override (BUG-12) even without a named agent.
         let provider = if provider_name != self.provider_name {
-            match providers::create_provider_with_options(
+            match Self::build_override_provider(
                 &provider_name,
                 resolved_api_key.as_deref(),
+                &self.reliability,
                 &self.provider_runtime_options,
             ) {
-                Ok(provider) => Arc::<dyn Provider>::from(provider),
+                Ok(provider) => provider,
                 Err(error) => {
                     return Ok(ToolResult {
                         success: false,
@@ -4043,6 +4104,126 @@ mod tests {
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy::default())
+    }
+
+    // ── Sub-agent provider override: resilience evidence ─────────
+
+    /// Serializes the tests that drive the mock provider through
+    /// `OPENPRX_MOCK_ERROR`, since env vars are process-global.
+    fn mock_error_env_lock() -> &'static parking_lot::Mutex<()> {
+        static LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| parking_lot::Mutex::new(()))
+    }
+
+    struct MockErrorEnvGuard {
+        original: Option<String>,
+    }
+
+    impl MockErrorEnvGuard {
+        #[allow(unsafe_code)]
+        fn set(value: &str) -> Self {
+            let original = std::env::var("OPENPRX_MOCK_ERROR").ok();
+            // SAFETY: test-only env mutation, serialized by `mock_error_env_lock`
+            // and restored on drop.
+            unsafe { std::env::set_var("OPENPRX_MOCK_ERROR", value) };
+            Self { original }
+        }
+    }
+
+    impl Drop for MockErrorEnvGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            // SAFETY: paired with the mutation above, under the same lock.
+            unsafe {
+                match &self.original {
+                    Some(value) => std::env::set_var("OPENPRX_MOCK_ERROR", value),
+                    None => std::env::remove_var("OPENPRX_MOCK_ERROR"),
+                }
+            }
+        }
+    }
+
+    /// A sub-agent that pins its own provider must still get the reliability
+    /// layer. This path used to build a **bare** provider: an upstream 429 ended
+    /// the sub-agent in well under a second with zero retries, and the surfaced
+    /// error carried no attempt trail at all — the signature of the 2026-08-21
+    /// incident. Reverting `build_override_provider` to
+    /// `create_provider_with_options` turns this test red on both assertions.
+    #[tokio::test]
+    async fn provider_override_goes_through_the_reliability_layer() {
+        // The env lock and the env mutation are both released before the first
+        // await: the mock captured its error at construction time, so nothing
+        // after this block depends on the variable still being set.
+        let provider = {
+            let _serialized = mock_error_env_lock().lock();
+            let _env = MockErrorEnvGuard::set("Mock API error (429 Too Many Requests): rate_limit_error");
+            SessionsSpawnTool::build_override_provider(
+                "mock",
+                None,
+                &crate::config::ReliabilityConfig {
+                    provider_retries: 2,
+                    provider_backoff_ms: 200,
+                    ..crate::config::ReliabilityConfig::default()
+                },
+                &providers::ProviderRuntimeOptions::default(),
+            )
+            .expect("test: mock provider must build")
+        };
+
+        let started = std::time::Instant::now();
+        let error = provider
+            .chat_with_system(None, "audit this module", "mock-model", 0.0)
+            .await
+            .expect_err("test: the mock is configured to fail");
+        let elapsed = started.elapsed();
+        let text = error.to_string();
+
+        assert!(
+            text.contains("All providers/models failed"),
+            "the override path must produce the aggregated reliability error, got: {text}"
+        );
+        assert!(
+            text.contains("attempt 1/3") && text.contains("attempt 3/3"),
+            "every attempt must be in the trail, got: {text}"
+        );
+        assert!(
+            text.contains("rate_limited"),
+            "the failure reason must be classified as a rate limit, got: {text}"
+        );
+        // Two jittered backoffs: [100,200] + [200,400].
+        assert!(
+            elapsed >= std::time::Duration::from_millis(280),
+            "the override path did not back off (bare provider fails instantly): {elapsed:?}"
+        );
+    }
+
+    /// The pinned provider must stay pinned: widening the chain would silently
+    /// answer "run this with a different model" from the wrong vendor, and would
+    /// replay the gateway's rotation credentials against it.
+    #[test]
+    fn override_reliability_drops_chain_widening_knobs() {
+        let base = crate::config::ReliabilityConfig {
+            provider_retries: 5,
+            provider_backoff_ms: 900,
+            fallback_providers: vec!["openai".to_string()],
+            api_keys: vec!["sk-gateway-key".to_string()],
+            model_fallbacks: std::collections::HashMap::from([("k3".to_string(), vec!["k3-mini".to_string()])]),
+            ..crate::config::ReliabilityConfig::default()
+        };
+
+        let scoped = SessionsSpawnTool::override_reliability(&base);
+
+        assert_eq!(scoped.provider_retries, 5, "retry budget must carry over");
+        assert_eq!(scoped.provider_backoff_ms, 900, "backoff must carry over");
+        assert_eq!(scoped.model_fallbacks, base.model_fallbacks, "model chain carries over");
+        assert!(
+            scoped.fallback_providers.is_empty(),
+            "a pinned provider must not fail over"
+        );
+        assert!(
+            scoped.api_keys.is_empty(),
+            "gateway rotation keys belong to another vendor"
+        );
     }
 
     /// A channel that records sent messages.

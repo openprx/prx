@@ -1,4 +1,7 @@
 use super::Provider;
+use super::rate_limit::{
+    self, MAX_HONORED_RETRY_AFTER_MS, RateLimitGate, jitter_after_hint_ms, jitter_backoff_ms, retry_after_hint_ms,
+};
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, ChatTrace, ProviderCapabilities, ProviderRequestMode, StreamChunk,
     StreamOptions, StreamResult,
@@ -141,6 +144,32 @@ fn is_rate_limited(err: &anyhow::Error) -> bool {
     msg.contains("429") && (msg.contains("Too Many") || msg.contains("rate") || msg.contains("limit"))
 }
 
+/// Business error codes observed on 429 responses where retrying is futile
+/// (Z.AI / GLM: plan does not cover the model, insufficient balance).
+const NON_RETRYABLE_RATE_LIMIT_CODES: [u16; 2] = [1113, 1311];
+
+/// Match a provider business code only where it appears as the value of a
+/// `code`-like key (`"code":1311`, `error_code = 1113`, ...).
+///
+/// A bare digit scan over the whole message is not safe: an ordinary 429 body
+/// carries a `request_id`, token counters and timestamps, and any digit run
+/// that happened to read `1113` or `1311` used to classify that response as
+/// permanently failed — silently skipping the entire retry budget. Requiring
+/// the key context keeps the real business codes matched while making an
+/// accidental hit impossible. Default is "retryable".
+fn has_non_retryable_business_code(lower: &str) -> bool {
+    lower.match_indices("code").any(|(idx, keyword)| {
+        let Some(rest) = lower.get(idx + keyword.len()..) else {
+            return false;
+        };
+        let value = rest.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ':' | '='));
+        let digits: String = value.chars().take_while(char::is_ascii_digit).collect();
+        digits
+            .parse::<u16>()
+            .is_ok_and(|code| NON_RETRYABLE_RATE_LIMIT_CODES.contains(&code))
+    })
+}
+
 /// Check if a 429 is a business/quota-plan error that retries cannot fix.
 ///
 /// Examples:
@@ -151,14 +180,25 @@ fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
     if !is_rate_limited(err) {
         return false;
     }
+    is_business_rate_limit_message(&err.to_string().to_lowercase())
+}
 
-    let msg = err.to_string();
-    let lower = msg.to_lowercase();
-
+/// Whether an already-confirmed 429 body describes a billing/entitlement
+/// condition rather than transient throttling.
+///
+/// Split out from [`is_non_retryable_rate_limit`] so the streaming path — which
+/// learns the `429` from the structured status code, not from the text — can
+/// apply the same verdict without the message having to spell out "429".
+fn is_business_rate_limit_message(lower: &str) -> bool {
+    // Every hint below names a *billing or entitlement* condition. The bare
+    // `"not include"` fragment used to live here too and was far too broad —
+    // any upstream sentence containing those two words (for example "this
+    // error does not include a request id") turned a transient 429 into a
+    // permanent failure.
     let business_hints = [
         "plan does not include",
+        "does not include",
         "doesn't include",
-        "not include",
         "insufficient balance",
         "insufficient_balance",
         "insufficient quota",
@@ -175,21 +215,22 @@ fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
         return true;
     }
 
-    // Known provider business codes observed for 429 where retry is futile.
-    for token in lower.split(|c: char| !c.is_ascii_digit()) {
-        if let Ok(code) = token.parse::<u16>() {
-            if matches!(code, 1113 | 1311) {
-                return true;
-            }
-        }
-    }
-
-    false
+    has_non_retryable_business_code(lower)
 }
 
-/// Try to extract a Retry-After value (in milliseconds) from an error message.
-/// Looks for patterns like `Retry-After: 5` or `retry_after: 2.5` in the error string.
+/// Extract a `Retry-After` value (in milliseconds) from a non-streaming error.
+///
+/// Prefers the **structured** hint attached by
+/// [`api_error`](super::api_error), which reads the real HTTP `Retry-After`
+/// response header. Before that hint existed this function could only inspect
+/// the error's text, and no provider ever put the header into the message — so
+/// the whole honor path was unreachable on the non-streaming side and every
+/// 429 fell back to a locally guessed exponential backoff. The textual scan is
+/// kept as a fallback for upstreams that spell the delay into the body.
 fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
+    if let Some(millis) = retry_after_hint_ms(err) {
+        return Some(millis);
+    }
     let msg = err.to_string();
     let lower = msg.to_lowercase();
 
@@ -310,6 +351,13 @@ pub struct ReliableProvider {
     model_fallbacks: HashMap<String, Vec<String>>,
     /// Providers filtered out at startup with reasons (invalid/missing credential/init failure).
     unavailable_providers: Vec<(String, String)>,
+    /// Per-provider cool-down learned from upstream 429/503 responses.
+    ///
+    /// Chains built by [`create_resilient_provider_with_options`](super::create_resilient_provider_with_options)
+    /// share the process-wide gate, so a 429 on one request defers every other
+    /// in-flight request to the same provider. Chains constructed directly get
+    /// a private gate, keeping unit tests isolated from one another.
+    rate_limit_gate: Arc<RateLimitGate>,
 }
 
 impl ReliableProvider {
@@ -328,7 +376,15 @@ impl ReliableProvider {
             base_backoff_ms: base_backoff_ms.max(50),
             model_fallbacks: HashMap::new(),
             unavailable_providers: Vec::new(),
+            rate_limit_gate: Arc::new(RateLimitGate::new()),
         }
+    }
+
+    /// Share a rate-limit gate with other provider chains in this process.
+    #[must_use]
+    pub fn with_rate_limit_gate(mut self, gate: Arc<RateLimitGate>) -> Self {
+        self.rate_limit_gate = gate;
+        self
     }
 
     /// Set per-model fallback chains.
@@ -384,9 +440,107 @@ impl ReliableProvider {
         chain
     }
 
-    /// Compute backoff duration, respecting Retry-After if present.
-    fn compute_backoff(&self, base: u64, err: &anyhow::Error) -> u64 {
-        parse_retry_after_ms(err).map_or(base, |retry_after| retry_after.min(30_000).max(base))
+    /// Emit rate-limit telemetry, publish the cool-down to the shared gate and
+    /// sleep before the next attempt on the same candidate.
+    ///
+    /// Returns `false` when the upstream asked for longer than
+    /// [`MAX_HONORED_RETRY_AFTER_MS`], meaning this candidate must be abandoned
+    /// rather than retried after a truncated (and therefore useless) wait.
+    async fn wait_before_retry(&self, ctx: &RetryContext<'_>, backoff_ms: u64, err: &anyhow::Error) -> bool {
+        let hint_ms = parse_retry_after_ms(err);
+        if ctx.rate_limited {
+            rate_limit::record_rate_limited(ctx.provider_name, ctx.model, false, hint_ms.is_some());
+        }
+        match plan_retry_wait(backoff_ms, err) {
+            RetryWait::HintExceedsCap(requested_ms) => {
+                tracing::warn!(
+                    provider = ctx.provider_name,
+                    model = ctx.model,
+                    requested_retry_after_ms = requested_ms,
+                    max_honored_ms = MAX_HONORED_RETRY_AFTER_MS,
+                    reason = ctx.failure_reason,
+                    "Upstream Retry-After exceeds the honored ceiling; abandoning this candidate instead of waiting a truncated interval"
+                );
+                // Still publish the real cool-down: other in-flight requests
+                // must not keep hammering a provider that just asked for a very
+                // long pause, even though this request gives up on it.
+                self.rate_limit_gate.note_rate_limited(ctx.provider_name, requested_ms);
+                false
+            }
+            RetryWait::Sleep(wait) => {
+                tracing::warn!(
+                    provider = ctx.provider_name,
+                    model = ctx.model,
+                    attempt = ctx.attempt,
+                    backoff_ms = wait,
+                    retry_after_ms = hint_ms,
+                    reason = ctx.failure_reason,
+                    error = ctx.error_detail,
+                    "Provider call failed, retrying"
+                );
+                if ctx.rate_limited {
+                    self.rate_limit_gate.note_rate_limited(ctx.provider_name, wait);
+                }
+                tokio::time::sleep(Duration::from_millis(wait)).await;
+                true
+            }
+        }
+    }
+
+    /// Park until the shared cool-down for `provider_name` has elapsed.
+    async fn await_rate_limit_gate(&self, provider_name: &str, model: &str) {
+        if let Some(deferred_ms) = self.rate_limit_gate.wait_until_clear(provider_name).await {
+            tracing::warn!(
+                provider = provider_name,
+                model,
+                deferred_ms,
+                "Deferred behind the shared provider rate-limit cool-down"
+            );
+        }
+    }
+}
+
+/// How long to wait before the next attempt on the same candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryWait {
+    /// Sleep this many milliseconds (jitter already applied), then retry.
+    Sleep(u64),
+    /// The upstream asked for a longer pause than we honor in place; the
+    /// payload is the delay it actually requested, for diagnostics.
+    HintExceedsCap(u64),
+}
+
+/// Shared inputs for one retry decision, kept in a struct so the four
+/// non-streaming failover loops call an identical code path.
+struct RetryContext<'a> {
+    provider_name: &'a str,
+    model: &'a str,
+    /// 1-based attempt number that just failed.
+    attempt: u32,
+    failure_reason: &'static str,
+    error_detail: &'a str,
+    rate_limited: bool,
+}
+
+/// Compute the (jittered) wait before retrying the same provider/model.
+///
+/// * With a `Retry-After` hint: honor it, floored at the local backoff so a
+///   `0` hint still pauses, and add a small positive spread. The wait is never
+///   shortened below what the server asked for — truncating a server-declared
+///   cool-down guarantees an immediate second 429.
+/// * Without a hint: equal-jitter the local exponential backoff so concurrent
+///   callers throttled in the same instant stop retrying in lock-step.
+fn plan_retry_wait(base: u64, err: &anyhow::Error) -> RetryWait {
+    plan_wait_from_hint(base, parse_retry_after_ms(err))
+}
+
+/// [`plan_retry_wait`] for callers that already extracted the hint (the
+/// streaming driver reads it off the structured `StreamError` variant).
+fn plan_wait_from_hint(base: u64, hint_ms: Option<u64>) -> RetryWait {
+    match hint_ms {
+        Some(hint) if hint > MAX_HONORED_RETRY_AFTER_MS => RetryWait::HintExceedsCap(hint),
+        Some(hint) => RetryWait::Sleep(jitter_after_hint_ms(hint.max(base))),
+        None => RetryWait::Sleep(jitter_backoff_ms(base)),
     }
 }
 
@@ -448,8 +602,12 @@ impl Provider for ReliableProvider {
                 }
 
                 let mut backoff_ms = self.base_backoff_ms;
+                // Tracks whether this candidate was ever throttled, so recovery
+                // and give-up can be reported separately from ordinary errors.
+                let mut rate_limited_seen = false;
 
                 for attempt in 0..=self.max_retries {
+                    self.await_rate_limit_gate(provider_name, current_model).await;
                     match provider
                         .chat_with_system(system_prompt, message, current_model, temperature)
                         .await
@@ -464,6 +622,9 @@ impl Provider for ReliableProvider {
                                     "Provider recovered (failover/retry)"
                                 );
                             }
+                            if rate_limited_seen {
+                                rate_limit::record_recovered(provider_name);
+                            }
                             return Ok(resp);
                         }
                         Err(e) => {
@@ -472,6 +633,7 @@ impl Provider for ReliableProvider {
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
+                            rate_limited_seen = rate_limited_seen || (rate_limited && !non_retryable);
 
                             push_failure(
                                 &mut failures,
@@ -502,23 +664,43 @@ impl Provider for ReliableProvider {
                             }
 
                             if attempt < self.max_retries {
-                                let wait = self.compute_backoff(backoff_ms, &e);
-                                tracing::warn!(
-                                    provider = %provider_name,
-                                    model = *current_model,
-                                    attempt = attempt + 1,
-                                    backoff_ms = wait,
-                                    reason = failure_reason,
-                                    error = %error_detail,
-                                    "Provider call failed, retrying"
-                                );
-                                tokio::time::sleep(Duration::from_millis(wait)).await;
+                                let ctx = RetryContext {
+                                    provider_name,
+                                    model: current_model,
+                                    attempt: attempt + 1,
+                                    failure_reason,
+                                    error_detail: &error_detail,
+                                    rate_limited,
+                                };
+                                if !self.wait_before_retry(&ctx, backoff_ms, &e).await {
+                                    break;
+                                }
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                            } else if rate_limited {
+                                // Final attempt: no sleep follows, but the
+                                // throttle still has to reach the counters — and
+                                // the cool-down still has to reach every other
+                                // in-flight request, even though this one gives up.
+                                let hint = parse_retry_after_ms(&e);
+                                rate_limit::record_rate_limited(provider_name, current_model, false, hint.is_some());
+                                self.rate_limit_gate.note_rate_limited(
+                                    provider_name,
+                                    hint.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
+                                );
                             }
                         }
                     }
                 }
 
+                if rate_limited_seen {
+                    rate_limit::record_exhausted(provider_name);
+                    tracing::error!(
+                        provider = %provider_name,
+                        model = *current_model,
+                        attempts = self.max_retries + 1,
+                        "Provider rate limit outlasted the retry budget; abandoning this candidate"
+                    );
+                }
                 tracing::warn!(
                     provider = %provider_name,
                     model = *current_model,
@@ -559,8 +741,12 @@ impl Provider for ReliableProvider {
                 }
 
                 let mut backoff_ms = self.base_backoff_ms;
+                // Tracks whether this candidate was ever throttled, so recovery
+                // and give-up can be reported separately from ordinary errors.
+                let mut rate_limited_seen = false;
 
                 for attempt in 0..=self.max_retries {
+                    self.await_rate_limit_gate(provider_name, current_model).await;
                     match provider.chat_with_history(messages, current_model, temperature).await {
                         Ok(resp) => {
                             if attempt > 0 || *current_model != model {
@@ -572,6 +758,9 @@ impl Provider for ReliableProvider {
                                     "Provider recovered (failover/retry)"
                                 );
                             }
+                            if rate_limited_seen {
+                                rate_limit::record_recovered(provider_name);
+                            }
                             return Ok(resp);
                         }
                         Err(e) => {
@@ -580,6 +769,7 @@ impl Provider for ReliableProvider {
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
+                            rate_limited_seen = rate_limited_seen || (rate_limited && !non_retryable);
 
                             push_failure(
                                 &mut failures,
@@ -610,23 +800,43 @@ impl Provider for ReliableProvider {
                             }
 
                             if attempt < self.max_retries {
-                                let wait = self.compute_backoff(backoff_ms, &e);
-                                tracing::warn!(
-                                    provider = %provider_name,
-                                    model = *current_model,
-                                    attempt = attempt + 1,
-                                    backoff_ms = wait,
-                                    reason = failure_reason,
-                                    error = %error_detail,
-                                    "Provider call failed, retrying"
-                                );
-                                tokio::time::sleep(Duration::from_millis(wait)).await;
+                                let ctx = RetryContext {
+                                    provider_name,
+                                    model: current_model,
+                                    attempt: attempt + 1,
+                                    failure_reason,
+                                    error_detail: &error_detail,
+                                    rate_limited,
+                                };
+                                if !self.wait_before_retry(&ctx, backoff_ms, &e).await {
+                                    break;
+                                }
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                            } else if rate_limited {
+                                // Final attempt: no sleep follows, but the
+                                // throttle still has to reach the counters — and
+                                // the cool-down still has to reach every other
+                                // in-flight request, even though this one gives up.
+                                let hint = parse_retry_after_ms(&e);
+                                rate_limit::record_rate_limited(provider_name, current_model, false, hint.is_some());
+                                self.rate_limit_gate.note_rate_limited(
+                                    provider_name,
+                                    hint.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
+                                );
                             }
                         }
                     }
                 }
 
+                if rate_limited_seen {
+                    rate_limit::record_exhausted(provider_name);
+                    tracing::error!(
+                        provider = %provider_name,
+                        model = *current_model,
+                        attempts = self.max_retries + 1,
+                        "Provider rate limit outlasted the retry budget; abandoning this candidate"
+                    );
+                }
                 tracing::warn!(
                     provider = %provider_name,
                     model = *current_model,
@@ -675,8 +885,12 @@ impl Provider for ReliableProvider {
                 }
 
                 let mut backoff_ms = self.base_backoff_ms;
+                // Tracks whether this candidate was ever throttled, so recovery
+                // and give-up can be reported separately from ordinary errors.
+                let mut rate_limited_seen = false;
 
                 for attempt in 0..=self.max_retries {
+                    self.await_rate_limit_gate(provider_name, current_model).await;
                     let attempt_started_at = chrono::Utc::now();
                     match provider.chat_traced(request, current_model, temperature).await {
                         Ok(trace) => {
@@ -688,6 +902,9 @@ impl Provider for ReliableProvider {
                                     original_model = model,
                                     "Provider recovered (failover/retry)"
                                 );
+                            }
+                            if rate_limited_seen {
+                                rate_limit::record_recovered(provider_name);
                             }
                             seq = seq.saturating_add(1);
                             attempts.push(build_attempt(
@@ -712,6 +929,7 @@ impl Provider for ReliableProvider {
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
+                            rate_limited_seen = rate_limited_seen || (rate_limited && !non_retryable);
 
                             push_failure(
                                 &mut failures,
@@ -751,23 +969,43 @@ impl Provider for ReliableProvider {
                             }
 
                             if attempt < self.max_retries {
-                                let wait = self.compute_backoff(backoff_ms, &e);
-                                tracing::warn!(
-                                    provider = %provider_name,
-                                    model = *current_model,
-                                    attempt = attempt + 1,
-                                    backoff_ms = wait,
-                                    reason = failure_reason,
-                                    error = %error_detail,
-                                    "Provider call failed, retrying"
-                                );
-                                tokio::time::sleep(Duration::from_millis(wait)).await;
+                                let ctx = RetryContext {
+                                    provider_name,
+                                    model: current_model,
+                                    attempt: attempt + 1,
+                                    failure_reason,
+                                    error_detail: &error_detail,
+                                    rate_limited,
+                                };
+                                if !self.wait_before_retry(&ctx, backoff_ms, &e).await {
+                                    break;
+                                }
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                            } else if rate_limited {
+                                // Final attempt: no sleep follows, but the
+                                // throttle still has to reach the counters — and
+                                // the cool-down still has to reach every other
+                                // in-flight request, even though this one gives up.
+                                let hint = parse_retry_after_ms(&e);
+                                rate_limit::record_rate_limited(provider_name, current_model, false, hint.is_some());
+                                self.rate_limit_gate.note_rate_limited(
+                                    provider_name,
+                                    hint.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
+                                );
                             }
                         }
                     }
                 }
 
+                if rate_limited_seen {
+                    rate_limit::record_exhausted(provider_name);
+                    tracing::error!(
+                        provider = %provider_name,
+                        model = *current_model,
+                        attempts = self.max_retries + 1,
+                        "Provider rate limit outlasted the retry budget; abandoning this candidate"
+                    );
+                }
                 tracing::warn!(
                     provider = %provider_name,
                     model = *current_model,
@@ -840,8 +1078,12 @@ impl Provider for ReliableProvider {
                 }
 
                 let mut backoff_ms = self.base_backoff_ms;
+                // Tracks whether this candidate was ever throttled, so recovery
+                // and give-up can be reported separately from ordinary errors.
+                let mut rate_limited_seen = false;
 
                 for attempt in 0..=self.max_retries {
+                    self.await_rate_limit_gate(provider_name, current_model).await;
                     match provider
                         .chat_with_tools(messages, tools, current_model, temperature)
                         .await
@@ -856,6 +1098,9 @@ impl Provider for ReliableProvider {
                                     "Provider recovered (failover/retry)"
                                 );
                             }
+                            if rate_limited_seen {
+                                rate_limit::record_recovered(provider_name);
+                            }
                             return Ok(resp);
                         }
                         Err(e) => {
@@ -864,6 +1109,7 @@ impl Provider for ReliableProvider {
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
+                            rate_limited_seen = rate_limited_seen || (rate_limited && !non_retryable);
 
                             push_failure(
                                 &mut failures,
@@ -894,23 +1140,43 @@ impl Provider for ReliableProvider {
                             }
 
                             if attempt < self.max_retries {
-                                let wait = self.compute_backoff(backoff_ms, &e);
-                                tracing::warn!(
-                                    provider = %provider_name,
-                                    model = *current_model,
-                                    attempt = attempt + 1,
-                                    backoff_ms = wait,
-                                    reason = failure_reason,
-                                    error = %error_detail,
-                                    "Provider call failed, retrying"
-                                );
-                                tokio::time::sleep(Duration::from_millis(wait)).await;
+                                let ctx = RetryContext {
+                                    provider_name,
+                                    model: current_model,
+                                    attempt: attempt + 1,
+                                    failure_reason,
+                                    error_detail: &error_detail,
+                                    rate_limited,
+                                };
+                                if !self.wait_before_retry(&ctx, backoff_ms, &e).await {
+                                    break;
+                                }
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                            } else if rate_limited {
+                                // Final attempt: no sleep follows, but the
+                                // throttle still has to reach the counters — and
+                                // the cool-down still has to reach every other
+                                // in-flight request, even though this one gives up.
+                                let hint = parse_retry_after_ms(&e);
+                                rate_limit::record_rate_limited(provider_name, current_model, false, hint.is_some());
+                                self.rate_limit_gate.note_rate_limited(
+                                    provider_name,
+                                    hint.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
+                                );
                             }
                         }
                     }
                 }
 
+                if rate_limited_seen {
+                    rate_limit::record_exhausted(provider_name);
+                    tracing::error!(
+                        provider = %provider_name,
+                        model = *current_model,
+                        attempts = self.max_retries + 1,
+                        "Provider rate limit outlasted the retry budget; abandoning this candidate"
+                    );
+                }
                 tracing::warn!(
                     provider = %provider_name,
                     model = *current_model,
@@ -954,6 +1220,7 @@ impl Provider for ReliableProvider {
             options,
             self.max_retries,
             self.base_backoff_ms,
+            Arc::clone(&self.rate_limit_gate),
             move |provider, model, temperature, options| {
                 provider.stream_chat_with_history(&messages, model, temperature, options)
             },
@@ -980,6 +1247,7 @@ impl Provider for ReliableProvider {
             options,
             self.max_retries,
             self.base_backoff_ms,
+            Arc::clone(&self.rate_limit_gate),
             move |provider, model, temperature, options| {
                 provider.stream_chat_with_system(system_prompt.as_deref(), &message, model, temperature, options)
             },
@@ -1055,8 +1323,19 @@ fn classify_stream_error(err: &super::traits::StreamError) -> StreamFailureClass
 
     // Structured rate-limit (FIX-P0-33): a 429 is rate-limited; a 503 is a
     // transient server failure worth retrying/falling back. Both already carry
-    // the parsed Retry-After hint, so no textual heuristics are needed.
-    if let StreamError::RateLimited { status, .. } = err {
+    // the parsed Retry-After hint, so the transport classification needs no
+    // textual heuristics.
+    //
+    // The message still has to be inspected for *business* 429s (plan does not
+    // cover the model, insufficient balance, ...): those never clear on their
+    // own, and since the driver now retries a `RateLimited` class even without
+    // a Retry-After hint, misclassifying one would burn the whole retry budget
+    // waiting for a quota that is not coming back. This keeps the streaming and
+    // non-streaming verdicts identical for the same upstream body.
+    if let StreamError::RateLimited { status, message, .. } = err {
+        if *status == 429 && is_business_rate_limit_message(&message.to_lowercase()) {
+            return StreamFailureClass::NonRetryable;
+        }
         return if *status == 429 {
             StreamFailureClass::RateLimited
         } else {
@@ -1113,12 +1392,15 @@ fn classify_stream_error(err: &super::traits::StreamError) -> StreamFailureClass
 
 /// Extract a Retry-After value (in milliseconds) from a streaming error.
 ///
-/// FIX-P0-33: prefers the **structured** `retry_after_ms` field carried by
+/// Prefers the **structured** `retry_after_ms` field carried by
 /// [`StreamError::RateLimited`] — read directly off the real HTTP `Retry-After`
-/// header by the provider — so the honor path works against live upstreams
-/// rather than only against errors whose textual form happens to embed the
-/// value. Falls back to parsing the error's `Display` form (mirroring
+/// header by the provider — rather than errors whose textual form happens to
+/// embed the value. Falls back to parsing the error's `Display` form (mirroring
 /// [`parse_retry_after_ms`]) for any other error shape.
+///
+/// The non-streaming side reaches the same header through
+/// [`RetryAfterHint`](super::rate_limit::RetryAfterHint); neither path depends
+/// on an upstream spelling the delay into the response body any more.
 fn parse_stream_retry_after_ms(err: &super::traits::StreamError) -> Option<u64> {
     if let super::traits::StreamError::RateLimited {
         retry_after_ms: Some(ms),
@@ -1145,13 +1427,18 @@ fn no_streaming_provider_stream() -> stream::BoxStream<'static, StreamResult<Str
 ///
 /// `build_stream` creates the per-attempt provider stream from owned request
 /// data. The driver:
-/// 1. Tries candidates in order, buffering the first chunk of each.
-/// 2. If the first chunk is a rate-limit error carrying a `Retry-After`
-///    ([FIX-P0-33]), sleeps for that interval and retries the **same**
-///    provider/model (up to `max_retries`) before considering fallback — this
-///    honors the upstream backoff hint instead of immediately rotating
-///    candidates. The sleep is interruptible via `tx.closed()` so a dropped
-///    receiver never leaves the driver sleeping pointlessly.
+/// 1. Tries candidates in order, buffering the first chunk of each. Before each
+///    attempt it observes the shared [`RateLimitGate`], so a 429 seen by any
+///    other in-flight request defers this one too.
+/// 2. If the first chunk is a recoverable error (rate-limited or retryable),
+///    backs off and retries the **same** provider/model up to `max_retries`
+///    before considering fallback — mirroring the non-streaming loops. An
+///    upstream `Retry-After` decides how long that wait is; its absence no
+///    longer means "do not retry". A hint above
+///    [`MAX_HONORED_RETRY_AFTER_MS`] is not truncated: the candidate is
+///    abandoned and the cool-down published to the gate. The sleep is
+///    interruptible via `tx.closed()` so a dropped receiver never leaves the
+///    driver sleeping pointlessly.
 /// 3. Otherwise, if the first chunk is an error that
 ///    [allows fallback](StreamFailureClass::allows_fallback) and another viable
 ///    candidate remains, moves on (context-overflow only falls back to a
@@ -1167,6 +1454,7 @@ fn drive_streaming_fallback<F>(
     options: StreamOptions,
     max_retries: u32,
     base_backoff_ms: u64,
+    gate: Arc<RateLimitGate>,
     build_stream: F,
 ) -> stream::BoxStream<'static, StreamResult<StreamChunk>>
 where
@@ -1191,8 +1479,19 @@ where
             // (after sleeping) before we fall back to the next candidate.
             let mut backoff_ms = base_backoff_ms;
             let mut pre_content_retries = 0u32;
+            // Whether this candidate was throttled at least once, so recovery /
+            // give-up land in the rate-limit counters rather than being lost.
+            let mut rate_limited_seen = false;
 
             'candidate: loop {
+                if let Some(deferred_ms) = gate.wait_until_clear(&attempt.provider_name).await {
+                    tracing::warn!(
+                        provider = %attempt.provider_name,
+                        model = %attempt.model,
+                        deferred_ms,
+                        "Deferred behind the shared provider rate-limit cool-down"
+                    );
+                }
                 attempt_seq = attempt_seq.saturating_add(1);
                 let attempt_started_at = chrono::Utc::now();
                 let mut stream = build_stream(&attempt.provider, &attempt.model, temperature, options.clone());
@@ -1202,6 +1501,9 @@ where
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(mut content) => {
+                            if !emitted_content && rate_limited_seen {
+                                rate_limit::record_recovered(&attempt.provider_name);
+                            }
                             emitted_content = true;
                             if content.is_final {
                                 content.route_attempt = Some(ProviderAttempt {
@@ -1262,42 +1564,89 @@ where
                                 return;
                             }
 
-                            // FIX-P0-33 (#3): honor a structured Retry-After hint
-                            // before falling back, regardless of failure class.
-                            // 503/529 overload responses (classified `Retryable`)
-                            // carry the same parsed `retry_after_ms` as a 429
-                            // (`RateLimited`); both deserve a same-provider/model
-                            // backoff retry rather than an immediate rotation. The
-                            // honor condition is therefore keyed on the presence of
-                            // a structured `retry_after_ms` — not on the class — so
-                            // 429 and 503/529 are treated consistently. A
-                            // `Retryable` error WITHOUT a structured hint falls
-                            // through to the normal fallback path below, preserving
-                            // prior behavior.
-                            if pre_content_retries < max_retries {
-                                if let Some(retry_after_ms) = parse_stream_retry_after_ms(&err) {
-                                    let wait = retry_after_ms.min(30_000).max(backoff_ms);
-                                    tracing::warn!(
-                                        provider = %attempt.provider_name,
-                                        model = %attempt.model,
-                                        ?class,
-                                        retry_after_ms,
-                                        wait_ms = wait,
-                                        attempt = pre_content_retries + 1,
-                                        "Streaming failure before content carries Retry-After; honoring it and retrying same provider/model: {err}"
-                                    );
-                                    // Interruptible sleep: bail out early if the
-                                    // receiver has gone away rather than waiting
-                                    // out the full backoff for nobody.
-                                    tokio::select! {
-                                        () = tx.closed() => return,
-                                        () = tokio::time::sleep(Duration::from_millis(wait)) => {}
+                            // Retry the SAME candidate before rotating, exactly
+                            // like the non-streaming loops do.
+                            //
+                            // This used to be gated on the presence of a
+                            // structured `Retry-After` hint, which made the
+                            // streaming path strictly weaker than the
+                            // non-streaming one: a 429 or 503 from an upstream
+                            // that sends no `Retry-After` header (most of them)
+                            // got zero retries and, with a single candidate,
+                            // killed the turn outright. The hint now only
+                            // decides *how long* to wait, never *whether* to
+                            // retry. Classes that cannot self-heal
+                            // (`NonRetryable`) and context overflow (which only
+                            // benefits from a different model) are excluded.
+                            let hint_ms = parse_stream_retry_after_ms(&err);
+                            let rate_limited = class == StreamFailureClass::RateLimited;
+                            if rate_limited {
+                                rate_limit::record_rate_limited(
+                                    &attempt.provider_name,
+                                    &attempt.model,
+                                    true,
+                                    hint_ms.is_some(),
+                                );
+                                rate_limited_seen = true;
+                            }
+                            let retry_in_place =
+                                matches!(class, StreamFailureClass::RateLimited | StreamFailureClass::Retryable)
+                                    && pre_content_retries < max_retries;
+
+                            if retry_in_place {
+                                match plan_wait_from_hint(backoff_ms, hint_ms) {
+                                    RetryWait::Sleep(wait) => {
+                                        tracing::warn!(
+                                            provider = %attempt.provider_name,
+                                            model = %attempt.model,
+                                            ?class,
+                                            retry_after_ms = hint_ms,
+                                            wait_ms = wait,
+                                            attempt = pre_content_retries + 1,
+                                            "Streaming failure before content; backing off and retrying same provider/model: {err}"
+                                        );
+                                        if rate_limited {
+                                            gate.note_rate_limited(&attempt.provider_name, wait);
+                                        }
+                                        // Interruptible sleep: bail out early if the
+                                        // receiver has gone away rather than waiting
+                                        // out the full backoff for nobody.
+                                        tokio::select! {
+                                            () = tx.closed() => return,
+                                            () = tokio::time::sleep(Duration::from_millis(wait)) => {}
+                                        }
+                                        pre_content_retries += 1;
+                                        backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                                        last_error = Some(err);
+                                        continue 'candidate; // Retry the same candidate.
                                     }
-                                    pre_content_retries += 1;
-                                    backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
-                                    last_error = Some(err);
-                                    continue 'candidate; // Retry the same candidate.
+                                    RetryWait::HintExceedsCap(requested_ms) => {
+                                        tracing::warn!(
+                                            provider = %attempt.provider_name,
+                                            model = %attempt.model,
+                                            requested_retry_after_ms = requested_ms,
+                                            max_honored_ms = MAX_HONORED_RETRY_AFTER_MS,
+                                            "Upstream Retry-After exceeds the honored ceiling; not retrying this candidate in place"
+                                        );
+                                        gate.note_rate_limited(&attempt.provider_name, requested_ms);
+                                    }
                                 }
+                            }
+
+                            if rate_limited_seen {
+                                rate_limit::record_exhausted(&attempt.provider_name);
+                                // Publish the cool-down even though this request
+                                // stops here, so concurrent streams defer too.
+                                gate.note_rate_limited(
+                                    &attempt.provider_name,
+                                    hint_ms.unwrap_or(backoff_ms).min(MAX_HONORED_RETRY_AFTER_MS),
+                                );
+                                tracing::error!(
+                                    provider = %attempt.provider_name,
+                                    model = %attempt.model,
+                                    attempts = pre_content_retries + 1,
+                                    "Streaming rate limit outlasted the retry budget; abandoning this candidate"
+                                );
                             }
 
                             let can_fallback = !is_last
@@ -2337,6 +2686,350 @@ mod tests {
         assert_eq!(parse_retry_after_ms(&err), None);
     }
 
+    // ── Rate-limit handling: mocks and evidence ─────────────────
+
+    /// Non-streaming mock answering with a 429 in the exact shape
+    /// [`api_error`](super::super::api_error) builds: sanitized body text, plus
+    /// the structured `Retry-After` hint when the upstream sent that header.
+    struct RateLimit429Mock {
+        calls: Arc<AtomicUsize>,
+        /// Number of leading calls that fail; later calls succeed.
+        fail_until_attempt: usize,
+        retry_after_ms: Option<u64>,
+        body: &'static str,
+    }
+
+    impl RateLimit429Mock {
+        fn error(&self) -> anyhow::Error {
+            let message = format!("Mock API error (429 Too Many Requests): {}", self.body);
+            match self.retry_after_ms {
+                Some(millis) => {
+                    anyhow::Error::new(super::super::rate_limit::RetryAfterHint { millis }).context(message)
+                }
+                None => anyhow::anyhow!("{message}"),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for RateLimit429Mock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt <= self.fail_until_attempt {
+                return Err(self.error());
+            }
+            Ok("recovered".to_string())
+        }
+    }
+
+    /// Mock that records the wall-clock offset of every call, so a test can see
+    /// whether concurrent retries land on the same instant.
+    struct CallTimeRecorderMock {
+        origin: std::time::Instant,
+        offsets: Arc<parking_lot::Mutex<Vec<u128>>>,
+        calls: Arc<AtomicUsize>,
+        fail_until_attempt: usize,
+    }
+
+    #[async_trait]
+    impl Provider for CallTimeRecorderMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt == 2 {
+                self.offsets.lock().push(self.origin.elapsed().as_millis());
+            }
+            if attempt <= self.fail_until_attempt {
+                anyhow::bail!("Mock API error (429 Too Many Requests): rate limit exceeded");
+            }
+            Ok("recovered".to_string())
+        }
+    }
+
+    /// Evidence (non-streaming, no `Retry-After`): a 429 is retried on the local
+    /// exponential schedule, and the schedule is really slept through.
+    #[tokio::test]
+    async fn non_streaming_429_without_retry_after_backs_off_exponentially() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "np-no-hint".into(),
+                Box::new(RateLimit429Mock {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: 2,
+                    retry_after_ms: None,
+                    body: "rate limit exceeded",
+                }),
+            )],
+            2,
+            200,
+        );
+
+        let started = std::time::Instant::now();
+        let out = provider.chat_with_system(None, "hi", "m", 0.0).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(out.ok().as_deref(), Some("recovered"));
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "initial attempt plus two retries");
+        // Jittered equal-jitter band: [100,200] + [200,400] = [300,600].
+        assert!(
+            elapsed >= Duration::from_millis(290),
+            "backoff was not actually slept: {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_millis(1_500), "backoff overshot: {elapsed:?}");
+    }
+
+    /// Evidence (non-streaming, with `Retry-After`): the upstream delay wins over
+    /// the (much smaller) local backoff. Before the structured hint existed this
+    /// header was dropped on the floor for every non-streaming provider.
+    #[tokio::test]
+    async fn non_streaming_429_with_retry_after_honors_the_upstream_delay() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "np-hint".into(),
+                Box::new(RateLimit429Mock {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: 1,
+                    retry_after_ms: Some(400),
+                    body: "rate_limit_error",
+                }),
+            )],
+            2,
+            50,
+        );
+
+        let started = std::time::Instant::now();
+        let out = provider.chat_with_system(None, "hi", "m", 0.0).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(out.ok().as_deref(), Some("recovered"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            elapsed >= Duration::from_millis(390),
+            "upstream Retry-After was ignored (local backoff is only 50ms): {elapsed:?}"
+        );
+    }
+
+    /// Evidence: a `Retry-After` beyond the honored ceiling is not truncated into
+    /// a wait that is known to be too short — the candidate is abandoned and the
+    /// caller gets the full attempt trail instead.
+    #[tokio::test]
+    async fn non_streaming_oversized_retry_after_abandons_candidate_without_waiting() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "np-oversized".into(),
+                Box::new(RateLimit429Mock {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: 99,
+                    retry_after_ms: Some(MAX_HONORED_RETRY_AFTER_MS + 1_000),
+                    body: "rate_limit_error",
+                }),
+            )],
+            3,
+            50,
+        );
+
+        let started = std::time::Instant::now();
+        let out = provider.chat_with_system(None, "hi", "m", 0.0).await;
+
+        assert!(out.is_err(), "an unrelievable throttle must surface");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no truncated wait, no blind retry");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "must not sleep out an over-ceiling hint"
+        );
+    }
+
+    /// Evidence: concurrent callers throttled at the same instant no longer retry
+    /// in lock-step. Remove the jitter and every offset collapses onto the same
+    /// millisecond, which is exactly the thundering herd this guards.
+    #[tokio::test]
+    async fn concurrent_retries_are_not_phase_locked() {
+        const CALLERS: usize = 12;
+        let origin = std::time::Instant::now();
+        let offsets = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        let mut handles = Vec::new();
+        for _ in 0..CALLERS {
+            let offsets = Arc::clone(&offsets);
+            handles.push(tokio::spawn(async move {
+                // A private gate per caller: this test isolates jitter, and the
+                // shared-gate behaviour is covered separately.
+                let provider = ReliableProvider::new(
+                    vec![(
+                        "jitter-probe".into(),
+                        Box::new(CallTimeRecorderMock {
+                            origin,
+                            offsets,
+                            calls: Arc::new(AtomicUsize::new(0)),
+                            fail_until_attempt: 1,
+                        }),
+                    )],
+                    2,
+                    400,
+                );
+                let _ = provider.chat_with_system(None, "hi", "m", 0.0).await;
+            }));
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
+
+        let samples = offsets.lock().clone();
+        assert_eq!(samples.len(), CALLERS, "every caller must have retried once");
+        let min = samples.iter().copied().min().unwrap_or(0);
+        let max = samples.iter().copied().max().unwrap_or(0);
+        assert!(
+            max - min >= 40,
+            "retry instants are phase-locked (spread {}ms over {samples:?}); jitter is missing",
+            max - min
+        );
+    }
+
+    /// Evidence: the shared gate turns one request's 429 into a deferral for the
+    /// others, without capping how many may run at once.
+    #[tokio::test]
+    async fn a_429_defers_other_requests_sharing_the_gate() {
+        let gate = Arc::new(RateLimitGate::new());
+        let throttled = ReliableProvider::new(
+            vec![(
+                "gate-probe".into(),
+                Box::new(RateLimit429Mock {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: 99,
+                    retry_after_ms: Some(400),
+                    body: "rate_limit_error",
+                }),
+            )],
+            0,
+            50,
+        )
+        .with_rate_limit_gate(Arc::clone(&gate));
+        let healthy = ReliableProvider::new(
+            vec![(
+                "gate-probe".into(),
+                Box::new(RateLimit429Mock {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: 0,
+                    retry_after_ms: None,
+                    body: "unused",
+                }),
+            )],
+            0,
+            50,
+        )
+        .with_rate_limit_gate(Arc::clone(&gate));
+
+        assert!(throttled.chat_with_system(None, "hi", "m", 0.0).await.is_err());
+
+        let started = std::time::Instant::now();
+        let out = healthy.chat_with_system(None, "hi", "m", 0.0).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(out.ok().as_deref(), Some("recovered"));
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "a second request must observe the shared cool-down: {elapsed:?}"
+        );
+    }
+
+    /// Evidence: an ordinary 429 whose `request_id` happens to contain `1113` or
+    /// `1311` must keep its retries. The old bare digit scan classified these as
+    /// permanent business failures and skipped the whole budget.
+    #[tokio::test]
+    async fn generic_429_with_business_code_digits_in_request_id_is_still_retried() {
+        for request_id in ["req_011CbBM1113uwxpsbDo2", "req_01311FQE3zdVWaa"] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let body: &'static str = Box::leak(
+                format!(
+                    "{{\"type\":\"error\",\"error\":{{\"type\":\"rate_limit_error\"}},\"request_id\":\"{request_id}\"}}"
+                )
+                .into_boxed_str(),
+            );
+            let provider = ReliableProvider::new(
+                vec![(
+                    "digits-probe".into(),
+                    Box::new(RateLimit429Mock {
+                        calls: Arc::clone(&calls),
+                        fail_until_attempt: 1,
+                        retry_after_ms: None,
+                        body,
+                    }),
+                )],
+                2,
+                1,
+            );
+
+            let out = provider.chat_with_system(None, "hi", "m", 0.0).await;
+            assert_eq!(
+                out.ok().as_deref(),
+                Some("recovered"),
+                "request_id containing {request_id} must not be read as a business code"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "the retry must actually happen");
+        }
+    }
+
+    #[test]
+    fn business_code_matching_requires_a_code_key() {
+        assert!(has_non_retryable_business_code("{\"code\":1311,\"message\":\"nope\"}"));
+        assert!(has_non_retryable_business_code("error_code = 1113"));
+        assert!(has_non_retryable_business_code("{\"error_code\": 1113}"));
+        assert!(
+            !has_non_retryable_business_code("\"request_id\":\"req_1311abc\""),
+            "a bare digit run must not be read as a business code"
+        );
+        assert!(
+            !has_non_retryable_business_code("input_tokens: 1113"),
+            "token counters must not be read as business codes"
+        );
+        assert!(!has_non_retryable_business_code("{\"code\":429}"));
+    }
+
+    #[test]
+    fn non_retryable_rate_limit_ignores_incidental_business_digits() {
+        let err = anyhow::anyhow!(
+            "{}",
+            "Anthropic API error (429 Too Many Requests): {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Number of request tokens has exceeded your per-minute rate limit\"},\"request_id\":\"req_011CbBM1113uwx\"}"
+        );
+        assert!(
+            !is_non_retryable_rate_limit(&err),
+            "an ordinary 429 must stay retryable regardless of digits in its request id"
+        );
+    }
+
+    #[test]
+    fn non_retryable_rate_limit_ignores_a_bare_not_include_phrase() {
+        let err = anyhow::anyhow!(
+            "{}",
+            "API error (429 Too Many Requests): {\"message\":\"this response does not include a retry hint\"}"
+        );
+        // "does not include" is still an entitlement hint, but the previously
+        // matched bare "not include" fragment is gone; guard the narrower rule.
+        assert!(is_non_retryable_rate_limit(&err));
+        let unrelated = anyhow::anyhow!(
+            "{}",
+            "API error (429 Too Many Requests): {\"message\":\"retry later; results will not include cached rows\"}"
+        );
+        assert!(
+            !is_non_retryable_rate_limit(&unrelated),
+            "a bare 'not include' must no longer condemn a transient 429"
+        );
+    }
+
     #[test]
     fn rate_limited_detection() {
         assert!(is_rate_limited(&anyhow::anyhow!("429 Too Many Requests")));
@@ -2379,24 +3072,65 @@ mod tests {
     }
 
     #[test]
-    fn compute_backoff_uses_retry_after() {
-        let provider = ReliableProvider::new(vec![], 0, 500);
+    fn retry_plan_uses_retry_after() {
         let err = anyhow::anyhow!("429 Retry-After: 3");
-        assert_eq!(provider.compute_backoff(500, &err), 3000);
+        // Honored hints are only ever jittered upward, never below the ask.
+        let RetryWait::Sleep(wait) = plan_retry_wait(500, &err) else {
+            panic!("a 3s hint is well under the honored ceiling");
+        };
+        assert!((3_000..=3_750).contains(&wait), "unexpected wait {wait}");
     }
 
     #[test]
-    fn compute_backoff_caps_at_30s() {
-        let provider = ReliableProvider::new(vec![], 0, 500);
-        let err = anyhow::anyhow!("429 Retry-After: 120");
-        assert_eq!(provider.compute_backoff(500, &err), 30_000);
+    fn retry_plan_honors_a_60s_retry_after_instead_of_truncating_it() {
+        // Regression: the old 30s ceiling halved Anthropic/OpenAI's routine
+        // `Retry-After: 60`, which guarantees an immediate second 429.
+        let err = anyhow::anyhow!("429 Too Many Requests Retry-After: 60");
+        let RetryWait::Sleep(wait) = plan_retry_wait(1_000, &err) else {
+            panic!("60s is within the honored ceiling");
+        };
+        assert!(wait >= 60_000, "a 60s Retry-After must not be truncated: {wait}");
+        assert!(wait <= 65_000, "jitter must stay bounded: {wait}");
     }
 
     #[test]
-    fn compute_backoff_falls_back_to_base() {
-        let provider = ReliableProvider::new(vec![], 0, 500);
+    fn retry_plan_abandons_candidate_when_hint_exceeds_the_ceiling() {
+        let err = anyhow::anyhow!("429 Retry-After: 600");
+        assert_eq!(plan_retry_wait(500, &err), RetryWait::HintExceedsCap(600_000));
+    }
+
+    #[test]
+    fn retry_plan_falls_back_to_jittered_base() {
         let err = anyhow::anyhow!("500 Server Error");
-        assert_eq!(provider.compute_backoff(500, &err), 500);
+        for _ in 0..200 {
+            let RetryWait::Sleep(wait) = plan_retry_wait(500, &err) else {
+                panic!("no hint means a plain backoff");
+            };
+            assert!((250..=500).contains(&wait), "unexpected wait {wait}");
+        }
+    }
+
+    #[test]
+    fn retry_plan_reads_the_structured_retry_after_hint() {
+        // Evidence for the non-streaming Retry-After path: providers attach the
+        // real header as a structured source, not as message text.
+        let err = anyhow::Error::new(super::super::rate_limit::RetryAfterHint { millis: 45_000 })
+            .context("Anthropic API error (429 Too Many Requests): rate_limit_error");
+        assert_eq!(parse_retry_after_ms(&err), Some(45_000));
+        let RetryWait::Sleep(wait) = plan_retry_wait(1_000, &err) else {
+            panic!("45s is within the honored ceiling");
+        };
+        assert!((45_000..=50_000).contains(&wait), "unexpected wait {wait}");
+    }
+
+    #[test]
+    fn retry_plan_floors_a_zero_hint_at_the_local_backoff() {
+        let err = anyhow::Error::new(super::super::rate_limit::RetryAfterHint { millis: 0 })
+            .context("API error (429 Too Many Requests): slow down");
+        let RetryWait::Sleep(wait) = plan_retry_wait(800, &err) else {
+            panic!("0ms hint must still sleep");
+        };
+        assert!(wait >= 800, "a zero hint must not defeat the local backoff: {wait}");
     }
 
     // ── §2.1 API auth error (401/403) tests ──────────────────
@@ -2835,7 +3569,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_falls_back_to_next_provider_on_pre_content_error() {
+    async fn streaming_retries_same_candidate_then_falls_back_on_pre_content_error() {
         let primary_calls = Arc::new(AtomicUsize::new(0));
         let fallback_calls = Arc::new(AtomicUsize::new(0));
         let provider = ReliableProvider::new(
@@ -2864,7 +3598,12 @@ mod tests {
         let (text, err) = collect_stream(s).await;
         assert!(err.is_none(), "fallback should have succeeded, got {err:?}");
         assert_eq!(text, "hello from fallback");
-        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            primary_calls.load(Ordering::SeqCst),
+            3,
+            "a retryable pre-content failure must spend the same-candidate retry budget \
+             (initial + max_retries) before rotating, exactly like the non-streaming loops"
+        );
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -3220,10 +3959,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_503_without_retry_after_falls_back_immediately() {
-        // Guard the unchanged path: a 503 (Retryable) carrying NO structured
-        // Retry-After hint must keep its prior behavior — fall back to the next
-        // candidate rather than retrying the same provider.
+    async fn streaming_503_without_retry_after_still_retries_the_same_candidate() {
+        // The absence of a `Retry-After` header used to mean "zero retries" on
+        // the streaming path — strictly weaker than the non-streaming loops, and
+        // fatal with a single candidate. The header now only decides how long to
+        // wait, never whether to retry at all.
         let primary_calls = Arc::new(AtomicUsize::new(0));
         let fallback_calls = Arc::new(AtomicUsize::new(0));
         let provider = ReliableProvider::new(
@@ -3234,8 +3974,8 @@ mod tests {
                         calls: Arc::clone(&primary_calls),
                         fail_first: 1,
                         status: 503,
-                        retry_after_ms: None, // No hint → no same-provider retry.
-                        success_text: "never reached",
+                        retry_after_ms: None, // No hint: local backoff decides the wait.
+                        success_text: "recovered in place",
                     }),
                 ),
                 (
@@ -3254,14 +3994,122 @@ mod tests {
         let s = provider.stream_chat_with_history(&messages, "test", 0.0, enabled_options());
         let (text, err) = collect_stream(s).await;
 
-        assert!(err.is_none(), "should recover via fallback, got {err:?}");
-        assert_eq!(text, "from fallback", "503 without Retry-After falls back");
+        assert!(err.is_none(), "should recover in place, got {err:?}");
+        assert_eq!(text, "recovered in place");
         assert_eq!(
             primary_calls.load(Ordering::SeqCst),
-            1,
-            "no structured hint → primary tried exactly once, no in-place retry"
+            2,
+            "hintless 503 must still earn a same-candidate retry"
         );
-        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1, "fallback served the request");
+        assert_eq!(
+            fallback_calls.load(Ordering::SeqCst),
+            0,
+            "recovery in place must not consume the fallback candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_429_without_retry_after_retries_instead_of_dying() {
+        // The exact production shape of the two logged streaming outages: one
+        // candidate, a 429 with no `Retry-After`, and previously zero retries —
+        // the turn died on the spot.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "only".into(),
+                Box::new(StructuredRateLimitStreamMock {
+                    calls: Arc::clone(&calls),
+                    fail_first: 2,
+                    status: 429,
+                    retry_after_ms: None,
+                    success_text: "recovered after backoff",
+                }),
+            )],
+            3,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hi")];
+        let started = std::time::Instant::now();
+        let s = provider.stream_chat_with_history(&messages, "test", 0.0, enabled_options());
+        let (text, err) = collect_stream(s).await;
+
+        assert!(err.is_none(), "single-candidate 429 must recover, got {err:?}");
+        assert_eq!(text, "recovered after backoff");
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "two retries then success");
+        assert!(
+            started.elapsed() >= Duration::from_millis(35),
+            "retries must actually back off, not spin: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_business_429_still_fails_fast() {
+        // Counterweight to the previous test: quota/plan 429s never clear, so
+        // they must not consume the (now unconditional) retry budget.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "only".into(),
+                Box::new(BusinessRateLimitStreamMock {
+                    calls: Arc::clone(&calls),
+                }),
+            )],
+            3,
+            50,
+        );
+
+        let messages = vec![ChatMessage::user("hi")];
+        let s = provider.stream_chat_with_history(&messages, "test", 0.0, enabled_options());
+        let (text, err) = collect_stream(s).await;
+
+        assert!(text.is_empty());
+        assert!(err.is_some(), "business 429 must surface");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "an insufficient-balance 429 must not be retried"
+        );
+    }
+
+    /// Streaming mock that always answers with a structured business 429
+    /// (quota exhausted), the shape that retries can never fix.
+    struct BusinessRateLimitStreamMock {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for BusinessRateLimitStreamMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("non-stream".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            stream::iter(vec![Err(StreamError::RateLimited {
+                status: 429,
+                retry_after_ms: Some(10),
+                message: "{\"code\":1113,\"message\":\"insufficient balance\"}".to_string(),
+            })])
+            .boxed()
+        }
     }
 
     /// Streaming mock that first emits a content chunk (a visible-text delta, a
@@ -3606,12 +4454,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_caps_oversized_retry_after_at_30s_floor_backoff() {
-        // FIX-P0-33 (#6): the honored wait is `retry_after_ms.min(30_000).max(backoff)`.
-        // With retry_after_ms = 0 the floor is the layer backoff (>=1ms here), and
-        // with a huge value the 30s cap applies. We exercise the floor branch end
-        // to end (a 0ms hint must still recover quickly via the same provider),
-        // proving the `.max(backoff_ms)` floor does not break recovery.
+    async fn streaming_floors_a_zero_retry_after_at_the_layer_backoff() {
+        // The honored wait is `max(retry_after_ms, backoff)` plus jitter. With
+        // retry_after_ms = 0 the floor is the layer backoff, so a 0ms hint must
+        // still recover quickly via the same provider rather than hot-spinning.
         let primary_calls = Arc::new(AtomicUsize::new(0));
         let fallback_calls = Arc::new(AtomicUsize::new(0));
         let provider = ReliableProvider::new(

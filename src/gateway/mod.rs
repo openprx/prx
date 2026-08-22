@@ -1124,6 +1124,7 @@ fn build_gateway_turn_runtime(
             config.router.clone(),
             config.model_routes.clone(),
         ))
+        .with_reliability(config.reliability.clone())
         .with_channels(Arc::new(channels_by_name))
         .with_shared_memory(Arc::clone(&memory))
         .with_event_recording(config.memory.event_recording_config());
@@ -1371,6 +1372,7 @@ pub async fn run_gateway(
             config.router.clone(),
             config.model_routes.clone(),
         ))
+        .with_reliability(config.reliability.clone())
         .with_channels(Arc::new(spawn_channels_by_name))
         .with_shared_memory(Arc::clone(&mem))
         .with_event_recording(config.memory.event_recording_config());

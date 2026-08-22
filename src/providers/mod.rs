@@ -25,6 +25,7 @@ pub mod ollama;
 pub mod openai;
 pub mod openai_codex;
 pub mod openrouter;
+pub mod rate_limit;
 pub mod reliable;
 pub mod router;
 pub mod traits;
@@ -1172,14 +1173,28 @@ pub fn sanitize_api_error(input: &str) -> String {
 }
 
 /// Build a sanitized provider error from a failed HTTP response.
+///
+/// The real `Retry-After` header is read *before* `response.text()` consumes the
+/// body and, when present, attached as a structured
+/// [`RetryAfterHint`](rate_limit::RetryAfterHint) source on the returned error.
+/// The reliability layer recovers it with
+/// [`retry_after_hint_ms`](rate_limit::retry_after_hint_ms) and honors the
+/// upstream delay instead of falling back to its own exponential guess. The
+/// `Display` form is unchanged, so every existing caller and log line keeps
+/// exactly the message it had before.
 pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::Error {
     let status = response.status();
+    let retry_after_ms = traits::retry_after_ms_from_headers(response.headers());
     let body = response
         .text()
         .await
         .unwrap_or_else(|_| "<failed to read provider error body>".to_string());
     let sanitized = sanitize_api_error(&body);
-    anyhow::anyhow!("{provider} API error ({status}): {sanitized}")
+    let message = format!("{provider} API error ({status}): {sanitized}");
+    match retry_after_ms {
+        Some(millis) => anyhow::Error::new(rate_limit::RetryAfterHint { millis }).context(message),
+        None => anyhow::anyhow!("{message}"),
+    }
 }
 
 /// Build a [`StreamError`](traits::StreamError) from a failed streaming HTTP
@@ -1868,7 +1883,10 @@ pub fn create_resilient_provider_with_options(
 
     let reliable = ReliableProvider::new(providers, reliability.provider_retries, reliability.provider_backoff_ms)
         .with_model_fallbacks(reliability.model_fallbacks.clone())
-        .with_unavailable_providers(unavailable);
+        .with_unavailable_providers(unavailable)
+        // Every chain built through the factory observes the same per-provider
+        // cool-down, so one request's 429 defers the others already in flight.
+        .with_rate_limit_gate(rate_limit::shared_gate());
 
     Ok(Box::new(reliable))
 }
@@ -2504,6 +2522,83 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    // ── Retry-After capture on the non-streaming error path ──────
+
+    /// Answer exactly one request with the given raw HTTP response and return
+    /// the address to point a client at.
+    async fn serve_one_raw_response(raw: &'static str) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test: bind loopback");
+        let addr = listener.local_addr().expect("test: local addr");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut discard = [0_u8; 2048];
+                let _ = socket.read(&mut discard).await;
+                let _ = socket.write_all(raw.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        addr
+    }
+
+    /// The non-streaming error path must carry the real `Retry-After` response
+    /// header. It never did: `api_error` only read the status and the body, so
+    /// the reliability layer's Retry-After branch was unreachable for every
+    /// non-streaming provider and each 429 fell back to a guessed backoff.
+    #[tokio::test]
+    async fn api_error_captures_the_retry_after_response_header() {
+        const RAW: &str = "HTTP/1.1 429 Too Many Requests\r\n\
+Content-Type: application/json\r\n\
+Retry-After: 60\r\n\
+Content-Length: 24\r\n\
+Connection: close\r\n\
+\r\n\
+{\"type\":\"rate_limit\"}\r\n\r\n";
+        let addr = serve_one_raw_response(RAW).await;
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/v1/messages"))
+            .send()
+            .await
+            .expect("test: request the fake upstream");
+        assert_eq!(response.status().as_u16(), 429);
+
+        let error = api_error("anthropic", response).await;
+
+        assert_eq!(
+            rate_limit::retry_after_hint_ms(&error),
+            Some(60_000),
+            "the upstream Retry-After must survive into the error"
+        );
+        assert!(
+            error
+                .to_string()
+                .starts_with("anthropic API error (429 Too Many Requests)"),
+            "the user-visible message must be unchanged: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_error_without_retry_after_header_carries_no_hint() {
+        const RAW: &str = "HTTP/1.1 429 Too Many Requests\r\n\
+Content-Type: application/json\r\n\
+Content-Length: 24\r\n\
+Connection: close\r\n\
+\r\n\
+{\"type\":\"rate_limit\"}\r\n\r\n";
+        let addr = serve_one_raw_response(RAW).await;
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/v1/messages"))
+            .send()
+            .await
+            .expect("test: request the fake upstream");
+
+        let error = api_error("anthropic", response).await;
+
+        assert_eq!(rate_limit::retry_after_hint_ms(&error), None);
+    }
 
     struct EnvGuard {
         key: &'static str,

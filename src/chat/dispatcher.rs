@@ -1576,8 +1576,13 @@ pub(crate) fn resolve_supervised_approval_override(raw: Option<&str>) -> bool {
 
 /// 判断 [`StreamError`] 是否值得重试.
 ///
-/// 与 reducer `Action::StreamFailed { retryable, .. }` 字段对齐：让上层（chat::run
-/// 主循环或未来的自动重试逻辑）依据布尔值决定是否安排另一轮 turn。当前判断准则：
+/// 与 reducer `Action::StreamFailed { retryable, .. }` 字段对齐。**这个布尔不驱动
+/// 任何自动重发**，也不打算驱动：真正的重试发生在 provider 层
+/// ([`ReliableProvider`](crate::providers::reliable::ReliableProvider) 的退避 /
+/// `Retry-After` / failover 链)，等错误冒到 chat turn 这一层时该轮的工具副作用
+/// 可能已经执行过，静默重发一轮是不安全的。它的用途是诊断：写进 trace 日志、
+/// 并作为 `HookEvent::Error` 载荷字段暴露给外部审计 / webhook，让它们能区分
+/// "上游瞬时故障" 与 "请求本身不可能成功"。当前判断准则：
 /// - `Http` / `Io`：网络瞬时故障，retryable
 /// - `RateLimited`：上游限流 (429/503)，retryable（FIX-P0-33：携带 Retry-After 结构化提示）
 /// - `Json` / `InvalidSse`：数据破损，多半重试也复发，non-retryable
