@@ -4677,6 +4677,18 @@ pub struct WacliConfig {
     /// 设备后缀（`:3` 等）会自动去除。
     #[serde(default)]
     pub bot_lid: Option<String>,
+    /// Confine **outbound** media markers (`[IMAGE:…]` and friends) to the
+    /// workspace again.
+    ///
+    /// Defaults to `false`: a marker may name any path the daemon can read,
+    /// because agents attach files from the operator's own working directories.
+    /// Set it to `true` to restore the workspace-confined, `O_NOFOLLOW` loader,
+    /// after which a marker pointing outside the workspace degrades to literal
+    /// text. It changes nothing else: the SSRF policy for `http(s)` sources, the
+    /// per-category size caps, byte-derived typing, the private temp copy handed
+    /// to wacli, and the `INFO` audit log all apply in both modes.
+    #[serde(default)]
+    pub outbound_media_workspace_only: bool,
     /// When true, only process group messages that mention the bot.
     #[serde(default)]
     pub mention_only: bool,
@@ -4717,6 +4729,7 @@ impl Default for WacliConfig {
             bot_jid: None,
             bot_number: None,
             bot_lid: None,
+            outbound_media_workspace_only: false,
             mention_only: false,
             group_reply_mode: None,
             host: None,
@@ -4794,6 +4807,20 @@ impl WacliConfig {
                      webhook_listen address (got {bind})"
                 );
             }
+        }
+
+        // Outbound media path policy is a deliberate deployment choice, so it
+        // is stated at startup instead of being silently implied by a default.
+        if self.outbound_media_workspace_only {
+            tracing::info!(
+                "channels_config.wacli: outbound media is confined to the workspace \
+                 (outbound_media_workspace_only = true)"
+            );
+        } else {
+            tracing::info!(
+                "channels_config.wacli: outbound media may reference any readable path \
+                 (set outbound_media_workspace_only = true to confine it to the workspace)"
+            );
         }
 
         // mention / smart modes need a bot identity to detect `@`s. The official
@@ -9292,6 +9319,21 @@ classifier_timeout_secs = 8
         assert_eq!(cfg.webhook_secret.as_deref(), Some("s3cr3t"));
         assert_eq!(cfg.group_reply_mode, Some(GroupReplyMode::Smart));
         cfg.validate().expect("valid wacli config");
+    }
+
+    #[test]
+    async fn wacli_config_outbound_media_path_policy_defaults_to_unrestricted() {
+        assert!(
+            !WacliConfig::default().outbound_media_workspace_only,
+            "outbound media paths are unrestricted unless the operator opts in"
+        );
+        let toml = r#"
+            webhook_secret = "s3cr3t"
+            outbound_media_workspace_only = true
+        "#;
+        let cfg: WacliConfig = toml::from_str(toml).expect("parse wacli config");
+        assert!(cfg.outbound_media_workspace_only);
+        cfg.validate().expect("the confinement switch is a valid setting");
     }
 
     #[test]

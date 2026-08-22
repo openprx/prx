@@ -29,13 +29,22 @@ Unrecognised content is never silently rewritten to `bin`. The caller's own exte
 The owner keeps a bounded inventory of managed channel artifacts: at most 256 files, 512 MiB, and one hour of age. Admission evicts expired or excess records. Dropping the process owner removes the files still in its inventory.
 
 Outbound attachments are not part of that inventory. When a channel turns a
-`[KIND:source]` marker into a real upload (currently wacli), the source is
-admitted through the same `MediaArtifactOwner::load` gate — workspace
-confinement for paths, SSRF policy for URLs, `max + 1` streaming caps — and the
-admitted bytes are then staged into a private `0600` temp file owned by a
+`[KIND:source]` marker into a real upload (currently wacli), a remote source is
+admitted through `MediaArtifactOwner::load` (SSRF policy, `max + 1` streaming
+caps) while a local path is read directly: outbound paths are **not** confined to
+the workspace by default, because agents attach files from the operator's own
+working directories. The local read still resolves the path with `canonicalize`,
+opens it `O_NOFOLLOW | O_NONBLOCK`, accepts regular files only, and enforces the
+same per-category ceiling before and after the read. Setting
+`channels_config.wacli.outbound_media_workspace_only = true` routes local paths
+back through the workspace-confined loader.
+
+The admitted bytes are then staged into a private `0600` temp file owned by a
 `tempfile::TempPath`. The staged copy is unlinked as soon as the send finishes,
 whether it succeeded, failed, or unwound from a panic, and the external CLI
-never opens the model-supplied path itself.
+never opens the model-supplied path itself. Every admitted attachment is logged
+at `INFO` with the resolved real path, its size, its detected class and the
+recipient — with the path restriction lifted that log is the audit trail.
 
 ## Audio and video processing
 

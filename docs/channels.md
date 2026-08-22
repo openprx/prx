@@ -47,11 +47,25 @@ WhatsApp attachment (`wacli send file`, or `wacli send voice` for an OGG/Opus
 voice note); the surrounding text rides along as the `--caption` of the first
 caption-capable attachment, or is sent as its own message when it cannot.
 
-* **Source** — either a path inside the workspace or an `http(s)` URL. Local
-  paths are read through the workspace-confined, `O_NOFOLLOW` loader used by
-  every other media path, so `/etc/shadow`, `~/.ssh/id_rsa`, `../` escapes and
-  symlinks pointing out of the workspace are refused. URLs go through the shared
-  SSRF policy (loopback, link-local and private ranges blocked).
+* **Source** — any local path the daemon can read, or an `http(s)` URL. Local
+  paths are **not** confined to the workspace: an agent is expected to attach
+  files from the directories it works in. A relative source still resolves
+  against the workspace, and `~` is never expanded. The path is resolved with
+  `canonicalize()` and then opened `O_NOFOLLOW | O_NONBLOCK`, so a symlinked
+  document resolves normally while a component swapped for a link between the
+  resolve and the open is refused, a FIFO cannot wedge the open, and anything
+  that is not a regular file (directory, device node) is rejected. URLs go
+  through the shared SSRF policy (credentials in the URL, loopback, link-local
+  and private ranges blocked, each redirect hop re-resolved and pinned).
+* **Path policy** — `outbound_media_workspace_only = true` restores the previous
+  behaviour: local sources go back through the workspace-confined, `O_NOFOLLOW`
+  traversal, and anything outside the workspace degrades to literal text. It
+  changes nothing else. Default is `false`.
+* **Audit** — every admitted attachment is logged at `INFO`
+  (`outbound media admitted`) with the resolved real path, byte size, detected
+  class, MIME, recipient and effective policy; a refused or failed one is logged
+  at `WARN` with the marker source and the policy. Because the path restriction
+  is off by default, this log is the record of which file left the host.
 * **Type** — decided from the file's own bytes by the media type identifier, not
   from the marker or the extension, so a JPEG named `photo.jfif` is sent as
   `photo.jpg` with `--mime image/jpeg`. A marker whose declared class disagrees
@@ -65,8 +79,8 @@ caption-capable attachment, or is sent as its own message when it cannot.
   channel did before media send existed. Nothing is dropped and nothing is sent
   twice.
 
-These limits are fixed constants; the wacli channel adds no configuration keys
-for outbound media.
+The size caps are fixed constants. The only outbound-media configuration key is
+`outbound_media_workspace_only` (default `false`).
 
 ## Turn Duration
 

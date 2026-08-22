@@ -216,6 +216,9 @@ webhook_listen = "127.0.0.1:16868"
 webhook_path = "/wacli"
 webhook_secret = "replace-with-secret"
 store_dir = "/path/to/wacli-store" # required for group-title fallback and inbound downloaded images
+# Outbound [IMAGE:…]/[DOCUMENT:…] markers may name any readable path by default.
+# Set to true to confine them to the workspace again (see docs/channels.md).
+outbound_media_workspace_only = false
 
 [heartbeat]
 interval_minutes = 30

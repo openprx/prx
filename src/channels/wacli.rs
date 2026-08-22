@@ -14,13 +14,38 @@
 //!
 //! ## Outbound media security model
 //!
-//! A marker source is model output, i.e. untrusted. Every source is admitted
-//! through [`crate::media::MediaArtifactOwner::load`], which confines local
-//! paths to the workspace with an `O_NOFOLLOW` traversal and runs remote URLs
-//! through the shared SSRF policy. The admitted bytes are then staged into a
-//! private temp file (`tempfile::TempPath`, unlinked on drop) so wacli never
-//! opens the model-supplied path itself, and the attachment type is decided by
-//! [`crate::media::type_id`] from the bytes rather than from the marker.
+//! A marker source is model output, i.e. untrusted. It is nevertheless **not**
+//! confined to the workspace: an agent is expected to attach files from the
+//! directories it actually works in, and the workspace restriction blocked that
+//! in practice. This is a deliberate operator decision with a known cost — a
+//! prompt-injected model can name any path the daemon can read. The
+//! `outbound_media_workspace_only` key puts the old confinement back
+//! (default `false`).
+//!
+//! Lifting the *directory* restriction removes nothing else. Every send still
+//! enforces:
+//!
+//! - remote sources go through [`crate::media::MediaArtifactOwner::load`] and
+//!   therefore the shared SSRF policy (no credentials in the URL, no loopback /
+//!   private / link-local hosts, each redirect hop re-resolved and pinned, hop
+//!   count bounded);
+//! - local sources are resolved with `canonicalize()` and then opened
+//!   `O_NOFOLLOW | O_NONBLOCK`: a canonical path holds no symlinks by
+//!   construction, so `O_NOFOLLOW` never rejects a legitimate one and still
+//!   catches the final component being swapped for a link between the resolve
+//!   and the open, while `O_NONBLOCK` keeps a FIFO from wedging the open;
+//! - only regular files are read — the check is an `fstat` on the descriptor
+//!   that is about to be read, not a `stat` on the path;
+//! - the per-category byte ceiling is checked against the file's own size
+//!   before the read and against the bytes after it;
+//! - the attachment type comes from [`crate::media::type_id`] and the bytes,
+//!   never from the marker or the file name;
+//! - the admitted bytes are copied into a private temp file
+//!   (`tempfile::TempPath`, unlinked on drop) and *that* path is what wacli
+//!   opens, so the model-supplied path is never handed to another process;
+//! - every admitted attachment is logged at `INFO` with the resolved real path,
+//!   its size, its detected class and the recipient. With the path restriction
+//!   lifted that log is the audit trail, so it is not `debug`.
 //!
 //! This replaces the previous self-maintained JSON-RPC TCP daemon client
 //! (the forked `openprx/wacli daemon`), which is no longer supported.
@@ -644,6 +669,15 @@ pub struct WacliChannelConfig {
     pub bot_number: Option<String>,
     /// Bot 的 WhatsApp LID（裸数字或含 `@lid` 域名）。
     pub bot_lid: Option<String>,
+    /// Re-enable the workspace confinement for **outbound** media sources.
+    ///
+    /// `false` (default) lets a marker name any path the daemon can read, which
+    /// is what an agent working in the operator's own directories needs. `true`
+    /// restores the workspace-confined, `O_NOFOLLOW`-traversed loader, so a
+    /// marker pointing outside `workspace_dir` degrades to literal text again.
+    /// Every other outbound guard (SSRF, size caps, byte-derived typing, temp
+    /// staging, audit log) is unaffected by this switch.
+    pub outbound_media_workspace_only: bool,
 }
 
 impl Default for WacliChannelConfig {
@@ -659,6 +693,7 @@ impl Default for WacliChannelConfig {
             bot_jid: None,
             bot_number: None,
             bot_lid: None,
+            outbound_media_workspace_only: false,
         }
     }
 }
@@ -771,20 +806,63 @@ impl WacliChannel {
         Ok(())
     }
 
-    /// Stage one `[KIND:source]` marker into a temp file wacli can upload.
+    /// Read one marker source into memory, honouring the outbound path policy.
     ///
-    /// `source` is model output and therefore untrusted. Local paths are read
-    /// through [`MediaArtifactOwner::load`], the same workspace-confined,
-    /// `O_NOFOLLOW` traversal the inbound/multimodal paths use, so anything
-    /// outside the workspace (`/etc/shadow`, `~/.ssh/id_rsa`, `../` escapes,
-    /// symlinks pointing out) is rejected before a single byte is read. URLs go
-    /// through the same loader's SSRF-checked fetch. The declared marker kind is
-    /// only a hint: the attachment is classified from its own bytes.
-    async fn prepare_outbound_media(&self, marker: &str, source: &str) -> Result<PreparedMedia> {
+    /// `data:` and `http(s):` sources always go through
+    /// [`MediaArtifactOwner::load`] — that is where the SSRF policy lives and it
+    /// is not affected by the path policy. A local path goes through the same
+    /// loader only when `outbound_media_workspace_only` is set; otherwise it is
+    /// read directly by [`read_outbound_local_file`], which drops the workspace
+    /// confinement but keeps every other check.
+    ///
+    /// The media artifact owner is required in both modes: it supplies the
+    /// remote fetcher and the base directory a relative marker source resolves
+    /// against, so a channel wired without one does no outbound media at all.
+    async fn load_outbound_source(&self, source: &str, max_bytes: usize) -> Result<OutboundSourceBytes> {
         let owner = self
             .artifact_owner
             .as_deref()
             .context("outbound media requires the workspace media artifact owner")?;
+
+        let needs_loader = source.starts_with("data:")
+            || source.starts_with("http://")
+            || source.starts_with("https://")
+            || self.config.outbound_media_workspace_only;
+        if needs_loader {
+            let loaded = owner
+                .load(source, max_bytes, ALLOW_OUTBOUND_REMOTE_FETCH)
+                .await
+                .with_context(|| format!("refused outbound media source '{source}'"))?;
+            let resolved = loaded
+                .path_hint
+                .as_deref()
+                .map_or_else(|| source.to_string(), |path| path.display().to_string());
+            return Ok(OutboundSourceBytes {
+                bytes: loaded.bytes,
+                content_type_hint: loaded.content_type_hint,
+                resolved,
+            });
+        }
+
+        let (bytes, resolved) = read_outbound_local_file(owner.workspace_dir(), source, max_bytes)
+            .await
+            .with_context(|| format!("refused outbound media source '{source}'"))?;
+        Ok(OutboundSourceBytes {
+            bytes,
+            content_type_hint: None,
+            resolved: resolved.display().to_string(),
+        })
+    }
+
+    /// Stage one `[KIND:source]` marker into a temp file wacli can upload.
+    ///
+    /// `source` is model output and therefore untrusted, but by operator
+    /// decision it is not restricted to the workspace — see the module docs for
+    /// what that does and does not give up, and for the
+    /// `outbound_media_workspace_only` switch that restores the confinement.
+    /// The declared marker kind is only a hint: the attachment is classified
+    /// from its own bytes.
+    async fn prepare_outbound_media(&self, marker: &str, source: &str, recipient: &str) -> Result<PreparedMedia> {
         let source = source.trim();
         if source.is_empty() {
             anyhow::bail!("empty media source");
@@ -792,10 +870,7 @@ impl WacliChannel {
 
         let marker_category = super::traits::outgoing_marker_category(marker);
         let load_cap = marker_category.map_or(MAX_OUTBOUND_DOCUMENT_BYTES, outbound_category_cap);
-        let loaded = owner
-            .load(source, load_cap, ALLOW_OUTBOUND_REMOTE_FETCH)
-            .await
-            .with_context(|| format!("refused outbound media source '{source}'"))?;
+        let loaded = self.load_outbound_source(source, load_cap).await?;
 
         let name_hint = outbound_source_basename(source);
         let hint = TypeHint::new()
@@ -818,6 +893,7 @@ impl WacliChannel {
                 marker = %marker,
                 detected = %category.as_str(),
                 source = %source,
+                resolved = %loaded.resolved,
                 "outbound media marker disagrees with the file content; sending it as the detected type"
             );
         }
@@ -830,6 +906,22 @@ impl WacliChannel {
                 category.as_str()
             );
         }
+
+        // Audit trail. With the workspace restriction lifted this is the only
+        // record of which file on this host was read out for sending, so it is
+        // `INFO` and it carries the resolved real path rather than the marker.
+        tracing::info!(
+            channel = "wacli",
+            recipient = %recipient,
+            marker = %marker,
+            source = %source,
+            resolved = %loaded.resolved,
+            bytes = size_bytes,
+            category = %category.as_str(),
+            mime = mime.unwrap_or("application/octet-stream"),
+            policy = self.outbound_path_policy(),
+            "outbound media admitted"
+        );
 
         // A voice note has to be an OGG/Opus stream; any other audio the model
         // labelled `[VOICE:…]` degrades to a regular audio attachment.
@@ -849,6 +941,7 @@ impl WacliChannel {
         };
 
         let filename = outbound_display_name(source, &extension);
+        let resolved = loaded.resolved;
         let temp = stage_outbound_media(loaded.bytes, &extension).await?;
         Ok(PreparedMedia {
             temp,
@@ -857,7 +950,17 @@ impl WacliChannel {
             mime,
             category,
             size_bytes,
+            resolved,
         })
+    }
+
+    /// Label for the effective outbound path policy, used in audit logs.
+    fn outbound_path_policy(&self) -> &'static str {
+        if self.config.outbound_media_workspace_only {
+            "workspace_only"
+        } else {
+            "unrestricted"
+        }
     }
 
     /// Invoke `wacli send file|voice` for one staged attachment.
@@ -924,7 +1027,7 @@ impl WacliChannel {
         let mut leftover: Vec<String> = Vec::new();
 
         for (marker, source) in media {
-            match self.prepare_outbound_media(marker, source).await {
+            match self.prepare_outbound_media(marker, source, &message.recipient).await {
                 Ok(prepared) => {
                     let caption =
                         (caption_eligible && !caption_used && prepared.supports_caption()).then_some(clean_text);
@@ -933,17 +1036,21 @@ impl WacliChannel {
                             caption_used |= caption.is_some();
                             tracing::info!(
                                 channel = "wacli",
+                                recipient = %message.recipient,
                                 marker = %marker,
                                 subcommand = prepared.command.as_str(),
                                 category = %prepared.category.as_str(),
                                 bytes = prepared.size_bytes,
+                                resolved = %prepared.resolved,
                                 "sent outbound media attachment"
                             );
                         }
                         Err(error) => {
                             tracing::warn!(
                                 channel = "wacli",
+                                recipient = %message.recipient,
                                 marker = %marker,
+                                resolved = %prepared.resolved,
                                 error = %error,
                                 "outbound media upload failed; falling back to the literal marker text"
                             );
@@ -954,7 +1061,10 @@ impl WacliChannel {
                 Err(error) => {
                     tracing::warn!(
                         channel = "wacli",
+                        recipient = %message.recipient,
                         marker = %marker,
+                        source = %source,
+                        policy = self.outbound_path_policy(),
                         error = %error,
                         "outbound media rejected; falling back to the literal marker text"
                     );
@@ -1052,6 +1162,8 @@ struct PreparedMedia {
     mime: Option<&'static str>,
     category: MediaCategory,
     size_bytes: usize,
+    /// Real path (or URL) the bytes came from, kept for the audit log only.
+    resolved: String,
 }
 
 impl PreparedMedia {
@@ -1106,6 +1218,93 @@ fn outbound_display_name(source: &str, extension: &str) -> String {
     } else {
         format!("{cleaned}.{extension}")
     }
+}
+
+/// Bytes admitted for one outbound attachment, plus where they came from.
+struct OutboundSourceBytes {
+    bytes: Vec<u8>,
+    /// `Content-Type` reported by a remote source, if any.
+    content_type_hint: Option<String>,
+    /// The resolved real path, or the URL for a remote source. Audit only —
+    /// nothing is re-opened from this value.
+    resolved: String,
+}
+
+/// Read a local marker source with the workspace confinement lifted.
+///
+/// Relative sources still resolve against `base_dir` (the workspace): there is
+/// no other stable base, and that keeps every marker that worked before working
+/// unchanged. `~` is not expanded, here or anywhere else in PRX.
+///
+/// Dropping the confinement is not the same as dropping `O_NOFOLLOW`. The path
+/// is first resolved with `canonicalize()`, which follows symlinks — a symlinked
+/// document directory is ordinary, and refusing it bought nothing once every
+/// directory is allowed. The *canonical* path is then opened `O_NOFOLLOW`: it
+/// contains no symlinks by construction, so the flag can only fire when the
+/// final component was swapped for a link between the resolve and the open,
+/// which is exactly the TOCTOU it exists to catch. `O_NONBLOCK` keeps a FIFO
+/// from wedging the open, and the regular-file check is an `fstat` on the
+/// descriptor that is about to be read, not a `stat` on the path.
+///
+/// An intermediate directory component could still be swapped in that window.
+/// With no directory restriction that is not an escalation — the attacker would
+/// only redirect the read to another file the daemon may already read — and the
+/// bytes are copied to a private temp file before wacli sees them, so the send
+/// itself cannot be re-targeted.
+async fn read_outbound_local_file(base_dir: &Path, source: &str, max_bytes: usize) -> Result<(Vec<u8>, PathBuf)> {
+    let requested = Path::new(source);
+    let joined = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        base_dir.join(requested)
+    };
+    crate::runtime::blocking::spawn_blocking(move || read_outbound_local_file_blocking(&joined, max_bytes))
+        .await
+        .context("wacli: outbound media read task failed")?
+}
+
+/// Blocking half of [`read_outbound_local_file`].
+fn read_outbound_local_file_blocking(path: &Path, max_bytes: usize) -> Result<(Vec<u8>, PathBuf)> {
+    use std::io::Read as _;
+
+    let resolved = path
+        .canonicalize()
+        .with_context(|| format!("cannot resolve media path '{}'", path.display()))?;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(&resolved)
+        .with_context(|| format!("cannot open media path '{}'", resolved.display()))?;
+
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("cannot stat media path '{}'", resolved.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!("media path '{}' is not a regular file", resolved.display());
+    }
+    let limit = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    if metadata.len() > limit {
+        anyhow::bail!(
+            "media path '{}' is {} bytes, over the {max_bytes} byte limit",
+            resolved.display(),
+            metadata.len()
+        );
+    }
+
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("cannot read media path '{}'", resolved.display()))?;
+    if bytes.len() > max_bytes {
+        anyhow::bail!("media path '{}' is over the {max_bytes} byte limit", resolved.display());
+    }
+    Ok((bytes, resolved))
 }
 
 /// Write `bytes` into a fresh 0600 temp file whose name ends in `extension`.
@@ -2688,6 +2887,7 @@ mod tests {
             bot_jid: bot_jid.map(str::to_owned),
             bot_number: bot_number.map(str::to_owned),
             bot_lid: bot_lid.map(str::to_owned),
+            outbound_media_workspace_only: false,
         }
     }
 
@@ -2827,21 +3027,31 @@ mod outbound_media_tests {
 
     struct Fixture {
         workspace: tempfile::TempDir,
+        /// A directory that is deliberately *not* under the workspace.
+        outside: tempfile::TempDir,
         cli: FakeCli,
         channel: WacliChannel,
     }
 
     impl Fixture {
+        /// Default policy: outbound media may name any readable path.
         fn new(media_exit: i32) -> Self {
-            Self::build(media_exit, true)
+            Self::build(media_exit, true, false)
         }
 
-        fn build(media_exit: i32, with_owner: bool) -> Self {
+        /// `outbound_media_workspace_only = true`, i.e. the old confinement.
+        fn workspace_only(media_exit: i32) -> Self {
+            Self::build(media_exit, true, true)
+        }
+
+        fn build(media_exit: i32, with_owner: bool, workspace_only: bool) -> Self {
             let workspace = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
             let root = workspace.path().canonicalize().unwrap();
             let cli = FakeCli::new(media_exit);
             let cfg = WacliChannelConfig {
                 cli_path: Some(cli.bin.to_string_lossy().into_owned()),
+                outbound_media_workspace_only: workspace_only,
                 ..WacliChannelConfig::default()
             };
             let channel = if with_owner {
@@ -2851,6 +3061,7 @@ mod outbound_media_tests {
             };
             Self {
                 workspace,
+                outside,
                 cli,
                 channel,
             }
@@ -2862,6 +3073,26 @@ mod outbound_media_tests {
                 std::fs::create_dir_all(parent).unwrap();
             }
             std::fs::write(path, bytes).unwrap();
+        }
+
+        /// Write a file the workspace-confined loader would always refuse, and
+        /// return its canonical absolute path.
+        fn write_outside(&self, name: &str, bytes: &[u8]) -> PathBuf {
+            let path = self.outside.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path.canonicalize().unwrap()
+        }
+
+        /// Canonical name of the outside directory, for `../<dir>/<file>` paths.
+        fn outside_dir_name(&self) -> String {
+            self.outside
+                .path()
+                .canonicalize()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
         }
 
         async fn send(&self, content: &str) -> Result<()> {
@@ -3158,14 +3389,83 @@ mod outbound_media_tests {
         );
     }
 
-    // ── Evidence 2: untrusted paths never leave the workspace ────────────────
+    // ── Evidence 1b: the workspace restriction is gone ───────────────────────
 
-    async fn assert_source_is_refused(source: &str) {
+    #[tokio::test]
+    async fn an_absolute_path_outside_the_workspace_is_sent() {
         let fixture = Fixture::new(0);
-        let content = format!("here [IMAGE:{source}]");
+        let source = fixture.write_outside("design-notes.pdf", &pdf_bytes());
+        let source_str = source.to_string_lossy().into_owned();
 
-        fixture.send(&content).await.unwrap();
+        fixture.send(&format!("here [DOCUMENT:{source_str}]")).await.unwrap();
 
+        let invocations = fixture.cli.invocations();
+        assert_eq!(
+            invocations.len(),
+            1,
+            "an out-of-workspace file must be sent, not described"
+        );
+        let argv = &invocations[0];
+        let temp = flag(argv, "--file").unwrap().to_string();
+        assert!(
+            temp.contains("prx-wacli-") && temp.ends_with(".pdf"),
+            "staged as {temp}"
+        );
+        assert_eq!(
+            masked(argv, &temp),
+            expect_argv(&[
+                "send",
+                "file",
+                "--to",
+                "99551234567@s.whatsapp.net",
+                "--file",
+                "<TEMP>",
+                "--filename",
+                "design-notes.pdf",
+                "--mime",
+                "application/pdf",
+                "--caption",
+                "here",
+            ])
+        );
+        assert_eq!(fixture.cli.staged_paths().len(), 1, "the bytes must reach wacli");
+    }
+
+    #[tokio::test]
+    async fn a_parent_traversal_out_of_the_workspace_is_sent() {
+        let fixture = Fixture::new(0);
+        fixture.write_outside("escaped.png", &png_bytes());
+        let source = format!("../{}/escaped.png", fixture.outside_dir_name());
+
+        fixture.send(&format!("[IMAGE:{source}]")).await.unwrap();
+
+        let invocations = fixture.cli.invocations();
+        assert_eq!(invocations.len(), 1);
+        let argv = &invocations[0];
+        assert_eq!(argv.get(1).map(String::as_str), Some("file"));
+        assert_eq!(flag(argv, "--filename"), Some("escaped.png"));
+        assert_eq!(fixture.cli.staged_paths().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_symlink_out_of_the_workspace_is_followed() {
+        let fixture = Fixture::new(0);
+        let target = fixture.write_outside("real.pdf", &pdf_bytes());
+        std::os::unix::fs::symlink(&target, fixture.workspace.path().join("link.pdf")).unwrap();
+
+        fixture.send("[DOCUMENT:link.pdf]").await.unwrap();
+
+        let invocations = fixture.cli.invocations();
+        assert_eq!(invocations.len(), 1, "a symlink to a readable file must resolve");
+        let argv = &invocations[0];
+        assert_eq!(flag(argv, "--mime"), Some("application/pdf"));
+        assert_eq!(fixture.cli.staged_paths().len(), 1);
+    }
+
+    // ── Evidence 2: every other guard survives the relaxation ────────────────
+
+    /// One `send text` carrying the literal marker, and nothing staged.
+    fn assert_refused(fixture: &Fixture, source: &str, content: &str) {
         let invocations = fixture.cli.invocations();
         assert_eq!(invocations.len(), 1, "{source} must not produce a media send");
         assert_eq!(
@@ -3176,7 +3476,7 @@ mod outbound_media_tests {
                 "--to",
                 "99551234567@s.whatsapp.net",
                 "--message",
-                &format!("here [IMAGE:{source}]"),
+                content,
             ]),
             "{source} must degrade to the literal marker text"
         );
@@ -3186,60 +3486,80 @@ mod outbound_media_tests {
         );
     }
 
-    #[tokio::test]
-    async fn an_absolute_system_path_is_refused() {
-        assert_source_is_refused("/etc/passwd").await;
+    async fn assert_source_is_refused(source: &str) {
+        let fixture = Fixture::new(0);
+        let content = format!("here [IMAGE:{source}]");
+
+        fixture.send(&content).await.unwrap();
+
+        assert_refused(&fixture, source, &content);
+    }
+
+    /// The same assertion against a channel with the confinement switched back on.
+    async fn assert_source_is_refused_when_confined(source: &str) {
+        let fixture = Fixture::workspace_only(0);
+        let content = format!("here [IMAGE:{source}]");
+
+        fixture.send(&content).await.unwrap();
+
+        assert_refused(&fixture, source, &content);
     }
 
     #[tokio::test]
-    async fn a_shadow_file_path_is_refused() {
-        assert_source_is_refused("/etc/shadow").await;
+    async fn the_model_supplied_path_is_never_handed_to_wacli() {
+        let fixture = Fixture::new(0);
+        let source = fixture.write_outside("original.png", &png_bytes());
+        let source_str = source.to_string_lossy().into_owned();
+
+        fixture.send(&format!("[IMAGE:{source_str}]")).await.unwrap();
+
+        let invocations = fixture.cli.invocations();
+        assert_eq!(invocations.len(), 1);
+        let handed = flag(&invocations[0], "--file").unwrap();
+        assert_ne!(
+            handed, source_str,
+            "wacli must open a private copy of the bytes, never the model-supplied path"
+        );
+        let staged = fixture.cli.staged_paths();
+        assert_eq!(staged.len(), 1);
+        assert_ne!(staged[0], source);
+        assert!(
+            staged[0].to_string_lossy().contains("prx-wacli-"),
+            "staged as {}",
+            staged[0].display()
+        );
+        assert!(source.exists(), "the original file must be left untouched");
+        assert!(!staged[0].exists(), "the private copy must be unlinked afterwards");
     }
 
     #[tokio::test]
     async fn a_home_relative_ssh_key_is_refused() {
+        // `~` is never expanded, so this stays a relative path under the
+        // workspace and simply does not exist.
         assert_source_is_refused("~/.ssh/id_rsa").await;
     }
 
     #[tokio::test]
-    async fn a_parent_traversal_is_refused() {
-        assert_source_is_refused("../../etc/passwd").await;
-    }
-
-    #[tokio::test]
-    async fn an_embedded_parent_traversal_is_refused() {
-        assert_source_is_refused("uploads/../../../etc/passwd").await;
-    }
-
-    #[tokio::test]
-    async fn a_symlink_pointing_out_of_the_workspace_is_refused() {
-        let fixture = Fixture::new(0);
-        std::os::unix::fs::symlink("/etc/passwd", fixture.workspace.path().join("leak.png")).unwrap();
-
-        fixture.send("here [IMAGE:leak.png]").await.unwrap();
-
-        let invocations = fixture.cli.invocations();
-        assert_eq!(invocations.len(), 1);
-        assert_eq!(invocations[0].get(1).map(String::as_str), Some("text"));
-        assert!(fixture.cli.staged_paths().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_symlinked_directory_component_is_refused() {
-        let fixture = Fixture::new(0);
-        std::os::unix::fs::symlink("/etc", fixture.workspace.path().join("etc")).unwrap();
-
-        fixture.send("[IMAGE:etc/passwd]").await.unwrap();
-
-        let invocations = fixture.cli.invocations();
-        assert_eq!(invocations.len(), 1);
-        assert_eq!(invocations[0].get(1).map(String::as_str), Some("text"));
-        assert!(fixture.cli.staged_paths().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_workspace_file_that_does_not_exist_is_refused() {
+    async fn a_file_that_does_not_exist_is_refused() {
         assert_source_is_refused("missing.png").await;
+    }
+
+    #[tokio::test]
+    async fn a_directory_is_refused() {
+        let fixture = Fixture::new(0);
+        std::fs::create_dir(fixture.workspace.path().join("folder")).unwrap();
+        let content = "[IMAGE:folder]".to_string();
+
+        fixture.send(&content).await.unwrap();
+
+        assert_refused(&fixture, "folder", &content);
+    }
+
+    #[tokio::test]
+    async fn a_device_node_is_refused() {
+        // Not a regular file: the check is an `fstat` on the descriptor that
+        // would be read, so `/dev/null` never becomes an attachment.
+        assert_source_is_refused("/dev/null").await;
     }
 
     #[tokio::test]
@@ -3253,8 +3573,13 @@ mod outbound_media_tests {
     }
 
     #[tokio::test]
+    async fn a_url_with_credentials_is_blocked() {
+        assert_source_is_refused("http://user:pass@127.0.0.1:9/secret.png").await;
+    }
+
+    #[tokio::test]
     async fn media_is_refused_when_the_channel_has_no_workspace_owner() {
-        let fixture = Fixture::build(0, false);
+        let fixture = Fixture::build(0, false, false);
         fixture.write("pic.png", &png_bytes());
 
         fixture.send("[IMAGE:pic.png]").await.unwrap();
@@ -3288,6 +3613,167 @@ mod outbound_media_tests {
             ])
         );
         assert!(fixture.cli.staged_paths().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_file_outside_the_workspace_is_still_refused() {
+        let fixture = Fixture::new(0);
+        let mut oversized = png_bytes();
+        oversized.resize(16 * 1024 * 1024 + 1, 0);
+        let source = fixture.write_outside("huge.png", &oversized);
+        let source_str = source.to_string_lossy().into_owned();
+        let content = format!("[IMAGE:{source_str}]");
+
+        fixture.send(&content).await.unwrap();
+
+        assert_refused(&fixture, &source_str, &content);
+    }
+
+    // ── Evidence 4: the confinement can be switched back on ──────────────────
+
+    #[tokio::test]
+    async fn workspace_only_still_sends_a_workspace_file() {
+        let fixture = Fixture::workspace_only(0);
+        fixture.write("pic.png", &png_bytes());
+
+        fixture.send("[IMAGE:pic.png]").await.unwrap();
+
+        let invocations = fixture.cli.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].get(1).map(String::as_str), Some("file"));
+        assert_eq!(fixture.cli.staged_paths().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn workspace_only_refuses_an_absolute_system_path() {
+        assert_source_is_refused_when_confined("/etc/passwd").await;
+    }
+
+    #[tokio::test]
+    async fn workspace_only_refuses_a_shadow_file_path() {
+        assert_source_is_refused_when_confined("/etc/shadow").await;
+    }
+
+    #[tokio::test]
+    async fn workspace_only_refuses_an_absolute_path_outside_the_workspace() {
+        let fixture = Fixture::workspace_only(0);
+        let source = fixture.write_outside("design-notes.pdf", &pdf_bytes());
+        let source_str = source.to_string_lossy().into_owned();
+        let content = format!("[DOCUMENT:{source_str}]");
+
+        fixture.send(&content).await.unwrap();
+
+        assert_refused(&fixture, &source_str, &content);
+    }
+
+    #[tokio::test]
+    async fn workspace_only_refuses_a_parent_traversal() {
+        assert_source_is_refused_when_confined("../../etc/passwd").await;
+    }
+
+    #[tokio::test]
+    async fn workspace_only_refuses_an_embedded_parent_traversal() {
+        assert_source_is_refused_when_confined("uploads/../../../etc/passwd").await;
+    }
+
+    #[tokio::test]
+    async fn workspace_only_refuses_a_symlink_pointing_out_of_the_workspace() {
+        let fixture = Fixture::workspace_only(0);
+        std::os::unix::fs::symlink("/etc/passwd", fixture.workspace.path().join("leak.png")).unwrap();
+        let content = "[IMAGE:leak.png]".to_string();
+
+        fixture.send(&content).await.unwrap();
+
+        assert_refused(&fixture, "leak.png", &content);
+    }
+
+    #[tokio::test]
+    async fn workspace_only_refuses_a_symlinked_directory_component() {
+        let fixture = Fixture::workspace_only(0);
+        std::os::unix::fs::symlink("/etc", fixture.workspace.path().join("etc")).unwrap();
+        let content = "[IMAGE:etc/passwd]".to_string();
+
+        fixture.send(&content).await.unwrap();
+
+        assert_refused(&fixture, "etc/passwd", &content);
+    }
+
+    // ── Evidence 3b: the audit log records what actually left the host ───────
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_send_is_audited_at_info_with_the_resolved_path_and_size() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let fixture = Fixture::new(0);
+        let source = fixture.write_outside("audit-me.png", &png_bytes());
+        let source_str = source.to_string_lossy().into_owned();
+        fixture.send(&format!("[IMAGE:{source_str}]")).await.unwrap();
+        drop(guard);
+
+        let text = logs.text();
+        assert!(text.contains("outbound media admitted"), "{text}");
+        assert!(text.contains(&format!("resolved={source_str}")), "{text}");
+        assert!(text.contains(&format!("bytes={}", png_bytes().len())), "{text}");
+        assert!(text.contains("recipient=99551234567@s.whatsapp.net"), "{text}");
+        assert!(text.contains("category=image"), "{text}");
+        assert!(text.contains("mime=\"image/png\""), "{text}");
+        assert!(text.contains("policy=\"unrestricted\""), "{text}");
+        assert!(text.contains("sent outbound media attachment"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_source_is_logged_with_the_effective_policy() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let fixture = Fixture::workspace_only(0);
+        fixture.send("[IMAGE:/etc/passwd]").await.unwrap();
+        drop(guard);
+
+        let text = logs.text();
+        assert!(text.contains("outbound media rejected"), "{text}");
+        assert!(text.contains("policy=\"workspace_only\""), "{text}");
+        assert!(text.contains("source=/etc/passwd"), "{text}");
+        assert!(!text.contains("outbound media admitted"), "{text}");
     }
 
     // ── Evidence 3: a failed upload falls back to text without losing text ───
