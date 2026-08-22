@@ -2084,7 +2084,10 @@ async fn recall_context_pages(
         if !result.chunk.document_id.starts_with("context-page:") {
             continue;
         }
-        let snippet = truncate_with_ellipsis(result.chunk.content.trim(), COMPACTION_MAX_SUMMARY_CHARS);
+        // A page is a verbatim transcript of older turns: its media markers
+        // belong to those turns, not to the one being assembled now.
+        let quoted = crate::multimodal::neutralize_media_markers(result.chunk.content.trim());
+        let snippet = truncate_with_ellipsis(&quoted, COMPACTION_MAX_SUMMARY_CHARS);
         let _ = write!(recalled, "\n\n---\n{snippet}");
         injected += 1;
     }
@@ -2275,12 +2278,15 @@ pub(crate) async fn build_context_with_scope(
                 }
                 ids.push(entry.id.clone());
 
-                // Cap each entry to avoid a single huge memory dominating the preamble
-                let content = if entry.content.len() > MAX_MEMORY_ENTRY_BYTES {
-                    let end = entry.content.floor_char_boundary(MAX_MEMORY_ENTRY_BYTES);
-                    format!("{}...", &entry.content[..end])
+                // Quoted material: strip the marker syntax before it is spliced
+                // into the live user turn, then cap the entry so a single huge
+                // memory cannot dominate the preamble.
+                let quoted = crate::multimodal::neutralize_media_markers(&entry.content);
+                let content = if quoted.len() > MAX_MEMORY_ENTRY_BYTES {
+                    let end = quoted.floor_char_boundary(MAX_MEMORY_ENTRY_BYTES);
+                    format!("{}...", quoted.get(..end).unwrap_or_default())
                 } else {
-                    entry.content.clone()
+                    quoted.into_owned()
                 };
 
                 let line = format!("- {}: {}\n", entry.key, content);
@@ -2302,6 +2308,19 @@ pub(crate) async fn build_context_with_scope(
     RecalledMemoryContext { preamble: context, ids }
 }
 
+/// Flatten a historical message into a single prompt line.
+///
+/// Every preamble builder below quotes content that was authored in some other
+/// turn (or by some other role) and splices it into the live user message.
+/// Media markers must lose their trigger on the way in: an `[IMAGE:...]` the
+/// assistant once wrote about, or a path whose artifact has since been cleaned
+/// up, would otherwise be resolved as an attachment of the current turn and
+/// fail the provider call. Neutralising happens *before* truncation so a cut
+/// can never land inside a marker either.
+fn neutralize_quoted_content(content: &str) -> String {
+    crate::multimodal::neutralize_media_markers(content).replace('\n', " ")
+}
+
 #[allow(dead_code)]
 fn format_shared_event_line(event: &MessageEvent) -> String {
     let channel = event.channel.as_deref().unwrap_or("unknown");
@@ -2311,10 +2330,10 @@ fn format_shared_event_line(event: &MessageEvent) -> String {
         .or(event.agent_id.as_deref())
         .or(event.persona_id.as_deref())
         .unwrap_or("unknown");
-    let mut content = event.content.trim().replace('\n', " ");
+    let mut content = neutralize_quoted_content(event.content.trim());
     if content.len() > MAX_MEMORY_ENTRY_BYTES {
         let end = content.floor_char_boundary(MAX_MEMORY_ENTRY_BYTES);
-        content = format!("{}...", &content[..end]);
+        content = format!("{}...", content.get(..end).unwrap_or_default());
     }
     format!("- [{}:{}:{}] {}\n", event.source, channel, actor, content)
 }
@@ -2327,10 +2346,10 @@ fn format_session_event_line(event: &MessageEvent) -> String {
         .or(event.agent_id.as_deref())
         .or(event.persona_id.as_deref())
         .unwrap_or("unknown");
-    let mut content = event.content.trim().replace('\n', " ");
+    let mut content = neutralize_quoted_content(event.content.trim());
     if content.len() > MAX_MEMORY_ENTRY_BYTES {
         let end = content.floor_char_boundary(MAX_MEMORY_ENTRY_BYTES);
-        content = format!("{}...", &content[..end]);
+        content = format!("{}...", content.get(..end).unwrap_or_default());
     }
     format!("- [{}:{}] {}\n", event.role, actor, content)
 }
@@ -2415,10 +2434,10 @@ fn build_current_session_events_preamble(
 
 #[allow(dead_code)]
 fn format_session_turn_line(turn: &ConversationTurn) -> String {
-    let mut content = turn.content.trim().replace('\n', " ");
+    let mut content = neutralize_quoted_content(turn.content.trim());
     if content.len() > MAX_MEMORY_ENTRY_BYTES {
         let end = content.floor_char_boundary(MAX_MEMORY_ENTRY_BYTES);
-        content = format!("{}...", &content[..end]);
+        content = format!("{}...", content.get(..end).unwrap_or_default());
     }
     format!("- [{}] {}\n", turn.role, content)
 }
@@ -2450,10 +2469,10 @@ fn build_current_session_preamble(turns: &[ConversationTurn], user_msg: &str) ->
 
 fn format_document_result_line(result: &DocumentSearchResult) -> String {
     let chunk = &result.chunk;
-    let mut content = chunk.content.trim().replace('\n', " ");
+    let mut content = neutralize_quoted_content(chunk.content.trim());
     if content.len() > MAX_MEMORY_ENTRY_BYTES {
         let end = content.floor_char_boundary(MAX_MEMORY_ENTRY_BYTES);
-        content = format!("{}...", &content[..end]);
+        content = format!("{}...", content.get(..end).unwrap_or_default());
     }
     format!(
         "- [document_id={} chunk_id={} source_anchor={}] {}\n",
@@ -8368,6 +8387,48 @@ mod tests {
         }
     }
 
+    /// Records the exact payload handed to the provider so a test can assert on
+    /// what the model really received, not on what the caller intended to send.
+    struct PayloadCapturingProvider {
+        captured: Arc<Mutex<Vec<ChatMessage>>>,
+    }
+
+    #[async_trait]
+    impl Provider for PayloadCapturingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: false,
+                vision: true,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            if let Ok(mut captured) = self.captured.lock() {
+                *captured = request.messages.to_vec();
+            }
+            Ok(ChatResponse {
+                text: Some("answered".to_string()),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            })
+        }
+    }
+
     struct ScriptedProvider {
         responses: Arc<Mutex<VecDeque<ChatResponse>>>,
     }
@@ -9360,6 +9421,208 @@ mod tests {
 
         assert_eq!(result, "vision-ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Production incident 2026-08-22: a WhatsApp session went permanently mute.
+    /// The assistant had once quoted `src/channels/wacli.rs` — comment text that
+    /// contains a literal `[IMAGE:...]` — and that turn is replayed on every
+    /// later turn. Resolving it aborted the provider call before it was made, so
+    /// the user got nothing back. The turn must complete; only the phantom image
+    /// is missing.
+    #[tokio::test]
+    async fn quoted_image_marker_fossil_still_completes_the_turn() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let provider = PayloadCapturingProvider {
+            captured: Arc::clone(&captured),
+        };
+
+        let live_question = "N: does wacli support sending files?";
+        let mut history = vec![ChatMessage::user(format!(
+            "[Current session context]\n\
+             - [assistant:prx] Media markers (`[IMAGE:...]` etc.) are not mapped to `wacli send file`.\n\n\
+             {live_question}"
+        ))];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            Arc::new(tools_registry),
+            &observer,
+            &crate::hooks::HookManager::new(std::env::temp_dir()),
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            3,
+            2,
+            false,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ToolLoopMemory::none(),
+            ChatMode::default(),
+        )
+        .await
+        .expect("a quoted marker fossil must not abort the turn");
+
+        assert_eq!(result, "answered");
+        let payload = captured.lock().expect("captured payload").clone();
+        let user_text: String = payload
+            .iter()
+            .filter(|message| message.role == "user")
+            .map(|message| message.content.clone())
+            .collect();
+        assert!(
+            user_text.contains(live_question),
+            "the live question must reach the model: {user_text}"
+        );
+    }
+
+    /// The same incident one layer up: the poisoned text is not typed by the
+    /// user, it is *assembled* from the shared event log into the live user
+    /// turn. Quoted content must arrive with its media markers already defanged.
+    #[tokio::test]
+    async fn quoted_events_reach_the_prompt_without_live_media_markers() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        let poisoned = "Media markers (`[IMAGE:...]` etc.) are not mapped; \
+                        an older shot lived at [IMAGE:/gone/artifacts/deleted.jpg] \
+                        and a clip at [VOICE:/gone/artifacts/deleted.m4a]";
+        mem.append_message_event(MessageEventInput {
+            event_id: None,
+            idempotency_key: None,
+            workspace_id: "workspace-a".to_string(),
+            owner_id: None,
+            source: "channel".into(),
+            channel: Some("wacli".to_string()),
+            session_key: Some("wacli:chat-1".to_string()),
+            parent_session_key: None,
+            run_id: None,
+            parent_run_id: None,
+            agent_id: None,
+            persona_id: None,
+            sender: Some("prx".to_string()),
+            recipient: None,
+            role: "assistant".to_string(),
+            event_type: "message.created".to_string(),
+            subject: None,
+            goal_id: None,
+            causation_event_id: None,
+            correlation_id: None,
+            attempt_id: None,
+            lease_epoch: None,
+            config_generation_id: Some(0),
+            config_source_revision: None,
+            content: poisoned.to_string(),
+            raw_payload_json: None,
+            visibility: MemoryVisibility::Workspace,
+        })
+        .await
+        .unwrap();
+
+        let context = build_context_with_shared_events_and_scope(
+            &mem,
+            MemoryPrincipal {
+                workspace_id: "workspace-a".to_string(),
+                agent_id: None,
+                persona_id: None,
+                session_key: Some("wacli:chat-1".to_string()),
+                channel: Some("wacli".to_string()),
+                sender: Some("prx".to_string()),
+                owner_id: None,
+                legacy_session_key: None,
+            },
+            "does wacli support sending files?",
+            0.0,
+            None,
+        )
+        .await;
+
+        assert!(
+            context.preamble.contains("deleted.jpg"),
+            "the quoted reference must stay readable: {}",
+            context.preamble
+        );
+        for kind in ["IMAGE", "VOICE", "DOCUMENT", "VIDEO", "AUDIO"] {
+            assert!(
+                !context.preamble.contains(&format!("[{kind}:")),
+                "quoted {kind} marker leaked into the prompt preamble: {}",
+                context.preamble
+            );
+        }
+
+        // The preamble is prepended to the live user turn; that composed message
+        // is what the provider layer normalizes.
+        let composed = vec![ChatMessage::user(format!(
+            "{}does wacli support sending files?",
+            context.preamble
+        ))];
+        let artifacts = crate::media::MediaArtifactOwner::for_workspace(tmp.path());
+        let prepared = crate::multimodal::prepare_messages_for_provider(
+            &composed,
+            &crate::config::MultimodalConfig::default(),
+            artifacts.as_ref(),
+        )
+        .await
+        .expect("a preamble built from history must never fail the provider call");
+        assert!(!prepared.contains_images);
+    }
+
+    /// Recalled pages are verbatim transcripts of evicted turns. Their markers
+    /// belong to those turns and must not be resolved as attachments of the new
+    /// one — the recall role is configurable, so `system` is not a safeguard.
+    #[tokio::test]
+    async fn recalled_context_pages_carry_no_live_image_markers() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().to_string_lossy().to_string();
+        let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let envelope = RuntimeEnvelope::agent(workspace, "run-paging-markers");
+        let runtime = DocumentIngestRuntime::from_envelope(mem, &envelope);
+
+        let mut config = paging_test_config(true);
+        config.os_paging.retrieval_injection_role = crate::config::RetrievalInjectionRole::User;
+
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(format!(
+                "ZEBRA-PANGOLIN receipt [IMAGE:/gone/artifacts/receipt.jpg] {}",
+                "please read it. ".repeat(40)
+            )),
+            ChatMessage::assistant("Noted the receipt. ".repeat(40)),
+            ChatMessage::user("latest question please summarize"),
+        ];
+
+        assert!(apply_os_paging(&mut history, &config, Some(&runtime)).await.unwrap());
+
+        let recalled = recall_context_pages("ZEBRA-PANGOLIN receipt", &config, Some(&runtime))
+            .await
+            .expect("evicted page should be recalled");
+        assert_eq!(recalled.role, "user");
+        assert!(
+            recalled.content.contains("receipt.jpg"),
+            "the reference must stay readable: {}",
+            recalled.content
+        );
+        assert!(
+            !recalled.content.contains("[IMAGE:"),
+            "a recalled page must not re-arm an old image marker: {}",
+            recalled.content
+        );
+        assert_eq!(
+            crate::multimodal::count_image_markers(std::slice::from_ref(&recalled)),
+            0,
+            "a user-role recall must contribute no resolvable image references"
+        );
     }
 
     #[tokio::test]

@@ -2,10 +2,20 @@ use crate::config::MultimodalConfig;
 use crate::media::{ArtifactError, MediaArtifactOwner};
 use crate::providers::ChatMessage;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use std::borrow::Cow;
 use std::path::Path;
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
 const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp"];
+
+/// Marker kinds that something downstream acts on: `[IMAGE:...]` is resolved
+/// into a provider image payload by [`prepare_messages_for_provider`], the rest
+/// are turned into channel attachments by
+/// [`crate::channels::traits::extract_outgoing_media`].
+const ACTIONABLE_MEDIA_MARKER_KINDS: &[&str] = &["IMAGE", "DOCUMENT", "AUDIO", "VOICE", "VIDEO"];
+
+/// Suffix appended by every truncation helper in this module.
+const TRUNCATION_ELLIPSIS: &str = "...";
 
 #[derive(Debug, Clone)]
 pub struct PreparedMessages {
@@ -50,6 +60,168 @@ pub enum MultimodalError {
     WorkspacePathDenied { input: String },
 }
 
+/// Byte offsets of one `[KIND:payload]` media marker inside a string.
+#[derive(Debug, Clone, Copy)]
+struct MediaMarkerSpan {
+    /// Offset of the opening `[`.
+    start: usize,
+    /// Offset just past the closing `]`.
+    end: usize,
+    /// Range of the marker kind (`IMAGE`, `VOICE`, ...).
+    kind_start: usize,
+    kind_end: usize,
+    /// Range of the payload between `:` and `]`.
+    payload_start: usize,
+    payload_end: usize,
+}
+
+/// Find the first complete actionable media marker at or after `from`.
+///
+/// Only complete markers are reported: an unterminated `[IMAGE:` is prose as
+/// far as every caller here is concerned.
+fn find_media_marker(content: &str, from: usize) -> Option<MediaMarkerSpan> {
+    let mut cursor = from;
+    loop {
+        let rest = content.get(cursor..)?;
+        let rel = rest.find('[')?;
+        let start = cursor + rel;
+        let after_bracket = start + 1;
+        let tail = content.get(after_bracket..)?;
+        let matched = ACTIONABLE_MEDIA_MARKER_KINDS
+            .iter()
+            .find(|kind| tail.starts_with(**kind) && tail.as_bytes().get(kind.len()) == Some(&b':'));
+        if let Some(kind) = matched {
+            let payload_start = after_bracket + kind.len() + 1;
+            if let Some(rel_end) = content.get(payload_start..).and_then(|payload| payload.find(']')) {
+                let payload_end = payload_start + rel_end;
+                return Some(MediaMarkerSpan {
+                    start,
+                    end: payload_end + 1,
+                    kind_start: after_bracket,
+                    kind_end: after_bracket + kind.len(),
+                    payload_start,
+                    payload_end,
+                });
+            }
+        }
+        cursor = after_bracket;
+    }
+}
+
+/// Rewrite actionable media markers into an inert, human-readable form.
+///
+/// Recalled pages, shared events, memory entries and document chunks are all
+/// *quoted* material that gets folded into the live user turn as a preamble.
+/// A marker inside quoted text describes an attachment that belonged to some
+/// other turn — or, when the assistant was talking about the marker syntax
+/// itself, no attachment at all. Re-reading it as a live reference makes the
+/// provider call fail on a file that was never meant to be opened, which is
+/// why quoted content is de-fanged before it is spliced into a prompt.
+///
+/// The payload is preserved so the model still sees what was referenced; only
+/// the bracket syntax that triggers resolution is dropped.
+pub fn neutralize_media_markers(content: &str) -> Cow<'_, str> {
+    let Some(mut span) = find_media_marker(content, 0) else {
+        return Cow::Borrowed(content);
+    };
+
+    let mut out = String::with_capacity(content.len());
+    let mut cursor = 0usize;
+    loop {
+        out.push_str(content.get(cursor..span.start).unwrap_or_default());
+        out.push('(');
+        out.push_str(content.get(span.kind_start..span.kind_end).unwrap_or_default());
+        out.push_str(": ");
+        out.push_str(content.get(span.payload_start..span.payload_end).unwrap_or_default());
+        out.push(')');
+        cursor = span.end;
+        match find_media_marker(content, cursor) {
+            Some(next) => span = next,
+            None => break,
+        }
+    }
+    out.push_str(content.get(cursor..).unwrap_or_default());
+    Cow::Owned(out)
+}
+
+/// Truncate to `max_chars` characters without ever emitting half a marker.
+///
+/// Compacted channel history is replayed to the provider verbatim, so a plain
+/// character cut can slice `[IMAGE:/path/a.png]` into `[IMAGE:/pa...` — the
+/// attachment silently disappears, and once anything is appended after the
+/// ellipsis the fragment can close against a later `]` and forge a reference
+/// to a path that never existed. Markers are structured data: they survive
+/// whole or not at all. Complete markers pushed past the cut are re-attached
+/// after the ellipsis, bounded by the same character budget, so the model
+/// still sees every attachment the turn carried.
+pub fn truncate_preserving_media_markers(content: &str, max_chars: usize) -> Cow<'_, str> {
+    let Some((char_cut, _)) = content.char_indices().nth(max_chars) else {
+        return Cow::Borrowed(content);
+    };
+
+    // Pull the cut back to the opening bracket of a straddled marker so the
+    // whole marker lands in the dropped tail instead of being sliced.
+    let mut cut = char_cut;
+    let mut scan = 0usize;
+    while let Some(span) = find_media_marker(content, scan) {
+        if span.start >= cut {
+            break;
+        }
+        if span.end > cut {
+            cut = span.start;
+            break;
+        }
+        scan = span.end;
+    }
+
+    let mut out = String::with_capacity(cut + TRUNCATION_ELLIPSIS.len());
+    out.push_str(content.get(..cut).unwrap_or_default().trim_end());
+    out.push_str(TRUNCATION_ELLIPSIS);
+
+    let mut budget = max_chars;
+    let mut scan = cut;
+    while let Some(span) = find_media_marker(content, scan) {
+        scan = span.end;
+        let marker = content.get(span.start..span.end).unwrap_or_default();
+        let marker_chars = marker.chars().count();
+        if marker_chars > budget {
+            continue;
+        }
+        budget -= marker_chars;
+        out.push('\n');
+        out.push_str(marker);
+    }
+
+    Cow::Owned(out)
+}
+
+/// Whether a marker payload is a truncation fossil rather than a reference.
+///
+/// `[IMAGE:...]` is what an ellipsis leaves behind — and, once written into a
+/// transcript, what the assistant quotes back when it explains marker syntax.
+/// Either way there is no image behind it, so it must never be resolved.
+fn is_placeholder_reference(candidate: &str) -> bool {
+    !candidate.is_empty() && candidate.chars().all(|ch| ch == '.' || ch == '\u{2026}')
+}
+
+impl MultimodalError {
+    /// Whether the failure means "this one reference is unusable" rather than
+    /// "the request crosses a limit or a security boundary".
+    ///
+    /// Unusable references are dropped with a warning so a single dead or
+    /// mangled marker cannot fail an entire turn. Conversation history is
+    /// durable: a `[IMAGE:...]` fossil or a path whose media artifact was
+    /// cleaned up is replayed on every subsequent turn, and a fatal error there
+    /// leaves the session permanently unable to answer. Limit and security
+    /// rejections stay fatal — those are decisions, not accidents.
+    const fn is_unusable_reference(&self) -> bool {
+        matches!(
+            self,
+            Self::ImageSourceNotFound { .. } | Self::LocalReadFailed { .. } | Self::InvalidMarker { .. }
+        )
+    }
+}
+
 pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
     let mut refs = Vec::new();
     let mut cleaned = String::with_capacity(content.len());
@@ -69,8 +241,11 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
         let end = marker_start + rel_end;
         let candidate = content[marker_start..end].trim();
 
-        if candidate.is_empty() {
-            cleaned.push_str(&content[start..=end]);
+        if candidate.is_empty() || is_placeholder_reference(candidate) {
+            // Keep the fossil as literal text: it carries meaning for the reader
+            // (it is usually the assistant quoting marker syntax) and resolving
+            // it would fail the whole turn.
+            cleaned.push_str(content.get(start..=end).unwrap_or_default());
         } else {
             refs.push(candidate.to_string());
         }
@@ -133,6 +308,7 @@ pub async fn prepare_messages_for_provider(
     }
 
     let mut normalized_messages = Vec::with_capacity(messages.len());
+    let mut resolved_images = 0usize;
     for message in messages {
         if message.role != "user" {
             normalized_messages.push(message.clone());
@@ -147,10 +323,23 @@ pub async fn prepare_messages_for_provider(
 
         let mut normalized_refs = Vec::with_capacity(refs.len());
         for reference in refs {
-            let data_uri = normalize_image_reference(&reference, config, max_bytes, artifacts).await?;
-            normalized_refs.push(data_uri);
+            match normalize_image_reference(&reference, config, max_bytes, artifacts).await {
+                Ok(data_uri) => normalized_refs.push(data_uri),
+                Err(error) if error.is_unusable_reference() => {
+                    // Drop just this reference and keep the message text. Never
+                    // silent: an image the model cannot see must be visible in
+                    // the logs.
+                    tracing::warn!(
+                        image_ref = %reference,
+                        error = %error,
+                        "multimodal: dropping unusable image reference and continuing without it"
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
 
+        resolved_images = resolved_images.saturating_add(normalized_refs.len());
         let content = compose_multimodal_message(&cleaned_text, &normalized_refs);
         normalized_messages.push(ChatMessage {
             role: message.role.clone(),
@@ -160,7 +349,7 @@ pub async fn prepare_messages_for_provider(
 
     Ok(PreparedMessages {
         messages: normalized_messages,
-        contains_images: true,
+        contains_images: resolved_images > 0,
     })
 }
 
@@ -190,7 +379,7 @@ async fn normalize_image_reference(
     config: &MultimodalConfig,
     max_bytes: usize,
     artifacts: &MediaArtifactOwner,
-) -> anyhow::Result<String> {
+) -> Result<String, MultimodalError> {
     let loaded = artifacts
         .load(source, max_bytes, config.allow_remote_fetch)
         .await
@@ -247,7 +436,7 @@ fn map_artifact_error(source: &str, error: ArtifactError) -> MultimodalError {
     }
 }
 
-fn validate_mime(source: &str, mime: &str) -> anyhow::Result<()> {
+fn validate_mime(source: &str, mime: &str) -> Result<(), MultimodalError> {
     if ALLOWED_IMAGE_MIME_TYPES.iter().any(|allowed| *allowed == mime) {
         return Ok(());
     }
@@ -255,8 +444,7 @@ fn validate_mime(source: &str, mime: &str) -> anyhow::Result<()> {
     Err(MultimodalError::UnsupportedMime {
         input: source.to_string(),
         mime: mime.to_string(),
-    }
-    .into())
+    })
 }
 
 fn detect_mime(path: Option<&Path>, bytes: &[u8], header_content_type: Option<&str>) -> Option<String> {
@@ -463,6 +651,155 @@ mod tests {
         let payload =
             extract_ollama_image_payload("data:image/png;base64,abcd==").expect("payload should be extracted");
         assert_eq!(payload, "abcd==");
+    }
+
+    #[test]
+    fn parse_image_markers_ignores_ellipsis_placeholder() {
+        // Exactly what production history carries: the assistant quoting marker
+        // syntax. There is no file called "...", so it must stay prose.
+        let input = "Media markers (`[IMAGE:...]` etc.) are not mapped to sends";
+        let (cleaned, refs) = parse_image_markers(input);
+
+        assert!(refs.is_empty(), "an ellipsis fossil is not an image reference");
+        assert_eq!(cleaned, input, "the surrounding prose must survive untouched");
+    }
+
+    #[test]
+    fn parse_image_markers_ignores_unicode_ellipsis_placeholder() {
+        let (_, refs) = parse_image_markers("see [IMAGE:\u{2026}] here");
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn parse_image_markers_still_accepts_a_dotted_relative_path() {
+        let (_, refs) = parse_image_markers("[IMAGE:../shots/a.png]");
+        assert_eq!(refs, vec!["../shots/a.png".to_string()]);
+    }
+
+    #[test]
+    fn neutralize_media_markers_borrows_when_there_is_nothing_to_do() {
+        let content = "plain text with [brackets] but no markers";
+        assert!(matches!(neutralize_media_markers(content), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn neutralize_media_markers_defangs_every_actionable_kind() {
+        let quoted = "a [IMAGE:/tmp/a.png] b [VOICE:/tmp/b.m4a] c [DOCUMENT:/tmp/c.pdf] \
+                      d [VIDEO:/tmp/d.mp4] e [AUDIO:/tmp/e.ogg] f";
+        let out = neutralize_media_markers(quoted);
+
+        for kind in ["IMAGE", "VOICE", "DOCUMENT", "VIDEO", "AUDIO"] {
+            assert!(
+                !out.contains(&format!("[{kind}:")),
+                "quoted {kind} marker must lose its trigger, got: {out}"
+            );
+            assert!(out.contains(&format!("({kind}: ")), "payload must stay readable: {out}");
+        }
+        assert!(out.contains("/tmp/a.png") && out.contains("/tmp/e.ogg"));
+        assert!(crate::channels::traits::extract_outgoing_media(&out).1.is_empty());
+        assert!(parse_image_markers(&out).1.is_empty());
+    }
+
+    #[test]
+    fn neutralize_media_markers_leaves_unterminated_prefix_alone() {
+        let content = "truncated tail [IMAGE:/tmp/half";
+        assert_eq!(neutralize_media_markers(content), content);
+    }
+
+    #[test]
+    fn truncate_preserving_media_markers_returns_short_input_unchanged() {
+        assert!(matches!(
+            truncate_preserving_media_markers("short", 64),
+            Cow::Borrowed("short")
+        ));
+    }
+
+    #[test]
+    fn truncate_preserving_media_markers_never_slices_a_marker() {
+        // Cut lands in the middle of the marker payload.
+        let content = format!("{}[IMAGE:/tmp/very/long/path/photo.png] tail", "x".repeat(20));
+        let out = truncate_preserving_media_markers(&content, 40);
+
+        assert!(
+            !out.contains("[IMAGE:/tmp/very/long/path/ph..."),
+            "a half marker must never be emitted: {out}"
+        );
+        assert!(
+            out.contains("[IMAGE:/tmp/very/long/path/photo.png]"),
+            "the whole marker must be preserved: {out}"
+        );
+        let (_, refs) = parse_image_markers(&out);
+        assert_eq!(refs, vec!["/tmp/very/long/path/photo.png".to_string()]);
+    }
+
+    #[test]
+    fn truncate_preserving_media_markers_drops_an_oversized_marker_whole() {
+        // A marker that cannot fit the budget (an inline data: URI is the real
+        // case) is dropped entirely — never emitted as a fragment.
+        let content = format!("{}[IMAGE:/tmp/very/long/path/photo.png] tail", "x".repeat(20));
+        let out = truncate_preserving_media_markers(&content, 30);
+
+        assert!(!out.contains("[IMAGE:"), "no marker fragment may survive: {out}");
+        assert!(parse_image_markers(&out).1.is_empty());
+    }
+
+    #[test]
+    fn truncate_preserving_media_markers_keeps_markers_past_the_cut() {
+        let content = format!("{}[IMAGE:/tmp/a.png]", "y".repeat(200));
+        let out = truncate_preserving_media_markers(&content, 50);
+
+        assert!(out.starts_with(&"y".repeat(50)));
+        assert!(out.contains("..."));
+        assert_eq!(parse_image_markers(&out).1, vec!["/tmp/a.png".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_drops_a_dead_reference_and_keeps_the_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("deleted-artifact.png");
+        let messages = vec![ChatMessage::user(format!(
+            "what is this [IMAGE:{}] please",
+            missing.display()
+        ))];
+        let artifacts = MediaArtifactOwner::for_workspace(temp.path());
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default(), artifacts.as_ref())
+            .await
+            .expect("a dead reference must not fail the turn");
+
+        assert!(!prepared.contains_images);
+        assert_eq!(prepared.messages.len(), 1);
+        let content = &prepared.messages[0].content;
+        assert!(content.contains("what is this"), "text must survive: {content}");
+        assert!(content.contains("please"), "text must survive: {content}");
+        assert!(
+            !content.contains("[IMAGE:"),
+            "the dead reference must be dropped, not forwarded: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_keeps_live_images_when_a_sibling_reference_is_dead() {
+        let temp = tempfile::tempdir().unwrap();
+        let good = temp.path().join("good.png");
+        std::fs::write(&good, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let missing = temp.path().join("gone.png");
+
+        let messages = vec![ChatMessage::user(format!(
+            "compare [IMAGE:{}] with [IMAGE:{}]",
+            good.display(),
+            missing.display()
+        ))];
+        let artifacts = MediaArtifactOwner::for_workspace(temp.path());
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default(), artifacts.as_ref())
+            .await
+            .expect("one dead sibling must not fail the turn");
+
+        assert!(prepared.contains_images);
+        let refs = parse_image_markers(&prepared.messages[0].content).1;
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].starts_with("data:image/png;base64,"));
     }
 
     #[tokio::test]
