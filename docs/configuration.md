@@ -266,6 +266,47 @@ An unrestricted profile is always explicit: set `workspace_only = false`,
 clear `forbidden_paths`, and widen both ceilings deliberately. `prx doctor`
 warns when all four unrestricted choices are active together.
 
+### Scope rules
+
+`[[autonomy.scopes.rules]]` narrows what a given sender / channel / chat type
+may do. Rules are evaluated top-to-bottom and the **first** rule whose
+`user`, `channel`, and `chat_type` criteria all match decides; an unset
+criterion matches anything, and `"*"` matches explicitly.
+
+A rule carries two independent ACLs:
+
+| Field | Governs | Deny/allow order |
+|---|---|---|
+| `tools_allow` / `tools_deny` | which tools may run | `tools_deny` first, then `tools_allow` (empty = no whitelist) |
+| `send_allow` / `send_deny` | which recipients `message_send` may reach | `send_deny` first, then `send_allow` (empty = no whitelist) |
+
+Outbound entries are `{channel}:{recipient}`; a bare `"*"` matches every
+destination and either segment may be `"*"`. The entry is split at its first
+colon, so recipients that contain colons themselves (JIDs, group ids) stay
+intact. A malformed entry — no colon, or an empty segment — is a hard config
+error, because a `send_deny` typo that silently matched nothing would fail
+open.
+
+```toml
+[[autonomy.scopes.rules]]
+channel = "wacli"
+# WhatsApp turns may never message this number, on any channel.
+send_deny = ["*:+15550001111"]
+
+[[autonomy.scopes.rules]]
+user = "uuid:untrusted-user-uuid"
+tools_allow = ["memory_recall"]        # whitelist-only tools
+send_allow = ["telegram:12345"]        # whitelist-only recipients
+```
+
+The outbound decision defaults to **allow for the channel the turn already
+owns** and **deny for any other channel**: sending a reply back where the
+message came from behaves exactly as it did before scope rules existed, while
+reaching a different channel requires an explicit `send_allow` entry. Rejections
+name only the destination channel and the recipient's stable audit fingerprint,
+never the plaintext recipient. `autonomy.scopes.default` applies to tool access
+only — it does not gate recipients.
+
 Agentic delegates fail closed when `allowed_tools` is missing or empty. Named
 entries select only matching eligible parent tools. Use `allowed_tools = ["*"]`
 to explicitly inherit every eligible parent tool except `delegate`; the

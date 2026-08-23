@@ -123,6 +123,32 @@ fn current_message_send_execution_context() -> Option<MessageSendExecutionContex
     MESSAGE_SEND_EXECUTION_CONTEXT.try_with(Clone::clone).ok()
 }
 
+/// Sender / chat-type identity for the outbound authorization decision.
+///
+/// Read only from the runtime-injected trusted scope (`crate::tools::execution`
+/// scrubs any model-supplied `_zc_scope*` before rewriting it), so a model
+/// cannot claim a different sender to widen its own outbound reach. When no
+/// trusted scope is present — direct tool invocation, tests, non-turn calls —
+/// the identity is unknown and only wildcard scope rules can match.
+fn trusted_outbound_identity(args: &serde_json::Value) -> (String, String) {
+    let trusted = args
+        .get("_zc_scope_trusted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !trusted {
+        return ("unknown".to_string(), "unknown".to_string());
+    }
+    let field = |key: &str| {
+        args.pointer(&format!("/_zc_scope/{key}"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    (field("sender"), field("chat_type"))
+}
+
 pub struct MessageSendTool {
     /// Active channel — updated per-message via `set_active_channel` so that
     /// replies are always routed back on the same channel the message arrived on
@@ -167,6 +193,37 @@ impl MessageSendTool {
     /// Convenience: update the default recipient from the current message's reply_target.
     pub async fn set_default_recipient(&self, recipient: Option<String>) {
         *self.default_recipient.write().await = recipient;
+    }
+
+    /// Outbound recipient authorization, applied to every action that reaches a
+    /// recipient (`send`, `react`, `edit`, `delete`/`unsend`, `thread`).
+    ///
+    /// `src_channel` is the channel the turn is anchored to and `dst_channel`
+    /// the one the message actually leaves on; today they are always the same
+    /// object, which is what makes this a no-op unless an operator configures
+    /// `send_allow` / `send_deny`.
+    ///
+    /// The rejection message carries only the stable audit fingerprint of the
+    /// destination, never the plaintext recipient.
+    fn authorize_outbound(
+        &self,
+        args: &serde_json::Value,
+        src_channel: &str,
+        dst_channel: &str,
+        recipient: &str,
+    ) -> Result<(), String> {
+        let (sender, chat_type) = trusted_outbound_identity(args);
+        if self
+            .security
+            .is_outbound_allowed(&sender, src_channel, &chat_type, dst_channel, recipient)
+        {
+            return Ok(());
+        }
+        let recipient_ref = op_id::ref_for_channel_recipient(dst_channel, recipient);
+        Err(crate::security::audit::redact_secrets(&format!(
+            "Security policy: outbound messaging to recipient {recipient_ref} on channel \
+             '{dst_channel}' is not permitted by the configured scope rules"
+        )))
     }
 }
 
@@ -298,6 +355,13 @@ impl Tool for MessageSendTool {
                         });
                     }
                 };
+                if let Err(error) = self.authorize_outbound(&args, channel.name(), channel.name(), &recipient) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(error),
+                    });
+                }
                 let recipient_ref = op_id::ref_for_channel_recipient(channel.name(), &recipient);
                 let operation_name = op_id::op_id(self.name(), "send", &[channel.name(), &recipient_ref]);
                 let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
@@ -390,6 +454,21 @@ impl Tool for MessageSendTool {
                     }
                 };
 
+                // Reactions are delivered through the Signal channel handle, which
+                // may differ from the turn's active channel; authorize the channel
+                // that actually carries the reaction.
+                let react_channel_name = self
+                    .signal
+                    .as_ref()
+                    .map_or_else(|| channel.name(), |signal| signal.name());
+                if let Err(error) = self.authorize_outbound(&args, react_channel_name, react_channel_name, &recipient) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(error),
+                    });
+                }
+
                 let emoji = match args.get("emoji").and_then(|v| v.as_str()) {
                     Some(e) if !e.is_empty() => e.to_owned(),
                     _ => {
@@ -464,6 +543,13 @@ impl Tool for MessageSendTool {
                         });
                     }
                 };
+                if let Err(error) = self.authorize_outbound(&args, channel.name(), channel.name(), &recipient) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(error),
+                    });
+                }
                 let message_id = match args.get("message_id").and_then(|v| v.as_str()) {
                     Some(id) if !id.is_empty() => id.to_owned(),
                     _ => {
@@ -501,6 +587,13 @@ impl Tool for MessageSendTool {
                         });
                     }
                 };
+                if let Err(error) = self.authorize_outbound(&args, channel.name(), channel.name(), &recipient) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(error),
+                    });
+                }
                 let message_id = match args.get("message_id").and_then(|v| v.as_str()) {
                     Some(id) if !id.is_empty() => id.to_owned(),
                     _ => {
@@ -537,6 +630,13 @@ impl Tool for MessageSendTool {
                         });
                     }
                 };
+                if let Err(error) = self.authorize_outbound(&args, channel.name(), channel.name(), &recipient) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(error),
+                    });
+                }
                 let thread_id = match args.get("thread_id").and_then(|v| v.as_str()) {
                     Some(id) if !id.is_empty() => id.to_owned(),
                     _ => {
@@ -906,5 +1006,166 @@ mod tests {
             1,
             "new channel should have received the second message"
         );
+    }
+
+    // ── Outbound recipient authorization (plan a1) ──────────────────────────
+
+    const DENIED_RECIPIENT: &str = "+15550001111";
+    const POLICY_ERROR_MARKER: &str = "not permitted by the configured scope rules";
+
+    fn scoped_security(send_allow: &[&str], send_deny: &[&str]) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            scope_rules: vec![crate::config::ScopeRule {
+                user: None,
+                channel: None,
+                chat_type: None,
+                tools_allow: vec![],
+                tools_deny: vec![],
+                send_allow: send_allow.iter().map(|s| (*s).to_string()).collect(),
+                send_deny: send_deny.iter().map(|s| (*s).to_string()).collect(),
+            }],
+            ..SecurityPolicy::default()
+        })
+    }
+
+    /// Every action that reaches a recipient, with a target that a `send_deny`
+    /// entry can match.
+    fn denied_recipient_actions() -> Vec<serde_json::Value> {
+        vec![
+            json!({"action": "send", "target": DENIED_RECIPIENT, "message": "hi"}),
+            json!({
+                "action": "react", "target": DENIED_RECIPIENT, "emoji": "\u{1F44D}",
+                "target_author": "+19998887777", "target_timestamp": 1_700_000_000_000u64
+            }),
+            json!({"action": "edit", "target": DENIED_RECIPIENT, "message_id": "1", "message": "hi"}),
+            json!({"action": "delete", "target": DENIED_RECIPIENT, "message_id": "1"}),
+            json!({"action": "unsend", "target": DENIED_RECIPIENT, "message_id": "1"}),
+            json!({"action": "thread", "target": DENIED_RECIPIENT, "thread_id": "t1", "message": "hi"}),
+        ]
+    }
+
+    #[tokio::test]
+    async fn send_deny_blocks_every_recipient_action_without_leaking_the_recipient() {
+        let (ch, sent) = DummyChannel::new();
+        let tool = MessageSendTool::new(ch, scoped_security(&[], &["*:+15550001111"]));
+
+        for args in denied_recipient_actions() {
+            let action = args["action"].as_str().unwrap().to_string();
+            let result = tool.execute(args).await.unwrap();
+            assert!(!result.success, "action {action} must be denied");
+            let error = result.error.unwrap_or_default();
+            assert!(
+                error.contains(POLICY_ERROR_MARKER),
+                "action {action} must fail on the outbound policy, got: {error}"
+            );
+            assert!(
+                !error.contains(DENIED_RECIPIENT),
+                "action {action} error must not leak the plaintext recipient: {error}"
+            );
+        }
+        assert!(sent.lock().await.is_empty(), "no message may reach the channel");
+    }
+
+    /// Zero-regression guard: with no scope rules configured, not one action
+    /// changes behaviour — in particular none of them can fail on the new
+    /// outbound decision point.
+    #[tokio::test]
+    async fn without_scope_rules_no_action_hits_the_outbound_policy() {
+        let (ch, sent) = DummyChannel::new();
+        let tool = MessageSendTool::new(ch, test_security(AutonomyLevel::Full));
+
+        for args in denied_recipient_actions() {
+            let action = args["action"].as_str().unwrap().to_string();
+            let result = tool.execute(args).await.unwrap();
+            let error = result.error.clone().unwrap_or_default();
+            assert!(
+                !error.contains(POLICY_ERROR_MARKER),
+                "action {action} must not be touched by the outbound policy, got: {error}"
+            );
+        }
+        // `send` is the only action DummyChannel implements; it still went out.
+        assert_eq!(sent.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_deny_outranks_send_allow() {
+        let (ch, sent) = DummyChannel::new();
+        let tool = MessageSendTool::new(ch, scoped_security(&["*"], &["*:+15550001111"]));
+
+        let denied = tool
+            .execute(json!({"action": "send", "target": DENIED_RECIPIENT, "message": "hi"}))
+            .await
+            .unwrap();
+        assert!(!denied.success);
+        assert!(denied.error.unwrap_or_default().contains(POLICY_ERROR_MARKER));
+
+        // The wildcard allow still lets every other recipient through.
+        let allowed = tool
+            .execute(json!({"action": "send", "target": "+15550002222", "message": "hi"}))
+            .await
+            .unwrap();
+        assert!(allowed.success, "got: {:?}", allowed.error);
+        assert_eq!(sent.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_allow_whitelist_scopes_the_destination_channel() {
+        let (ch, _sent, _recipients) = DummyChannel::new_named("dummy");
+        let tool = MessageSendTool::new(ch, scoped_security(&["telegram:*"], &[]));
+
+        // The turn's own channel is "dummy", which the whitelist excludes.
+        let result = tool
+            .execute(json!({"action": "send", "target": "+15550002222", "message": "hi"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains(POLICY_ERROR_MARKER));
+    }
+
+    #[tokio::test]
+    async fn outbound_identity_comes_from_the_trusted_scope_only() {
+        let (ch, sent) = DummyChannel::new();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            scope_rules: vec![crate::config::ScopeRule {
+                user: Some("uuid:mallory".into()),
+                channel: None,
+                chat_type: None,
+                tools_allow: vec![],
+                tools_deny: vec![],
+                send_allow: vec![],
+                send_deny: vec!["*".into()],
+            }],
+            ..SecurityPolicy::default()
+        });
+        let tool = MessageSendTool::new(ch, security);
+
+        // Runtime-injected trusted scope: the rule matches and denies.
+        let denied = tool
+            .execute(json!({
+                "action": "send", "target": "+15550002222", "message": "hi",
+                "_zc_scope_trusted": true,
+                "_zc_scope": {"sender": "uuid:mallory", "channel": "dummy", "chat_type": "direct"}
+            }))
+            .await
+            .unwrap();
+        assert!(!denied.success);
+        assert!(denied.error.unwrap_or_default().contains(POLICY_ERROR_MARKER));
+
+        // A model-supplied scope without the trusted marker must not be believed:
+        // the identity stays unknown, so mallory's rule cannot be dodged *or*
+        // impersonated. Here it simply does not match.
+        let untrusted = tool
+            .execute(json!({
+                "action": "send", "target": "+15550002222", "message": "hi",
+                "_zc_scope": {"sender": "uuid:mallory", "channel": "dummy", "chat_type": "direct"}
+            }))
+            .await
+            .unwrap();
+        assert!(untrusted.success, "got: {:?}", untrusted.error);
+        assert_eq!(sent.lock().await.len(), 1);
     }
 }

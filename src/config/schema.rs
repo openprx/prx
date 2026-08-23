@@ -3265,6 +3265,20 @@ pub struct ScopeRule {
     /// Tool blacklist: these tools are denied regardless of allow list.
     #[serde(default)]
     pub tools_deny: Vec<String>,
+    /// Outbound recipient whitelist for `message_send`.
+    ///
+    /// Entries are `{channel}:{recipient}` (for example `"telegram:*"` or
+    /// `"wacli:1234@s.whatsapp.net"`); a bare `"*"` matches every destination.
+    /// Empty (the default) means this rule imposes no whitelist, so the
+    /// same-channel / cross-channel default decides.
+    #[serde(default)]
+    pub send_allow: Vec<String>,
+    /// Outbound recipient blacklist, in the same `{channel}:{recipient}` form.
+    ///
+    /// Evaluated before `send_allow`, mirroring how `tools_deny` outranks
+    /// `tools_allow`.
+    #[serde(default)]
+    pub send_deny: Vec<String>,
 }
 
 fn default_scope_action() -> String {
@@ -3288,6 +3302,10 @@ fn default_scope_action() -> String {
 /// [[autonomy.scopes.rules]]
 /// user = "uuid:untrusted-user-uuid"
 /// tools_allow = ["memory_recall"]   # whitelist-only
+///
+/// [[autonomy.scopes.rules]]
+/// channel = "wacli"
+/// send_deny = ["*:+15550001111"]    # never message this recipient
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ScopeConfig {
@@ -3306,6 +3324,47 @@ impl Default for ScopeConfig {
             rules: Vec::new(),
         }
     }
+}
+
+impl ScopeConfig {
+    /// Validate the outbound recipient ACL entries of every rule.
+    ///
+    /// An entry that is neither `"*"` nor a well-formed `{channel}:{recipient}`
+    /// pair could never match anything, which for a `send_deny` entry would be
+    /// a silent fail-open. Reject it at load time instead.
+    pub fn validate(&self) -> Result<()> {
+        for (index, rule) in self.rules.iter().enumerate() {
+            for (field, entries) in [("send_allow", &rule.send_allow), ("send_deny", &rule.send_deny)] {
+                for entry in entries {
+                    validate_outbound_acl_entry(index, field, entry)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Reject an outbound ACL entry that cannot match any destination.
+fn validate_outbound_acl_entry(index: usize, field: &str, entry: &str) -> Result<()> {
+    let trimmed = entry.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("autonomy.scopes.rules[{index}].{field} must not contain an empty entry");
+    }
+    if trimmed == "*" {
+        return Ok(());
+    }
+    let Some((channel, recipient)) = trimmed.split_once(':') else {
+        anyhow::bail!(
+            "autonomy.scopes.rules[{index}].{field} entry {trimmed:?} must be \"*\" or \"{{channel}}:{{recipient}}\""
+        );
+    };
+    if channel.trim().is_empty() {
+        anyhow::bail!("autonomy.scopes.rules[{index}].{field} entry {trimmed:?} has an empty channel segment");
+    }
+    if recipient.trim().is_empty() {
+        anyhow::bail!("autonomy.scopes.rules[{index}].{field} entry {trimmed:?} has an empty recipient segment");
+    }
+    Ok(())
 }
 
 /// Autonomy and security policy configuration (`[autonomy]` section).
@@ -6127,6 +6186,9 @@ impl Config {
         if let Some(wacli) = self.channels_config.wacli.as_ref() {
             wacli.validate().context("invalid channels_config.wacli")?;
         }
+
+        // Scope ACLs, including the outbound recipient allow/deny entries.
+        self.autonomy.scopes.validate()?;
 
         Ok(())
     }
@@ -9447,5 +9509,43 @@ classifier_timeout_secs = 8
             !config_dir.join("workspace").exists(),
             "read-only loading must not create the workspace directory"
         );
+    }
+
+    // ── Outbound recipient ACL validation (plan a1) ─────────────────────────
+
+    fn scope_config_with(send_allow: &[&str], send_deny: &[&str]) -> ScopeConfig {
+        ScopeConfig {
+            default: "allow".into(),
+            rules: vec![ScopeRule {
+                send_allow: send_allow.iter().map(|s| (*s).to_string()).collect(),
+                send_deny: send_deny.iter().map(|s| (*s).to_string()).collect(),
+                ..ScopeRule::default()
+            }],
+        }
+    }
+
+    #[test]
+    async fn scope_config_accepts_well_formed_outbound_entries() {
+        assert!(
+            scope_config_with(&["telegram:*", "*"], &["wacli:1234@s.whatsapp.net", "*:+15550001111"])
+                .validate()
+                .is_ok()
+        );
+        assert!(ScopeConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    async fn scope_config_rejects_outbound_entry_without_channel_segment() {
+        // A colon-less entry can never match, which for send_deny would be a
+        // silent fail-open.
+        let err = scope_config_with(&[], &["+15550001111"]).validate().unwrap_err();
+        assert!(err.to_string().contains("send_deny"), "{err}");
+    }
+
+    #[test]
+    async fn scope_config_rejects_empty_outbound_segments() {
+        assert!(scope_config_with(&[], &[":+1555"]).validate().is_err());
+        assert!(scope_config_with(&[], &["telegram:"]).validate().is_err());
+        assert!(scope_config_with(&["  "], &[]).validate().is_err());
     }
 }

@@ -1874,6 +1874,63 @@ impl SecurityPolicy {
         self.scope_default_allow
     }
 
+    /// Outbound recipient authorization — the outbound counterpart of
+    /// [`is_tool_allowed`](Self::is_tool_allowed).
+    ///
+    /// `src_channel` is the channel the turn is anchored to, i.e. the channel a
+    /// reply would implicitly go out on. `dst_channel` / `dst_recipient` are the
+    /// destination actually being addressed.
+    ///
+    /// Evaluation order (deliberately identical in shape to `is_tool_allowed`):
+    /// 1. Walk the scope rules top-to-bottom; the first rule whose
+    ///    `user`/`channel`/`chat_type` criteria match wins.
+    /// 2. Within that rule, `send_deny` is checked first and always wins.
+    /// 3. A non-empty `send_allow` then acts as a whitelist.
+    /// 4. An empty `send_allow`, or no matching rule at all, falls back to the
+    ///    channel default below.
+    ///
+    /// The channel default is what keeps this a zero-regression addition:
+    /// sending to the channel the turn already owns stays allowed (exactly
+    /// today's behaviour), while reaching a *different* channel is denied
+    /// unless a `send_allow` entry opts into it. Note that
+    /// `autonomy.scopes.default` is intentionally not consulted here: it
+    /// governs tool access, and a `deny` default already blocks `message_send`
+    /// itself before any recipient is resolved.
+    #[must_use]
+    pub fn is_outbound_allowed(
+        &self,
+        sender: &str,
+        src_channel: &str,
+        chat_type: &str,
+        dst_channel: &str,
+        dst_recipient: &str,
+    ) -> bool {
+        let same_channel = dst_channel == src_channel;
+
+        for rule in &self.scope_rules {
+            if !rule_matches(rule, sender, src_channel, chat_type) {
+                continue;
+            }
+            // Rule matched — deny first, then allow, mirroring tools_deny/tools_allow.
+            if rule
+                .send_deny
+                .iter()
+                .any(|entry| outbound_entry_matches(entry, dst_channel, dst_recipient))
+            {
+                return false;
+            }
+            if rule.send_allow.is_empty() {
+                return same_channel;
+            }
+            return rule
+                .send_allow
+                .iter()
+                .any(|entry| outbound_entry_matches(entry, dst_channel, dst_recipient));
+        }
+
+        same_channel
+    }
+
     /// Unified tool-authorization decision point (permission-model Phase 1).
     ///
     /// This is the single entry point that replaces the former scattered
@@ -1914,6 +1971,29 @@ impl SecurityPolicy {
 
 /// Check whether a scope rule's criteria match the given request context.
 /// A criterion is skipped (matches anything) when not specified (`None`).
+/// Match one `{channel}:{recipient}` outbound ACL entry against a destination.
+///
+/// `"*"` matches everything. Otherwise the entry is split at its first colon so
+/// recipients that themselves contain colons (group ids, JIDs) stay intact.
+/// Either segment may be `"*"`. An entry without a colon matches nothing;
+/// `ScopeConfig::validate` rejects that shape at load time so a `send_deny`
+/// typo cannot silently fail open.
+fn outbound_entry_matches(entry: &str, dst_channel: &str, dst_recipient: &str) -> bool {
+    let entry = entry.trim();
+    if entry == "*" {
+        return true;
+    }
+    let Some((channel, recipient)) = entry.split_once(':') else {
+        return false;
+    };
+    let channel = channel.trim();
+    if channel != "*" && channel != dst_channel {
+        return false;
+    }
+    let recipient = recipient.trim();
+    recipient == "*" || recipient == dst_recipient
+}
+
 fn rule_matches(rule: &crate::config::ScopeRule, sender: &str, channel: &str, chat_type: &str) -> bool {
     if let Some(ref user_pattern) = rule.user {
         if user_pattern != "*" && user_pattern != sender {
@@ -3437,6 +3517,113 @@ mod tests {
 
     // ── from_config ─────────────────────────────────────────
 
+    // ── Outbound recipient authorization (plan a1) ──────────────────────
+
+    fn outbound_rule(channel: Option<&str>, send_allow: &[&str], send_deny: &[&str]) -> crate::config::ScopeRule {
+        crate::config::ScopeRule {
+            user: None,
+            channel: channel.map(str::to_string),
+            chat_type: None,
+            tools_allow: vec![],
+            tools_deny: vec![],
+            send_allow: send_allow.iter().map(|s| (*s).to_string()).collect(),
+            send_deny: send_deny.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn outbound_same_channel_allowed_without_any_rule() {
+        let p = make_scope_policy(vec![], true);
+        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "+15550001111"));
+    }
+
+    #[test]
+    fn outbound_same_channel_allowed_even_when_scope_default_is_deny() {
+        // `autonomy.scopes.default` governs tool access, not recipients.
+        let p = make_scope_policy(vec![], false);
+        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "+15550001111"));
+    }
+
+    #[test]
+    fn outbound_cross_channel_denied_without_send_allow() {
+        let p = make_scope_policy(vec![], true);
+        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "telegram", "12345"));
+    }
+
+    #[test]
+    fn outbound_cross_channel_allowed_by_send_allow() {
+        let p = make_scope_policy(vec![outbound_rule(Some("wacli"), &["telegram:*"], &[])], true);
+        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "telegram", "12345"));
+        // A destination outside the whitelist stays denied, same channel included.
+        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "discord", "99"));
+        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "+1"));
+    }
+
+    #[test]
+    fn outbound_send_deny_blocks_same_channel() {
+        let p = make_scope_policy(vec![outbound_rule(None, &[], &["*:+15550001111"])], true);
+        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "+15550001111"));
+        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "+15550002222"));
+    }
+
+    #[test]
+    fn outbound_send_deny_outranks_send_allow() {
+        let p = make_scope_policy(vec![outbound_rule(None, &["*"], &["telegram:12345"])], true);
+        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "telegram", "12345"));
+        // Same rule still allows every other destination via the wildcard allow.
+        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "telegram", "67890"));
+    }
+
+    #[test]
+    fn outbound_first_matching_rule_wins() {
+        let p = make_scope_policy(
+            vec![outbound_rule(Some("wacli"), &[], &[]), outbound_rule(None, &[], &["*"])],
+            true,
+        );
+        // The wacli rule matches first and imposes nothing, so the later
+        // deny-everything rule is never reached.
+        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "+1"));
+        // A telegram turn skips the first rule and hits the deny-all rule.
+        assert!(!p.is_outbound_allowed("alice", "telegram", "direct", "telegram", "+1"));
+    }
+
+    #[test]
+    fn outbound_entry_channel_scoping_is_exact() {
+        let p = make_scope_policy(vec![outbound_rule(None, &[], &["signal:+1"])], true);
+        assert!(!p.is_outbound_allowed("alice", "signal", "direct", "signal", "+1"));
+        // Same recipient on a different channel is untouched by the entry.
+        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "+1"));
+    }
+
+    #[test]
+    fn outbound_entry_recipient_may_contain_colons() {
+        let p = make_scope_policy(vec![outbound_rule(None, &[], &["wacli:1234@s.whatsapp.net:1"])], true);
+        assert!(!p.is_outbound_allowed("alice", "wacli", "group", "wacli", "1234@s.whatsapp.net:1"));
+        assert!(p.is_outbound_allowed("alice", "wacli", "group", "wacli", "1234@s.whatsapp.net"));
+    }
+
+    #[test]
+    fn outbound_rule_criteria_must_match_before_entries_apply() {
+        let mut rule = outbound_rule(Some("signal"), &[], &["*"]);
+        rule.user = Some("uuid:mallory".into());
+        rule.chat_type = Some("group".into());
+        let p = make_scope_policy(vec![rule], true);
+        // Every criterion matches → deny-all applies.
+        assert!(!p.is_outbound_allowed("uuid:mallory", "signal", "group", "signal", "+1"));
+        // Any mismatch → rule skipped → same-channel default allows.
+        assert!(p.is_outbound_allowed("uuid:alice", "signal", "group", "signal", "+1"));
+        assert!(p.is_outbound_allowed("uuid:mallory", "signal", "direct", "signal", "+1"));
+        assert!(p.is_outbound_allowed("uuid:mallory", "telegram", "group", "telegram", "+1"));
+    }
+
+    #[test]
+    fn outbound_entry_without_colon_matches_nothing() {
+        // `ScopeConfig::validate` rejects this shape at load time; the matcher
+        // must still fail closed rather than treat it as a bare channel match.
+        assert!(!outbound_entry_matches("telegram", "telegram", "12345"));
+        assert!(outbound_entry_matches("*", "telegram", "12345"));
+    }
+
     #[test]
     fn from_config_maps_all_fields() {
         let autonomy_config = crate::config::AutonomyConfig {
@@ -3764,6 +3951,8 @@ mod tests {
                 chat_type: Some("group".into()),
                 tools_allow: vec![],
                 tools_deny: vec!["shell".into()],
+                send_allow: vec![],
+                send_deny: vec![],
             }],
             true,
         );
@@ -3784,6 +3973,8 @@ mod tests {
                 chat_type: None,
                 tools_allow: vec!["memory_recall".into()],
                 tools_deny: vec![],
+                send_allow: vec![],
+                send_deny: vec![],
             }],
             true,
         );
@@ -3805,6 +3996,8 @@ mod tests {
                 chat_type: None,
                 tools_allow: vec!["shell".into(), "memory_recall".into()],
                 tools_deny: vec!["shell".into()],
+                send_allow: vec![],
+                send_deny: vec![],
             }],
             true,
         );
@@ -3821,6 +4014,8 @@ mod tests {
                 chat_type: None,
                 tools_allow: vec![],
                 tools_deny: vec!["file_write".into()],
+                send_allow: vec![],
+                send_deny: vec![],
             }],
             true,
         );
@@ -3842,6 +4037,8 @@ mod tests {
                     chat_type: Some("group".into()),
                     tools_allow: vec![],
                     tools_deny: vec!["shell".into()],
+                    send_allow: vec![],
+                    send_deny: vec![],
                 },
                 crate::config::ScopeRule {
                     user: Some("uuid:alice".into()),
@@ -3849,6 +4046,8 @@ mod tests {
                     chat_type: None,
                     tools_allow: vec![],
                     tools_deny: vec![],
+                    send_allow: vec![],
+                    send_deny: vec![],
                 },
             ],
             true,
@@ -3870,6 +4069,8 @@ mod tests {
                     chat_type: Some("group".into()),
                     tools_allow: vec![],
                     tools_deny: vec!["shell".into()],
+                    send_allow: vec![],
+                    send_deny: vec![],
                 }],
             },
             ..crate::config::AutonomyConfig::default()
