@@ -774,10 +774,14 @@ mod tests {
 
         let analyzer = EvolutionAnalyzer::new(writer.clone(), dir.path().join("data/analysis"));
 
-        let days = ["2026-02-22T12:00:00Z", "2026-02-23T12:00:00Z", "2026-02-24T12:00:00Z"];
+        // Anchored to today rather than fixed dates: the writer enforces
+        // JsonlRetentionPolicy::default(), whose cold_days of 180 silently
+        // deleted the two oldest fixtures once they aged out, which is exactly
+        // what happened on 2026-08-22 and left digests.len() at 1.
+        let base = Utc::now();
+        let days = [base - chrono::Duration::days(2), base - chrono::Duration::days(1), base];
 
         for now in days {
-            let now = DateTime::parse_from_rfc3339(now).unwrap().with_timezone(&Utc);
             writer
                 .append_decision(&DecisionLog {
                     timestamp: now.to_rfc3339(),
@@ -818,10 +822,7 @@ mod tests {
             analyzer.generate_daily_digest(now).await.unwrap();
         }
 
-        let trend = analyzer
-            .generate_three_day_trend(NaiveDate::from_ymd_opt(2026, 2, 24).unwrap())
-            .await
-            .unwrap();
+        let trend = analyzer.generate_three_day_trend(base.date_naive()).await.unwrap();
 
         assert_eq!(trend.digests.len(), 3);
         assert!(!trend.noise_memories.is_empty());
