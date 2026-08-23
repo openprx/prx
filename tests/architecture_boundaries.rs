@@ -92,6 +92,11 @@ const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
     "src/tools/sessions_spawn.rs::owner_mediated_process_kill_reaps_leader_and_terminates_group::let child = command.spawn().expect(\"test child should spawn\");",
     "src/tools/sessions_spawn.rs::process_mode_parent_timeout_kills_stuck_process::let mut child = command.spawn().unwrap();",
     "src/tools/sessions_spawn.rs::run_sub_agent_process::let mut child = command.spawn()?;",
+    // Test-only: the steer wire is only proved by a real pipe to a real child,
+    // so these two stand in for a session-worker (one echoes stdin, one never
+    // reads it) rather than mocking the very pipe under test.
+    "src/tools/sessions_spawn.rs::steer_frames_reach_worker_stdin_and_land_in_history::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
+    "src/tools/sessions_spawn.rs::steer_pump_backpressures_when_the_worker_never_reads_stdin::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
     "src/tools/sessions_spawn.rs::termination_after_leader_exit_does_not_wait_forever_on_inherited_pipe::let mut child = command.spawn().expect(\"test leader should spawn\");",
     // Test-only: the orphan-reclaim test must create a child that deliberately
     // bypasses the managed path, otherwise there is no orphan to detect.

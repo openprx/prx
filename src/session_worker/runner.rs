@@ -12,14 +12,17 @@ use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::SecurityPolicy;
 use crate::security::SideEffectGate;
 use crate::security::policy::ResourceRiskLevel;
-use crate::session_worker::protocol::{WorkerManifest, WorkerResult, config_source_generation};
-use crate::tools::sessions_spawn::{SPAWN_EXECUTION_CONTEXT, SpawnExecutionContext};
+use crate::session_worker::protocol::{WorkerControlFrame, WorkerManifest, WorkerResult, config_source_generation};
+use crate::tools::sessions_spawn::{
+    SPAWN_EXECUTION_CONTEXT, STEER_CHANNEL_CAPACITY, SpawnExecutionContext, steering_instruction,
+};
 use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
 use std::future::Future;
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 const DEFAULT_SUB_AGENT_SYSTEM_PROMPT: &str = "\
 You are a sub-agent handling a specific delegated task. \
@@ -33,6 +36,112 @@ fn write_worker_result(result: &WorkerResult) -> Result<()> {
     stdout.write_all(b"\n").context("write worker newline")?;
     stdout.flush().context("flush worker stdout")?;
     Ok(())
+}
+
+/// Start the stdin control-frame reader for a running worker.
+///
+/// Line 1 of stdin was already consumed as the manifest; everything after it is
+/// a [`WorkerControlFrame`]. The reader runs on a **detached OS thread**, not on
+/// the tokio blocking pool and not on `tokio::io::stdin`, for three reasons:
+///
+/// * A `tokio::io::stdin` read that is pending when the worker finishes parks a
+///   blocking-pool thread, and runtime drop joins it — the process then never
+///   exits, because the parent deliberately keeps the write end of the pipe
+///   open for the whole run. A detached OS thread is simply torn down at
+///   process exit, so the single-line stdout `WorkerResult` protocol still ends
+///   the process the moment it is written.
+/// * It leaves the configured blocking pool (`[runtime] max_blocking_threads`,
+///   the process's last implicit concurrency gate) untouched.
+/// * It reads the same global buffered `std::io::Stdin` handle the manifest was
+///   read from, so bytes the manifest read buffered past its newline — a steer
+///   frame that arrived in the same write — are not lost.
+///
+/// Back-pressure, not loss: `blocking_send` parks this thread while the queue is
+/// full, which stops draining the pipe, which parks the parent's writer, which
+/// fills the parent's bounded queue and finally slows the steering caller down.
+/// There is deliberately no wall-clock deadline anywhere on that chain: a worker
+/// too busy to accept a frame is the idle detector's business, not a timeout's.
+fn spawn_stdin_control_reader(steer_tx: tokio::sync::mpsc::Sender<String>) {
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut reader = stdin.lock();
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                // Parent closed the pipe: no further steering is possible.
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            // A malformed frame must never end the run: skip it and keep reading.
+            let Ok(frame) = serde_json::from_str::<WorkerControlFrame>(line) else {
+                tracing::warn!("session-worker discarded an unparseable stdin control frame");
+                continue;
+            };
+            let WorkerControlFrame::Steer { message } = frame;
+            if steer_tx.blocking_send(message).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Output of one cancellable agent-loop segment: the history it advanced plus
+/// its result.
+type SteeredSegment = (Vec<ChatMessage>, Result<(String, crate::agent::loop_::ToolLoopTrace)>);
+
+/// Run an agent-loop segment, restarting it with an injected operator turn each
+/// time a steer frame arrives.
+///
+/// This is the worker-process twin of the task-mode steering race in
+/// `sessions_spawn::run_sub_agent_task`, and injects the identical
+/// [`steering_instruction`] wording so both modes read the same in history.
+/// A steer cancels the in-flight segment, waits for it to unwind (so the
+/// history it already advanced is preserved), appends the operator turn and
+/// re-enters the loop. A closed channel means no more steering, so the current
+/// segment is simply awaited to its natural end.
+async fn run_segments_with_steering<F, Fut>(
+    mut history: Vec<ChatMessage>,
+    steer_rx: &mut Option<tokio::sync::mpsc::Receiver<String>>,
+    mut run_segment: F,
+) -> SteeredSegment
+where
+    F: FnMut(Vec<ChatMessage>, CancellationToken) -> Fut,
+    Fut: Future<Output = SteeredSegment>,
+{
+    loop {
+        let cancel = CancellationToken::new();
+        let segment = run_segment(history, cancel.clone());
+        tokio::pin!(segment);
+
+        let steered = tokio::select! {
+            finished = &mut segment => return finished,
+            steer = next_steer(steer_rx) => steer,
+        };
+
+        match steered {
+            Some(message) => {
+                cancel.cancel();
+                let (mut advanced, _cancelled) = segment.await;
+                advanced.push(ChatMessage::user(steering_instruction(&message)));
+                history = advanced;
+            }
+            // Steer channel closed — wait for natural completion.
+            None => return segment.await,
+        }
+    }
+}
+
+/// Await the next steer message, or never resolve when the run has no steer
+/// channel at all (in-process callers and tests).
+async fn next_steer(steer_rx: &mut Option<tokio::sync::mpsc::Receiver<String>>) -> Option<String> {
+    match steer_rx.as_mut() {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 fn select_tools_for_worker(source: Vec<Box<dyn Tool>>, allowed_tools: &[String]) -> Result<Vec<Box<dyn Tool>>> {
@@ -457,7 +566,11 @@ fn validate_parent_memory_backend(manifest: &WorkerManifest, configured_memory_b
     Ok(())
 }
 
-async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: Option<&str>) -> Result<WorkerResult> {
+async fn run_validated_manifest(
+    manifest: WorkerManifest,
+    mut steer_rx: Option<tokio::sync::mpsc::Receiver<String>>,
+    explicit_config_dir: Option<&str>,
+) -> Result<WorkerResult> {
     let explicit_config_dir = explicit_config_dir
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -617,7 +730,7 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
         } else {
             format!("{shared_context}{}", manifest.task)
         };
-        let mut history = vec![ChatMessage::system(system_prompt), ChatMessage::user(user_task)];
+        let initial_history = vec![ChatMessage::system(system_prompt), ChatMessage::user(user_task)];
 
         let observer = NoopObserver;
         let hooks = HookManager::new(manifest.workspace_dir.clone());
@@ -646,41 +759,71 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
             }
             _ => None,
         };
-        let loop_result = run_tool_call_loop_traced(
-            provider.as_ref(),
-            &mut history,
-            Arc::new(tools_registry),
-            &observer,
-            &hooks,
-            &manifest.provider_name,
-            &manifest.model,
-            manifest.temperature,
-            true,
-            None,
-            "session-worker",
-            &config.multimodal,
-            manifest.max_iterations.max(1),
-            config.agent.read_only_tool_concurrency_window,
-            config.agent.priority_scheduling_enabled,
-            config.agent.low_priority_tools.clone(),
-            manifest.compaction_config.as_ref(),
-            None,
-            None,
-            scope_ctx.as_ref(),
-            None,
-            Some(&config.tool_tiering),
-            // The ledger comes from `memory` directly: a session worker without a
-            // resolved ingest scope must still be able to run side-effecting tools.
-            crate::agent::loop_::ToolLoopMemory::new(
-                &memory,
-                &manifest.workspace_dir,
-                scope_ctx
-                    .as_ref()
-                    .map(|ctx| DocumentIngestRuntime::from_scope(memory.clone(), ctx)),
-            ),
-            crate::agent::loop_::ChatMode::default(),
-        )
-        .await;
+        // Borrow everything the segment needs once, outside the closure: an
+        // `async move` segment future must capture `Copy` references, never move
+        // fields out of the `FnMut` closure's captured environment.
+        let provider_ref = provider.as_ref();
+        let observer_ref = &observer;
+        let hooks_ref = &hooks;
+        let scope_ctx_ref = scope_ctx.as_ref();
+        let memory_ref = &memory;
+        let provider_name_ref: &str = &manifest.provider_name;
+        let model_ref: &str = &manifest.model;
+        let workspace_dir_ref: &Path = &manifest.workspace_dir;
+        let compaction_config_ref = manifest.compaction_config.as_ref();
+        let multimodal_ref = &config.multimodal;
+        let tool_tiering_ref = &config.tool_tiering;
+        let low_priority_tools_ref: &[String] = &config.agent.low_priority_tools;
+        let temperature = manifest.temperature;
+        let max_iterations = manifest.max_iterations.max(1);
+        let read_only_window = config.agent.read_only_tool_concurrency_window;
+        let priority_scheduling_enabled = config.agent.priority_scheduling_enabled;
+        let tools_registry = Arc::new(tools_registry);
+        let tools_registry_ref = &tools_registry;
+        let (history, loop_result) =
+            run_segments_with_steering(initial_history, &mut steer_rx, |mut segment_history, cancel| {
+                let tools_registry = Arc::clone(tools_registry_ref);
+                let memory = Arc::clone(memory_ref);
+                async move {
+                    let loop_result = run_tool_call_loop_traced(
+                        provider_ref,
+                        &mut segment_history,
+                        tools_registry,
+                        observer_ref,
+                        hooks_ref,
+                        provider_name_ref,
+                        model_ref,
+                        temperature,
+                        true,
+                        None,
+                        "session-worker",
+                        multimodal_ref,
+                        max_iterations,
+                        read_only_window,
+                        priority_scheduling_enabled,
+                        low_priority_tools_ref.to_vec(),
+                        compaction_config_ref,
+                        // Steering cancels the in-flight segment; without a token the
+                        // worker could only append after the loop finished on its own.
+                        Some(cancel),
+                        None,
+                        scope_ctx_ref,
+                        None,
+                        Some(tool_tiering_ref),
+                        // The ledger comes from `memory` directly: a session worker without a
+                        // resolved ingest scope must still be able to run side-effecting tools.
+                        crate::agent::loop_::ToolLoopMemory::new(
+                            &memory,
+                            workspace_dir_ref,
+                            scope_ctx_ref.map(|ctx| DocumentIngestRuntime::from_scope(Arc::clone(&memory), ctx)),
+                        ),
+                        crate::agent::loop_::ChatMode::default(),
+                    )
+                    .await;
+                    (segment_history, loop_result)
+                }
+            })
+            .await;
         (loop_result, history.len())
     };
 
@@ -837,17 +980,35 @@ async fn run_manifest_with_capability_env(
     explicit_config_dir: Option<&str>,
 ) -> Result<WorkerResult> {
     validate_worker_manifest_with_capability_env(&manifest, env_capability)?;
-    run_validated_manifest(manifest, explicit_config_dir).await
+    run_validated_manifest(manifest, None, explicit_config_dir).await
 }
 
-async fn run_manifest(manifest: WorkerManifest, explicit_config_dir: Option<&str>) -> Result<WorkerResult> {
+/// Validate the sealed manifest, scrub the capability material, and only then
+/// start the run.
+///
+/// `read_stdin_control_frames` asks for the post-manifest stdin reader. It is
+/// started **after** `scrub_capability_env`, never before: that scrub uses
+/// `unsafe { remove_var }`, whose soundness argument is that the worker is
+/// still single-threaded at that point. Starting the reader earlier would break
+/// exactly that invariant, so the steering protocol stays strictly downstream
+/// of authentication.
+async fn run_manifest(
+    manifest: WorkerManifest,
+    read_stdin_control_frames: bool,
+    explicit_config_dir: Option<&str>,
+) -> Result<WorkerResult> {
     let env_capability = std::env::var("OPENPRX_SESSION_WORKER_CAPABILITY").ok();
     // Validate up front, then scrub the capability material from the environment
     // so it cannot leak to any grandchild process or be re-read after boot.
     let validation = validate_worker_manifest_with_capability_env(&manifest, env_capability.as_deref());
     scrub_capability_env();
     validation?;
-    run_validated_manifest(manifest, explicit_config_dir).await
+    let steer_rx = read_stdin_control_frames.then(|| {
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<String>(STEER_CHANNEL_CAPACITY);
+        spawn_stdin_control_reader(steer_tx);
+        steer_rx
+    });
+    run_validated_manifest(manifest, steer_rx, explicit_config_dir).await
 }
 
 /// Remove the capability-bearing environment variables after validation.
@@ -1141,7 +1302,7 @@ pub async fn run_from_stdin(
         return Ok(());
     }
 
-    let result = match run_manifest(manifest, explicit_config_dir.as_deref()).await {
+    let result = match run_manifest(manifest, true, explicit_config_dir.as_deref()).await {
         Ok(result) => result,
         Err(error) => WorkerResult {
             success: false,
@@ -1199,6 +1360,137 @@ mod tests {
             parent_run_id: None,
             compaction_config: None,
         }
+    }
+
+    /// A fake agent-loop segment: parks until cancelled for its first
+    /// `natural_completion_on - 1` entries, then completes on its own. This
+    /// exercises the steering race — cancel, unwind, re-enter, finish — without
+    /// a provider, config, or memory backend.
+    fn segment_cancellable_until(
+        entries: Arc<std::sync::atomic::AtomicUsize>,
+        natural_completion_on: usize,
+    ) -> impl FnMut(Vec<ChatMessage>, CancellationToken) -> std::pin::Pin<Box<dyn Future<Output = SteeredSegment> + Send>>
+    {
+        move |history, cancel| {
+            let entries = entries.clone();
+            Box::pin(async move {
+                let entry = entries.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if entry < natural_completion_on {
+                    cancel.cancelled().await;
+                }
+                let output = format!("finished on entry {entry}");
+                (history, Ok((output, crate::agent::loop_::ToolLoopTrace::default())))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn steering_injects_operator_turn_and_restarts_the_segment() {
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let mut steer_rx = Some(steer_rx);
+        let entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Two steers cancel and re-enter the loop; the third entry finishes.
+        let mut segment = segment_cancellable_until(entries.clone(), 3);
+
+        let driver = tokio::spawn(async move {
+            steer_tx.send("pivot to X".to_string()).await.expect("first steer");
+            steer_tx.send("now do Y".to_string()).await.expect("second steer");
+            drop(steer_tx);
+        });
+
+        let (history, result) = run_segments_with_steering(
+            vec![ChatMessage::system("sys"), ChatMessage::user("task")],
+            &mut steer_rx,
+            &mut segment,
+        )
+        .await;
+        driver.await.expect("driver");
+
+        assert!(result.is_ok(), "steered run must still complete");
+        let injected = history
+            .iter()
+            .filter(|message| message.content.contains("[Steering instruction from operator]"))
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            injected,
+            vec![
+                "[Steering instruction from operator] pivot to X".to_string(),
+                "[Steering instruction from operator] now do Y".to_string(),
+            ],
+            "both steer messages must land in the worker's own history"
+        );
+        assert_eq!(
+            entries.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "each steer must cancel and re-enter the loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_steer_channel_runs_exactly_one_segment() {
+        let mut steer_rx: Option<tokio::sync::mpsc::Receiver<String>> = None;
+        let entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let history_in = vec![ChatMessage::system("sys"), ChatMessage::user("task")];
+
+        // Without a steer channel the segment must never be cancelled by the
+        // steering race, so drive completion from outside.
+        let (finished, result) = run_segments_with_steering(history_in, &mut steer_rx, |history, cancel| {
+            let entries = entries.clone();
+            async move {
+                entries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                cancel.cancel();
+                cancel.cancelled().await;
+                (
+                    history,
+                    Ok(("done".to_string(), crate::agent::loop_::ToolLoopTrace::default())),
+                )
+            }
+        })
+        .await;
+
+        assert_eq!(finished.len(), 2, "no operator turn may be injected");
+        assert_eq!(result.expect("result").0, "done");
+        assert_eq!(entries.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn closed_steer_channel_waits_for_natural_completion() {
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<String>(1);
+        drop(steer_tx);
+        let mut steer_rx = Some(steer_rx);
+        let entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let (history, result) =
+            run_segments_with_steering(vec![ChatMessage::user("task")], &mut steer_rx, |history, cancel| {
+                let entries = entries.clone();
+                async move {
+                    entries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // A closed channel resolves immediately; the segment must
+                    // still be awaited to its own end rather than abandoned.
+                    tokio::task::yield_now().await;
+                    cancel.cancel();
+                    (
+                        history,
+                        Ok(("natural".to_string(), crate::agent::loop_::ToolLoopTrace::default())),
+                    )
+                }
+            })
+            .await;
+
+        assert_eq!(history.len(), 1, "a closed channel must not inject anything");
+        assert_eq!(result.expect("result").0, "natural");
+        assert_eq!(entries.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stdin_control_reader_only_accepts_steer_frames() {
+        // The stdin stream carries no capability material: the sealed manifest is
+        // the sole authenticated frame, so an unknown `kind` must be rejected
+        // outright rather than interpreted.
+        assert!(serde_json::from_str::<WorkerControlFrame>(r#"{"kind":"steer","message":"x"}"#).is_ok());
+        assert!(serde_json::from_str::<WorkerControlFrame>(r#"{"kind":"grant","capability":"x"}"#).is_err());
+        assert!(serde_json::from_str::<WorkerControlFrame>("not json").is_err());
     }
 
     #[test]
@@ -1504,7 +1796,7 @@ mod tests {
         let mut manifest = base_manifest(&workspace, "unused-for-direct-validation");
         manifest.config_dir = config_dir.clone();
 
-        let result = run_validated_manifest(manifest, Some(&config_dir_arg)).await;
+        let result = run_validated_manifest(manifest, None, Some(&config_dir_arg)).await;
 
         assert!(result.is_err());
         assert!(
@@ -1525,7 +1817,7 @@ mod tests {
         manifest.config_dir = config_dir;
         manifest.config_generation = "0".repeat(64);
 
-        let error = run_validated_manifest(manifest, Some(&config_dir_arg))
+        let error = run_validated_manifest(manifest, None, Some(&config_dir_arg))
             .await
             .unwrap_err();
 

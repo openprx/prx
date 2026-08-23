@@ -111,6 +111,23 @@ fn config_source_generation_once(config_dir: &Path) -> anyhow::Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Control frame streamed from the parent to a **running** `session-worker` on
+/// stdin, one JSON object per line.
+///
+/// Line 1 of the worker's stdin is always the [`WorkerManifest`]; every later
+/// line is one of these frames. The manifest is the only authenticated part of
+/// the stream (sealed HMAC + absolute expiry, see
+/// `session_worker::runner::validate_worker_capability_with_env`); control
+/// frames inherit their trust from the pipe itself, which only the spawning
+/// parent holds a write end of. They therefore carry no capability material and
+/// can never widen what the sealed manifest already granted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkerControlFrame {
+    /// Inject an operator message into the worker's running conversation.
+    Steer { message: String },
+}
+
 /// Result returned by `session-worker` on stdout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerResult {
@@ -206,6 +223,24 @@ mod tests {
         assert_eq!(parsed.session_scope_key, "telegram:chat-1:openprx_user".to_string());
         assert_eq!(parsed.parent_run_id.as_deref(), Some("run-0"));
         assert!(parsed.compaction_config.is_some());
+    }
+
+    #[test]
+    fn worker_control_frame_is_tagged_line_json() {
+        let frame = WorkerControlFrame::Steer {
+            message: "pivot to X".into(),
+        };
+        let json = serde_json::to_string(&frame).expect("serialize control frame");
+        assert!(!json.contains('\n'), "control frames must fit on a single line");
+        assert_eq!(json, r#"{"kind":"steer","message":"pivot to X"}"#);
+        let parsed: WorkerControlFrame = serde_json::from_str(&json).expect("deserialize control frame");
+        assert_eq!(parsed, frame);
+    }
+
+    #[test]
+    fn worker_control_frame_rejects_unknown_kind() {
+        let error = serde_json::from_str::<WorkerControlFrame>(r#"{"kind":"exec","command":"rm"}"#).unwrap_err();
+        assert!(error.to_string().contains("unknown variant"), "{error}");
     }
 
     #[test]

@@ -23,7 +23,7 @@ use crate::router::CompactionResolver;
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
 use crate::security::{SecurityPolicy, SideEffectGate};
-use crate::session_worker::protocol::{WorkerManifest, WorkerResult, config_source_generation};
+use crate::session_worker::protocol::{WorkerControlFrame, WorkerManifest, WorkerResult, config_source_generation};
 use anyhow::Context as _;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -115,6 +115,49 @@ pub struct SubAgentRun {
     pub session_scope_key: String,
     pub spawn_depth: usize,
     pub token_usage_records: Vec<crate::llm::route_decision::MeteredTokenUsageRecord>,
+}
+
+/// Everything the registry row for a process-mode run is built from.
+struct ProcessModeRunSeed<'a> {
+    id: String,
+    task: String,
+    lineage: &'a SpawnLineage,
+    recipient: Option<String>,
+    channel_name: Option<String>,
+    process_control: Arc<ProcessRunControl>,
+    history: Arc<RwLock<Vec<HistoryEntry>>>,
+    steer_tx: tokio::sync::mpsc::Sender<String>,
+    parent_run_id: Option<String>,
+    session_scope_key: String,
+    spawn_depth: usize,
+}
+
+/// Build the registry row for a process-mode run.
+///
+/// Split out from the spawn path so the steering wiring is testable: the row a
+/// process-mode spawn publishes must always carry a live `steer_tx`, otherwise
+/// `sessions_send` rejects the run as a "legacy run without steer support".
+fn new_process_mode_run(seed: ProcessModeRunSeed<'_>) -> SubAgentRun {
+    SubAgentRun {
+        id: seed.id,
+        task: seed.task,
+        owner_id: seed.lineage.owner_id.clone(),
+        topic_id: seed.lineage.topic_id.clone(),
+        source_message_event_id: seed.lineage.source_message_event_id.clone(),
+        started_at: Utc::now(),
+        finished_at: None,
+        status: SubAgentStatus::Running,
+        recipient: seed.recipient,
+        channel_name: seed.channel_name,
+        abort_handle: None,
+        process_control: Some(seed.process_control),
+        history: seed.history,
+        steer_tx: Some(seed.steer_tx),
+        parent_run_id: seed.parent_run_id,
+        session_scope_key: seed.session_scope_key,
+        spawn_depth: seed.spawn_depth,
+        token_usage_records: Vec::new(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1494,29 +1537,28 @@ impl Tool for SessionsSpawnTool {
             let temperature = resolved_temperature;
             let history_arc: Arc<RwLock<Vec<HistoryEntry>>> = Arc::new(RwLock::new(Vec::new()));
             let process_control = ProcessRunControl::new();
+            // Process-mode steering: the sender lives in the registry exactly as
+            // it does for task mode, so `sessions_send` / `sessions_spawn:steer`
+            // reach an OS-process sub-agent through the same code path. The
+            // receiver is handed to the child owner, which forwards each message
+            // as a line-delimited control frame on the worker's stdin.
+            let (process_steer_tx, process_steer_rx) = tokio::sync::mpsc::channel::<String>(STEER_CHANNEL_CAPACITY);
 
             {
                 let mut runs = self.active_runs.write().await;
-                runs.push(SubAgentRun {
+                runs.push(new_process_mode_run(ProcessModeRunSeed {
                     id: run_id.clone(),
                     task: task.to_string(),
-                    owner_id: run_lineage.owner_id.clone(),
-                    topic_id: run_lineage.topic_id.clone(),
-                    source_message_event_id: run_lineage.source_message_event_id.clone(),
-                    started_at: Utc::now(),
-                    finished_at: None,
-                    status: SubAgentStatus::Running,
+                    lineage: &run_lineage,
                     recipient: recipient.clone(),
                     channel_name: run_channel_name.clone(),
-                    abort_handle: None,
-                    process_control: Some(process_control.clone()),
-                    history: history_arc,
-                    steer_tx: None,
+                    process_control: process_control.clone(),
+                    history: history_arc.clone(),
+                    steer_tx: process_steer_tx,
                     parent_run_id: parent_run_id.clone(),
                     session_scope_key: session_scope_key.clone(),
                     spawn_depth,
-                    token_usage_records: Vec::new(),
-                });
+                }));
             }
 
             let model = resolved_model;
@@ -1637,6 +1679,8 @@ impl Tool for SessionsSpawnTool {
                             process_event_recording,
                             &process_compaction_config,
                             monitor_process_control.as_ref(),
+                            process_steer_rx,
+                            history_arc,
                         )
                         .await;
 
@@ -2725,6 +2769,16 @@ fn resolve_tools_for_agent(
 /// worst-case memory held here is negligible next to the run's own history.
 pub(crate) const STEER_CHANNEL_CAPACITY: usize = 1024;
 
+/// Render a steer message as the user turn that gets injected into a sub-agent's
+/// conversation.
+///
+/// Shared by both modes on purpose: task mode injects it in-process and process
+/// mode injects it inside the worker, so a steered run reads identically in
+/// `sessions_history` whichever way it was spawned.
+pub(crate) fn steering_instruction(message: &str) -> String {
+    format!("[Steering instruction from operator] {message}")
+}
+
 /// Maximum tool-call iterations for a sub-agent run (per steering segment).
 const SUB_AGENT_MAX_ITERATIONS: usize = 200;
 
@@ -3208,9 +3262,7 @@ async fn run_sub_agent_task(
                         restore_running().await;
                         // Inject the steering message as a user turn
                         tracing::info!("Sub-agent steering: injecting message");
-                        history.push(ChatMessage::user(format!(
-                            "[Steering instruction from operator] {steer_msg}"
-                        )));
+                        history.push(ChatMessage::user(steering_instruction(&steer_msg)));
                         // Update shared history so callers can see the injected message
                         *history_out.write().await = chat_messages_to_history(&history);
                         // Loop continues — will re-enter with updated history
@@ -3624,6 +3676,13 @@ impl OwnedProcessGroup {
     }
 }
 
+/// Steering plumbing handed to the owner of a session-worker child process.
+struct WorkerSteerPipe {
+    steer_rx: tokio::sync::mpsc::Receiver<String>,
+    history: Arc<RwLock<Vec<HistoryEntry>>>,
+    run_id: String,
+}
+
 enum ProcessOutputDrain {
     Finished { stdout: Vec<u8>, stderr: Vec<u8> },
     TerminationFailed(String),
@@ -3737,21 +3796,93 @@ async fn run_owned_child_phase(
     }
 }
 
+/// Aborts a background task when the owning scope unwinds.
+///
+/// The steer pump owns the child's `ChildStdin`; dropping this guard closes that
+/// pipe, which is the worker's EOF signal that no further steering can arrive.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Forward steer messages to a running session-worker as line-delimited control
+/// frames on its stdin, and mirror each delivered message into the run history.
+///
+/// Back-pressure, not loss, and deliberately without any wall-clock deadline: a
+/// worker that is too busy to drain its stdin blocks this write, which fills the
+/// bounded steer channel, which parks `sessions_send` — the same contract task
+/// mode already has. A stuck target is the idle detector's problem, not a
+/// timeout's.
+async fn pump_worker_steer_frames(
+    mut stdin: tokio::process::ChildStdin,
+    mut steer_rx: tokio::sync::mpsc::Receiver<String>,
+    history: Arc<RwLock<Vec<HistoryEntry>>>,
+    run_id: String,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    while let Some(message) = steer_rx.recv().await {
+        let frame = match serde_json::to_string(&WorkerControlFrame::Steer {
+            message: message.clone(),
+        }) {
+            Ok(frame) => frame,
+            Err(error) => {
+                tracing::warn!(run_id = %run_id, "failed to encode sub-agent steer frame: {error}");
+                continue;
+            }
+        };
+        let write = async {
+            stdin.write_all(frame.as_bytes()).await?;
+            stdin.write_all(b"\n").await?;
+            stdin.flush().await
+        };
+        if let Err(error) = write.await {
+            // Broken pipe: the worker exited. Stop pumping; the run's terminal
+            // commit drops the sender so no caller can park on it afterwards.
+            tracing::debug!(run_id = %run_id, "sub-agent steer pipe closed: {error}");
+            return;
+        }
+        // Recorded only after the frame is on the wire, so history reflects what
+        // was actually delivered rather than what was merely queued.
+        history.write().await.push(HistoryEntry {
+            role: "user".to_string(),
+            content: steering_instruction(&message),
+            timestamp: Utc::now(),
+        });
+    }
+}
+
 async fn run_spawned_child_lifecycle(
     child: &mut tokio::process::Child,
     process_group: &mut OwnedProcessGroup,
     payload: &str,
     parent_timeout: std::time::Duration,
     process_control: &ProcessRunControl,
+    steer: Option<WorkerSteerPipe>,
     #[cfg(test)] panic_before_wait: bool,
 ) -> anyhow::Result<OwnedProcessPhase> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    if let Some(mut stdin) = child.stdin.take() {
+    // The manifest is line 1 of the worker's stdin. Unlike before, the pipe is
+    // then kept open for the life of the run so steer frames can follow it.
+    let _steer_pump = if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(payload.as_bytes()).await?;
         stdin.write_all(b"\n").await?;
         stdin.flush().await?;
-    }
+        steer.map(|steer| {
+            AbortOnDrop(tokio::spawn(pump_worker_steer_frames(
+                stdin,
+                steer.steer_rx,
+                steer.history,
+                steer.run_id,
+            )))
+        })
+    } else {
+        None
+    };
 
     let stdout_stream = child
         .stdout
@@ -3872,6 +4003,8 @@ async fn run_sub_agent_process(
     event_recording: MemoryEventRecording,
     compaction_config: &AgentCompactionConfig,
     process_control: &ProcessRunControl,
+    steer_rx: tokio::sync::mpsc::Receiver<String>,
+    history: Arc<RwLock<Vec<HistoryEntry>>>,
 ) -> anyhow::Result<ProcessWorkerOutcome> {
     let worker_workspace = worker_workspace_root.join(run_id);
     std::fs::create_dir_all(&worker_workspace)?;
@@ -4006,6 +4139,11 @@ async fn run_sub_agent_process(
         &payload,
         parent_timeout,
         process_control,
+        Some(WorkerSteerPipe {
+            steer_rx,
+            history,
+            run_id: run_id.to_string(),
+        }),
         #[cfg(test)]
         false,
     ))
@@ -6094,6 +6232,190 @@ mod tests {
         assert!(result.error.unwrap().contains("No run found"));
     }
 
+    /// G4/G5: a process-mode run must publish a live steer channel.
+    ///
+    /// Before this existed the process branch registered `steer_tx: None`, so
+    /// every `sessions_send` / `sessions_spawn:steer` against an OS-process
+    /// sub-agent was rejected as a "legacy run without steer support". Flipping
+    /// `new_process_mode_run` back to `None` turns this test red.
+    #[tokio::test]
+    async fn process_mode_run_is_steerable_and_not_reported_as_legacy() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+        let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel(STEER_CHANNEL_CAPACITY);
+        let lineage = SpawnLineage {
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
+        };
+        let run = new_process_mode_run(ProcessModeRunSeed {
+            id: "run-process-steer".to_string(),
+            task: "long task".to_string(),
+            lineage: &lineage,
+            recipient: None,
+            channel_name: None,
+            process_control: ProcessRunControl::new(),
+            history: Arc::new(RwLock::new(Vec::new())),
+            steer_tx,
+            parent_run_id: None,
+            session_scope_key: "test-session".to_string(),
+            spawn_depth: 0,
+        });
+        assert!(
+            run.steer_tx.is_some(),
+            "a process-mode run must own a steer channel or sessions_send cannot reach it"
+        );
+        assert!(run.process_control.is_some(), "this must remain a process-mode row");
+        tool.active_runs.write().await.push(run);
+
+        let result = tool
+            .execute(json!({
+                "action": "steer",
+                "run_id": "run-process-steer",
+                "message": "switch to plan B",
+            }))
+            .await
+            .expect("steer tool call");
+
+        assert!(result.success, "{result:?}");
+        let error = result.error.unwrap_or_default();
+        assert!(
+            !error.contains("legacy run"),
+            "process-mode steering must not report legacy-run: {error}"
+        );
+        assert_eq!(steer_rx.recv().await.as_deref(), Some("switch to plan B"));
+    }
+
+    /// Frames must reach the worker's stdin as line-delimited JSON, and each
+    /// delivered frame must show up in the run history `sessions_history` reads.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn steer_frames_reach_worker_stdin_and_land_in_history() {
+        use tokio::io::AsyncBufReadExt;
+
+        // Stand-in worker: echo every stdin line straight back on stdout.
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("while IFS= read -r line; do printf '%s\\n' \"$line\"; done")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().expect("stand-in worker spawns");
+        let stdin = child.stdin.take().expect("worker stdin");
+        let stdout = child.stdout.take().expect("worker stdout");
+
+        let history: Arc<RwLock<Vec<HistoryEntry>>> = Arc::new(RwLock::new(Vec::new()));
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel(STEER_CHANNEL_CAPACITY);
+        let pump = tokio::spawn(pump_worker_steer_frames(
+            stdin,
+            steer_rx,
+            Arc::clone(&history),
+            "run-pipe".to_string(),
+        ));
+
+        steer_tx.send("pivot to X".to_string()).await.expect("first steer");
+        steer_tx.send("now do Y".to_string()).await.expect("second steer");
+
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        let mut received = Vec::new();
+        for _ in 0..2 {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line())
+                .await
+                .expect("worker echoes each steer frame")
+                .expect("stdout read")
+                .expect("stdout line");
+            received.push(serde_json::from_str::<WorkerControlFrame>(&line).expect("frame is line JSON"));
+        }
+        assert_eq!(
+            received,
+            vec![
+                WorkerControlFrame::Steer {
+                    message: "pivot to X".to_string()
+                },
+                WorkerControlFrame::Steer {
+                    message: "now do Y".to_string()
+                },
+            ]
+        );
+
+        // Closing the channel ends the pump; history is complete afterwards.
+        drop(steer_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(10), pump)
+            .await
+            .expect("pump finishes once the steer channel closes")
+            .expect("pump task");
+        let entries = history.read().await;
+        assert_eq!(
+            entries.iter().map(|e| e.content.clone()).collect::<Vec<_>>(),
+            vec![steering_instruction("pivot to X"), steering_instruction("now do Y"),],
+            "every delivered steer must be visible to sessions_history"
+        );
+        assert!(entries.iter().all(|entry| entry.role == "user"));
+    }
+
+    /// Back-pressure on the pipe itself: a worker that never reads its stdin
+    /// must slow the producer down rather than lose frames. No wall-clock
+    /// deadline is involved anywhere on that chain.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn steer_pump_backpressures_when_the_worker_never_reads_stdin() {
+        let mut command = tokio::process::Command::new("sleep");
+        command
+            .arg("300")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().expect("stand-in worker spawns");
+        let stdin = child.stdin.take().expect("worker stdin");
+
+        let history: Arc<RwLock<Vec<HistoryEntry>>> = Arc::new(RwLock::new(Vec::new()));
+        // Capacity 1 keeps the test fast: one frame is in flight in the pump,
+        // one sits in the queue, and the third producer send must park.
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel(1);
+        let pump = tokio::spawn(pump_worker_steer_frames(
+            stdin,
+            steer_rx,
+            Arc::clone(&history),
+            "run-blocked".to_string(),
+        ));
+
+        // Fill the pipe: `sleep` never reads, so once the kernel buffer is full
+        // the pump parks mid-write and stops draining the queue.
+        let mut parked = false;
+        let filler = "x".repeat(8192);
+        for _ in 0..64 {
+            if tokio::time::timeout(std::time::Duration::from_millis(200), steer_tx.send(filler.clone()))
+                .await
+                .is_err()
+            {
+                parked = true;
+                break;
+            }
+        }
+        assert!(parked, "a worker that never drains stdin must park the producer");
+        assert!(
+            !steer_tx.is_closed(),
+            "parking must not close the channel: nothing may be dropped"
+        );
+
+        pump.abort();
+        let _ = child.kill().await;
+    }
+
+    /// Task mode must be untouched by the process-mode work: the injected turn
+    /// keeps its exact historical wording, now shared with the worker.
+    #[test]
+    fn task_mode_steering_wording_is_unchanged() {
+        assert_eq!(
+            steering_instruction("pivot now"),
+            "[Steering instruction from operator] pivot now"
+        );
+    }
+
     /// Backpressure contract for a sub-agent's steering channel.
     ///
     /// The channel is bounded, so when a sub-agent has not drained it the
@@ -6741,6 +7063,7 @@ mod tests {
             "{}",
             std::time::Duration::from_secs(30),
             &control,
+            None,
             true,
         ))
         .catch_unwind()
