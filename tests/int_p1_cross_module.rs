@@ -110,6 +110,8 @@ async fn int_cs_02_scope_rule_channel_differentiation() {
             chat_type: None,
             tools_allow: vec!["memory_recall".into()],
             tools_deny: vec!["shell".into()],
+            send_allow: vec![],
+            send_deny: vec![],
         }],
         scope_default_allow: true,
         ..SecurityPolicy::default()
@@ -673,6 +675,8 @@ async fn int_cs_03_decide_layers_scope_and_autonomy() {
             chat_type: None,
             tools_allow: Vec::new(),
             tools_deny: vec!["shell".into()],
+            send_allow: vec![],
+            send_deny: vec![],
         }],
         scope_default_allow: true,
         ..SecurityPolicy::default()

@@ -337,6 +337,8 @@ async fn int_das_03_delegate_scope_context_propagation() {
             chat_type: None,
             tools_allow: vec!["delegate".to_string(), "memory_recall".to_string()],
             tools_deny: vec!["shell".to_string()],
+            send_allow: vec![],
+            send_deny: vec![],
         }],
         scope_default_allow: false,
         ..SecurityPolicy::default()
@@ -465,6 +467,8 @@ async fn int_e2e_04_scope_denied_audit_log_error_response() {
             chat_type: None,
             tools_allow: vec!["memory_recall".to_string()],
             tools_deny: vec!["shell".to_string()],
+            send_allow: vec![],
+            send_deny: vec![],
         }],
         scope_default_allow: false,
         ..SecurityPolicy::default()

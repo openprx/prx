@@ -39,6 +39,8 @@ async fn scope_policy_shell_deny_untrusted_user_blocked() {
             chat_type: None,
             tools_allow: vec![],
             tools_deny: vec!["shell".into()],
+            send_allow: vec![],
+            send_deny: vec![],
         }],
         scope_default_allow: true,
         ..SecurityPolicy::default()
@@ -71,6 +73,8 @@ async fn scope_policy_shell_deny_trusted_user_unaffected() {
             chat_type: None,
             tools_allow: vec![],
             tools_deny: vec!["shell".into()],
+            send_allow: vec![],
+            send_deny: vec![],
         }],
         scope_default_allow: true,
         ..SecurityPolicy::default()
@@ -100,6 +104,8 @@ async fn scope_policy_multi_rule_layered_evaluation() {
                 chat_type: None,
                 tools_allow: vec![],
                 tools_deny: vec!["shell".into()],
+                send_allow: vec![],
+                send_deny: vec![],
             },
             // Rule 2: whitelist-only for restricted_user
             ScopeRule {
@@ -108,6 +114,8 @@ async fn scope_policy_multi_rule_layered_evaluation() {
                 chat_type: None,
                 tools_allow: vec!["memory_recall".into()],
                 tools_deny: vec![],
+                send_allow: vec![],
+                send_deny: vec![],
             },
         ],
         scope_default_allow: true,
