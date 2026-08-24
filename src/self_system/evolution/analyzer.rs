@@ -648,6 +648,11 @@ mod tests {
 
     #[tokio::test]
     async fn daily_digest_computes_metrics_and_alerts() {
+        // Anchored to today: the writer enforces JsonlRetentionPolicy::default(),
+        // which prunes by wall clock, so a fixed date silently ages out of the
+        // window - this fixture started failing on 2026-08-24.
+        let day = Utc::now().date_naive();
+        let ts = |hms: &str| format!("{day}T{hms}Z");
         let dir = tempdir().unwrap();
         let writer = Arc::new(
             AsyncJsonlWriter::new(
@@ -661,7 +666,7 @@ mod tests {
 
         writer
             .append_decision(&DecisionLog {
-                timestamp: "2026-02-24T08:00:00Z".into(),
+                timestamp: ts("08:00:00"),
                 experiment_id: "exp-a".into(),
                 trace_id: "trace-a".into(),
                 decision_type: DecisionType::ToolSelection,
@@ -681,7 +686,7 @@ mod tests {
 
         writer
             .append_decision(&DecisionLog {
-                timestamp: "2026-02-24T09:00:00Z".into(),
+                timestamp: ts("09:00:00"),
                 experiment_id: "exp-a".into(),
                 trace_id: "trace-b".into(),
                 decision_type: DecisionType::RuntimePolicy,
@@ -701,7 +706,7 @@ mod tests {
 
         writer
             .append_memory_access(&MemoryAccessLog {
-                timestamp: "2026-02-24T08:10:00Z".into(),
+                timestamp: ts("08:10:00"),
                 experiment_id: "exp-a".into(),
                 trace_id: "trace-a".into(),
                 action: MemoryAction::Read,
@@ -719,7 +724,7 @@ mod tests {
 
         writer
             .append_memory_access(&MemoryAccessLog {
-                timestamp: "2026-02-24T08:30:00Z".into(),
+                timestamp: ts("08:30:00"),
                 experiment_id: "exp-a".into(),
                 trace_id: "trace-b".into(),
                 action: MemoryAction::Read,
@@ -739,7 +744,7 @@ mod tests {
 
         let analyzer =
             EvolutionAnalyzer::new(writer, dir.path().join("data/analysis")).with_thresholds(0.7, 0.15, 0.30);
-        let now = DateTime::parse_from_rfc3339("2026-02-24T12:00:00Z")
+        let now = DateTime::parse_from_rfc3339(&ts("12:00:00"))
             .unwrap()
             .with_timezone(&Utc);
         let digest = analyzer.generate_daily_digest(now).await.unwrap();
@@ -753,7 +758,7 @@ mod tests {
         assert!((digest.unknown_annotation_ratio - 0.5).abs() < 1e-6);
         assert!(!digest.alerts.is_empty());
 
-        let persisted = fs::read_to_string(dir.path().join("data/analysis/daily/2026-02-24.json"))
+        let persisted = fs::read_to_string(dir.path().join(format!("data/analysis/daily/{day}.json")))
             .await
             .unwrap();
         assert!(persisted.contains("memory_hit_rate"));
