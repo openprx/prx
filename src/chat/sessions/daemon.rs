@@ -44,9 +44,12 @@ pub enum DaemonRequest {
 /// outbound `message_send` address the *same* daemon rather than each deciding
 /// for itself. With it unset the address falls back to the `[gateway]` block
 /// this config carries, which is right whenever chat and the daemon share a
-/// config dir, and the credential falls back to the first paired token there —
-/// when pairing is required the gateway rejects anything else, and when it is
-/// not required an unused token is harmless.
+/// config dir. The credential falls back to `[gateway] paired_tokens`, but only
+/// to an entry that is still plaintext: pairing stores SHA-256 hashes, and the
+/// gateway hashes whatever bearer it is given before comparing, so sending a
+/// stored hash would hash it a second time and never match. Skipping those
+/// yields no credential and a plain 401 the operator can act on, instead of a
+/// token that looks configured and silently cannot authenticate.
 #[must_use]
 pub fn endpoint(config: &Config) -> TasksEndpoint {
     TasksEndpoint::resolve(config, configured_url(config), operator_token(config))
@@ -67,7 +70,7 @@ fn operator_token(config: &Config) -> Option<String> {
         .paired_tokens
         .iter()
         .map(|token| token.trim())
-        .find(|token| !token.is_empty())
+        .find(|token| !token.is_empty() && !crate::security::pairing::is_token_hash(token))
         .map(ToString::to_string)
 }
 
@@ -252,6 +255,22 @@ mod tests {
         assert_eq!(operator_token(&config).as_deref(), Some("tok-abc"));
         config.gateway.paired_tokens.clear();
         assert!(operator_token(&config).is_none());
+    }
+
+    #[test]
+    fn a_stored_token_hash_is_not_offered_as_a_bearer() {
+        // What pairing actually persists is the hash, not the token. The
+        // gateway hashes the bearer it receives before comparing, so handing
+        // back a stored hash authenticates as nothing; the operator is better
+        // served by no credential and a 401 than by one that looks configured.
+        let mut config = Config::default();
+        let hash = "a".repeat(64);
+        assert!(crate::security::pairing::is_token_hash(&hash));
+        config.gateway.paired_tokens = vec![hash];
+        assert!(operator_token(&config).is_none());
+
+        config.gateway.paired_tokens.push("tok-plain".to_string());
+        assert_eq!(operator_token(&config).as_deref(), Some("tok-plain"));
     }
 
     #[test]

@@ -236,7 +236,7 @@ fn hash_token(token: &str) -> String {
 
 /// Check if a stored value looks like a SHA-256 hash (64 hex chars)
 /// rather than a plaintext token.
-fn is_token_hash(value: &str) -> bool {
+pub(crate) fn is_token_hash(value: &str) -> bool {
     value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
