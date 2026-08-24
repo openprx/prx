@@ -185,6 +185,13 @@ const DIFF_CANDIDATES: &[CommandArgCandidate] = &[CommandArgCandidate {
     description: "Show staged changes",
 }];
 
+/// The `--daemon` scope flag: the same command, pointed at the work a daemon
+/// process holds instead of this chat's own child sessions.
+const DAEMON_SCOPE_CANDIDATES: &[CommandArgCandidate] = &[CommandArgCandidate {
+    value: "--daemon",
+    description: "Address the daemon's tasks instead of this chat's sessions",
+}];
+
 /// Single source of truth for user-visible chat slash commands.
 pub const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
@@ -340,9 +347,11 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         name: "/sessions",
         aliases: &[],
-        args_hint: "",
-        description: "List child TUI sessions",
-        arg: NO_ARG,
+        args_hint: "[--daemon]",
+        description: "List child TUI sessions (--daemon: the daemon's tasks)",
+        arg: CommandArgSpec {
+            source: CommandArgSource::Static(DAEMON_SCOPE_CANDIDATES),
+        },
     },
     CommandSpec {
         name: "/shell",
@@ -395,8 +404,8 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         name: "/steer",
         aliases: &[],
-        args_hint: "<id> <msg>",
-        description: "Send a steering instruction to a child session",
+        args_hint: "[--daemon] <id> <msg>",
+        description: "Send a steering instruction to a child session (--daemon: a daemon task)",
         arg: CommandArgSpec {
             source: CommandArgSource::LiveSessions,
         },
@@ -404,8 +413,8 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         name: "/kill",
         aliases: &[],
-        args_hint: "<id>",
-        description: "Stop a child session",
+        args_hint: "[--daemon] <id>",
+        description: "Stop a child session (--daemon: a daemon task)",
         arg: CommandArgSpec {
             source: CommandArgSource::LiveSessions,
         },

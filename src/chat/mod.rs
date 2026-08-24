@@ -1811,6 +1811,35 @@ fn surface_active_turn_message(
     surface_session_message(dispatcher, redraw_tx, text);
 }
 
+/// Run one `--daemon`-scoped session command without holding the input loop (a5).
+///
+/// The runtime control API deliberately carries no request timeout — a running
+/// task must not be abandoned because a clock expired — so awaiting it inline
+/// would let an unresponsive daemon freeze the TUI, which is strictly worse
+/// than the feature being missing. The request therefore runs in its own task
+/// and reports back through the same system-message path background sessions
+/// use; the loop returns to reading input immediately.
+///
+/// `local_fallback` is this chat's own `/sessions` listing, captured by the
+/// caller *before* the task starts: `chat_sessions` is loop-owned mutable state
+/// that cannot cross into a spawned task, so a listing that degrades on failure
+/// has to bring its fallback with it.
+fn spawn_daemon_session_request(
+    request: crate::chat::sessions::daemon::DaemonRequest,
+    endpoint: crate::runtime::tasks_cli::TasksEndpoint,
+    local_fallback: Option<String>,
+    dispatcher: &dispatcher::ChatDispatcher,
+    redraw_tx: Option<&mpsc::Sender<()>>,
+) {
+    let dispatcher = dispatcher.clone();
+    let redraw_tx = redraw_tx.cloned();
+    tokio::spawn(async move {
+        // `run` renders both outcomes, so there is no error path to drop here.
+        let text = crate::chat::sessions::daemon::run(&endpoint, request, local_fallback.as_deref()).await;
+        surface_session_message(&dispatcher, redraw_tx.as_ref(), &text);
+    });
+}
+
 #[cfg(feature = "terminal-tui")]
 fn defer_resume_saved_session_if_provider_turn_pending(
     pending_turns: usize,
@@ -3824,6 +3853,14 @@ pub async fn run(
     )));
     base_tools_vec.push(Box::new(crate::chat::scheduled_input::ScheduledInputTool::new(
         scheduled_input_handle.clone(),
+    )));
+    // Outbound IM. This process owns no channel object on purpose — a second
+    // listener would race the daemon for inbound messages — so `message_send`
+    // here is the variant that asks the daemon to deliver. Same tool name, same
+    // schema as the daemon's, so a model writes the same call either side.
+    base_tools_vec.push(Box::new(crate::tools::DaemonMessageSendTool::from_config(
+        &config,
+        security.clone(),
     )));
 
     // Wrap the now-complete registry in `Arc`, then inject it back into
@@ -6570,6 +6607,79 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                      timed out, completed, or was killed)."
                                 ));
                             }
+                            continue;
+                        }
+                        SessionCommand::DaemonSessions => {
+                            // a5: the daemon's work registry lives in another
+                            // process, so this is a control-API call, not a
+                            // registry read — and chat sees the daemon's work as
+                            // a local *operator*, not as the user whose sessions
+                            // `/sessions` lists. The local listing is built here,
+                            // on the loop where `chat_sessions` is reachable, and
+                            // handed to the request as the fallback to show if
+                            // the daemon turns out to be unreachable.
+                            let local_fallback = handle_local_session_command(
+                                &SessionCommand::Sessions,
+                                &mut chat_sessions,
+                                &session_rings,
+                                &mut reaped_log_archive,
+                                &reap_policy,
+                                &tools_registry,
+                            )
+                            .await;
+                            let request = crate::chat::sessions::daemon::DaemonRequest::List;
+                            let endpoint = crate::chat::sessions::daemon::endpoint(&config);
+                            emit_chat_output(&crate::chat::sessions::daemon::pending_notice(
+                                &request,
+                                endpoint.base_url(),
+                            ));
+                            spawn_daemon_session_request(
+                                request,
+                                endpoint,
+                                local_fallback,
+                                &chat_dispatcher,
+                                redraw_tx_for_main.as_ref(),
+                            );
+                            continue;
+                        }
+                        SessionCommand::DaemonKill { address } => {
+                            // No local fallback: a kill either happened in the
+                            // daemon or it did not, and this chat's own sessions
+                            // are not a partial answer to that question.
+                            let request = crate::chat::sessions::daemon::DaemonRequest::Kill { address };
+                            let endpoint = crate::chat::sessions::daemon::endpoint(&config);
+                            emit_chat_output(&crate::chat::sessions::daemon::pending_notice(
+                                &request,
+                                endpoint.base_url(),
+                            ));
+                            spawn_daemon_session_request(
+                                request,
+                                endpoint,
+                                None,
+                                &chat_dispatcher,
+                                redraw_tx_for_main.as_ref(),
+                            );
+                            continue;
+                        }
+                        SessionCommand::DaemonSteer { address, message } => {
+                            // The daemon resolves the address and decides
+                            // whether the target can be steered at all (a turn
+                            // has no steer channel and is refused there), so
+                            // chat does no kind dispatch of its own — unlike the
+                            // local `/steer`, which owns its session kinds.
+                            let request = crate::chat::sessions::daemon::DaemonRequest::Steer { address, message };
+                            let endpoint = crate::chat::sessions::daemon::endpoint(&config);
+                            emit_chat_output(&crate::chat::sessions::daemon::pending_notice(
+                                &request,
+                                endpoint.base_url(),
+                            ));
+                            spawn_daemon_session_request(
+                                request,
+                                endpoint,
+                                None,
+                                &chat_dispatcher,
+                                redraw_tx_for_main.as_ref(),
+                            );
                             continue;
                         }
                     }

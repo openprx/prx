@@ -14,6 +14,9 @@
 //! - [`id::SessionId`] — stable handle over the run UUID.
 //! - [`model::ManagedSessionView`] / [`model::project_run`] — UI projection.
 //! - [`command::SessionCommand`] / [`command::parse_session_command`] — parsing.
+//! - [`daemon`] — the `--daemon` scope of `/sessions`, `/steer`, and `/kill`:
+//!   the same commands pointed at the work a *daemon* process holds, over the
+//!   runtime control API rather than this process's registries.
 //! - [`runtime::ChatSessionsHandle`] — thin handle over the shared registry for
 //!   `/sessions`, `/kill`, `/steer`, and `/attach`.
 //! - [`runtime::status_summary`] — persistent status-line summary builder.
@@ -29,6 +32,7 @@
 
 pub mod approval;
 pub mod command;
+pub mod daemon;
 pub mod event;
 pub mod focus;
 pub mod id;

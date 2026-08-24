@@ -41,6 +41,52 @@ pub enum SessionCommand {
     /// `/deny <seq>` — deny a child session suspended on the approval gate
     /// (NeedsInput); the gated tool is reported as denied to the sub-agent.
     Deny { seq: u64 },
+    /// `/sessions --daemon` — list the work a daemon process is holding (a5).
+    ///
+    /// The three `Daemon*` variants are separate from their local counterparts
+    /// rather than a scope field on them, because the two scopes do not share
+    /// an address space: a local session is a display sequence (`#3`) minted by
+    /// this process, while a daemon address is a run id (portable) or the
+    /// daemon's own work id (`w42`). Keeping them apart also keeps the local
+    /// commands byte-for-byte what they were.
+    DaemonSessions,
+    /// `/kill --daemon <address>` — terminate one daemon work item (a5).
+    DaemonKill { address: String },
+    /// `/steer --daemon <address> <message>` — hand a message to a running
+    /// daemon task, redirecting it mid-flight (a5).
+    DaemonSteer { address: String, message: String },
+}
+
+/// Strip the `--daemon` scope flag from a command's argument text.
+///
+/// Returns the remaining argument text when the flag is present (possibly
+/// empty), and `None` when it is not. The flag sits directly after the command
+/// word, mirroring `/diff --cached` — the only other flag on the chat command
+/// surface — so the scope is visible before the argument it applies to.
+/// `--daemonize` and friends are rejected rather than treated as the flag.
+fn strip_daemon_scope(arg: &str) -> Option<&str> {
+    let rest = arg.trim_start().strip_prefix("--daemon")?;
+    if rest.is_empty() {
+        return Some("");
+    }
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some(rest.trim())
+}
+
+/// Parse a daemon work address: a run id, or the daemon's own `w42` / `42`.
+///
+/// Deliberately not `parse_seq_arg`: a daemon address is opaque to chat and is
+/// forwarded verbatim, so nothing here may rewrite it. A leading `-` is
+/// rejected so a mistyped flag becomes "unknown command" instead of an address
+/// the daemon will simply fail to resolve.
+fn parse_daemon_address(arg: &str) -> Option<String> {
+    let token = arg.split_whitespace().next()?;
+    if token.starts_with('-') {
+        return None;
+    }
+    Some(token.to_string())
 }
 
 /// Parse a session display sequence argument (`N`) robustly.
@@ -87,6 +133,16 @@ pub fn parse_session_command(input: &str) -> Option<SessionCommand> {
         return None;
     }
 
+    // `/sessions --daemon` — the bare form was matched above, so anything left
+    // here carries an argument, and the only argument is the scope flag.
+    if let Some(rest) = trimmed.strip_prefix("/sessions") {
+        let arg = rest.strip_prefix(char::is_whitespace)?;
+        if !strip_daemon_scope(arg)?.is_empty() {
+            return None;
+        }
+        return Some(SessionCommand::DaemonSessions);
+    }
+
     // `/bg <task>` — everything after the command word is the task.
     if let Some(rest) = trimmed.strip_prefix("/bg") {
         // Require a separator so `/bgsomething` is not matched.
@@ -120,9 +176,13 @@ pub fn parse_session_command(input: &str) -> Option<SessionCommand> {
         });
     }
 
-    // `/kill <seq>`
+    // `/kill [--daemon] <id>`
     if let Some(rest) = trimmed.strip_prefix("/kill") {
         let arg = rest.strip_prefix(char::is_whitespace)?;
+        if let Some(scoped) = strip_daemon_scope(arg) {
+            let address = parse_daemon_address(scoped)?;
+            return Some(SessionCommand::DaemonKill { address });
+        }
         let seq = parse_seq_arg(arg)?;
         return Some(SessionCommand::Kill { seq });
     }
@@ -155,9 +215,21 @@ pub fn parse_session_command(input: &str) -> Option<SessionCommand> {
         return Some(SessionCommand::Deny { seq });
     }
 
-    // `/steer <seq> <message>` (v1b)
+    // `/steer [--daemon] <id> <message>` (v1b; `--daemon` in a5)
     if let Some(rest) = trimmed.strip_prefix("/steer") {
         let rest = rest.strip_prefix(char::is_whitespace)?.trim_start();
+        if let Some(scoped) = strip_daemon_scope(rest) {
+            let (address, message) = scoped.split_once(char::is_whitespace)?;
+            let address = parse_daemon_address(address)?;
+            let message = message.trim();
+            if message.is_empty() {
+                return None;
+            }
+            return Some(SessionCommand::DaemonSteer {
+                address,
+                message: message.to_string(),
+            });
+        }
         let (seq_str, message) = rest.split_once(char::is_whitespace)?;
         let seq = parse_seq_arg(seq_str)?;
         let message = message.trim();
@@ -236,6 +308,97 @@ mod tests {
     fn bg_requires_separator() {
         // `/bgsomething` must not be treated as `/bg something`.
         assert_eq!(parse_session_command("/bgsomething"), None);
+    }
+
+    /// Evidence 3, at the parser level: without `--daemon` every command
+    /// parses to exactly the variant it parsed to before a5.
+    #[test]
+    fn the_local_scope_is_untouched_by_the_daemon_flag() {
+        assert_eq!(parse_session_command("/sessions"), Some(SessionCommand::Sessions));
+        assert_eq!(parse_session_command("/kill 3"), Some(SessionCommand::Kill { seq: 3 }));
+        assert_eq!(parse_session_command("/kill #3"), Some(SessionCommand::Kill { seq: 3 }));
+        assert_eq!(
+            parse_session_command("/steer 3 do the other thing"),
+            Some(SessionCommand::Steer {
+                seq: 3,
+                message: "do the other thing".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parses_daemon_scoped_sessions() {
+        assert_eq!(
+            parse_session_command("/sessions --daemon"),
+            Some(SessionCommand::DaemonSessions)
+        );
+        assert_eq!(
+            parse_session_command("  /sessions   --daemon  "),
+            Some(SessionCommand::DaemonSessions)
+        );
+    }
+
+    #[test]
+    fn sessions_rejects_anything_that_is_not_the_scope_flag() {
+        assert_eq!(parse_session_command("/sessions --all"), None);
+        assert_eq!(parse_session_command("/sessions --daemonize"), None);
+        assert_eq!(parse_session_command("/sessions --daemon extra"), None);
+        assert_eq!(parse_session_command("/sessionsx"), None);
+    }
+
+    /// Evidence 4, at the parser level: a run id and a `w42` are both carried
+    /// through verbatim, because chat does not own that address space.
+    #[test]
+    fn daemon_addresses_pass_through_in_both_id_spaces() {
+        assert_eq!(
+            parse_session_command("/kill --daemon w3"),
+            Some(SessionCommand::DaemonKill {
+                address: "w3".to_string()
+            })
+        );
+        assert_eq!(
+            parse_session_command("/kill --daemon d9671848-1111-2222-3333-444444444444"),
+            Some(SessionCommand::DaemonKill {
+                address: "d9671848-1111-2222-3333-444444444444".to_string()
+            })
+        );
+        assert_eq!(
+            parse_session_command("/steer --daemon w3 also check Y"),
+            Some(SessionCommand::DaemonSteer {
+                address: "w3".to_string(),
+                message: "also check Y".to_string()
+            })
+        );
+        assert_eq!(
+            parse_session_command("/steer --daemon d9671848-1111-2222-3333-444444444444 also check Y"),
+            Some(SessionCommand::DaemonSteer {
+                address: "d9671848-1111-2222-3333-444444444444".to_string(),
+                message: "also check Y".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_daemon_address_is_never_rewritten_the_way_a_local_seq_is() {
+        // `#3` is a local display form; the daemon knows nothing about it, so
+        // it is forwarded as typed rather than silently turned into `3`.
+        assert_eq!(
+            parse_session_command("/kill --daemon #3"),
+            Some(SessionCommand::DaemonKill {
+                address: "#3".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn daemon_commands_reject_missing_or_flag_shaped_arguments() {
+        assert_eq!(parse_session_command("/kill --daemon"), None);
+        assert_eq!(parse_session_command("/kill --daemon   "), None);
+        assert_eq!(parse_session_command("/kill --daemon --force"), None);
+        assert_eq!(parse_session_command("/steer --daemon w3"), None);
+        assert_eq!(parse_session_command("/steer --daemon w3    "), None);
+        assert_eq!(parse_session_command("/steer --daemon --force go"), None);
+        assert_eq!(parse_session_command("/kill --daemonize w3"), None);
     }
 
     #[test]

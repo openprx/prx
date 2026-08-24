@@ -1,9 +1,12 @@
-//! Client for the runtime work-registry control API, backing `prx tasks`.
+//! Client for the daemon's control API, backing `prx tasks` and the chat-side
+//! `message_send`.
 //!
 //! The registry lives inside the process that owns the work, so inspecting it
 //! means talking to that process's gateway rather than looking at local state:
 //! a second `prx` invocation has an empty registry of its own and would report
-//! nothing useful.
+//! nothing useful. The same is true of channels: only the process holding the
+//! channel objects can send on them, which is why the outbound call below is a
+//! request rather than a local send.
 //!
 //! This module owns transport and decoding only. Rendering lives in the binary,
 //! where writing to stdout is the point.
@@ -219,6 +222,50 @@ pub async fn request_message(endpoint: &TasksEndpoint, id: &str, message: &str) 
         .await
         .map_err(|error| unreachable_hint(endpoint, &error))?;
     decode(response, "runtime task message").await
+}
+
+/// Outcome of an outbound send performed by the daemon on the caller's behalf.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelSendReport {
+    /// Channel the daemon delivered on.
+    pub channel: String,
+    pub delivered: bool,
+    /// The daemon's own account of the delivery.
+    pub detail: String,
+}
+
+/// Ask the daemon to send one message on one of its channels.
+///
+/// The caller supplies a destination and a body; **every policy decision is the
+/// daemon's**. Nothing here pre-approves the send, and the daemon does not
+/// trust this client to have checked anything — a refusal comes back as a
+/// non-success status whose body carries the reason, which is surfaced verbatim
+/// rather than reinterpreted.
+///
+/// As everywhere else in this client, there is no overall request timeout: a
+/// channel that takes its time to accept a message is working, not stalled.
+pub async fn request_channel_send(
+    endpoint: &TasksEndpoint,
+    channel: &str,
+    recipient: &str,
+    message: &str,
+    as_voice: bool,
+) -> Result<ChannelSendReport> {
+    let client = client()?;
+    // The channel name reaches here from a model or an operator; percent-encode
+    // it so a name that is not a bare identifier cannot alter the request path.
+    let path = format!("/api/channels/{}/send", urlencoding::encode(channel));
+    let response = endpoint
+        .request(&client, reqwest::Method::POST, &path)
+        .json(&serde_json::json!({
+            "recipient": recipient,
+            "message": message,
+            "as_voice": as_voice,
+        }))
+        .send()
+        .await
+        .map_err(|error| unreachable_hint(endpoint, &error))?;
+    decode(response, "channel send").await
 }
 
 /// Fetch connection-pool occupancy and saturation counters.
