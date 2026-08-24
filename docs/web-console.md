@@ -50,6 +50,7 @@ Two ways to collect the result:
 | `GET /api/runtime/tasks` | Every registered work item, jobs included |
 | `POST /api/runtime/tasks/{id}/kill` | End that item and, by default, its lineage |
 | `POST /api/runtime/tasks/{id}/message` | Hand a running sub-agent an operator instruction |
+| `POST /api/channels/{name}/send` | Send one message on a configured channel, on behalf of an entry point that owns none |
 
 Job status is one of `running`, `succeeded`, `failed`, `cancelled`. Finished
 jobs are retained for one hour; running jobs are never evicted. The `work_id` in

@@ -29,6 +29,7 @@ pub mod linq;
 pub mod matrix;
 pub mod mattermost;
 pub mod nextcloud_talk;
+pub mod outbound_registry;
 pub mod pre_gate;
 pub mod qq;
 pub mod signal;
@@ -5790,6 +5791,13 @@ pub async fn start_channels_with_config(
             .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
             .collect::<HashMap<_, _>>(),
     );
+    // Publish the same registry process-wide for as long as these channels are
+    // running, so the gateway control plane (`POST /api/channels/{name}/send`)
+    // can reach the very channel objects that own the live connections. The
+    // guard is held for the lifetime of this component: a reconfigured or
+    // stopped channels supervisor withdraws its entries instead of leaving dead
+    // channel objects addressable.
+    let _outbound_publication = outbound_registry::publish(Arc::clone(&channels_registry));
 
     // Register message_send tool backed by Signal (or first channel) for proactive messaging.
     // Always use SignalChannel (HTTP) pointing to the effective URL (local daemon in native mode,

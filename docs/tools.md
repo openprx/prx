@@ -30,6 +30,21 @@ refused, because an attachment is a local path owned by the originating channel.
 `action="react"` cannot be redirected — reactions are always delivered by the
 Signal handle — so it rejects a `channel` naming anything else.
 
+In `prx chat` the same tool name and the same schema are registered, but the
+send is performed by the daemon: a chat session opens no IM connection of its
+own, because a second listener would race the daemon for inbound messages. The
+chat variant therefore requires `channel` (there is no conversation to inherit
+one from), offers `action="send"` only, and refuses arguments it cannot carry
+(`quote_timestamp` / `quote_author`) instead of dropping them. It reaches the
+daemon over `POST /api/channels/{name}/send` using `[chat.daemon]`
+(see [Configuration](configuration.md#chatdaemon)); when no daemon is running
+the tool reports that and the chat turn continues. Every gate above — unknown
+channel, `send_allow`, text-only — is applied **by the daemon**, against the
+daemon's configuration; the chat side decides nothing. Because such a send has
+no inbound conversation behind it, it is authorized as a send *from* the
+operator plane channel `api`, which makes it cross-channel by construction and
+therefore denied until an operator opts in with `send_allow`.
+
 Agentic `delegate` configurations require an explicit non-empty
 `allowed_tools`. A named list is intersected with the eligible parent registry;
 unknown or ineligible names fail before the provider turn starts. The exclusive

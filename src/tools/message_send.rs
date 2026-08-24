@@ -9,6 +9,8 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::channels::SignalChannel;
 use crate::channels::traits::{Channel, SendMessage};
+use crate::config::Config;
+use crate::runtime::tasks_cli::{TasksEndpoint, request_channel_send};
 use crate::security::op_id;
 use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
 use crate::security::{SecurityPolicy, SideEffectGate};
@@ -161,6 +163,82 @@ fn requested_channel(args: &serde_json::Value) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
+/// The one tool name both `message_send` entry points answer to.
+///
+/// `prx chat` holds no channel object of its own, so its variant reaches the
+/// daemon over HTTP — but a model must not have to know which process it is
+/// running in. Name and schema come from here so the two can never drift apart.
+pub(crate) const MESSAGE_SEND_TOOL_NAME: &str = "message_send";
+
+/// The one parameter schema both `message_send` entry points expose.
+fn message_send_parameters_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["send", "react", "edit", "delete", "unsend", "thread"],
+                "description": "Action type: 'send' for text/files/voice, 'react' for emoji reactions, \
+                                'edit' to edit a sent message (message_id + message), \
+                                'delete'/'unsend' to delete a sent message (message_id), \
+                                'thread' to reply in a thread (thread_id + message)"
+            },
+            "target": {
+                "type": "string",
+                "description": "Recipient identifier (phone number, group ID, Signal UUID, etc.). \
+                                Defaults to the current conversation's sender when omitted."
+            },
+            "channel": {
+                "type": "string",
+                "description": "Destination channel name (e.g. 'signal', 'telegram', 'wacli'). \
+                                Omit to stay on the current conversation's channel. Naming another \
+                                channel requires it to be permitted by the outbound scope rules and \
+                                delivers text only — media markers and as_voice are refused. \
+                                Not accepted for action='react'."
+            },
+            "message": {
+                "type": "string",
+                "description": "Message text. Embed media by including markers: \
+                                [IMAGE:/path/to/file.png], [VOICE:/path/to/audio.m4a], \
+                                [DOCUMENT:/path/to/file.pdf]. Text outside markers is sent as caption."
+            },
+            "as_voice": {
+                "type": "boolean",
+                "description": "When true, the first [VOICE:] or [AUDIO:] attachment is sent as a voice note (default: false)."
+            },
+            "quote_timestamp": {
+                "type": "integer",
+                "description": "Timestamp (ms) of the message to quote-reply to."
+            },
+            "quote_author": {
+                "type": "string",
+                "description": "Author identifier of the message being replied to (required when quote_timestamp is set)."
+            },
+            "emoji": {
+                "type": "string",
+                "description": "For action='react': the emoji to react with, e.g. '👍', '❤️', '😂'."
+            },
+            "target_author": {
+                "type": "string",
+                "description": "For action='react': the author of the message to react to."
+            },
+            "target_timestamp": {
+                "type": "integer",
+                "description": "For action='react': the timestamp (ms) of the message to react to."
+            },
+            "message_id": {
+                "type": "string",
+                "description": "For action='edit'/'delete'/'unsend': the platform-specific message identifier (timestamp in ms for Signal)."
+            },
+            "thread_id": {
+                "type": "string",
+                "description": "For action='thread': the thread/conversation identifier to reply into."
+            }
+        },
+        "required": ["action"]
+    })
+}
+
 pub struct MessageSendTool {
     /// Active channel — updated per-message via `set_active_channel` so that
     /// replies are always routed back on the same channel the message arrived on
@@ -250,7 +328,7 @@ impl MessageSendTool {
     /// turns an outbound text send into "read this local path". So a request
     /// that both names another channel and embeds (or asks to synthesise) media
     /// is refused outright rather than silently downgraded to plain text.
-    fn reject_cross_channel_media(args: &serde_json::Value, dst_channel: &str) -> Result<(), String> {
+    pub(crate) fn reject_cross_channel_media(args: &serde_json::Value, dst_channel: &str) -> Result<(), String> {
         let message = args.get("message").and_then(serde_json::Value::as_str).unwrap_or("");
         let (_, media) = crate::channels::traits::extract_outgoing_media(message);
         if let Some((marker, _)) = media.first() {
@@ -366,7 +444,7 @@ impl MessageSendTool {
 #[async_trait]
 impl Tool for MessageSendTool {
     fn name(&self) -> &str {
-        "message_send"
+        MESSAGE_SEND_TOOL_NAME
     }
 
     fn description(&self) -> &str {
@@ -377,71 +455,7 @@ impl Tool for MessageSendTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["send", "react", "edit", "delete", "unsend", "thread"],
-                    "description": "Action type: 'send' for text/files/voice, 'react' for emoji reactions, \
-                                    'edit' to edit a sent message (message_id + message), \
-                                    'delete'/'unsend' to delete a sent message (message_id), \
-                                    'thread' to reply in a thread (thread_id + message)"
-                },
-                "target": {
-                    "type": "string",
-                    "description": "Recipient identifier (phone number, group ID, Signal UUID, etc.). \
-                                    Defaults to the current conversation's sender when omitted."
-                },
-                "channel": {
-                    "type": "string",
-                    "description": "Destination channel name (e.g. 'signal', 'telegram', 'wacli'). \
-                                    Omit to stay on the current conversation's channel. Naming another \
-                                    channel requires it to be permitted by the outbound scope rules and \
-                                    delivers text only — media markers and as_voice are refused. \
-                                    Not accepted for action='react'."
-                },
-                "message": {
-                    "type": "string",
-                    "description": "Message text. Embed media by including markers: \
-                                    [IMAGE:/path/to/file.png], [VOICE:/path/to/audio.m4a], \
-                                    [DOCUMENT:/path/to/file.pdf]. Text outside markers is sent as caption."
-                },
-                "as_voice": {
-                    "type": "boolean",
-                    "description": "When true, the first [VOICE:] or [AUDIO:] attachment is sent as a voice note (default: false)."
-                },
-                "quote_timestamp": {
-                    "type": "integer",
-                    "description": "Timestamp (ms) of the message to quote-reply to."
-                },
-                "quote_author": {
-                    "type": "string",
-                    "description": "Author identifier of the message being replied to (required when quote_timestamp is set)."
-                },
-                "emoji": {
-                    "type": "string",
-                    "description": "For action='react': the emoji to react with, e.g. '👍', '❤️', '😂'."
-                },
-                "target_author": {
-                    "type": "string",
-                    "description": "For action='react': the author of the message to react to."
-                },
-                "target_timestamp": {
-                    "type": "integer",
-                    "description": "For action='react': the timestamp (ms) of the message to react to."
-                },
-                "message_id": {
-                    "type": "string",
-                    "description": "For action='edit'/'delete'/'unsend': the platform-specific message identifier (timestamp in ms for Signal)."
-                },
-                "thread_id": {
-                    "type": "string",
-                    "description": "For action='thread': the thread/conversation identifier to reply into."
-                }
-            },
-            "required": ["action"]
-        })
+        message_send_parameters_schema()
     }
 
     async fn set_active_recipient(&self, recipient: &str) {
@@ -844,6 +858,170 @@ impl Tool for MessageSendTool {
                     "Unknown action '{unknown}'. Use 'send', 'react', 'edit', 'delete', 'unsend', or 'thread'."
                 )),
             }),
+        }
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Standard
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Communication]
+    }
+}
+
+// ── Chat-side variant: outbound through the daemon ──────────────────────────
+
+/// `message_send` for a process that holds no channel of its own.
+///
+/// `prx chat` deliberately opens no IM connection: doing so would put a second
+/// listener on the same account and race the daemon for inbound messages. So
+/// its outbound goes the other way — the daemon, which already owns the channel
+/// objects, is asked to send. The tool name and parameter schema are literally
+/// the ones [`MessageSendTool`] exposes, so a model writes the same call in
+/// either process.
+///
+/// It performs **no** policy decision of its own beyond the local autonomy
+/// check every tool honours. Destination resolution, outbound authorization and
+/// the media refusal all happen in the daemon, against the daemon's
+/// configuration, and their verdicts are surfaced here verbatim. This is the
+/// point: there is exactly one implementation of those gates, and it is the one
+/// next to the channels.
+pub struct DaemonMessageSendTool {
+    endpoint: TasksEndpoint,
+    security: Arc<SecurityPolicy>,
+}
+
+impl DaemonMessageSendTool {
+    /// Build from the chat process's configuration.
+    ///
+    /// The endpoint defaults to the configured gateway bind address — the same
+    /// default `prx tasks` uses — so a local daemon needs no extra setup beyond
+    /// a control-plane token.
+    #[must_use]
+    pub fn from_config(config: &Config, security: Arc<SecurityPolicy>) -> Self {
+        let daemon = &config.chat.daemon;
+        Self {
+            endpoint: TasksEndpoint::resolve(
+                config,
+                Some(daemon.url.clone()).filter(|url| !url.trim().is_empty()),
+                Some(daemon.token.clone()).filter(|token| !token.trim().is_empty()),
+            ),
+            security,
+        }
+    }
+
+    /// Arguments this route cannot carry, and must therefore refuse.
+    ///
+    /// Dropping them silently would be worse than failing: the model would be
+    /// told its quoted reply was sent when a plain message went out instead.
+    fn reject_uncarried_arguments(args: &serde_json::Value) -> Result<(), String> {
+        const UNCARRIED: [&str; 2] = ["quote_timestamp", "quote_author"];
+        let named: Vec<&str> = UNCARRIED
+            .into_iter()
+            .filter(|key| args.get(*key).is_some_and(|value| !value.is_null()))
+            .collect();
+        if named.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "Outbound from chat is routed through the PRX daemon, which carries text only: {} \
+             cannot be honoured. Drop it, or run the send from the channel itself.",
+            named.join(", ")
+        ))
+    }
+}
+
+#[async_trait]
+impl Tool for DaemonMessageSendTool {
+    fn name(&self) -> &str {
+        MESSAGE_SEND_TOOL_NAME
+    }
+
+    fn description(&self) -> &str {
+        "Send a message through one of the PRX daemon's messaging channels (Signal, Telegram, wacli, etc.). \
+         This chat session holds no channel of its own, so the send is performed by the daemon: \
+         'channel' is required, only action='send' is available, and the daemon's outbound scope \
+         rules decide whether the recipient may be reached."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        message_send_parameters_schema()
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if !self.security.can_act() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Action blocked: autonomy is read-only".into()),
+            });
+        }
+
+        let refuse = |error: String| {
+            Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            })
+        };
+
+        let action = args.get("action").and_then(serde_json::Value::as_str).unwrap_or("send");
+        if action != "send" {
+            return refuse(format!(
+                "Action '{action}' is not available from chat: outbound here is routed through the PRX \
+                 daemon, which exposes sending only. Use action='send'."
+            ));
+        }
+        let Some(channel) = requested_channel(&args) else {
+            return refuse(
+                "Missing 'channel': this chat session has no conversation channel to inherit, so the \
+                 destination channel must be named explicitly."
+                    .to_string(),
+            );
+        };
+        let Some(recipient) = args
+            .get("target")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+        else {
+            return refuse(
+                "Missing 'target': a send through the daemon has no conversation to reply to, so the \
+                 recipient must be given."
+                    .to_string(),
+            );
+        };
+        let message = args
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if message.is_empty() {
+            return refuse("Missing 'message': nothing to send.".to_string());
+        }
+        if let Err(error) = Self::reject_uncarried_arguments(&args) {
+            return refuse(error);
+        }
+        let as_voice = args
+            .get("as_voice")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        match request_channel_send(&self.endpoint, channel, recipient, message, as_voice).await {
+            Ok(report) => Ok(ToolResult {
+                success: report.delivered,
+                output: if report.delivered {
+                    format!("{} (via the PRX daemon on channel '{}')", report.detail, report.channel)
+                } else {
+                    String::new()
+                },
+                error: (!report.delivered).then(|| report.detail.clone()),
+            }),
+            // A refusal, an unreachable daemon and a channel error all arrive
+            // here as one error chain. It is reported, not retried and not
+            // reinterpreted: the chat turn continues either way.
+            Err(error) => refuse(format!("{error:#}")),
         }
     }
 
@@ -1668,5 +1846,166 @@ mod tests {
             .unwrap();
         assert!(untrusted.success, "got: {:?}", untrusted.error);
         assert_eq!(sent.lock().await.len(), 1);
+    }
+    // ── Chat-side variant (routes through the daemon) ───────────────────────
+
+    fn chat_tool_for(url: &str, level: AutonomyLevel) -> DaemonMessageSendTool {
+        let mut config = crate::config::Config::default();
+        config.chat.daemon.url = url.to_string();
+        config.chat.daemon.token = "zc_test".to_string();
+        DaemonMessageSendTool::from_config(&config, test_security(level))
+    }
+
+    /// An address nothing is listening on: bind, learn the port, release it.
+    async fn closed_port_url() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test: bind ephemeral port");
+        let port = listener.local_addr().expect("test: local addr").port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn both_message_send_entry_points_expose_the_same_surface() {
+        let (channel, _sent) = DummyChannel::new();
+        let in_process = MessageSendTool::new(channel, test_security(AutonomyLevel::Full));
+        let through_daemon = chat_tool_for("http://127.0.0.1:1", AutonomyLevel::Full);
+        assert_eq!(in_process.name(), through_daemon.name());
+        assert_eq!(in_process.parameters_schema(), through_daemon.parameters_schema());
+        assert_eq!(in_process.tier(), through_daemon.tier());
+        assert_eq!(in_process.categories(), through_daemon.categories());
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_daemon_is_reported_and_the_turn_continues() {
+        let tool = chat_tool_for(&closed_port_url().await, AutonomyLevel::Full);
+        let result = tool
+            .execute(json!({
+                "action": "send",
+                "channel": "wacli",
+                "target": "+15550001111",
+                "message": "hello",
+            }))
+            .await
+            .expect("test: an unreachable daemon must not abort the tool call");
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(
+            error.contains("cannot reach a running PRX process"),
+            "the operator must be told what to start: {error}"
+        );
+        assert!(error.contains("prx daemon"), "got: {error}");
+    }
+
+    #[tokio::test]
+    async fn a_send_from_chat_must_name_its_destination() {
+        let tool = chat_tool_for("http://127.0.0.1:1", AutonomyLevel::Full);
+        // No channel: chat has no conversation to inherit one from, and
+        // guessing would be how a message reaches the wrong platform.
+        let result = tool
+            .execute(json!({"action": "send", "target": "+15550001111", "message": "hi"}))
+            .await
+            .expect("test: the tool call must complete");
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Missing 'channel'")),
+            "test: {:?}",
+            result.error
+        );
+
+        for missing in [
+            json!({"action": "send", "channel": "wacli", "message": "hi"}),
+            json!({"action": "send", "channel": "wacli", "target": "  ", "message": "hi"}),
+        ] {
+            let result = tool.execute(missing).await.expect("test: the tool call must complete");
+            assert!(!result.success);
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("Missing 'target'")),
+                "test: {:?}",
+                result.error
+            );
+        }
+
+        let result = tool
+            .execute(json!({"action": "send", "channel": "wacli", "target": "+1", "message": "   "}))
+            .await
+            .expect("test: the tool call must complete");
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Missing 'message'")),
+            "test: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_refuses_the_actions_the_daemon_route_cannot_carry() {
+        let tool = chat_tool_for("http://127.0.0.1:1", AutonomyLevel::Full);
+        for action in ["react", "edit", "delete", "unsend", "thread"] {
+            let result = tool
+                .execute(json!({
+                    "action": action,
+                    "channel": "wacli",
+                    "target": "+15550001111",
+                    "message": "hi",
+                }))
+                .await
+                .expect("test: the tool call must complete");
+            assert!(!result.success, "action {action} must be refused");
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("is not available from chat")),
+                "test: {action}: {:?}",
+                result.error
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_refuses_arguments_it_would_otherwise_drop_silently() {
+        let tool = chat_tool_for("http://127.0.0.1:1", AutonomyLevel::Full);
+        let result = tool
+            .execute(json!({
+                "action": "send",
+                "channel": "wacli",
+                "target": "+15550001111",
+                "message": "hi",
+                "quote_timestamp": 1_700_000_000_000_u64,
+                "quote_author": "+15550002222",
+            }))
+            .await
+            .expect("test: the tool call must complete");
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("quote_timestamp"), "got: {error}");
+        assert!(error.contains("quote_author"), "got: {error}");
+    }
+
+    #[tokio::test]
+    async fn read_only_autonomy_blocks_the_chat_variant_before_any_request() {
+        let tool = chat_tool_for(&closed_port_url().await, AutonomyLevel::ReadOnly);
+        let result = tool
+            .execute(json!({
+                "action": "send",
+                "channel": "wacli",
+                "target": "+15550001111",
+                "message": "hi",
+            }))
+            .await
+            .expect("test: the tool call must complete");
+        assert!(!result.success);
+        assert_eq!(result.error.as_deref(), Some("Action blocked: autonomy is read-only"));
     }
 }

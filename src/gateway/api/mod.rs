@@ -65,6 +65,10 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/channels", get(channels::get_channels_status))
         // Phase 1: alias for frontend compatibility
         .route("/channels/status", get(channels::get_channels_status))
+        // Outbound on behalf of an entry point that holds no channel of its own
+        // (`prx chat`). Authenticated operator plane, and still subject to the
+        // same outbound scope rules as an in-process send.
+        .route("/channels/{name}/send", post(channels::post_channel_send))
         .route("/config", get(config::get_config))
         .route("/config/files", get(config::get_config_files))
         .route("/config/files/{filename}", put(config::put_config_file))

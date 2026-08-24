@@ -313,6 +313,43 @@ name only the destination channel and the recipient's stable audit fingerprint,
 never the plaintext recipient. `autonomy.scopes.default` applies to tool access
 only — it does not gate recipients.
 
+A send that arrives over `POST /api/channels/{name}/send` (what `prx chat` uses,
+see [`[chat.daemon]`](#chatdaemon)) has no inbound conversation behind it, so it
+is authorized as a send **from the operator plane channel `api`** by an unknown
+sender with an unknown chat type. Two consequences: it is always cross-channel,
+so it is denied until an operator opts in; and rules for it are written against
+`channel`, since `user` and `chat_type` cannot match it.
+
+```toml
+[[autonomy.scopes.rules]]
+channel = "api"
+# Let a chat session message this one WhatsApp number through the daemon.
+send_allow = ["wacli:15550001111@s.whatsapp.net"]
+```
+
+### `[chat.daemon]`
+
+`prx chat` deliberately opens no IM connection: a second listener on the same
+account would race the daemon for inbound messages. Its `message_send` therefore
+asks the daemon to deliver, which is an ordinary authenticated call to the
+daemon's control plane.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `chat.daemon.url` | derived from `[gateway] host`/`port` | Base URL of the daemon gateway. The default is right whenever chat and daemon share a host; `0.0.0.0` resolves to loopback. |
+| `chat.daemon.token` | empty | Bearer token for the control plane. Required unless the daemon runs with `gateway.require_pairing = false`; without it the daemon answers `401` and the send is refused. |
+
+```toml
+[chat.daemon]
+url = "http://127.0.0.1:16830"
+token = "zc_..."
+```
+
+The token is the same kind `prx tasks --token` takes. A paired token is stored
+in `gateway.paired_tokens` as a hash, not as plaintext, so the value here is the
+one handed out once at pairing time — a hash copied from the config file will
+not authenticate.
+
 Agentic delegates fail closed when `allowed_tools` is missing or empty. Named
 entries select only matching eligible parent tools. Use `allowed_tools = ["*"]`
 to explicitly inherit every eligible parent tool except `delegate`; the
