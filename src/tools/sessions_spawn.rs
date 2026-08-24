@@ -115,6 +115,45 @@ pub struct SubAgentRun {
     pub session_scope_key: String,
     pub spawn_depth: usize,
     pub token_usage_records: Vec<crate::llm::route_decision::MeteredTokenUsageRecord>,
+    /// Liveness evidence for this run: the beat every progress event inside it
+    /// stamps.
+    ///
+    /// Deliberately *not* a second definition of "what counts as progress".
+    /// The sub-agent's own turn already runs under
+    /// [`crate::agent::idle::run_guarded`], whose beat is parented on this one,
+    /// so every [`crate::agent::idle::ProgressKind`] event — provider chunk,
+    /// tool start/end, compaction, channel output — lands here for free. A
+    /// process-mode run has no in-process turn to borrow, so it stamps this
+    /// beat from the worker's output stream, the only progress signal that
+    /// crosses the process boundary.
+    ///
+    /// Read through [`SubAgentRun::last_progress_at`] /
+    /// [`SubAgentRun::idle_for`]; both are relaxed atomic loads, so a
+    /// supervisor may poll them without disturbing the run.
+    pub progress: Arc<crate::agent::idle::ProgressBeat>,
+}
+
+impl SubAgentRun {
+    /// How long this run has been silent.
+    #[must_use]
+    pub fn idle_for(&self) -> std::time::Duration {
+        self.progress.idle_for()
+    }
+
+    /// Wall-clock instant of the last observed progress event.
+    ///
+    /// Derived from the beat's monotonic clock rather than stored as a
+    /// wall-clock stamp, so a system clock step cannot make a live run look
+    /// stalled (or a stalled one look live). Never earlier than
+    /// [`Self::started_at`], and equal to it while the run has produced nothing
+    /// yet.
+    #[must_use]
+    pub fn last_progress_at(&self) -> DateTime<Utc> {
+        chrono::Duration::from_std(self.idle_for())
+            .ok()
+            .and_then(|idle| Utc::now().checked_sub_signed(idle))
+            .map_or(self.started_at, |at| at.max(self.started_at))
+    }
 }
 
 /// Everything the registry row for a process-mode run is built from.
@@ -130,6 +169,7 @@ struct ProcessModeRunSeed<'a> {
     parent_run_id: Option<String>,
     session_scope_key: String,
     spawn_depth: usize,
+    progress: Arc<crate::agent::idle::ProgressBeat>,
 }
 
 /// Build the registry row for a process-mode run.
@@ -157,6 +197,7 @@ fn new_process_mode_run(seed: ProcessModeRunSeed<'_>) -> SubAgentRun {
         session_scope_key: seed.session_scope_key,
         spawn_depth: seed.spawn_depth,
         token_usage_records: Vec::new(),
+        progress: seed.progress,
     }
 }
 
@@ -1111,6 +1152,92 @@ async fn commit_process_owner_failure_if_unfinalized(
     .await;
 }
 
+/// Publish a terminal status for a run whose owning task vanished without
+/// publishing one itself.
+///
+/// This is the discoverability half of the runtime's only automatic
+/// termination. The idle (no-progress) detector ends a wedged turn by killing
+/// everything the turn owns (`crate::agent::idle::kill_turn_subtree` ->
+/// `crate::runtime::registry::kill`), and for a sub-agent that means *aborting
+/// the monitor task* through the abort handle published on its registry row.
+/// An aborted task runs no more code, so the row it was going to update is
+/// left as it was: the registry's hang ledger records the termination while
+/// `sessions_list` keeps reporting `running`, forever. Nothing polls it back
+/// into line, so a join on that run would never return.
+///
+/// Only a non-terminal status is overwritten, so a terminal state committed by
+/// the monitor microseconds earlier always wins.
+async fn commit_run_termination_if_unfinished(
+    active_runs: &Arc<RwLock<Vec<SubAgentRun>>>,
+    run_id: &str,
+    reason: &str,
+) -> bool {
+    let mut runs = active_runs.write().await;
+    let Some(run) = runs.iter_mut().find(|run| run.id == run_id) else {
+        return false;
+    };
+    if matches!(run.status, SubAgentStatus::Completed(_) | SubAgentStatus::Failed(_)) {
+        return false;
+    }
+    run.finished_at = Some(Utc::now());
+    run.status = SubAgentStatus::Failed(reason.to_string());
+    run.steer_tx = None;
+    true
+}
+
+/// Why a monitor task stopped without reporting, when it stopped that way.
+fn vanished_monitor_reason(error: &tokio::task::JoinError, kind: &str) -> String {
+    if error.is_cancelled() {
+        format!("{kind} was terminated before it could report a result")
+    } else {
+        format!("{kind} panicked before it could report a result")
+    }
+}
+
+/// Watch a task-mode monitor from *outside* the run's registry subtree.
+///
+/// Awaiting the handle here neither aborts nor keeps the monitor alive; it only
+/// observes how it ended. The watcher deliberately runs in a task that carries
+/// no registry scope, so a cascade kill of the run cannot take the observer
+/// down with the observed.
+fn watch_task_mode_monitor(
+    handle: tokio::task::JoinHandle<()>,
+    active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
+    run_id: String,
+) {
+    tokio::spawn(async move {
+        let Err(error) = handle.await else {
+            return;
+        };
+        let reason = vanished_monitor_reason(&error, "sub-agent run");
+        if commit_run_termination_if_unfinished(&active_runs, &run_id, &reason).await {
+            tracing::warn!(run_id = %run_id, "{reason}");
+        }
+    });
+}
+
+/// Process-mode counterpart of [`watch_task_mode_monitor`].
+///
+/// Routes through [`commit_process_owner_failure_if_unfinalized`] so the run's
+/// `ProcessRunControl` is finalized together with the status — a caller parked
+/// on finalization must not be stranded by the very cancellation that ended the
+/// monitor.
+fn watch_process_mode_monitor(
+    handle: tokio::task::JoinHandle<()>,
+    active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
+    run_id: String,
+    process_control: Arc<ProcessRunControl>,
+) {
+    tokio::spawn(async move {
+        let Err(error) = handle.await else {
+            return;
+        };
+        let reason = vanished_monitor_reason(&error, "sub-agent process monitor");
+        tracing::warn!(run_id = %run_id, "{reason}");
+        commit_process_owner_failure_if_unfinalized(&active_runs, &run_id, process_control.as_ref(), reason).await;
+    });
+}
+
 #[async_trait]
 impl Tool for SessionsSpawnTool {
     fn name(&self) -> &str {
@@ -1543,6 +1670,12 @@ impl Tool for SessionsSpawnTool {
             // receiver is handed to the child owner, which forwards each message
             // as a line-delimited control frame on the worker's stdin.
             let (process_steer_tx, process_steer_rx) = tokio::sync::mpsc::channel::<String>(STEER_CHANNEL_CAPACITY);
+            // Minted here, on the *spawning* task, so the run's beat is parented
+            // on the caller's: a parent legitimately blocked on a working child
+            // must not look silent to its own hang detector. A beat minted
+            // inside the spawned monitor would have no parent at all, because
+            // task-locals do not cross `tokio::spawn`.
+            let process_progress = crate::agent::idle::child_beat();
 
             {
                 let mut runs = self.active_runs.write().await;
@@ -1558,6 +1691,7 @@ impl Tool for SessionsSpawnTool {
                     parent_run_id: parent_run_id.clone(),
                     session_scope_key: session_scope_key.clone(),
                     spawn_depth,
+                    progress: Arc::clone(&process_progress),
                 }));
             }
 
@@ -1649,159 +1783,183 @@ impl Tool for SessionsSpawnTool {
             // Same sender, same bounded queue as `sessions_send` — only the
             // lookup is new; see `registry::attach_steer_sender`.
             crate::runtime::registry::attach_steer_sender(sub_agent_work.id(), process_steer_tx.clone());
+            let monitor_active_runs = active_runs.clone();
+            let monitor_progress = Arc::clone(&process_progress);
             let jh = tokio::spawn(crate::runtime::registry::scoped(
                 sub_agent_work,
-                SPAWN_EXECUTION_CONTEXT.scope(process_execution_ctx, async move {
-                    let failure_active_runs = active_runs.clone();
-                    let failure_run_id = rid.clone();
-                    let monitor_result = std::panic::AssertUnwindSafe(async {
-                        tracing::info!(run_id = %rid, "Sub-agent process starting");
+                SPAWN_EXECUTION_CONTEXT.scope(
+                    process_execution_ctx,
+                    crate::agent::idle::scope_beat(Some(Arc::clone(&monitor_progress)), async move {
+                        let failure_active_runs = active_runs.clone();
+                        let failure_run_id = rid.clone();
+                        let monitor_result = std::panic::AssertUnwindSafe(async {
+                            tracing::info!(run_id = %rid, "Sub-agent process starting");
 
-                        let worker_result = run_sub_agent_process(
-                            &rid,
-                            &task_owned,
-                            &provider_name,
-                            &model,
-                            api_key.as_deref(),
-                            temperature,
-                            timeout_secs,
-                            max_iterations,
-                            &workspace_root,
-                            &worker_workspace_root,
-                            identity_dir.as_deref(),
-                            &allowed_tools,
-                            keep_workspace,
-                            process_scope.as_ref(),
-                            process_spawn_depth,
-                            &process_session_scope_key,
-                            process_parent_run_id.as_deref(),
-                            process_agent_id.as_deref(),
-                            &process_lineage,
-                            &process_memory_strategy,
-                            &process_memory_backend,
-                            &process_config_dir,
-                            &process_config_generation,
-                            process_event_recording,
-                            &process_compaction_config,
-                            monitor_process_control.as_ref(),
-                            process_steer_rx,
-                            history_arc,
-                        )
+                            let worker_result = run_sub_agent_process(
+                                &rid,
+                                &task_owned,
+                                &provider_name,
+                                &model,
+                                api_key.as_deref(),
+                                temperature,
+                                timeout_secs,
+                                max_iterations,
+                                &workspace_root,
+                                &worker_workspace_root,
+                                identity_dir.as_deref(),
+                                &allowed_tools,
+                                keep_workspace,
+                                process_scope.as_ref(),
+                                process_spawn_depth,
+                                &process_session_scope_key,
+                                process_parent_run_id.as_deref(),
+                                process_agent_id.as_deref(),
+                                &process_lineage,
+                                &process_memory_strategy,
+                                &process_memory_backend,
+                                &process_config_dir,
+                                &process_config_generation,
+                                process_event_recording,
+                                &process_compaction_config,
+                                monitor_process_control.as_ref(),
+                                process_steer_rx,
+                                history_arc,
+                                Arc::clone(&monitor_progress),
+                            )
+                            .await;
+
+                            let (status, result_text, token_usage_records, finalization) = match worker_result {
+                                Ok(ProcessWorkerOutcome::Finished(result)) if result.success => {
+                                    let token_usage_records = result
+                                        .tokens_used
+                                        .as_ref()
+                                        .and_then(|usage| {
+                                            crate::llm::route_decision::MeteredTokenUsageRecord::from_parts(
+                                                &provider_name,
+                                                &model,
+                                                usage,
+                                                &process_cost_config,
+                                            )
+                                        })
+                                        .into_iter()
+                                        .collect::<Vec<_>>();
+                                    (
+                                        SubAgentStatus::Completed(result.output.clone()),
+                                        result.output,
+                                        token_usage_records,
+                                        ProcessFinalization::Natural,
+                                    )
+                                }
+                                Ok(ProcessWorkerOutcome::Finished(result)) => {
+                                    let error = result.error.unwrap_or_else(|| "worker failed".to_string());
+                                    let msg = format!("Sub-agent error: {error}");
+                                    (
+                                        SubAgentStatus::Failed(error),
+                                        msg,
+                                        Vec::new(),
+                                        ProcessFinalization::Natural,
+                                    )
+                                }
+                                Ok(ProcessWorkerOutcome::Terminated(reason)) => {
+                                    let msg = format!("Sub-agent process terminated: {reason}");
+                                    (
+                                        SubAgentStatus::Failed(reason),
+                                        msg,
+                                        Vec::new(),
+                                        ProcessFinalization::Terminated,
+                                    )
+                                }
+                                Ok(ProcessWorkerOutcome::ExitedWithoutResult(detail)) => {
+                                    // MUTATION GUARD: folding this back into the
+                                    // generic parse-error path loses the only
+                                    // wording an operator can act on, and folding it
+                                    // into "keep waiting" would leave the run
+                                    // `Running` for as long as the process lives.
+                                    let error = format!("worker exited without result ({detail})");
+                                    let msg = format!("Sub-agent process error: {error}");
+                                    (
+                                        SubAgentStatus::Failed(error),
+                                        msg,
+                                        Vec::new(),
+                                        ProcessFinalization::Natural,
+                                    )
+                                }
+                                Ok(ProcessWorkerOutcome::TerminationFailed(error)) => {
+                                    let msg = format!("Sub-agent process termination failed: {error}");
+                                    (
+                                        SubAgentStatus::Failed(error),
+                                        msg,
+                                        Vec::new(),
+                                        ProcessFinalization::TerminationFailed,
+                                    )
+                                }
+                                Err(error) => {
+                                    let msg = format!("Sub-agent process error: {error}");
+                                    (
+                                        SubAgentStatus::Failed(error.to_string()),
+                                        msg,
+                                        Vec::new(),
+                                        ProcessFinalization::Natural,
+                                    )
+                                }
+                            };
+
+                            let announce = format_announce_message(&rid, &status, &result_text);
+                            record_spawn_result_event(
+                                process_memory_fabric.as_ref(),
+                                process_result_scope,
+                                &result_text,
+                                &status,
+                                &process_lineage,
+                                (finalization == ProcessFinalization::Terminated).then_some("task.killed"),
+                            )
+                            .await;
+
+                            commit_process_terminal_state(
+                                &active_runs,
+                                &rid,
+                                status,
+                                token_usage_records,
+                                monitor_process_control.as_ref(),
+                                finalization,
+                                #[cfg(test)]
+                                None,
+                            )
+                            .await;
+                            if let Some(target) = recipient {
+                                let msg = SendMessage::new(&announce, &target);
+                                if let Err(error) = channel.send(&msg).await {
+                                    tracing::error!(
+                                        run_id = %rid,
+                                        "Failed to announce sub-agent process result: {error}"
+                                    );
+                                }
+                            }
+
+                            tracing::info!(run_id = %rid, "Sub-agent process finished");
+                        })
+                        .catch_unwind()
                         .await;
 
-                        let (status, result_text, token_usage_records, finalization) = match worker_result {
-                            Ok(ProcessWorkerOutcome::Finished(result)) if result.success => {
-                                let token_usage_records = result
-                                    .tokens_used
-                                    .as_ref()
-                                    .and_then(|usage| {
-                                        crate::llm::route_decision::MeteredTokenUsageRecord::from_parts(
-                                            &provider_name,
-                                            &model,
-                                            usage,
-                                            &process_cost_config,
-                                        )
-                                    })
-                                    .into_iter()
-                                    .collect::<Vec<_>>();
-                                (
-                                    SubAgentStatus::Completed(result.output.clone()),
-                                    result.output,
-                                    token_usage_records,
-                                    ProcessFinalization::Natural,
-                                )
-                            }
-                            Ok(ProcessWorkerOutcome::Finished(result)) => {
-                                let error = result.error.unwrap_or_else(|| "worker failed".to_string());
-                                let msg = format!("Sub-agent error: {error}");
-                                (
-                                    SubAgentStatus::Failed(error),
-                                    msg,
-                                    Vec::new(),
-                                    ProcessFinalization::Natural,
-                                )
-                            }
-                            Ok(ProcessWorkerOutcome::Terminated(reason)) => {
-                                let msg = format!("Sub-agent process terminated: {reason}");
-                                (
-                                    SubAgentStatus::Failed(reason),
-                                    msg,
-                                    Vec::new(),
-                                    ProcessFinalization::Terminated,
-                                )
-                            }
-                            Ok(ProcessWorkerOutcome::TerminationFailed(error)) => {
-                                let msg = format!("Sub-agent process termination failed: {error}");
-                                (
-                                    SubAgentStatus::Failed(error),
-                                    msg,
-                                    Vec::new(),
-                                    ProcessFinalization::TerminationFailed,
-                                )
-                            }
-                            Err(error) => {
-                                let msg = format!("Sub-agent process error: {error}");
-                                (
-                                    SubAgentStatus::Failed(error.to_string()),
-                                    msg,
-                                    Vec::new(),
-                                    ProcessFinalization::Natural,
-                                )
-                            }
-                        };
-
-                        let announce = format_announce_message(&rid, &status, &result_text);
-                        record_spawn_result_event(
-                            process_memory_fabric.as_ref(),
-                            process_result_scope,
-                            &result_text,
-                            &status,
-                            &process_lineage,
-                            (finalization == ProcessFinalization::Terminated).then_some("task.killed"),
-                        )
-                        .await;
-
-                        commit_process_terminal_state(
-                            &active_runs,
-                            &rid,
-                            status,
-                            token_usage_records,
-                            monitor_process_control.as_ref(),
-                            finalization,
-                            #[cfg(test)]
-                            None,
-                        )
-                        .await;
-                        if let Some(target) = recipient {
-                            let msg = SendMessage::new(&announce, &target);
-                            if let Err(error) = channel.send(&msg).await {
-                                tracing::error!(
-                                    run_id = %rid,
-                                    "Failed to announce sub-agent process result: {error}"
-                                );
-                            }
+                        if monitor_result.is_err() {
+                            commit_process_owner_failure_if_unfinalized(
+                                &failure_active_runs,
+                                &failure_run_id,
+                                monitor_process_control.as_ref(),
+                                "process owner panicked".to_string(),
+                            )
+                            .await;
                         }
-
-                        tracing::info!(run_id = %rid, "Sub-agent process finished");
-                    })
-                    .catch_unwind()
-                    .await;
-
-                    if monitor_result.is_err() {
-                        commit_process_owner_failure_if_unfinalized(
-                            &failure_active_runs,
-                            &failure_run_id,
-                            monitor_process_control.as_ref(),
-                            "process owner panicked".to_string(),
-                        )
-                        .await;
-                    }
-                }),
+                    }),
+                ),
             ));
 
             // Process-mode callers must never abort this monitor: it is the
             // sole owner responsible for signalling and reaping the OS child.
-            drop(jh);
+            // Awaiting the handle from a *separate* task does not abort it, and
+            // is the only way a cancellation of the monitor (runtime shutdown,
+            // a future registry abort) can still reach the tool-plane row.
+            watch_process_mode_monitor(jh, monitor_active_runs, run_id.clone(), process_control.clone());
 
             return Ok(ToolResult {
                 success: true,
@@ -1820,6 +1978,11 @@ impl Tool for SessionsSpawnTool {
         // iterations. An unbounded queue therefore grows for the whole lifetime
         // of a long-running sub-agent.
         let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<String>(STEER_CHANNEL_CAPACITY);
+        // Minted on the spawning task so the run's beat is parented on the
+        // caller's (see `crate::agent::idle::child_beat`). The sub-agent's own
+        // guarded turn parents *its* beat on this one, so every ProgressKind
+        // event it produces refreshes this row and the caller's window alike.
+        let task_progress = crate::agent::idle::child_beat();
 
         // Register the run (abort_handle set after spawn)
         {
@@ -1843,6 +2006,7 @@ impl Tool for SessionsSpawnTool {
                 session_scope_key: session_scope_key.clone(),
                 spawn_depth,
                 token_usage_records: Vec::new(),
+                progress: Arc::clone(&task_progress),
             });
         }
 
@@ -2023,6 +2187,7 @@ impl Tool for SessionsSpawnTool {
                 run_approval_resolver,
                 restore_active_runs,
                 restore_run_id,
+                Arc::clone(&task_progress),
             );
             // `timeout_secs == 0` means "no timeout" — run until natural
             // completion. This matches the session-worker semantics in
@@ -2162,15 +2327,20 @@ impl Tool for SessionsSpawnTool {
         ));
 
         // Store the abort handle so kill action can cancel this run
+        let abort_handle = jh.abort_handle();
         {
             let mut runs = self.active_runs.write().await;
             if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-                run.abort_handle = Some(jh.abort_handle());
+                run.abort_handle = Some(abort_handle.clone());
             }
         }
         // Same handle for `prx tasks kill`: aborting drops the run future, which
         // drops its registry guard, which is how the kill is confirmed.
-        crate::runtime::registry::attach_abort_handle(sub_agent_work_id, jh.abort_handle());
+        crate::runtime::registry::attach_abort_handle(sub_agent_work_id, abort_handle);
+        // ... and because that abort runs no further code inside the monitor,
+        // an outside observer is what turns the kill into a terminal status on
+        // this run's row.
+        watch_task_mode_monitor(jh, self.active_runs.clone(), run_id.clone());
 
         Ok(ToolResult {
             success: true,
@@ -3038,6 +3208,11 @@ async fn run_sub_agent_task(
     // (channels / gateway), where suspension can never happen.
     active_runs: Option<Arc<RwLock<Vec<SubAgentRun>>>>,
     run_id: Option<String>,
+    // Liveness beat for this run, minted by the spawner and already parented on
+    // the spawner's own beat. Installed as the ambient beat of every loop
+    // iteration below, so the run's registry row observes exactly the events
+    // `crate::agent::idle` already defines as progress.
+    progress: Arc<crate::agent::idle::ProgressBeat>,
 ) -> anyhow::Result<SubAgentTaskResult> {
     // --- No-tools fallback: single-turn completion ---
     let Some(tools_registry) = tools else {
@@ -3052,6 +3227,8 @@ async fn run_sub_agent_task(
                 temperature,
             )
             .await?;
+        // A completed provider round-trip is progress by the shared definition.
+        progress.record(crate::agent::idle::ProgressKind::ProviderResponse);
         let response = trace.response.text_or_empty().to_string();
         // No incremental loop output exists on this path (single completion);
         // surface the final response as one delta so an attached follower sees
@@ -3151,13 +3328,17 @@ async fn run_sub_agent_task(
         // When absent (channels/gateway), no manager + no resolver = the
         // historical auto-fail-on-gate path (zero behaviour change).
         let approval_resolver_iter = approval_resolver.clone();
-        // Task-locals do not cross `tokio::spawn`, so the spawner's idle-hang
-        // beat is captured and re-installed inside the child run. Without it a
-        // parent turn that is legitimately blocked on a sub-agent which is
-        // visibly working would look silent to its own hang detector; with it
-        // the child's progress refreshes the parent's window too.
-        let spawner_beat = crate::agent::idle::current_beat();
-        let mut loop_handle = tokio::spawn(crate::agent::idle::scope_beat(spawner_beat, async move {
+        // Task-locals do not cross `tokio::spawn`, so this run's beat is
+        // re-installed inside the child task. It was minted on the *spawning*
+        // task and is parented on the spawner's beat, so a parent legitimately
+        // blocked on a visibly-working sub-agent is not mistaken for wedged —
+        // and the same events are what make this run's own silence visible.
+        //
+        // MUTATION GUARD: reading `current_beat()` here instead reads the beat
+        // of the spawned monitor task, which has none, and both properties are
+        // silently lost.
+        let run_beat = Arc::clone(&progress);
+        let mut loop_handle = tokio::spawn(crate::agent::idle::scope_beat(Some(run_beat), async move {
             let observer = NoopObserver;
             let hooks = HookManager::new(workspace_dir_owned.clone());
             let scope_ctx = scope_owned.as_ref().map(|scope| ScopeContext {
@@ -3588,6 +3769,38 @@ enum ProcessWorkerOutcome {
     Finished(WorkerResult),
     Terminated(String),
     TerminationFailed(String),
+    /// The worker's stdout reached EOF without a `WorkerResult` line.
+    ///
+    /// This is the process-mode half of "the run died where the parent cannot
+    /// see it": an OOM kill, a `SIGKILL`, or a segfault leaves the parent with
+    /// nothing but a closed pipe. It is a distinct variant rather than a
+    /// generic decode failure so the terminal status names the actual fault,
+    /// and so that a run in this state can never be left `Running`.
+    ExitedWithoutResult(String),
+}
+
+/// Human description of how a worker process ended, for the terminal status of
+/// a run that produced no result.
+fn describe_worker_exit(status: std::process::ExitStatus, stderr: &str) -> String {
+    #[cfg(unix)]
+    let signal = {
+        use std::os::unix::process::ExitStatusExt as _;
+        status.signal()
+    };
+    #[cfg(not(unix))]
+    let signal: Option<i32> = None;
+    let how = match (status.code(), signal) {
+        (_, Some(signal)) => format!("killed by signal {signal}"),
+        (Some(code), None) => format!("exit status {code}"),
+        (None, None) => "exit status unknown".to_string(),
+    };
+    if stderr.is_empty() {
+        how
+    } else {
+        let preview = stderr.chars().rev().take(400).collect::<String>();
+        let preview = preview.chars().rev().collect::<String>();
+        format!("{how}; stderr: {preview}")
+    }
 }
 
 #[derive(Debug)]
@@ -3864,6 +4077,54 @@ async fn pump_worker_steer_frames(
     }
 }
 
+/// Read one of the worker's output pipes to EOF, stamping the run's progress
+/// beat on every arrival.
+///
+/// Bytes from the worker are the only liveness signal that crosses the process
+/// boundary, which is why this replaced a plain `read_to_end`: the buffered
+/// result is byte-identical, but the parent now learns *while* the worker is
+/// working rather than only once it is gone. The event is recorded as
+/// [`crate::agent::idle::ProgressKind::ChannelOutput`] — output handed to a
+/// sink — rather than as a new kind, so there is exactly one definition of what
+/// counts as progress in this runtime.
+async fn drain_worker_stream<R>(
+    stream: R,
+    pipe: &'static str,
+    progress: Option<Arc<crate::agent::idle::ProgressBeat>>,
+) -> anyhow::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncReadExt;
+    let mut limited = stream.take(MAX_SUBPROCESS_OUTPUT);
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    let mut total: u64 = 0;
+    loop {
+        let read = limited.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if let Some(beat) = progress.as_ref() {
+            beat.record(crate::agent::idle::ProgressKind::ChannelOutput);
+        }
+        match chunk.get(..read) {
+            Some(bytes) => buffer.extend_from_slice(bytes),
+            None => anyhow::bail!("session-worker {pipe} read reported more bytes than the buffer holds"),
+        }
+    }
+    if total >= MAX_SUBPROCESS_OUTPUT {
+        tracing::warn!(
+            limit_bytes = MAX_SUBPROCESS_OUTPUT,
+            pipe,
+            "session-worker output reached size limit; output truncated"
+        );
+        buffer.extend_from_slice(b"\n[output truncated at 10MB]");
+    }
+    Ok(buffer)
+}
+
 async fn run_spawned_child_lifecycle(
     child: &mut tokio::process::Child,
     process_group: &mut OwnedProcessGroup,
@@ -3871,9 +4132,10 @@ async fn run_spawned_child_lifecycle(
     parent_timeout: std::time::Duration,
     process_control: &ProcessRunControl,
     steer: Option<WorkerSteerPipe>,
+    progress: Option<Arc<crate::agent::idle::ProgressBeat>>,
     #[cfg(test)] panic_before_wait: bool,
 ) -> anyhow::Result<OwnedProcessPhase> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
     // The manifest is line 1 of the worker's stdin. Unlike before, the pipe is
     // then kept open for the life of the run so steer frames can follow it.
@@ -3902,36 +4164,16 @@ async fn run_spawned_child_lifecycle(
         .take()
         .ok_or_else(|| anyhow::anyhow!("session-worker stderr pipe was not configured"))?;
 
-    let stdout_task = tokio::spawn(async move {
-        let mut stdout_buf = Vec::new();
-        let bytes_read = stdout_stream
-            .take(MAX_SUBPROCESS_OUTPUT)
-            .read_to_end(&mut stdout_buf)
-            .await?;
-        if bytes_read as u64 >= MAX_SUBPROCESS_OUTPUT {
-            tracing::warn!(
-                limit_bytes = MAX_SUBPROCESS_OUTPUT,
-                "session-worker stdout reached size limit; output truncated"
-            );
-            stdout_buf.extend_from_slice(b"\n[output truncated at 10MB]");
-        }
-        Ok::<Vec<u8>, anyhow::Error>(stdout_buf)
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut stderr_buf = Vec::new();
-        let bytes_read = stderr_stream
-            .take(MAX_SUBPROCESS_OUTPUT)
-            .read_to_end(&mut stderr_buf)
-            .await?;
-        if bytes_read as u64 >= MAX_SUBPROCESS_OUTPUT {
-            tracing::warn!(
-                limit_bytes = MAX_SUBPROCESS_OUTPUT,
-                "session-worker stderr reached size limit; output truncated"
-            );
-            stderr_buf.extend_from_slice(b"\n[output truncated at 10MB]");
-        }
-        Ok::<Vec<u8>, anyhow::Error>(stderr_buf)
-    });
+    let stdout_task = tokio::spawn(drain_worker_stream(
+        stdout_stream,
+        "stdout",
+        progress.as_ref().map(Arc::clone),
+    ));
+    let stderr_task = tokio::spawn(drain_worker_stream(
+        stderr_stream,
+        "stderr",
+        progress.as_ref().map(Arc::clone),
+    ));
 
     #[cfg(test)]
     assert!(!panic_before_wait, "injected owned-child lifecycle panic");
@@ -4014,6 +4256,7 @@ async fn run_sub_agent_process(
     process_control: &ProcessRunControl,
     steer_rx: tokio::sync::mpsc::Receiver<String>,
     history: Arc<RwLock<Vec<HistoryEntry>>>,
+    progress: Arc<crate::agent::idle::ProgressBeat>,
 ) -> anyhow::Result<ProcessWorkerOutcome> {
     let worker_workspace = worker_workspace_root.join(run_id);
     std::fs::create_dir_all(&worker_workspace)?;
@@ -4153,6 +4396,7 @@ async fn run_sub_agent_process(
             history,
             run_id: run_id.to_string(),
         }),
+        Some(progress),
         #[cfg(test)]
         false,
     ))
@@ -4203,24 +4447,55 @@ async fn run_sub_agent_process(
             return Ok(ProcessWorkerOutcome::TerminationFailed(error));
         }
     };
-    let output = std::process::Output { status, stdout, stderr };
-    let stdout_raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr_raw = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout_raw = String::from_utf8_lossy(&stdout).trim().to_string();
+    let stderr_raw = String::from_utf8_lossy(&stderr).trim().to_string();
+    let outcome = classify_worker_output(status, &stdout_raw, &stderr_raw);
+    // Cleanup on *every* exit path now, including the two error ones. The
+    // classification above no longer returns early, so a worker that died
+    // without a result cannot leak its workspace the way a decode failure used
+    // to.
+    cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
+    outcome
+}
 
-    let parsed: WorkerResult = serde_json::from_str(&stdout_raw).map_err(|error| {
+/// Turn "the worker process is gone, here is what it left on its pipes" into a
+/// run outcome.
+///
+/// Split out from [`run_sub_agent_process`] because this is the whole of the
+/// process-mode liveness contract and it must be testable against a real
+/// SIGKILLed child without standing up a manifest, a workspace and a config
+/// directory first.
+fn classify_worker_output(
+    status: std::process::ExitStatus,
+    stdout_raw: &str,
+    stderr_raw: &str,
+) -> anyhow::Result<ProcessWorkerOutcome> {
+    // EOF without a result line. A closed pipe is the *only* thing the parent
+    // observes when the worker is OOM-killed, SIGKILLed, or segfaults, so it has
+    // to be mapped to a terminal state right here — no later event is coming,
+    // and there is no wall clock in this runtime that would eventually give up.
+    //
+    // MUTATION GUARD: delete this branch and a killed worker falls through to
+    // the decode error below, which is still terminal but no longer names the
+    // fault; delete the whole classification and the run stays `Running`
+    // forever, which is the bug this exists for.
+    if stdout_raw.is_empty() {
+        return Ok(ProcessWorkerOutcome::ExitedWithoutResult(describe_worker_exit(
+            status, stderr_raw,
+        )));
+    }
+
+    let parsed: WorkerResult = serde_json::from_str(stdout_raw).map_err(|error| {
         anyhow::anyhow!(
-            "Failed to parse session-worker output: {error}; status={:?}; stderr={}",
-            output.status.code(),
-            stderr_raw
+            "Failed to parse session-worker output: {error}; status={:?}; stderr={stderr_raw}",
+            status.code(),
         )
     })?;
 
-    cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
-
-    if !output.status.success() && parsed.success {
+    if !status.success() && parsed.success {
         return Err(anyhow::anyhow!(
             "session-worker exited with status {:?} despite success result",
-            output.status.code()
+            status.code()
         ));
     }
 
@@ -5031,6 +5306,7 @@ mod tests {
             None,
             None,
             None,
+            crate::agent::idle::child_beat(),
         )
         .await
         .unwrap();
@@ -5961,6 +6237,7 @@ mod tests {
         {
             let mut runs = tool.active_runs.write().await;
             runs.push(SubAgentRun {
+                progress: crate::agent::idle::child_beat(),
                 id: "run-1".to_string(),
                 task: "task".to_string(),
                 owner_id: Some("owner-a".to_string()),
@@ -6259,6 +6536,7 @@ mod tests {
             source_message_event_id: None,
         };
         let run = new_process_mode_run(ProcessModeRunSeed {
+            progress: crate::agent::idle::child_beat(),
             id: "run-process-steer".to_string(),
             task: "long task".to_string(),
             lineage: &lineage,
@@ -6442,6 +6720,7 @@ mod tests {
         {
             let mut runs = tool.active_runs.write().await;
             runs.push(SubAgentRun {
+                progress: crate::agent::idle::child_beat(),
                 id: "run-backpressure".to_string(),
                 task: "task".to_string(),
                 owner_id: None,
@@ -6524,6 +6803,7 @@ mod tests {
         {
             let mut runs = tool.active_runs.write().await;
             runs.push(SubAgentRun {
+                progress: crate::agent::idle::child_beat(),
                 id: "run-steer".to_string(),
                 task: "task".to_string(),
                 owner_id: Some("owner-a".to_string()),
@@ -6638,6 +6918,7 @@ mod tests {
         {
             let mut runs = tool.active_runs.write().await;
             runs.push(SubAgentRun {
+                progress: crate::agent::idle::child_beat(),
                 id: "run-history-tail".to_string(),
                 task: "task".to_string(),
                 owner_id: None,
@@ -7072,6 +7353,7 @@ mod tests {
             "{}",
             std::time::Duration::from_secs(30),
             &control,
+            None,
             None,
             true,
         ))
@@ -7641,6 +7923,7 @@ mod tests {
     /// the deterministic approval-suspension restore logic.
     fn restore_test_run(id: &str, status: SubAgentStatus) -> SubAgentRun {
         SubAgentRun {
+            progress: crate::agent::idle::child_beat(),
             id: id.to_string(),
             task: "t".to_string(),
             owner_id: None,
@@ -7713,5 +7996,345 @@ mod tests {
         // Unknown id: no panic, no change.
         restore_run_to_running(&mut runs, "does-not-exist");
         assert!(matches!(runs[0].status, SubAgentStatus::Running));
+    }
+
+    // ── b1: sub-agent termination must be discoverable ──────────────
+
+    /// A run that has produced nothing yet reports its own start as its last
+    /// progress, so a supervisor never reads a nonsensical "last progress in
+    /// the future" or an epoch date.
+    #[test]
+    fn a_fresh_run_reports_its_start_as_its_last_progress() {
+        let run = restore_test_run("fresh", SubAgentStatus::Running);
+        assert_eq!(run.progress.events(), 0);
+        assert!(
+            (run.last_progress_at() - run.started_at).num_seconds().abs() <= 1,
+            "a run with no events must not claim progress it never made"
+        );
+    }
+
+    /// `last_progress_at` must be driven by real progress events and by nothing
+    /// else: it goes stale while the run is silent and jumps forward the moment
+    /// the shared `ProgressKind` vocabulary records an event.
+    #[tokio::test]
+    async fn last_progress_at_moves_forward_only_on_real_progress() {
+        let run = restore_test_run("beating", SubAgentStatus::Running);
+        let first = run.last_progress_at();
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let silent_for = run.idle_for();
+        assert!(
+            silent_for >= std::time::Duration::from_millis(60),
+            "silence must accumulate while nothing happens, got {silent_for:?}"
+        );
+        assert!(
+            (run.last_progress_at() - first).num_milliseconds().abs() <= 20,
+            "a silent run must not appear to be making progress"
+        );
+
+        run.progress.record(crate::agent::idle::ProgressKind::ToolEnd);
+        assert!(
+            run.idle_for() < silent_for,
+            "a recorded event must reset the run's silence"
+        );
+        assert!(
+            run.last_progress_at() > first,
+            "a recorded event must advance the run's last-progress stamp"
+        );
+        assert_eq!(run.progress.events(), 1);
+        assert_eq!(run.progress.last_kind(), crate::agent::idle::ProgressKind::ToolEnd);
+    }
+
+    /// Output arriving from a process-mode worker is the only progress signal
+    /// that crosses the process boundary, so the drain must stamp the run's beat
+    /// as the bytes arrive rather than once at EOF.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_output_refreshes_the_run_beat_while_it_is_still_arriving() {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf one; sleep 0.3; printf two; sleep 0.3; printf three")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().expect("stand-in worker spawns");
+        let stdout = child.stdout.take().expect("worker stdout");
+        let progress = crate::agent::idle::child_beat();
+
+        let bytes = drain_worker_stream(stdout, "stdout", Some(Arc::clone(&progress)))
+            .await
+            .expect("drain succeeds");
+
+        assert_eq!(String::from_utf8_lossy(&bytes), "onetwothree");
+        assert!(
+            progress.events() >= 2,
+            "each arrival is one progress event, got {}",
+            progress.events()
+        );
+        assert!(
+            progress.idle_for() < std::time::Duration::from_millis(250),
+            "the last arrival must have reset the window"
+        );
+        let _ = child.wait().await;
+    }
+
+    /// Core evidence 1, at the level that owns the decision: a worker killed
+    /// from outside (SIGKILL / OOM killer / segfault) leaves the parent with a
+    /// closed pipe and nothing else, and that must classify as a terminal
+    /// failure that names the fault.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_sigkilled_worker_is_classified_as_exited_without_result() {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("exec sleep 300")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        let mut child = command.spawn().expect("stand-in worker spawns");
+        let pid = child.id().expect("live child pid");
+        let mut process_group = OwnedProcessGroup::from_child(&child).expect("group ownership");
+        let control = ProcessRunControl::new();
+        let progress = crate::agent::idle::child_beat();
+
+        // External kill: nothing in this process asks for it, exactly like an
+        // OOM kill. The parent's only notification is EOF on the pipes.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let _ = tokio::process::Command::new("kill")
+                .arg("-9")
+                .arg(pid.to_string())
+                .status()
+                .await;
+        });
+
+        let phase = run_spawned_child_lifecycle(
+            &mut child,
+            &mut process_group,
+            "{}",
+            std::time::Duration::from_secs(30),
+            &control,
+            None,
+            Some(progress),
+            false,
+        )
+        .await
+        .expect("the lifecycle observes the child's death");
+
+        let OwnedProcessPhase::Exited { status, stdout, stderr } = phase else {
+            panic!("an externally killed worker exits; it is not a requested termination");
+        };
+        let stdout_raw = String::from_utf8_lossy(&stdout).trim().to_string();
+        let stderr_raw = String::from_utf8_lossy(&stderr).trim().to_string();
+        assert!(stdout_raw.is_empty(), "the worker never got to write a result");
+
+        match classify_worker_output(status, &stdout_raw, &stderr_raw) {
+            Ok(ProcessWorkerOutcome::ExitedWithoutResult(detail)) => {
+                assert!(detail.contains("signal 9"), "the fault must be named: {detail}");
+            }
+            Ok(_) => panic!("a killed worker must never be reported as a finished or terminated run"),
+            Err(error) => panic!("a killed worker must be a classified outcome, not an opaque error: {error}"),
+        }
+    }
+
+    /// The same classifier must leave a healthy worker completely alone.
+    #[test]
+    fn a_worker_that_reports_a_result_is_unaffected_by_the_eof_mapping() {
+        let status = std::process::Command::new("true")
+            .status()
+            .expect("test: /bin/true runs");
+        let payload = serde_json::json!({"success": true, "output": "done"}).to_string();
+        match classify_worker_output(status, &payload, "") {
+            Ok(ProcessWorkerOutcome::Finished(result)) => {
+                assert!(result.success);
+                assert_eq!(result.output, "done");
+            }
+            _ => panic!("a normal worker result must still be a Finished outcome"),
+        }
+    }
+
+    /// Core evidence 2, through the production spawn path: `registry::kill` —
+    /// the exact call the idle detector makes from `kill_turn_subtree` when it
+    /// terminates a wedged *parent* turn, and the one behind `prx tasks kill` —
+    /// aborts the sub-agent's monitor task through the abort handle on its
+    /// registry row. An aborted task runs no further code, so before b1 the
+    /// registry recorded the termination while the run's own row stayed
+    /// `Running` forever. It must now reach a terminal state.
+    ///
+    /// MUTATION GUARD: drop the `watch_task_mode_monitor` call in the spawn
+    /// path and this hangs until `await_terminal_reason`'s bound and then fails.
+    #[tokio::test]
+    async fn registry_kill_of_a_spawned_run_makes_its_row_terminal() {
+        let (ch, _) = RecordingChannel::new();
+        // Parked in the provider, so the run is genuinely live when it is killed.
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let tool = make_tool(
+            Arc::new(ch),
+            Arc::new(GatedProvider {
+                gate: Arc::clone(&gate),
+            }),
+        );
+
+        let spawned = tool
+            .execute(with_spawn_grant(
+                json!({"task": "about to be killed from the registry"}),
+            ))
+            .await
+            .expect("spawn tool call");
+        assert!(spawned.success, "{spawned:?}");
+        let run_id = {
+            let runs = tool.active_runs_snapshot().await;
+            runs.first().expect("the spawned run is registered").id.clone()
+        };
+
+        let work_id = crate::runtime::registry::resolve_address(&run_id)
+            .expect("a spawned run must be addressable in the work registry");
+        let _ = crate::runtime::registry::kill(work_id, true).await;
+
+        let reason = await_terminal_reason(&tool.active_runs, &run_id).await;
+        assert!(
+            reason.contains("terminated before it could report a result"),
+            "a registry kill must be visible on the run row itself, got: {reason}"
+        );
+        gate.add_permits(4);
+    }
+
+    /// The observer must never invent a failure for a run that finished
+    /// normally: a monitor that returns after committing its own terminal state
+    /// leaves that state exactly as it was.
+    #[tokio::test]
+    async fn a_run_that_finishes_normally_is_left_alone_by_the_observer() {
+        let active_runs: Arc<RwLock<Vec<SubAgentRun>>> = Arc::new(RwLock::new(vec![restore_test_run(
+            "happy-run",
+            SubAgentStatus::Running,
+        )]));
+        let commit_runs = Arc::clone(&active_runs);
+        let handle = tokio::spawn(async move {
+            let mut runs = commit_runs.write().await;
+            if let Some(run) = runs.iter_mut().find(|run| run.id == "happy-run") {
+                run.status = SubAgentStatus::Completed("all good".to_string());
+                run.finished_at = Some(Utc::now());
+            }
+        });
+        watch_task_mode_monitor(handle, Arc::clone(&active_runs), "happy-run".to_string());
+
+        // Give the observer every chance to misbehave.
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let runs = active_runs.read().await;
+            let run = runs.iter().find(|run| run.id == "happy-run").expect("run present");
+            assert!(
+                matches!(run.status, SubAgentStatus::Completed(ref text) if text == "all good"),
+                "a completed run must not be rewritten by the termination observer"
+            );
+        }
+    }
+
+    /// A terminal status already published by the monitor always wins the race
+    /// against the observer.
+    #[tokio::test]
+    async fn a_terminal_status_is_never_overwritten_by_the_termination_commit() {
+        let active_runs: Arc<RwLock<Vec<SubAgentRun>>> = Arc::new(RwLock::new(vec![
+            restore_test_run("done", SubAgentStatus::Completed("output".to_string())),
+            restore_test_run("failed", SubAgentStatus::Failed("real cause".to_string())),
+            restore_test_run("live", SubAgentStatus::Running),
+        ]));
+
+        assert!(!commit_run_termination_if_unfinished(&active_runs, "done", "late verdict").await);
+        assert!(!commit_run_termination_if_unfinished(&active_runs, "failed", "late verdict").await);
+        assert!(!commit_run_termination_if_unfinished(&active_runs, "absent", "late verdict").await);
+        assert!(commit_run_termination_if_unfinished(&active_runs, "live", "late verdict").await);
+
+        let runs = active_runs.read().await;
+        assert!(matches!(runs[0].status, SubAgentStatus::Completed(ref text) if text == "output"));
+        assert!(matches!(runs[1].status, SubAgentStatus::Failed(ref text) if text == "real cause"));
+        assert!(matches!(runs[2].status, SubAgentStatus::Failed(ref text) if text == "late verdict"));
+        assert!(runs[2].finished_at.is_some());
+        assert!(runs[2].steer_tx.is_none());
+    }
+
+    /// Core evidence 3, through the production spawn path: a run's registry row
+    /// reports staleness while the run is genuinely silent, and its
+    /// `last_progress_at` jumps forward exactly when the run produces something
+    /// real. Nothing here is simulated — the run is parked inside the provider
+    /// and released by the test.
+    #[tokio::test]
+    async fn a_spawned_run_row_tracks_its_own_real_progress() {
+        let (ch, _) = RecordingChannel::new();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let tool = make_tool(
+            Arc::new(ch),
+            Arc::new(GatedProvider {
+                gate: Arc::clone(&gate),
+            }),
+        );
+
+        let spawned = tool
+            .execute(with_spawn_grant(json!({"task": "watch me work"})))
+            .await
+            .expect("spawn tool call");
+        assert!(spawned.success, "{spawned:?}");
+
+        // While parked in the provider the run really has made no progress, and
+        // the row must say so instead of inventing activity.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let (events_before, idle_before, stamp_before) = {
+            let runs = tool.active_runs_snapshot().await;
+            let run = runs.first().expect("the spawned run is registered");
+            assert!(matches!(run.status, SubAgentStatus::Running));
+            (run.progress.events(), run.idle_for(), run.last_progress_at())
+        };
+        assert_eq!(events_before, 0, "a parked run has produced nothing");
+        assert!(
+            idle_before >= std::time::Duration::from_millis(150),
+            "silence must accumulate, got {idle_before:?}"
+        );
+
+        // Release it: the provider round-trip is a real ProgressKind event.
+        gate.add_permits(4);
+        let mut observed = None;
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let runs = tool.active_runs_snapshot().await;
+            let Some(run) = runs.first() else { continue };
+            if run.progress.events() > 0 {
+                observed = Some((run.progress.events(), run.idle_for(), run.last_progress_at()));
+                break;
+            }
+        }
+        let (events_after, idle_after, stamp_after) =
+            observed.expect("a released run must record progress on its own row");
+        assert!(events_after >= 1);
+        assert!(
+            idle_after < idle_before,
+            "real progress must reset the run's silence: {idle_after:?} vs {idle_before:?}"
+        );
+        assert!(
+            stamp_after > stamp_before,
+            "last_progress_at must move forward, and only forward"
+        );
+    }
+
+    /// Bounded wait for a run to leave `Running`, so a propagation test fails
+    /// loudly instead of hanging when the propagation is removed.
+    async fn await_terminal_reason(active_runs: &Arc<RwLock<Vec<SubAgentRun>>>, run_id: &str) -> String {
+        for _ in 0..400 {
+            {
+                let runs = active_runs.read().await;
+                if let Some(run) = runs.iter().find(|run| run.id == run_id) {
+                    match &run.status {
+                        SubAgentStatus::Failed(reason) => return reason.clone(),
+                        SubAgentStatus::Completed(output) => return output.clone(),
+                        SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => {}
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("run '{run_id}' never reached a terminal status: it is still reported as running");
     }
 }

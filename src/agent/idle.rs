@@ -350,16 +350,27 @@ impl ProgressBeat {
     }
 
     /// How long since the last recorded event.
-    fn idle_for(&self) -> Duration {
+    ///
+    /// Public because a beat is also the liveness evidence a *supervisor* reads
+    /// — `sessions_list` reports how long a sub-agent run has been silent — and
+    /// that reader is in another module. It is a read of a relaxed atomic, so
+    /// polling it costs nothing and can never disturb the turn it observes.
+    #[must_use]
+    pub fn idle_for(&self) -> Duration {
         let last = Duration::from_millis(self.last_ms.load(Ordering::Relaxed));
         self.origin.elapsed().saturating_sub(last)
     }
 
-    fn events(&self) -> u64 {
+    /// Total progress events recorded, so a reader can tell "never started"
+    /// from "stopped after working".
+    #[must_use]
+    pub fn events(&self) -> u64 {
         self.events.load(Ordering::Relaxed)
     }
 
-    fn last_kind(&self) -> ProgressKind {
+    /// What this beat was last seen doing.
+    #[must_use]
+    pub fn last_kind(&self) -> ProgressKind {
         ProgressKind::from_u8(self.kind.load(Ordering::Relaxed))
     }
 }
@@ -389,6 +400,22 @@ pub fn beat(kind: ProgressKind) {
 #[must_use]
 pub fn current_beat() -> Option<Arc<ProgressBeat>> {
     CURRENT_BEAT.try_with(Arc::clone).ok()
+}
+
+/// Mint a beat for a run that will be driven from a task other than this one.
+///
+/// The new beat is parented on the caller's current beat, so the child's
+/// progress still refreshes its spawner's window — the one deliberate exception
+/// documented in this module's header. Call it on the *spawning* task: task
+/// locals do not cross `tokio::spawn`, so a beat minted inside the spawned task
+/// would silently have no parent.
+///
+/// Handing the returned handle to a supervisor (rather than only installing it
+/// with [`scope_beat`]) is what lets a *third* party — `sessions_list`, a join
+/// — read how long a run has been silent without participating in it.
+#[must_use]
+pub fn child_beat() -> Arc<ProgressBeat> {
+    Arc::new(ProgressBeat::new(current_beat()))
 }
 
 /// Run `fut` with `beat` installed as the ambient beat, or unchanged when
@@ -1031,6 +1058,47 @@ mod tests {
         assert!(
             outcome.is_ok(),
             "a parent blocked on a visibly working child must not be terminated"
+        );
+    }
+
+    /// b1's foundation: a supervisor mints a beat, hands it to a run, and then
+    /// reads it from outside. That only works because the run's own guarded turn
+    /// parents *its* beat on the handed one — so the handed beat is refreshed by
+    /// the shared `ProgressKind` vocabulary and by nothing else.
+    ///
+    /// MUTATION GUARD: stop parenting the guard's beat on the ambient beat and
+    /// this goes red, taking every "is the sub-agent still alive?" answer with
+    /// it.
+    #[tokio::test]
+    async fn a_handed_beat_is_refreshed_by_the_guarded_turn_installed_under_it() {
+        let handed = child_beat();
+        assert_eq!(handed.events(), 0, "a fresh beat has seen nothing");
+
+        let outcome: anyhow::Result<()> = scope_beat(
+            Some(Arc::clone(&handed)),
+            run_guarded(guard_ms(10_000, None), "child-turn", None, async {
+                beat(ProgressKind::ToolStart);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                beat(ProgressKind::ToolEnd);
+                Ok(())
+            }),
+        )
+        .await;
+
+        assert!(outcome.is_ok(), "the turn itself must be unaffected");
+        assert!(
+            handed.events() >= 2,
+            "every progress event must reach the handed beat, got {}",
+            handed.events()
+        );
+        assert_eq!(
+            handed.last_kind(),
+            ProgressKind::ToolEnd,
+            "the handed beat must report what the run was last seen doing"
+        );
+        assert!(
+            handed.idle_for() < Duration::from_millis(500),
+            "the handed beat must show the run as recently active"
         );
     }
 

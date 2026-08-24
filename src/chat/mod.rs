@@ -1588,6 +1588,7 @@ mod session_cleanup_tests {
     #[tokio::test]
     async fn exit_shutdown_helper_calls_shutdown_all_and_records_interrupted_summary() {
         let run = crate::tools::sessions_spawn::SubAgentRun {
+            progress: crate::agent::idle::child_beat(),
             id: "quit-live-agent".to_string(),
             task: "still running".to_string(),
             owner_id: None,

@@ -226,6 +226,7 @@ mod tests {
 
     fn make_run(id: &str, status: SubAgentStatus, entries: Vec<HistoryEntry>) -> SubAgentRun {
         SubAgentRun {
+            progress: crate::agent::idle::child_beat(),
             id: id.to_string(),
             task: "test task".to_string(),
             owner_id: None,

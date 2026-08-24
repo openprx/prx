@@ -137,8 +137,9 @@ impl Tool for SessionsListTool {
                 let origin = if r.parent_run_id.is_some() { "model" } else { "user" };
                 let agent_index_hint = idx.saturating_add(1);
                 let usage = format_run_usage(&r.token_usage_records);
+                let liveness = format_run_liveness(r);
                 format!(
-                    "• `{}` [agent_index_hint=#{agent_index_hint}, source=runtime, manageable=true, origin={origin}, usage={usage}, {age}s ago] {status}\n  task: {}",
+                    "• `{}` [agent_index_hint=#{agent_index_hint}, source=runtime, manageable=true, origin={origin}, usage={usage}, {age}s ago{liveness}] {status}\n  task: {}",
                     r.id, r.task
                 )
             })
@@ -165,6 +166,27 @@ impl Tool for SessionsListTool {
     fn categories(&self) -> &'static [ToolCategory] {
         &[ToolCategory::Automation]
     }
+}
+
+/// Liveness of a run that has not reported a terminal status yet.
+///
+/// The point of surfacing it here is that "running" alone cannot be acted on:
+/// a run that has been silent since it started and one that emitted an event a
+/// second ago render identically without this. The numbers come from the run's
+/// own progress beat, i.e. from `crate::agent::idle`'s single definition of
+/// progress — this is a *report*, never a second policy, and nothing in this
+/// module terminates anything on the strength of it.
+///
+/// Empty for terminal runs, where silence is expected and meaningless.
+fn format_run_liveness(run: &SubAgentRun) -> String {
+    if matches!(run.status, SubAgentStatus::Completed(_) | SubAgentStatus::Failed(_)) {
+        return String::new();
+    }
+    format!(
+        ", last progress {}s ago after {} event(s)",
+        run.idle_for().as_secs(),
+        run.progress.events()
+    )
 }
 
 fn recovered_matches_filter(run: &RecoveredTaskRun, status_filter: &str) -> bool {
@@ -264,6 +286,7 @@ mod tests {
 
     fn make_run(id: &str, status: SubAgentStatus, task: &str) -> SubAgentRun {
         SubAgentRun {
+            progress: crate::agent::idle::child_beat(),
             id: id.to_string(),
             task: task.to_string(),
             owner_id: None,
@@ -314,6 +337,41 @@ mod tests {
         assert!(result.output.contains("aaa"));
         assert!(result.output.contains("bbb"));
         assert!(result.output.contains("task A"));
+    }
+
+    /// A live run must be listable as more than "running": how long it has been
+    /// silent is the difference between a healthy sub-agent and a dead one, and
+    /// it is what a join has to read.
+    #[tokio::test]
+    async fn a_live_run_reports_how_long_it_has_been_silent() {
+        let run = make_run("live", SubAgentStatus::Running, "long task");
+        run.progress.record(crate::agent::idle::ProgressKind::ToolEnd);
+        let runs = Arc::new(RwLock::new(vec![run]));
+        let tool = SessionsListTool::new(runs);
+
+        let result = tool.execute(json!({})).await.unwrap();
+
+        assert!(
+            result.output.contains("last progress 0s ago after 1 event(s)"),
+            "{}",
+            result.output
+        );
+    }
+
+    /// ...and a finished run must not, because silence after a terminal status
+    /// is expected and reporting it would read as a fault.
+    #[tokio::test]
+    async fn a_finished_run_reports_no_liveness() {
+        let runs = Arc::new(RwLock::new(vec![make_run(
+            "done",
+            SubAgentStatus::Completed("output".into()),
+            "short task",
+        )]));
+        let tool = SessionsListTool::new(runs);
+
+        let result = tool.execute(json!({})).await.unwrap();
+
+        assert!(!result.output.contains("last progress"), "{}", result.output);
     }
 
     #[tokio::test]

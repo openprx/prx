@@ -83,6 +83,13 @@ const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
     "src/chat/sessions/shell.rs::spawn_shell_with_origin::.spawn()",
     "src/chat/terminal_proto.rs::copy_to_tmux_buffer::.spawn()?;",
     "src/media/mod.rs::run_command_bounded::.spawn()",
+    // Test-only (b1): process-mode liveness is only proved against a real
+    // child. One is externally SIGKILLed so the parent sees nothing but a
+    // closed pipe (the OOM-kill shape); the other emits output in instalments
+    // so the drain can be observed refreshing the run's progress beat while the
+    // child is still alive. A managed spawn would hide both.
+    "src/tools/sessions_spawn.rs::a_sigkilled_worker_is_classified_as_exited_without_result::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
+    "src/tools/sessions_spawn.rs::worker_output_refreshes_the_run_beat_while_it_is_still_arriving::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
     "src/tools/sessions_spawn.rs::assert_explicit_cleanup_signals_once::let mut child = command.spawn().unwrap();",
     "src/tools/sessions_spawn.rs::injected_panic_cleanup_try_wait_error_keeps_owner_pending::let child = command.spawn().unwrap();",
     "src/tools/sessions_spawn.rs::injected_termination_wait_error_keeps_owner_pending::let child = command.spawn().unwrap();",

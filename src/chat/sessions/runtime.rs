@@ -1010,6 +1010,7 @@ mod tests {
 
     fn make_run(id: &str, task: &str, status: SubAgentStatus) -> SubAgentRun {
         SubAgentRun {
+            progress: crate::agent::idle::child_beat(),
             id: id.to_string(),
             task: task.to_string(),
             owner_id: None,

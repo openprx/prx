@@ -228,6 +228,7 @@ mod tests {
     async fn counts_runs_by_status() {
         let runs = vec![
             SubAgentRun {
+                progress: crate::agent::idle::child_beat(),
                 id: "r1".into(),
                 task: "t1".into(),
                 owner_id: None,
@@ -248,6 +249,7 @@ mod tests {
                 token_usage_records: Vec::new(),
             },
             SubAgentRun {
+                progress: crate::agent::idle::child_beat(),
                 id: "r2".into(),
                 task: "t2".into(),
                 owner_id: None,
@@ -268,6 +270,7 @@ mod tests {
                 token_usage_records: Vec::new(),
             },
             SubAgentRun {
+                progress: crate::agent::idle::child_beat(),
                 id: "r3".into(),
                 task: "t3".into(),
                 owner_id: None,

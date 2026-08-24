@@ -443,6 +443,7 @@ mod tests {
 
     fn make_run(id: &str, status: SubAgentStatus) -> SubAgentRun {
         SubAgentRun {
+            progress: crate::agent::idle::child_beat(),
             id: id.to_string(),
             task: "test-task".to_string(),
             owner_id: None,
@@ -667,6 +668,7 @@ mod tests {
     async fn steer_running_sends_message() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(crate::tools::sessions_spawn::STEER_CHANNEL_CAPACITY);
         let run = SubAgentRun {
+            progress: crate::agent::idle::child_beat(),
             id: "run-2".into(),
             task: "task".into(),
             owner_id: None,
@@ -702,6 +704,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(crate::tools::sessions_spawn::STEER_CHANNEL_CAPACITY);
         let run = SubAgentRun {
+            progress: crate::agent::idle::child_beat(),
             id: "run-steer-ledger".into(),
             task: "task".into(),
             owner_id: Some("owner-b".to_string()),
