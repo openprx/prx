@@ -92,6 +92,11 @@ const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
     // b2: a join must survive a member that is a real OS process emitting
     // nothing at all; only a real child can prove the silence is real.
     "src/tools/sessions_spawn.rs::a_join_survives_a_real_child_process_that_never_writes_anything::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
+    // Test-only (b3): the wording that separates `no_result` from `failed` must
+    // be derived from a genuinely SIGKILLed child through the production
+    // classifier, not typed into the test — a managed spawn would supply an
+    // exit status the classifier never sees in the fault this models.
+    "src/tools/sessions_spawn.rs::silent_death_reason_from_a_real_sigkill::.spawn()",
     "src/tools/sessions_spawn.rs::worker_output_refreshes_the_run_beat_while_it_is_still_arriving::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
     "src/tools/sessions_spawn.rs::assert_explicit_cleanup_signals_once::let mut child = command.spawn().unwrap();",
     "src/tools/sessions_spawn.rs::injected_panic_cleanup_try_wait_error_keeps_owner_pending::let child = command.spawn().unwrap();",

@@ -1202,7 +1202,7 @@ fn vanished_monitor_reason(error: &tokio::task::JoinError, kind: &str) -> String
     if error.is_cancelled() {
         format!("{kind} {TERMINATED_BEFORE_RESULT_SUFFIX}")
     } else {
-        format!("{kind} panicked before it could report a result")
+        format!("{kind} {PANICKED_BEFORE_RESULT_SUFFIX}")
     }
 }
 
@@ -1273,6 +1273,72 @@ fn failure_is_kill(reason: &str) -> bool {
     reason == KILLED_BY_USER_REASON || reason.ends_with(TERMINATED_BEFORE_RESULT_SUFFIX)
 }
 
+/// Head of the reason recorded when a process-mode worker's pipe closed before
+/// it ever wrote a result line — b1's classification of a SIGKILL, an OOM kill
+/// or a segfault.
+pub(crate) const EXITED_WITHOUT_RESULT_PREFIX: &str = "worker exited without result";
+
+/// Tail of the reason recorded when a run's monitor task panicked.
+///
+/// The counterpart of [`TERMINATED_BEFORE_RESULT_SUFFIX`]: both describe a run
+/// that stopped without a conclusion, but a cancellation was *asked for* by
+/// somebody and a panic was not.
+pub(crate) const PANICKED_BEFORE_RESULT_SUFFIX: &str = "panicked before it could report a result";
+
+/// Head of the reason recorded when the process-mode owner task itself blew up
+/// while holding the OS child.
+pub(crate) const PROCESS_OWNER_PANICKED_PREFIX: &str = "process owner panicked";
+
+/// Reason recorded when a run was cut off by its manifest `timeout_seconds`.
+pub(crate) const SUB_AGENT_TIMED_OUT_REASON: &str = "timeout";
+
+/// The reason a run's row carries after its worker died without writing a
+/// result.
+///
+/// A function rather than a `format!` at the single write site so a test can
+/// build the exact wording production would, from a real killed child, instead
+/// of re-typing it and drifting.
+fn exited_without_result_reason(detail: &str) -> String {
+    format!("{EXITED_WITHOUT_RESULT_PREFIX} ({detail})")
+}
+
+/// What a spawn confirmation tells the caller about where the result will show
+/// up.
+///
+/// The two sentences are not decoration: a model that just launched a batch has
+/// to know that nothing further will arrive on its own, or it will sit waiting
+/// for announcements that were switched off and never call `join`.
+const fn spawn_completion_note(announce_result: bool) -> &'static str {
+    if announce_result {
+        "Will announce result when complete."
+    } else {
+        "Result is not announced; collect it with the 'join' action on this batch_id."
+    }
+}
+
+/// Whether a `Failed` reason describes a run that never reached a conclusion at
+/// all, as opposed to a task that concluded it had failed.
+///
+/// This is the distinction `join` reports as `no_result` versus `failed`, and it
+/// is not cosmetic: a caller reading `failed` learns that the sub-agent looked
+/// at the problem and judged it undoable, while `no_result` says the sub-agent
+/// was cut down before it could judge anything. Collapsing the two invites the
+/// caller to trust a verdict that was never rendered.
+///
+/// Every arm matches a constant that the *writing* site also uses, so the two
+/// halves cannot drift; string matching is the only channel available because a
+/// run's outcome reaches the registry as `SubAgentStatus::Failed(String)`.
+///
+/// MUTATION GUARD: collapse this into `false` and every silent death is
+/// reported as a considered failure.
+fn failure_gave_no_conclusion(reason: &str) -> bool {
+    reason.starts_with(EXITED_WITHOUT_RESULT_PREFIX)
+        || reason.ends_with(PANICKED_BEFORE_RESULT_SUFFIX)
+        || reason.starts_with(PROCESS_OWNER_PANICKED_PREFIX)
+        || reason == SUB_AGENT_TIMED_OUT_REASON
+        || crate::agent::idle::message_describes_hang_termination(reason)
+}
+
 /// What one spawn attempt produced: the tool-visible result, plus the run id
 /// when a run was actually registered.
 pub(crate) struct SpawnOutcome {
@@ -1314,10 +1380,15 @@ impl SpawnOutcome {
 /// things to whoever reads the summary.
 enum JoinedVerdict {
     Completed(String),
+    /// The task looked at the problem and concluded it could not be done. The
+    /// string is the sub-agent's own account of why.
     Failed(String),
     Killed(String),
-    /// The run produced no conclusion at all — its registry row is gone, so
-    /// there is nothing left to report but the absence.
+    /// The run produced no conclusion at all: its worker died on a signal, its
+    /// monitor panicked, its own hang detector ended it, its deadline expired,
+    /// or its registry row is simply gone. Kept apart from `Failed` because a
+    /// caller reading a failure reasonably believes a judgement was made, and
+    /// here none ever was — see [`failure_gave_no_conclusion`].
     NoResult(String),
 }
 
@@ -1394,6 +1465,12 @@ fn settled_verdict(status: &SubAgentStatus) -> Option<JoinedVerdict> {
         SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => None,
         SubAgentStatus::Completed(output) => Some(JoinedVerdict::Completed(output.clone())),
         SubAgentStatus::Failed(reason) if failure_is_kill(reason) => Some(JoinedVerdict::Killed(reason.clone())),
+        // Ordered before the general `Failed` arm on purpose: a reason that
+        // names a silent death must never fall through to the bucket that means
+        // "the task decided this could not be done".
+        SubAgentStatus::Failed(reason) if failure_gave_no_conclusion(reason) => {
+            Some(JoinedVerdict::NoResult(reason.clone()))
+        }
         SubAgentStatus::Failed(reason) => Some(JoinedVerdict::Failed(reason.clone())),
     }
 }
@@ -1536,7 +1613,7 @@ impl Tool for SessionsSpawnTool {
                 "tasks": {
                     "type": "array",
                     "minItems": 1,
-                    "description": "For action='spawn_batch': the tasks to launch, all at once. Each entry is either a task string or an object {task, agent?, model?, provider?, mode?}; any top-level parameter of this call acts as the default for every entry. There is no limit on how many may be launched.",
+                    "description": "For action='spawn_batch': the tasks to launch, all at once. Each entry is either a task string or an object {task, agent?, model?, provider?, mode?}; any top-level parameter of this call acts as the default for every entry. There is no limit on how many may be launched. Members do not announce their own results — call 'join' with the returned batch_id and report the outcome yourself in a single message.",
                     "items": {
                         "anyOf": [
                             {"type": "string", "minLength": 1},
@@ -1550,6 +1627,7 @@ impl Tool for SessionsSpawnTool {
                                     "provider": {"type": "string"},
                                     "mode": {"type": "string", "enum": ["task", "process"]},
                                     "recipient": {"type": "string"},
+                                    "announce": {"type": "boolean"},
                                     "timeout_seconds": {"type": "integer", "minimum": 0},
                                     "max_iterations": {"type": "integer", "minimum": 1}
                                 },
@@ -1614,6 +1692,14 @@ impl Tool for SessionsSpawnTool {
                     "type": "string",
                     "description": "Optional recipient for result announcement (phone number, group ID, etc.). \
                                     Defaults to the current conversation sender."
+                },
+                "announce": {
+                    "type": "boolean",
+                    "description": "Whether this sub-agent posts its own result to the channel when it finishes. \
+                                    Defaults to true for 'spawn' and to false for every member of a 'spawn_batch' — \
+                                    a batch's results are collected by 'join' and summarised by you in one message, \
+                                    instead of each member reporting separately. Set true on a batch member to opt \
+                                    it back in."
                 },
                 "last_n": {
                     "type": "integer",
@@ -1757,8 +1843,10 @@ impl SessionsSpawnTool {
     ///
     /// Every member starts immediately — there is no concurrency cap, no
     /// staging, and no queue. Each member goes through [`Self::execute_spawn`],
-    /// so it is registered, gated and announced exactly as a standalone
-    /// `spawn` would be; the only difference is the `batch_id` on its row.
+    /// so it is registered and gated exactly as a standalone `spawn` would be;
+    /// the only differences are the `batch_id` on its row and that it does not
+    /// announce its own result (see `announce_result` there) — the fan-out's
+    /// account of itself is the one summary its caller sends after `join`.
     ///
     /// A member that cannot be started is reported in `rejected` rather than
     /// aborting the fan-out: the caller asked for N independent tasks, and one
@@ -1870,8 +1958,10 @@ impl SessionsSpawnTool {
     ///
     /// Split out of [`Tool::execute`] so `spawn_batch` starts its members
     /// through the *same* path a single `spawn` takes — same approval gate,
-    /// same registry row, same announce wiring — rather than a parallel
-    /// implementation that would drift.
+    /// same registry row, same announce routing — rather than a parallel
+    /// implementation that would drift. `batch_id` is the only thing that
+    /// changes behaviour, and only by flipping the default of the `announce`
+    /// argument.
     ///
     /// Must be called from the task that owns the requesting turn:
     /// [`crate::agent::idle::child_beat`] reads a task-local, so a run started
@@ -2037,6 +2127,28 @@ impl SessionsSpawnTool {
         // `None` (no trusted scope) falls back at announce time to the shared
         // active channel, preserving single-channel / legacy behaviour.
         let run_channel_name = spawn_scope.as_ref().map(|scope| scope.channel.clone());
+
+        // Whether this run posts its own result to the channel when it ends.
+        //
+        // Default by construction: a standalone `spawn` is fire-and-forget, so
+        // its announcement is the only way its result is ever seen and it stays
+        // on. A `spawn_batch` member's result is collected by `join`, so
+        // announcing it as well would put the fan-out's raw intermediate output
+        // on the channel *and* the parent's summary after it — N+1 messages for
+        // one request. Which of those two a run is, is exactly `batch_id`.
+        //
+        // This deliberately changes nothing else about the announce wiring: the
+        // run still captures `channel_name` + `recipient` atomically from the
+        // launching message's scope (below), so a later kill notification still
+        // routes to the right channel, and a member may opt back in with an
+        // explicit `announce: true`.
+        //
+        // MUTATION GUARD: make this `unwrap_or(true)` and a joined batch of
+        // three delivers four messages instead of one.
+        let announce_result = args
+            .get("announce")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| batch_id.is_none());
 
         let resolved_provider_name = provider_override.unwrap_or_else(|| {
             selected_agent
@@ -2333,7 +2445,7 @@ impl SessionsSpawnTool {
                                     // wording an operator can act on, and folding it
                                     // into "keep waiting" would leave the run
                                     // `Running` for as long as the process lives.
-                                    let error = format!("worker exited without result ({detail})");
+                                    let error = exited_without_result_reason(&detail);
                                     let msg = format!("Sub-agent process error: {error}");
                                     (
                                         SubAgentStatus::Failed(error),
@@ -2384,7 +2496,13 @@ impl SessionsSpawnTool {
                                 None,
                             )
                             .await;
-                            if let Some(target) = recipient {
+                            if !announce_result {
+                                tracing::debug!(
+                                    run_id = %rid,
+                                    "Sub-agent process result withheld from the channel (announce=false); \
+                                     it is delivered to whoever joins this run's batch"
+                                );
+                            } else if let Some(target) = recipient {
                                 let msg = SendMessage::new(&announce, &target);
                                 if let Err(error) = channel.send(&msg).await {
                                     tracing::error!(
@@ -2404,7 +2522,7 @@ impl SessionsSpawnTool {
                                 &failure_active_runs,
                                 &failure_run_id,
                                 monitor_process_control.as_ref(),
-                                "process owner panicked".to_string(),
+                                PROCESS_OWNER_PANICKED_PREFIX.to_string(),
                             )
                             .await;
                         }
@@ -2421,7 +2539,10 @@ impl SessionsSpawnTool {
 
             return Ok(SpawnOutcome::started(
                 run_id.clone(),
-                format!("Sub-agent spawned in process mode (run_id: {run_id}). Will announce result when complete."),
+                format!(
+                    "Sub-agent spawned in process mode (run_id: {run_id}). {}",
+                    spawn_completion_note(announce_result)
+                ),
             ));
         }
 
@@ -2689,7 +2810,7 @@ impl SessionsSpawnTool {
                     let msg = format!("Sub-agent timed out after {timeout_secs}s");
                     let error = anyhow::anyhow!(msg.clone());
                     (
-                        SubAgentStatus::Failed("timeout".into()),
+                        SubAgentStatus::Failed(SUB_AGENT_TIMED_OUT_REASON.into()),
                         msg,
                         crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
                             &route_decision,
@@ -2764,7 +2885,13 @@ impl SessionsSpawnTool {
             }
 
             // Announce result back to channel if we have a recipient
-            if let Some(target) = recipient {
+            if !announce_result {
+                tracing::debug!(
+                    run_id = %rid,
+                    "Sub-agent result withheld from the channel (announce=false); \
+                     it is delivered to whoever joins this run's batch"
+                );
+            } else if let Some(target) = recipient {
                 let msg = SendMessage::new(&announce, &target);
                 if let Err(e) = channel.send(&msg).await {
                     tracing::error!(run_id = %rid, "Failed to announce sub-agent result: {e}");
@@ -2796,7 +2923,10 @@ impl SessionsSpawnTool {
 
         Ok(SpawnOutcome::started(
             run_id.clone(),
-            format!("Sub-agent spawned (run_id: {run_id}). Will announce result when complete."),
+            format!(
+                "Sub-agent spawned (run_id: {run_id}). {}",
+                spawn_completion_note(announce_result)
+            ),
         ))
     }
     fn memory_fabric(&self) -> Option<MemoryFabric> {
@@ -4873,8 +5003,8 @@ async fn run_sub_agent_process(
             )
             .await;
             cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
-            cleanup.map_err(|error| anyhow::anyhow!("process owner panicked; cleanup failed: {error}"))?;
-            anyhow::bail!("process owner panicked while owning session-worker child");
+            cleanup.map_err(|error| anyhow::anyhow!("{PROCESS_OWNER_PANICKED_PREFIX}; cleanup failed: {error}"))?;
+            anyhow::bail!("{PROCESS_OWNER_PANICKED_PREFIX} while owning session-worker child");
         }
     };
     let (status, stdout, stderr) = match owned_phase {
@@ -9336,5 +9466,648 @@ mod tests {
         assert!(schema["properties"]["tasks"].is_object());
         assert!(schema["properties"]["batch_id"].is_object());
         assert!(tool.description().contains("spawn_batch") && tool.description().contains("join"));
+    }
+
+    // ── b3: partial-success semantics ────────────────────────────
+
+    /// A provider whose behaviour is chosen by the task text it is handed, so a
+    /// single fan-out can hold a member that succeeds, one that concludes it
+    /// cannot, and members that stay live until the test ends them from
+    /// outside. Without this, a mixed batch would have to be assembled by
+    /// hand-writing registry rows, and the buckets would then only prove that
+    /// `join_summary` sorts strings.
+    struct TaskRoutingProvider {
+        /// Members whose task carries [`Self::PARKS`] wait here and are never
+        /// released.
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl TaskRoutingProvider {
+        const FAILS: &'static str = "MEMBER-CONCLUDES-FAILURE";
+        const PARKS: &'static str = "MEMBER-STAYS-LIVE";
+        const FAILURE_TEXT: &'static str = "I looked at this and it cannot be done";
+
+        async fn route(&self, prompt: &str) -> anyhow::Result<String> {
+            if prompt.contains(Self::FAILS) {
+                anyhow::bail!(Self::FAILURE_TEXT);
+            }
+            if prompt.contains(Self::PARKS) {
+                if let Ok(permit) = self.gate.acquire().await {
+                    drop(permit);
+                }
+            }
+            Ok("member finished".to_string())
+        }
+
+        fn prompt_of(request: &crate::providers::ChatRequest<'_>) -> String {
+            request
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::Provider for TaskRoutingProvider {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.route(message).await
+        }
+
+        async fn chat(
+            &self,
+            request: crate::providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<crate::providers::ChatResponse> {
+            let text = self.route(&Self::prompt_of(&request)).await?;
+            Ok(crate::providers::ChatResponse {
+                text: Some(text),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            })
+        }
+
+        async fn chat_traced(
+            &self,
+            request: crate::providers::ChatRequest<'_>,
+            model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<crate::providers::traits::ChatTrace> {
+            let started_at = chrono::Utc::now();
+            let text = self.route(&Self::prompt_of(&request)).await?;
+            Ok(crate::providers::traits::ChatTrace {
+                response: crate::providers::ChatResponse {
+                    text: Some(text),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                },
+                attempts: vec![crate::llm::route_decision::ProviderAttempt {
+                    seq: 1,
+                    provider: "routing".to_string(),
+                    model: model.to_string(),
+                    started_at,
+                    finished_at: chrono::Utc::now(),
+                    status: crate::llm::route_decision::AttemptStatus::Success,
+                    error_class: None,
+                    error_message: None,
+                }],
+                final_provider: "routing".to_string(),
+                final_model: model.to_string(),
+                tokens_used: crate::llm::route_decision::TokenUsage::default(),
+            })
+        }
+    }
+
+    /// The exact wording production stamps on a run whose worker was killed
+    /// before it wrote anything — derived from a *real* `SIGKILL`ed child
+    /// through the same two production functions the process-mode monitor uses
+    /// (`classify_worker_output` -> `exited_without_result_reason`), never
+    /// re-typed here.
+    #[cfg(unix)]
+    async fn silent_death_reason_from_a_real_sigkill() -> String {
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("exec sleep 300")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("stand-in worker spawns");
+        let pid = child.id().expect("live child pid");
+        let killed = tokio::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status()
+            .await
+            .expect("kill -9 runs");
+        assert!(killed.success(), "the stand-in worker must actually be killed");
+        let status = child.wait().await.expect("the killed child is reaped");
+        // The parent's whole observation: closed pipes, nothing written.
+        match classify_worker_output(status, "", "") {
+            Ok(ProcessWorkerOutcome::ExitedWithoutResult(detail)) => {
+                assert!(detail.contains("signal 9"), "the fault must be named: {detail}");
+                exited_without_result_reason(&detail)
+            }
+            Ok(_) => panic!("a killed worker must never classify as a finished or terminated run"),
+            Err(error) => panic!("a killed worker must be a classified outcome, not an opaque error: {error}"),
+        }
+    }
+
+    /// Core evidence 1: a batch that ends four different ways accounts for every
+    /// member exactly once, and `total` is the sum of the four buckets.
+    ///
+    /// All four endings are produced by production code, not by hand-written
+    /// rows: the first two by the sub-agents themselves, the third by
+    /// `registry::kill` (the call behind `prx tasks kill`), the fourth by
+    /// classifying a genuinely `SIGKILL`ed child and committing the result
+    /// through `commit_run_termination_if_unfinished`, which is the same
+    /// function b1's monitor watchers use.
+    ///
+    /// MUTATION GUARD: drop any one bucket from `join_summary` and the identity
+    /// assertion at the end fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_mixed_batch_accounts_for_every_member_in_exactly_one_bucket() {
+        let silent_death_reason = silent_death_reason_from_a_real_sigkill().await;
+
+        let (ch, _) = RecordingChannel::new();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let tool = make_tool(
+            Arc::new(ch),
+            Arc::new(TaskRoutingProvider {
+                gate: Arc::clone(&gate),
+            }),
+        );
+
+        let spawned = tool
+            .execute(with_spawn_grant(json!({
+                "action": "spawn_batch",
+                "tasks": [
+                    "this one just works",
+                    format!("this one {}", TaskRoutingProvider::FAILS),
+                    format!("this one {} until it is killed", TaskRoutingProvider::PARKS),
+                    format!("this one {} until its worker dies", TaskRoutingProvider::PARKS),
+                ],
+            })))
+            .await
+            .expect("spawn_batch tool call");
+        assert!(spawned.success, "{spawned:?}");
+        let payload = parse_json(&spawned.output);
+        let batch_id = payload["batch_id"].as_str().expect("a batch id").to_string();
+        let run_ids = batch_run_ids(&payload);
+        assert_eq!(run_ids.len(), 4, "{payload}");
+
+        let killed_id = run_ids[2].clone();
+        let silent_id = run_ids[3].clone();
+
+        // Ending #3: an operator kill that reaches the run through the registry
+        // and never lets it write a result of its own.
+        let work_id = crate::runtime::registry::resolve_address(&killed_id)
+            .expect("a spawned run must be addressable in the work registry");
+        let _ = crate::runtime::registry::kill(work_id, true).await;
+
+        // Ending #4: the silent death. Committed exactly the way b1's watcher
+        // commits one, with the wording a real SIGKILL produced above.
+        let killed_reason = await_terminal_reason(&tool.active_runs, &killed_id).await;
+        assert!(
+            killed_reason.ends_with(TERMINATED_BEFORE_RESULT_SUFFIX),
+            "a registry kill must land as a kill, not as something else: {killed_reason}"
+        );
+        assert!(
+            commit_run_termination_if_unfinished(&tool.active_runs, &silent_id, &silent_death_reason).await,
+            "the parked member must still be non-terminal when its worker dies"
+        );
+
+        let joined = tool
+            .execute(json!({"action": "join", "batch_id": batch_id}))
+            .await
+            .expect("join tool call");
+        assert!(
+            joined.success,
+            "partial success is data, not a tool failure: {joined:?}"
+        );
+        let summary = parse_json(&joined.output);
+
+        let bucket = |name: &str| -> Vec<serde_json::Value> {
+            summary[name]
+                .as_array()
+                .unwrap_or_else(|| panic!("join must always render a '{name}' bucket: {summary}"))
+                .clone()
+        };
+        let completed = bucket("completed");
+        let failed = bucket("failed");
+        let killed = bucket("killed");
+        let no_result = bucket("no_result");
+
+        assert_eq!(completed.len(), 1, "one member simply worked: {summary}");
+        assert_eq!(completed[0]["run_id"].as_str(), Some(run_ids[0].as_str()));
+        assert_eq!(failed.len(), 1, "one member concluded a failure: {summary}");
+        assert_eq!(failed[0]["run_id"].as_str(), Some(run_ids[1].as_str()));
+        assert_eq!(killed.len(), 1, "one member was killed: {summary}");
+        assert_eq!(killed[0]["run_id"].as_str(), Some(killed_id.as_str()));
+        assert_eq!(no_result.len(), 1, "one member died silently: {summary}");
+        assert_eq!(no_result[0]["run_id"].as_str(), Some(silent_id.as_str()));
+
+        // The identity, spelled out: nothing is hidden, nothing is counted
+        // twice, and `total` is not an independently maintained number.
+        assert_eq!(summary["total"].as_u64(), Some(4), "{summary}");
+        assert_eq!(
+            summary["total"].as_u64(),
+            Some((completed.len() + failed.len() + killed.len() + no_result.len()) as u64),
+            "total must equal completed + failed + killed + no_result: {summary}"
+        );
+        gate.add_permits(8);
+    }
+
+    /// Core evidence 2: the two ways a run can stop without succeeding are not
+    /// the same thing, and `join` must not let a caller mistake one for the
+    /// other. A task that reported "this cannot be done" carries a judgement; a
+    /// task whose worker was `SIGKILL`ed never reached one.
+    ///
+    /// MUTATION GUARD: fold `no_result` into `failed` — by making
+    /// `failure_gave_no_conclusion` return `false`, or by pushing `NoResult`
+    /// into the `failed` vector in `join_summary` — and this fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_silent_death_is_reported_apart_from_a_concluded_failure() {
+        let silent_death_reason = silent_death_reason_from_a_real_sigkill().await;
+
+        let (ch, _) = RecordingChannel::new();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let tool = make_tool(
+            Arc::new(ch),
+            Arc::new(TaskRoutingProvider {
+                gate: Arc::clone(&gate),
+            }),
+        );
+
+        let spawned = tool
+            .execute(with_spawn_grant(json!({
+                "action": "spawn_batch",
+                "tasks": [
+                    format!("verdict member {}", TaskRoutingProvider::FAILS),
+                    format!("silent member {}", TaskRoutingProvider::PARKS),
+                ],
+            })))
+            .await
+            .expect("spawn_batch tool call");
+        let payload = parse_json(&spawned.output);
+        let batch_id = payload["batch_id"].as_str().expect("a batch id").to_string();
+        let run_ids = batch_run_ids(&payload);
+        assert_eq!(run_ids.len(), 2, "{payload}");
+        let verdict_id = run_ids[0].clone();
+        let silent_id = run_ids[1].clone();
+
+        assert!(
+            commit_run_termination_if_unfinished(&tool.active_runs, &silent_id, &silent_death_reason).await,
+            "the parked member must still be non-terminal when its worker dies"
+        );
+
+        let joined = tool
+            .execute(json!({"action": "join", "batch_id": batch_id}))
+            .await
+            .expect("join tool call");
+        let summary = parse_json(&joined.output);
+
+        let failed = summary["failed"].as_array().expect("a failed bucket");
+        let no_result = summary["no_result"].as_array().expect("a no_result bucket");
+
+        assert_eq!(
+            failed.len(),
+            1,
+            "the member that reached a verdict belongs there: {summary}"
+        );
+        assert_eq!(failed[0]["run_id"].as_str(), Some(verdict_id.as_str()));
+        assert!(
+            failed[0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains(TaskRoutingProvider::FAILURE_TEXT)),
+            "a concluded failure must carry the sub-agent's own words: {summary}"
+        );
+
+        assert_eq!(
+            no_result.len(),
+            1,
+            "the killed worker never reached a verdict: {summary}"
+        );
+        assert_eq!(no_result[0]["run_id"].as_str(), Some(silent_id.as_str()));
+        assert!(
+            no_result[0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("signal 9")),
+            "a silent death must name the fault instead of pretending to be a verdict: {summary}"
+        );
+
+        // And the crossings, stated directly: neither member appears in the
+        // other's bucket.
+        assert!(
+            !failed
+                .iter()
+                .any(|entry| entry["run_id"].as_str() == Some(silent_id.as_str())),
+            "a SIGKILLed member must never be reported as a task that decided it failed: {summary}"
+        );
+        assert!(
+            !no_result
+                .iter()
+                .any(|entry| entry["run_id"].as_str() == Some(verdict_id.as_str())),
+            "a task that reported a failure must never be reported as having said nothing: {summary}"
+        );
+        gate.add_permits(8);
+    }
+
+    /// Every wording production writes for a run that ended without a verdict
+    /// must classify as `no_result`, and an ordinary task failure must not.
+    ///
+    /// Each input below is built by the same production function that writes it
+    /// on the row, so this cannot pass by agreeing with a literal that has
+    /// since drifted.
+    #[test]
+    fn every_silent_death_wording_is_recognised_as_a_missing_conclusion() {
+        // b1: a process-mode worker that died on a signal.
+        assert!(failure_gave_no_conclusion(&exited_without_result_reason(
+            "killed by signal 9"
+        )));
+        // b1: the run's monitor task panicked instead of reporting.
+        assert!(failure_gave_no_conclusion(&format!(
+            "sub-agent run {PANICKED_BEFORE_RESULT_SUFFIX}"
+        )));
+        assert!(failure_gave_no_conclusion(&format!(
+            "sub-agent process monitor {PANICKED_BEFORE_RESULT_SUFFIX}"
+        )));
+        // The process owner blew up while holding the OS child.
+        assert!(failure_gave_no_conclusion(PROCESS_OWNER_PANICKED_PREFIX));
+        assert!(failure_gave_no_conclusion(&format!(
+            "{PROCESS_OWNER_PANICKED_PREFIX} while owning session-worker child"
+        )));
+        // The run's manifest deadline cut it off.
+        assert!(failure_gave_no_conclusion(SUB_AGENT_TIMED_OUT_REASON));
+        // The sub-agent's own hang detector ended it — rendered by the real
+        // `IdleHangTerminated`, not by a hand-copied phrase.
+        for reason in [
+            crate::agent::idle::HangReason::NoProgress,
+            crate::agent::idle::HangReason::TotalRuntimeCap,
+        ] {
+            let terminated = crate::agent::idle::IdleHangTerminated {
+                reason,
+                label: Arc::from("sub-agent turn"),
+                idle: std::time::Duration::from_mins(10),
+                threshold: std::time::Duration::from_mins(10),
+                elapsed: std::time::Duration::from_mins(15),
+                progress_events: 0,
+                last_progress: crate::agent::idle::ProgressKind::TurnStart,
+                killed: 1,
+            };
+            assert!(
+                failure_gave_no_conclusion(&terminated.to_string()),
+                "a turn the runtime stalled out has no verdict to report: {terminated}"
+            );
+        }
+
+        // A task that failed on its own terms is a verdict, and so is an
+        // operator kill — neither belongs in `no_result`.
+        assert!(!failure_gave_no_conclusion("the file could not be parsed"));
+        assert!(!failure_gave_no_conclusion(KILLED_BY_USER_REASON));
+        assert!(!failure_gave_no_conclusion(&format!(
+            "sub-agent run {TERMINATED_BEFORE_RESULT_SUFFIX}"
+        )));
+    }
+
+    /// A kill and a silent death are both "no verdict was reached", but only one
+    /// of them was asked for, so they stay in separate buckets.
+    #[test]
+    fn a_kill_and_a_silent_death_are_not_the_same_bucket() {
+        let killed = SubAgentStatus::Failed(format!("sub-agent run {TERMINATED_BEFORE_RESULT_SUFFIX}"));
+        let silent = SubAgentStatus::Failed(exited_without_result_reason("killed by signal 9"));
+        assert!(matches!(settled_verdict(&killed), Some(JoinedVerdict::Killed(_))));
+        assert!(matches!(settled_verdict(&silent), Some(JoinedVerdict::NoResult(_))));
+    }
+
+    /// The identity holds for any mixture, not just the one the fan-out test
+    /// happens to produce.
+    #[test]
+    fn the_summary_total_always_equals_the_sum_of_its_buckets() {
+        let statuses = [
+            SubAgentStatus::Completed("done".into()),
+            SubAgentStatus::Failed("could not be done".into()),
+            SubAgentStatus::Failed(KILLED_BY_USER_REASON.into()),
+            SubAgentStatus::Failed(format!("sub-agent run {TERMINATED_BEFORE_RESULT_SUFFIX}")),
+            SubAgentStatus::Failed(exited_without_result_reason("killed by signal 9")),
+            SubAgentStatus::Failed(SUB_AGENT_TIMED_OUT_REASON.into()),
+            SubAgentStatus::Failed(format!("sub-agent run {PANICKED_BEFORE_RESULT_SUFFIX}")),
+        ];
+        let settled = statuses
+            .iter()
+            .enumerate()
+            .map(|(index, status)| JoinedMember {
+                run_id: format!("run-{index}"),
+                task: format!("task {index}"),
+                verdict: settled_verdict(status).expect("every status above is terminal"),
+            })
+            .collect::<Vec<_>>();
+        let summary = join_summary("batch-identity", &settled);
+        let count = |name: &str| summary[name].as_array().map_or(0, Vec::len);
+        assert_eq!(summary["total"].as_u64(), Some(statuses.len() as u64));
+        assert_eq!(
+            statuses.len(),
+            count("completed") + count("failed") + count("killed") + count("no_result"),
+            "{summary}"
+        );
+        assert_eq!(count("completed"), 1, "{summary}");
+        assert_eq!(count("failed"), 1, "{summary}");
+        assert_eq!(count("killed"), 2, "{summary}");
+        assert_eq!(count("no_result"), 3, "{summary}");
+    }
+
+    // ── b4: routing of the summary ───────────────────────────────
+
+    /// Core evidence 3: "do these three things in parallel, then tell me" must
+    /// put **one** message on the channel — the parent's summary — not four.
+    ///
+    /// Every member here has a recipient and a live channel, so each of them
+    /// *could* announce; what stops them is the `announce` default that
+    /// `batch_id` flips. The parent then reports through the production
+    /// `message_send` tool on the very same channel object, so the count below
+    /// is the count a phone would show.
+    ///
+    /// MUTATION GUARD: make `announce_result` default to `true` inside a batch
+    /// and this sees 4.
+    #[tokio::test]
+    async fn a_joined_fan_out_puts_one_summary_on_the_channel_not_one_message_per_member() {
+        let (recorder, sent) = NamedRecordingChannel::new("wacli");
+        let channel: Arc<dyn Channel> = recorder;
+        let tool = make_tool(
+            Arc::clone(&channel),
+            Arc::new(EchoProvider {
+                response: "raw member output".into(),
+            }),
+        );
+        // A real destination: without one, members would stay silent for the
+        // uninteresting reason that they have nowhere to send.
+        tool.set_active_recipient("120363000000000000@g.us").await;
+
+        let spawned = tool
+            .execute(with_spawn_grant(json!({
+                "action": "spawn_batch",
+                "tasks": ["check the weather", "check the calendar", "check the inbox"],
+            })))
+            .await
+            .expect("spawn_batch tool call");
+        assert!(spawned.success, "{spawned:?}");
+        let payload = parse_json(&spawned.output);
+        let batch_id = payload["batch_id"].as_str().expect("a batch id").to_string();
+        assert_eq!(payload["started"], 3, "{payload}");
+        assert!(
+            payload["spawned"][0]["run_id"].is_string()
+                && !spawned.output.contains("Will announce result when complete."),
+            "a batch member must not promise an announcement it will not make: {payload}"
+        );
+
+        let joined = tool
+            .execute(json!({"action": "join", "batch_id": batch_id}))
+            .await
+            .expect("join tool call");
+        let summary = parse_json(&joined.output);
+        assert_eq!(summary["total"], 3, "{summary}");
+        assert_eq!(summary["completed"].as_array().map(Vec::len), Some(3), "{summary}");
+
+        // A member announces *after* it publishes its terminal status, so the
+        // join can return first. Waiting here is what makes the mutation
+        // visible: with announcing left on, three messages land in this window.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            sent.lock().await.is_empty(),
+            "no member of a batch may report on the channel by itself: {:?}",
+            sent.lock().await
+        );
+
+        // The parent turn now says one thing, in its own words, through the
+        // same tool an agent would use.
+        let reporter = crate::tools::message_send::MessageSendTool::new(Arc::clone(&channel), test_security());
+        let reported = reporter
+            .execute(json!({
+                "message": format!("All three are done ({} of {}).", summary["completed"].as_array().map_or(0, Vec::len), summary["total"]),
+                "target": "120363000000000000@g.us",
+            }))
+            .await
+            .expect("message_send tool call");
+        assert!(reported.success, "{reported:?}");
+
+        let messages = sent.lock().await;
+        assert_eq!(
+            messages.len(),
+            1,
+            "one request, one message: the summary — not one per sub-task plus a summary: {messages:?}"
+        );
+        assert!(messages[0].contains("All three are done"), "{messages:?}");
+        assert!(
+            !messages[0].contains("raw member output"),
+            "the channel must carry the parent's summary, not a member's raw output: {messages:?}"
+        );
+    }
+
+    /// Core evidence 4: nothing above may change what a plain `spawn` does. It
+    /// still announces its own result, on its own channel, with the same
+    /// confirmation text.
+    #[tokio::test]
+    async fn a_standalone_spawn_announces_exactly_as_before() {
+        let (recorder, sent) = NamedRecordingChannel::new("wacli");
+        let channel: Arc<dyn Channel> = recorder;
+        let tool = make_tool(
+            Arc::clone(&channel),
+            Arc::new(EchoProvider {
+                response: "solo result".into(),
+            }),
+        );
+        tool.set_active_recipient("120363000000000000@g.us").await;
+
+        let result = tool
+            .execute(with_spawn_grant(json!({"task": "do the one thing"})))
+            .await
+            .expect("spawn tool call");
+        assert!(result.success, "{result:?}");
+        assert!(
+            result.output.starts_with("Sub-agent spawned (run_id: "),
+            "the confirmation text is unchanged: {}",
+            result.output
+        );
+        assert!(
+            result.output.ends_with("). Will announce result when complete."),
+            "the confirmation text is unchanged: {}",
+            result.output
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let messages = sent.lock().await;
+        assert_eq!(messages.len(), 1, "a standalone spawn still announces: {messages:?}");
+        assert!(messages[0].contains("solo result"), "{messages:?}");
+    }
+
+    /// The switch is a switch, not a batch side effect: a standalone spawn may
+    /// turn its own announcement off, and a batch member may turn its own back
+    /// on.
+    #[tokio::test]
+    async fn announce_is_an_explicit_argument_in_both_directions() {
+        let (recorder, sent) = NamedRecordingChannel::new("wacli");
+        let channel: Arc<dyn Channel> = recorder;
+        let tool = make_tool(
+            Arc::clone(&channel),
+            Arc::new(EchoProvider {
+                response: "quiet result".into(),
+            }),
+        );
+        tool.set_active_recipient("120363000000000000@g.us").await;
+
+        let silenced = tool
+            .execute(with_spawn_grant(json!({"task": "do it quietly", "announce": false})))
+            .await
+            .expect("spawn tool call");
+        assert!(silenced.success, "{silenced:?}");
+        assert!(
+            silenced.output.contains("collect it with the 'join' action"),
+            "a run that will not announce must say where its result goes: {}",
+            silenced.output
+        );
+        let silenced_id = {
+            let runs = tool.active_runs_snapshot().await;
+            runs.first().expect("the silenced run is registered").id.clone()
+        };
+
+        let batch = tool
+            .execute(with_spawn_grant(json!({
+                "action": "spawn_batch",
+                "tasks": [{"task": "report for myself", "announce": true}],
+            })))
+            .await
+            .expect("spawn_batch tool call");
+        assert!(batch.success, "{batch:?}");
+        let opted_in_id = batch_run_ids(&parse_json(&batch.output))
+            .first()
+            .expect("the opted-in member is registered")
+            .clone();
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let messages = sent.lock().await;
+        assert_eq!(
+            messages.len(),
+            1,
+            "exactly the member that opted in may speak: {messages:?}"
+        );
+        // The announcement names its run, so the one message can be attributed
+        // rather than merely counted.
+        assert!(
+            messages[0].contains(&opted_in_id),
+            "the message must be the opted-in batch member's: {messages:?}"
+        );
+        assert!(
+            !messages[0].contains(&silenced_id),
+            "the standalone spawn that switched announcing off must stay quiet: {messages:?}"
+        );
+    }
+
+    /// The switch has to be discoverable or the model can never use it, and the
+    /// batch default has to be stated where the model reads it.
+    #[test]
+    fn schema_advertises_the_announce_switch_and_its_batch_default() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["properties"]["announce"]["type"].as_str(), Some("boolean"));
+        let description = schema["properties"]["announce"]["description"]
+            .as_str()
+            .expect("the announce switch is documented");
+        assert!(description.contains("spawn_batch"), "{description}");
+        assert!(description.contains("join"), "{description}");
+        // And per-member, so a single member can opt back in.
+        let member = &schema["properties"]["tasks"]["items"]["anyOf"][1]["properties"];
+        assert_eq!(member["announce"]["type"].as_str(), Some("boolean"));
     }
 }

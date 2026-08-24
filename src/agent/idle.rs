@@ -479,6 +479,35 @@ impl HangReason {
     }
 }
 
+/// Wording every no-progress termination message carries.
+///
+/// A shared constant because the *reader* of a terminated sub-agent's status is
+/// on the far side of a `to_string()`: `sessions_spawn`'s join classification
+/// only ever sees the rendered text, and it has to tell "the runtime ended a
+/// stalled turn" (no conclusion was ever reached) from "the task concluded that
+/// it failed". Keeping the phrase in one place is what stops those two from
+/// drifting apart silently.
+pub const HANG_TERMINATION_MARKER: &str = "was terminated as hung";
+
+/// Wording every absolute-ceiling termination message carries.
+///
+/// Same contract as [`HANG_TERMINATION_MARKER`], for the other threshold: a
+/// turn stopped at the ceiling also never reached a conclusion of its own.
+pub const RUNTIME_CEILING_TERMINATION_MARKER: &str = "was terminated at the absolute runtime ceiling";
+
+/// Whether a rendered error message describes a turn ended by this detector.
+///
+/// Text matching is not a shortcut here — it is the only channel available.
+/// A sub-agent's outcome crosses into the run registry as
+/// `SubAgentStatus::Failed(error.to_string())`, so the typed
+/// [`IdleHangTerminated`] is already gone by the time anything downstream can
+/// ask. The two markers are the constants the message is built from, so writer
+/// and reader cannot disagree.
+#[must_use]
+pub fn message_describes_hang_termination(message: &str) -> bool {
+    message.contains(HANG_TERMINATION_MARKER) || message.contains(RUNTIME_CEILING_TERMINATION_MARKER)
+}
+
 /// Error returned when a turn is terminated by this detector.
 ///
 /// Deliberately its own type, so the three ways a turn can stop stay
@@ -513,7 +542,7 @@ impl std::fmt::Display for IdleHangTerminated {
         match self.reason {
             HangReason::NoProgress => write!(
                 f,
-                "agent turn '{}' was terminated as hung: no observable progress for {}s \
+                "agent turn '{}' {HANG_TERMINATION_MARKER}: no observable progress for {}s \
                  (idle threshold {}s, `[runtime] idle_hang_secs`). Last progress: {} after \
                  {} event(s); total run time {}s; {} runtime work item(s) signalled. \
                  This is a stall, not a failure and not an operator kill — the turn's \
@@ -528,7 +557,7 @@ impl std::fmt::Display for IdleHangTerminated {
             ),
             HangReason::TotalRuntimeCap => write!(
                 f,
-                "agent turn '{}' was terminated at the absolute runtime ceiling of {}s \
+                "agent turn '{}' {RUNTIME_CEILING_TERMINATION_MARKER} of {}s \
                  (`[runtime] idle_hang_max_total_secs`) after {}s and {} progress event(s); \
                  {} runtime work item(s) signalled. The turn was still emitting events, so \
                  this is a backstop against a run that never converges, not a turn-duration \
