@@ -92,6 +92,9 @@ pub fn router(state: AppState) -> Router<AppState> {
         // replaces the timeouts PRX deliberately does not have.
         .route("/runtime/tasks", get(runtime::get_tasks))
         .route("/runtime/tasks/{id}/kill", post(runtime::post_task_kill))
+        // Cross-entry-point steering: address a live run by its run id and hand
+        // it an operator instruction. See `runtime::post_task_message`.
+        .route("/runtime/tasks/{id}/message", post(runtime::post_task_message))
         .route("/runtime/pools", get(runtime::get_pools))
         // Phase 4: WASM plugins
         .route("/plugins", get(plugins::list_plugins))

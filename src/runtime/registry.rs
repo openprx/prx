@@ -211,6 +211,12 @@ struct Slot {
     /// Aborting drops the run future, which drops its guard — that removal is
     /// what confirms the kill.
     abort: RwLock<Option<tokio::task::AbortHandle>>,
+    /// Operator-steering endpoint for sub-agent runs: a clone of the very
+    /// `SubAgentRun::steer_tx` that `sessions_send` sends on. Holding it here
+    /// adds an *address book*, not a second transport — the message still
+    /// travels the one bounded channel the run already listens on, so
+    /// backpressure and ordering are unchanged. See [`attach_steer_sender`].
+    steer: RwLock<Option<tokio::sync::mpsc::Sender<String>>>,
     pid: Option<u32>,
     pgid: Option<i32>,
     /// How many long-task warnings this item has already produced, so the
@@ -389,6 +395,7 @@ fn register(
         state: AtomicU8::new(STATE_RUNNING),
         cancel,
         abort: RwLock::new(None),
+        steer: RwLock::new(None),
         pid,
         pgid,
         warnings: AtomicU32::new(0),
@@ -490,6 +497,128 @@ pub fn attach_abort_handle(id: WorkId, handle: tokio::task::AbortHandle) {
     if let Some(slot) = REGISTRY.get(id.raw()) {
         *slot.abort.write() = Some(handle);
     }
+}
+
+/// Attach a running sub-agent's steering channel to its registry row.
+///
+/// This is deliberately *not* a new delivery mechanism. `sender` is a clone of
+/// the same `SubAgentRun::steer_tx` that `sessions_send` resolves out of the
+/// spawning tool's `active_runs` and sends on, so a message routed through here
+/// lands in the same bounded queue, in the same order, with the same
+/// backpressure and no wall clock anywhere.
+///
+/// It exists because `active_runs` is *per tool instance*: the gateway and the
+/// channel dispatch loop each build their own registry inside one daemon
+/// process, so a control-plane request arriving at the gateway cannot see a run
+/// that a channel turn started. The work registry is the only process-wide
+/// index of in-flight work, which makes it the only place a cross-entry-point
+/// address can be resolved.
+///
+/// A no-op for ids that already finished; the row and the sender it holds are
+/// released together by [`WorkGuard`]'s `Drop`, so a completed run stops being
+/// addressable without any explicit teardown.
+pub fn attach_steer_sender(id: WorkId, sender: tokio::sync::mpsc::Sender<String>) {
+    if let Some(slot) = REGISTRY.get(id.raw()) {
+        *slot.steer.write() = Some(sender);
+    }
+}
+
+/// Resolve an operator-supplied address to a live work item.
+///
+/// Two address spaces are accepted, and the order matters:
+///
+/// 1. **`run_id`** — the correlating id a run carries across processes. This is
+///    the only address a caller outside this process should use, because it is
+///    stable and meaningful everywhere the run is known.
+/// 2. **[`WorkId`]** (`w42` or a bare `42`) — a *process-local, monotonic*
+///    counter. It is convenient for an operator reading `prx tasks list` on the
+///    same box and it means nothing anywhere else.
+///
+/// `run_id` is tried first so that address space always wins: a `WorkId` is all
+/// digits (optionally `w`-prefixed) and a run id is a uuid, so in practice they
+/// cannot collide, but resolving the portable address first keeps that true by
+/// construction rather than by luck.
+///
+/// Several rows can share one `run_id` — a sub-agent run and every tool call
+/// made inside it. The lineage root is returned: ids are handed out
+/// monotonically and the run is registered before anything it starts, so the
+/// lowest matching id is the ancestor of the rest. Preferring [`WorkKind::Turn`]
+/// and [`WorkKind::SubAgent`] rows first keeps that intent explicit rather than
+/// relying on the ordering alone.
+#[must_use]
+pub fn resolve_address(address: &str) -> Option<WorkId> {
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let slots = REGISTRY.slots();
+    let root = slots
+        .iter()
+        .filter(|slot| slot.run_id.as_deref() == Some(trimmed))
+        .min_by_key(|slot| {
+            let rank = match slot.kind {
+                WorkKind::Turn | WorkKind::SubAgent => 0u8,
+                WorkKind::ToolCall | WorkKind::Process => 1,
+            };
+            (rank, slot.id)
+        });
+    if let Some(slot) = root {
+        return Some(WorkId(slot.id));
+    }
+    let candidate = WorkId::parse(trimmed)?;
+    slots.iter().any(|slot| slot.id == candidate.raw()).then_some(candidate)
+}
+
+/// Why a steering message could not be handed to a work item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteerRejection {
+    /// The item is live but exposes no steering channel — an agent turn, a tool
+    /// call, or a run started before steering existed.
+    NotSteerable,
+    /// The item's receiver is gone, or its row was retired while the message
+    /// was being routed: the run ended.
+    ChannelClosed,
+}
+
+impl SteerRejection {
+    /// Stable lowercase tag used by the CLI and the HTTP API.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotSteerable => "not_steerable",
+            Self::ChannelClosed => "channel_closed",
+        }
+    }
+}
+
+/// Deliver an operator message to a registered run's steering channel.
+///
+/// The sender is cloned out and every lock released *before* the send, for the
+/// same reason `sessions_send` drops its `active_runs` guard first: the queue is
+/// bounded, so a send legitimately parks until the run drains it, and parking
+/// while holding a registry lock would deadlock against the run's own
+/// registrations.
+///
+/// Parking is the intended behaviour, not a fault. A busy target slows the
+/// caller down; nothing here gives up on a clock, because a target that is deep
+/// in a long tool call is doing exactly what this runtime exists to allow.
+///
+/// # Errors
+///
+/// Returns [`SteerRejection`] when the item has no steering channel, or when
+/// its receiver has already gone away.
+pub async fn steer(id: WorkId, message: String) -> Result<(), SteerRejection> {
+    let sender = {
+        // A row that has already been retired means the run finished between
+        // the caller's resolution and this send — the same outcome as a dropped
+        // receiver, and reported as such rather than as "cannot be steered".
+        let Some(slot) = REGISTRY.get(id.raw()) else {
+            return Err(SteerRejection::ChannelClosed);
+        };
+        let sender = slot.steer.read().clone();
+        sender.ok_or(SteerRejection::NotSteerable)?
+    };
+    sender.send(message).await.map_err(|_| SteerRejection::ChannelClosed)
 }
 
 /// Run `fut` with `id` as the current work item, without transferring guard
@@ -1057,6 +1186,114 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
+    }
+
+    /// Unique run id per test: the registry is process-wide and tests run
+    /// concurrently, so an address must not be able to collide with another
+    /// test's rows.
+    fn unique_run_id(label: &str) -> String {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!("run-{label}-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    #[tokio::test]
+    async fn a_run_is_addressable_by_run_id_and_by_work_id_alike() {
+        let run_id = unique_run_id("both-addresses");
+        let guard = register_sub_agent("addressable", &run_id, None, None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        attach_steer_sender(guard.id(), tx);
+
+        assert_eq!(resolve_address(&run_id), Some(guard.id()));
+        assert_eq!(resolve_address(&guard.id().to_string()), Some(guard.id()));
+
+        steer(guard.id(), "by run id".to_string()).await.expect("test: deliver");
+        assert_eq!(rx.recv().await.as_deref(), Some("by run id"));
+    }
+
+    #[tokio::test]
+    async fn a_shared_run_id_resolves_to_the_lineage_root() {
+        let run_id = unique_run_id("shared");
+        let root = register_sub_agent("root run", &run_id, None, None);
+        // A tool call inside the run carries the same correlating run id.
+        let _child = register_tool_call("shell", Some(&run_id), None);
+
+        assert_eq!(
+            resolve_address(&run_id),
+            Some(root.id()),
+            "the run itself must win over the tool calls it correlates with"
+        );
+    }
+
+    #[test]
+    fn unknown_addresses_resolve_to_nothing_in_either_space() {
+        assert_eq!(resolve_address("no-such-run-id-at-all"), None);
+        assert_eq!(resolve_address("w999999999"), None);
+        assert_eq!(resolve_address("   "), None);
+    }
+
+    #[tokio::test]
+    async fn items_without_a_steer_channel_are_refused_rather_than_dropped() {
+        let run_id = unique_run_id("no-channel");
+        let guard = register_turn("inbound turn", &run_id, None);
+        assert_eq!(
+            steer(guard.id(), "nothing listens".to_string()).await,
+            Err(SteerRejection::NotSteerable)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_receiver_is_reported_instead_of_silently_succeeding() {
+        let run_id = unique_run_id("closed");
+        let guard = register_sub_agent("ending run", &run_id, None, None);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        attach_steer_sender(guard.id(), tx);
+        drop(rx);
+        assert_eq!(
+            steer(guard.id(), "too late".to_string()).await,
+            Err(SteerRejection::ChannelClosed)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_stops_being_addressable() {
+        let run_id = unique_run_id("finished");
+        let id = {
+            let guard = register_sub_agent("short run", &run_id, None, None);
+            let (tx, _rx) = tokio::sync::mpsc::channel(4);
+            attach_steer_sender(guard.id(), tx);
+            assert_eq!(resolve_address(&run_id), Some(guard.id()));
+            guard.id()
+        };
+        assert_eq!(resolve_address(&run_id), None, "the row is released with the guard");
+        assert_eq!(
+            steer(id, "after the end".to_string()).await,
+            Err(SteerRejection::ChannelClosed)
+        );
+    }
+
+    /// The queue is bounded on purpose: a target that is not draining slows the
+    /// sender down instead of losing messages, and nothing here gives up on a
+    /// clock.
+    #[tokio::test]
+    async fn a_full_queue_parks_the_sender_instead_of_dropping_the_message() {
+        let run_id = unique_run_id("backpressure");
+        let guard = register_sub_agent("busy run", &run_id, None, None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        attach_steer_sender(guard.id(), tx);
+
+        steer(guard.id(), "fills the queue".to_string())
+            .await
+            .expect("test: first message fits");
+        let mut parked = Box::pin(steer(guard.id(), "must wait".to_string()));
+        assert!(
+            futures::poll!(&mut parked).is_pending(),
+            "a full queue must park the sender, not fail or drop"
+        );
+        assert_eq!(rx.recv().await.as_deref(), Some("fills the queue"));
+        parked
+            .await
+            .expect("test: the parked send completes once space frees up");
+        assert_eq!(rx.recv().await.as_deref(), Some("must wait"));
     }
 
     /// Run `f` with every `tracing` event on this thread captured.

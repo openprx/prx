@@ -104,6 +104,21 @@ pub struct KillReport {
     pub targets: Vec<KillTarget>,
 }
 
+/// Result of handing a message to a running task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageReport {
+    /// The address the operator supplied.
+    pub requested: String,
+    /// Work item the address resolved to, in the target process's id space.
+    pub id: String,
+    /// Run id of the target, the address that is portable across processes.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    pub kind: String,
+    pub name: String,
+    pub outcome: String,
+}
+
 /// One connection pool's counters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolReport {
@@ -177,13 +192,33 @@ pub async fn fetch_tasks(endpoint: &TasksEndpoint) -> Result<TasksListing> {
 /// Ask the running process to terminate one work item.
 pub async fn request_kill(endpoint: &TasksEndpoint, id: &str, cascade: bool) -> Result<KillReport> {
     let client = client()?;
-    let path = format!("/api/runtime/tasks/{id}/kill?cascade={cascade}");
+    // Ids reach here straight from an operator's shell; percent-encode so an
+    // address that is not a bare uuid cannot alter the request path.
+    let path = format!("/api/runtime/tasks/{}/kill?cascade={cascade}", urlencoding::encode(id));
     let response = endpoint
         .request(&client, reqwest::Method::POST, &path)
         .send()
         .await
         .map_err(|error| unreachable_hint(endpoint, &error))?;
     decode(response, "runtime task kill").await
+}
+
+/// Hand a message to one running task, addressed by run id or work id.
+///
+/// No request timeout is imposed here for the same reason the rest of this
+/// client has none, and one more: the target's message queue is bounded, so a
+/// busy run legitimately parks the send until it drains. That is backpressure
+/// working, not a stall to abandon.
+pub async fn request_message(endpoint: &TasksEndpoint, id: &str, message: &str) -> Result<MessageReport> {
+    let client = client()?;
+    let path = format!("/api/runtime/tasks/{}/message", urlencoding::encode(id));
+    let response = endpoint
+        .request(&client, reqwest::Method::POST, &path)
+        .json(&serde_json::json!({ "message": message }))
+        .send()
+        .await
+        .map_err(|error| unreachable_hint(endpoint, &error))?;
+    decode(response, "runtime task message").await
 }
 
 /// Fetch connection-pool occupancy and saturation counters.

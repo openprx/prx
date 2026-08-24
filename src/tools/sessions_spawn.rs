@@ -1554,7 +1554,7 @@ impl Tool for SessionsSpawnTool {
                     channel_name: run_channel_name.clone(),
                     process_control: process_control.clone(),
                     history: history_arc.clone(),
-                    steer_tx: process_steer_tx,
+                    steer_tx: process_steer_tx.clone(),
                     parent_run_id: parent_run_id.clone(),
                     session_scope_key: session_scope_key.clone(),
                     spawn_depth,
@@ -1644,6 +1644,11 @@ impl Tool for SessionsSpawnTool {
                 .unwrap_or_else(|| "sub-agent (process)".to_string());
             let sub_agent_work =
                 crate::runtime::registry::register_sub_agent(&sub_agent_label, &rid, sub_agent_parent, None);
+            // Publish this run's steering channel on its registry row so the
+            // control plane can address it by run id from another entry point.
+            // Same sender, same bounded queue as `sessions_send` — only the
+            // lookup is new; see `registry::attach_steer_sender`.
+            crate::runtime::registry::attach_steer_sender(sub_agent_work.id(), process_steer_tx.clone());
             let jh = tokio::spawn(crate::runtime::registry::scoped(
                 sub_agent_work,
                 SPAWN_EXECUTION_CONTEXT.scope(process_execution_ctx, async move {
@@ -1833,7 +1838,7 @@ impl Tool for SessionsSpawnTool {
                 abort_handle: None,
                 process_control: None,
                 history: history_arc.clone(),
-                steer_tx: Some(steer_tx),
+                steer_tx: Some(steer_tx.clone()),
                 parent_run_id: parent_run_id.clone(),
                 session_scope_key: session_scope_key.clone(),
                 spawn_depth,
@@ -1963,6 +1968,10 @@ impl Tool for SessionsSpawnTool {
         let sub_agent_work =
             crate::runtime::registry::register_sub_agent(&sub_agent_label, &rid, sub_agent_parent, None);
         let sub_agent_work_id = sub_agent_work.id();
+        // As in the process branch: the control plane resolves `run_id` through
+        // the process-wide work registry, so the run's existing steer sender is
+        // published there. `active_runs` stays the tool-plane source of truth.
+        crate::runtime::registry::attach_steer_sender(sub_agent_work_id, steer_tx.clone());
 
         // Spawn async task (fire-and-forget); capture handle to support kill
         let jh = tokio::spawn(crate::runtime::registry::scoped(

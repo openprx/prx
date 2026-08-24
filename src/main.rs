@@ -678,6 +678,8 @@ Examples:
   prx tasks list --json               # machine-readable, includes unreaped children
   prx tasks kill w42                  # kill w42 and everything it started
   prx tasks kill w42 --no-cascade     # kill only w42
+  prx tasks kill <run-id>             # same, addressed by run id
+  prx tasks send <run-id> \"also check Y\"  # steer a running task mid-flight
   prx tasks pools                     # connection-pool saturation")]
     Tasks {
         #[command(subcommand)]
@@ -858,13 +860,34 @@ enum TasksCommands {
     },
     /// Terminate one work item by id
     Kill {
-        /// Work item id as printed by `prx tasks list` (`w42` or `42`)
+        /// Run id, or work item id as printed by `prx tasks list` (`w42` or `42`)
         id: String,
         /// Kill only this item, leaving the tools and processes it started
         /// running. Cascading is the default because nothing else will clean
         /// those up.
         #[arg(long)]
         no_cascade: bool,
+        /// Output machine-readable JSON
+        #[arg(long)]
+        json: bool,
+        /// Gateway base URL (default: the configured gateway bind address)
+        #[arg(long)]
+        url: Option<String>,
+        /// Bearer token, when the gateway requires pairing
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Send a message to a running task, redirecting it mid-flight
+    ///
+    /// Addresses a run started from any entry point — a channel message, the
+    /// chat TUI, another `prx` — because the work registry is process-wide.
+    /// Use the run id from `prx tasks list`; `w42` works too but means nothing
+    /// outside this machine.
+    Send {
+        /// Run id (portable) or work item id as printed by `prx tasks list`
+        id: String,
+        /// The instruction to hand to the running task
+        message: String,
         /// Output machine-readable JSON
         #[arg(long)]
         json: bool,
@@ -1388,6 +1411,26 @@ async fn handle_tasks_command(command: TasksCommands, config: &Config) -> anyhow
             // A target with no termination handle is a partial result, not a success.
             if report.targets.iter().any(|target| target.outcome == "not_killable") {
                 bail!("one or more targets had no termination handle and could not be killed");
+            }
+            Ok(())
+        }
+        TasksCommands::Send {
+            id,
+            message,
+            json,
+            url,
+            token,
+        } => {
+            let endpoint = TasksEndpoint::resolve(config, url, token);
+            let report = tasks_cli::request_message(&endpoint, &id, &message).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                let run_id = report.run_id.as_deref().unwrap_or("-");
+                println!(
+                    "Delivered to {} [{}] {} (run_id: {})",
+                    report.id, report.kind, report.name, run_id
+                );
             }
             Ok(())
         }
