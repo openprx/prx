@@ -1593,6 +1593,49 @@ fn s5_release_p0_1_openai_tool_call_turn_via_real_path() {
     assert!(wait_for_exit(session, EXIT_TIMEOUT), "openai flavor /exit 应干净退出");
 }
 
+/// b2 core evidence 1, through the real binary: a single model tool call fans
+/// out into three sub-agents, and all three land in the session registry.
+///
+/// `OPENPRX_MOCK_TOOL_CALL` (rather than `OPENPRX_MOCK_SCRIPT`) is what makes
+/// this safe to run: the mock emits the tool call only on the *first* stream
+/// call in the process, so the three sub-agents — which share the same provider
+/// instance and therefore the same counter — get plain text and cannot fan out
+/// again.
+#[test]
+#[serial(prx_chat_pty)]
+fn b2_sessions_spawn_batch_fans_out_three_subtasks_via_real_path() {
+    let sentinel = "[MOCK-B2-FANOUT-DONE]";
+    let tool_call =
+        r#"sessions_spawn:{"action":"spawn_batch","tasks":["b2 fan-out one","b2 fan-out two","b2 fan-out three"]}"#;
+    let (mut sg, _guard) = spawn_chat(
+        &["--plain"],
+        &[
+            ("OPENPRX_MOCK_TOOL_CALL", tool_call),
+            ("OPENPRX_MOCK_RESPONSE", sentinel),
+        ],
+    );
+    let session = sg.session();
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(200));
+    session.send("fan this out\r").expect("send prompt");
+    read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+
+    session.send("/sessions\r").expect("send /sessions");
+    let listed = read_until_with_dsr(session, "b2 fan-out three", TURN_TIMEOUT);
+    for task in ["b2 fan-out one", "b2 fan-out two", "b2 fan-out three"] {
+        assert!(
+            listed.contains(task),
+            "every member of the fan-out must be registered as its own session ({task}); captured:\n{listed}"
+        );
+    }
+
+    session.send("/exit\r").expect("send /exit");
+    assert!(
+        wait_for_exit(session, EXIT_TIMEOUT),
+        "fan-out session should exit cleanly"
+    );
+}
+
 /// S5 P0-1: gemini flavor cancel-mid-stream — 第一个 chunk 出现后双 Ctrl+C.
 #[test]
 #[serial(prx_chat_pty)]

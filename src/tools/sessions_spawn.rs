@@ -131,6 +131,16 @@ pub struct SubAgentRun {
     /// [`SubAgentRun::idle_for`]; both are relaxed atomic loads, so a
     /// supervisor may poll them without disturbing the run.
     pub progress: Arc<crate::agent::idle::ProgressBeat>,
+    /// Fan-out batch this run belongs to, when it was started by
+    /// `action: "spawn_batch"`.
+    ///
+    /// A plain label rather than a separate batch registry: the runs *are* the
+    /// batch, so there is no second structure that can disagree with
+    /// `active_runs` about which members exist or what state they are in. It is
+    /// what `action: "join"` selects on, what `sessions_list` groups by, and —
+    /// because a batch's members are all registered under the requesting turn —
+    /// what makes `prx tasks kill <parent>` a batch kill for free.
+    pub batch_id: Option<String>,
 }
 
 impl SubAgentRun {
@@ -170,6 +180,7 @@ struct ProcessModeRunSeed<'a> {
     session_scope_key: String,
     spawn_depth: usize,
     progress: Arc<crate::agent::idle::ProgressBeat>,
+    batch_id: Option<String>,
 }
 
 /// Build the registry row for a process-mode run.
@@ -198,6 +209,7 @@ fn new_process_mode_run(seed: ProcessModeRunSeed<'_>) -> SubAgentRun {
         spawn_depth: seed.spawn_depth,
         token_usage_records: Vec::new(),
         progress: seed.progress,
+        batch_id: seed.batch_id,
     }
 }
 
@@ -1188,7 +1200,7 @@ async fn commit_run_termination_if_unfinished(
 /// Why a monitor task stopped without reporting, when it stopped that way.
 fn vanished_monitor_reason(error: &tokio::task::JoinError, kind: &str) -> String {
     if error.is_cancelled() {
-        format!("{kind} was terminated before it could report a result")
+        format!("{kind} {TERMINATED_BEFORE_RESULT_SUFFIX}")
     } else {
         format!("{kind} panicked before it could report a result")
     }
@@ -1238,6 +1250,255 @@ fn watch_process_mode_monitor(
     });
 }
 
+/// Reason recorded when an operator ends a run through the tool/chat kill path.
+///
+/// A shared constant rather than a literal at each site because the *reader* of
+/// the status — `join`'s outcome classification, chat's `Failed -> Cancelled`
+/// projection — has to tell an operator kill from a task that failed on its own
+/// terms, and the only carrier of that distinction is this wording.
+pub(crate) const KILLED_BY_USER_REASON: &str = "killed by user";
+
+/// Tail of the reason [`vanished_monitor_reason`] records when a run's monitor
+/// was cancelled out from under it — the shape of a cascade kill
+/// (`prx tasks kill`, `kill_turn_subtree`), which reaches the run through the
+/// registry and never gets to write a result of its own.
+pub(crate) const TERMINATED_BEFORE_RESULT_SUFFIX: &str = "was terminated before it could report a result";
+
+/// Whether a `Failed` reason describes a kill rather than a task-level failure.
+///
+/// MUTATION GUARD: collapse this into `false` and a killed member of a joined
+/// batch is reported as an ordinary failure, which is the one distinction the
+/// caller of `join` needs in order to decide whether to retry it.
+fn failure_is_kill(reason: &str) -> bool {
+    reason == KILLED_BY_USER_REASON || reason.ends_with(TERMINATED_BEFORE_RESULT_SUFFIX)
+}
+
+/// What one spawn attempt produced: the tool-visible result, plus the run id
+/// when a run was actually registered.
+pub(crate) struct SpawnOutcome {
+    result: ToolResult,
+    run_id: Option<String>,
+}
+
+impl SpawnOutcome {
+    /// The request never became a run (bad argument, denied gate, unusable
+    /// agent/provider). There is nothing to join.
+    const fn rejected(error: String) -> Self {
+        Self {
+            result: ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            },
+            run_id: None,
+        }
+    }
+
+    /// A run is registered and its driver task is live.
+    const fn started(run_id: String, output: String) -> Self {
+        Self {
+            result: ToolResult {
+                success: true,
+                output,
+                error: None,
+            },
+            run_id: Some(run_id),
+        }
+    }
+}
+
+/// Terminal verdict for one member of a joined batch.
+///
+/// `Killed` is deliberately not folded into `Failed`: a task that concluded
+/// "this cannot be done" and a task an operator stopped mid-flight mean opposite
+/// things to whoever reads the summary.
+enum JoinedVerdict {
+    Completed(String),
+    Failed(String),
+    Killed(String),
+    /// The run produced no conclusion at all — its registry row is gone, so
+    /// there is nothing left to report but the absence.
+    NoResult(String),
+}
+
+/// One settled member of a joined batch.
+struct JoinedMember {
+    run_id: String,
+    task: String,
+    verdict: JoinedVerdict,
+}
+
+/// How often the join wait re-reads the batch.
+///
+/// This is a *sampling* interval, not a deadline. `join_batch_members` has no
+/// elapsed-time check, no iteration cap and no `tokio::time::timeout`: shorten
+/// this and a finished batch surfaces sooner, lengthen it and the only cost is
+/// latency. The tests in this module pin that difference — one of them runs a
+/// batch across an hour of (virtual) time and still requires the real result.
+const JOIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Render the settled batch as the structured summary `join` returns.
+///
+/// Structured rather than concatenated prose because the four buckets mean
+/// different things to whoever reads them, and a caller deciding what to retry
+/// has to be able to tell them apart without parsing English.
+///
+/// Two things keep `total` honest: the exhaustive match below, which gives
+/// every verdict exactly one bucket and makes a new variant a compile error
+/// here, and the debug assertion, which catches a bucket that is filled but
+/// never rendered. Neither is decoration — a member that quietly fits nowhere
+/// would disappear from the caller's account of its own fan-out.
+fn join_summary(batch_id: &str, settled: &[JoinedMember]) -> serde_json::Value {
+    let mut completed = Vec::new();
+    let mut failed = Vec::new();
+    let mut killed = Vec::new();
+    let mut no_result = Vec::new();
+    for member in settled {
+        match &member.verdict {
+            JoinedVerdict::Completed(output) => {
+                completed.push(json!({"run_id": member.run_id, "task": member.task, "output": output}));
+            }
+            JoinedVerdict::Failed(error) => {
+                failed.push(json!({"run_id": member.run_id, "task": member.task, "error": error}));
+            }
+            JoinedVerdict::Killed(reason) => {
+                killed.push(json!({"run_id": member.run_id, "task": member.task, "reason": reason}));
+            }
+            JoinedVerdict::NoResult(reason) => {
+                no_result.push(json!({"run_id": member.run_id, "task": member.task, "reason": reason}));
+            }
+        }
+    }
+    let total = settled.len();
+    debug_assert_eq!(
+        total,
+        completed.len() + failed.len() + killed.len() + no_result.len(),
+        "every joined member must appear in exactly one bucket"
+    );
+    json!({
+        "batch_id": batch_id,
+        "total": total,
+        "completed": completed,
+        "failed": failed,
+        "killed": killed,
+        "no_result": no_result,
+    })
+}
+
+/// Classify a run's current status, or `None` while it is still working.
+fn settled_verdict(status: &SubAgentStatus) -> Option<JoinedVerdict> {
+    match status {
+        // `AwaitingInput` is reversible by design (the operator approves,
+        // denies, or the request lapses), so it is *not* terminal and the join
+        // keeps waiting through it.
+        SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => None,
+        SubAgentStatus::Completed(output) => Some(JoinedVerdict::Completed(output.clone())),
+        SubAgentStatus::Failed(reason) if failure_is_kill(reason) => Some(JoinedVerdict::Killed(reason.clone())),
+        SubAgentStatus::Failed(reason) => Some(JoinedVerdict::Failed(reason.clone())),
+    }
+}
+
+/// Block until every member of the batch has reached a terminal status.
+///
+/// # Why this has no deadline
+///
+/// A deadline here would be a wall-clock turn timeout wearing a different hat:
+/// it would end a fan-out because it took long, and duration is not a fault in
+/// this runtime. What actually bounds the wait is that *every member is bounded
+/// on its own terms* — a task-mode member runs under
+/// [`crate::agent::idle::run_guarded`], a process-mode member's worker installs
+/// the same thresholds in its own process and may additionally carry the
+/// manifest's `timeout_seconds` — and every one of those endings now commits a
+/// terminal status on the member's row rather than leaving it `Running`. When
+/// the last member ends, this returns; there is no third outcome to time out
+/// on.
+///
+/// # Why it stamps the caller's beat
+///
+/// The caller is parked here, so it emits nothing of its own, and its own hang
+/// detector would eventually judge it wedged. For task-mode members that never
+/// happens — their beats are parented on the caller's, so their progress is the
+/// caller's progress. A process-mode member has no such link that works in
+/// practice: the only signal that crosses the process boundary is the bytes the
+/// worker writes, and a healthy `session-worker` writes exactly one line, at the
+/// very end. Waiting on one would therefore look identical to hanging.
+///
+/// So the wait itself supplies the evidence, as
+/// [`crate::agent::idle::ProgressKind::SubtaskAlive`] — recorded only on an
+/// iteration where a member is *observed* non-terminal, never on a timer alone.
+/// See that variant's documentation for why this cannot make a turn immortal.
+async fn join_batch_members(active_runs: &Arc<RwLock<Vec<SubAgentRun>>>, members: &[String]) -> Vec<JoinedMember> {
+    loop {
+        // The guard is bound and dropped inside this block: the wait below must
+        // never hold the registry lock, or a member trying to publish its own
+        // terminal status would be blocked by the very join waiting for it.
+        let settled = {
+            let runs = active_runs.read().await;
+            settled_batch(&runs, members)
+        };
+        if let Some(settled) = settled {
+            return settled;
+        }
+        // MUTATION GUARD: this line is the whole reason a turn joining a
+        // process-mode fan-out is not killed as hung. Remove it and a batch
+        // whose members produce no in-band signal takes the joining turn down
+        // with it after `[runtime] idle_hang_secs`.
+        crate::agent::idle::beat(crate::agent::idle::ProgressKind::SubtaskAlive);
+        tokio::time::sleep(JOIN_POLL_INTERVAL).await;
+    }
+}
+
+/// The batch's verdicts, or `None` while any member is still working.
+///
+/// Deliberately two passes under one lock rather than one pass that builds as
+/// it goes: a finished member's output can be large, and a join that polls for
+/// an hour would otherwise clone all of them on every poll only to throw them
+/// away. Building only once the answer is final also means the verdicts come
+/// from a single consistent snapshot, so a member cannot be seen `Completed`
+/// on the deciding pass and be gone by the reporting one.
+fn settled_batch(runs: &[SubAgentRun], members: &[String]) -> Option<Vec<JoinedMember>> {
+    let all_settled = members.iter().all(|run_id| {
+        runs.iter()
+            .find(|run| &run.id == run_id)
+            // A row that is gone is settled in the only sense that matters
+            // here: nothing about it will ever change again.
+            .is_none_or(|run| !matches!(run.status, SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. }))
+    });
+    if !all_settled {
+        return None;
+    }
+    Some(
+        members
+            .iter()
+            .map(|run_id| {
+                runs.iter().find(|run| &run.id == run_id).map_or_else(
+                    // The row was dropped from the registry (a session shutdown
+                    // retains it away) without ever publishing a conclusion.
+                    // Reporting the absence is the honest verdict; waiting for
+                    // a row that no longer exists would hang.
+                    || JoinedMember {
+                        run_id: run_id.clone(),
+                        task: String::new(),
+                        verdict: JoinedVerdict::NoResult(
+                            "the run's registry row disappeared before it reported a result".to_string(),
+                        ),
+                    },
+                    |run| JoinedMember {
+                        run_id: run_id.clone(),
+                        task: run.task.clone(),
+                        // Non-terminal statuses were ruled out above; a status
+                        // that slipped through is reported as the absence it is
+                        // rather than panicking inside a tool call.
+                        verdict: settled_verdict(&run.status).unwrap_or_else(|| {
+                            JoinedVerdict::NoResult("the run was still working when the batch settled".to_string())
+                        }),
+                    },
+                )
+            })
+            .collect(),
+    )
+}
+
 #[async_trait]
 impl Tool for SessionsSpawnTool {
     fn name(&self) -> &str {
@@ -1247,6 +1508,8 @@ impl Tool for SessionsSpawnTool {
     fn description(&self) -> &str {
         "Manage async sub-agents. Actions: \
          'spawn' (default) — launch a sub-agent for a task and return a run_id; \
+         'spawn_batch' — launch several sub-agents at once and return a batch_id; \
+         'join' — block until every sub-agent in a batch_id has finished, then return all their results; \
          'list' — show all active/completed sub-agent runs; \
          'kill' — abort a running sub-agent by run_id; \
          'history' — view the conversation log of a sub-agent run; \
@@ -1266,9 +1529,38 @@ impl Tool for SessionsSpawnTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["spawn", "list", "kill", "history", "steer"],
+                    "enum": ["spawn", "spawn_batch", "join", "list", "kill", "history", "steer"],
                     "default": "spawn",
-                    "description": "Action to perform: spawn a new sub-agent, list all runs, kill a run, view history, or steer a running sub-agent."
+                    "description": "Action to perform: spawn a new sub-agent, spawn_batch a whole fan-out, join a batch and wait for all of its results, list all runs, kill a run, view history, or steer a running sub-agent."
+                },
+                "tasks": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "For action='spawn_batch': the tasks to launch, all at once. Each entry is either a task string or an object {task, agent?, model?, provider?, mode?}; any top-level parameter of this call acts as the default for every entry. There is no limit on how many may be launched.",
+                    "items": {
+                        "anyOf": [
+                            {"type": "string", "minLength": 1},
+                            {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "task": {"type": "string", "minLength": 1},
+                                    "agent": {"type": "string"},
+                                    "model": {"type": "string"},
+                                    "provider": {"type": "string"},
+                                    "mode": {"type": "string", "enum": ["task", "process"]},
+                                    "recipient": {"type": "string"},
+                                    "timeout_seconds": {"type": "integer", "minimum": 0},
+                                    "max_iterations": {"type": "integer", "minimum": 1}
+                                },
+                                "required": ["task"]
+                            }
+                        ]
+                    }
+                },
+                "batch_id": {
+                    "type": "string",
+                    "description": "Batch identifier returned by 'spawn_batch'. Required for the 'join' action, which blocks until every member of that batch has finished — however long that takes — and then reports all of them."
                 },
                 "task": {
                     "type": "string",
@@ -1402,10 +1694,193 @@ impl Tool for SessionsSpawnTool {
                 let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
                 return self.execute_steer(run_id, message, approval_grant.as_ref()).await;
             }
+            "spawn_batch" => return self.execute_spawn_batch(&args).await,
+            "join" => {
+                let batch_id = args
+                    .get("batch_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'batch_id' parameter for join action"))?;
+                return self.execute_join(batch_id).await;
+            }
             _ => {} // fall through to spawn
         }
 
-        // --- spawn action ---
+        Ok(self.execute_spawn(&args, None).await?.result)
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Automation]
+    }
+}
+
+impl SessionsSpawnTool {
+    /// Merge one batch entry over the batch-level arguments.
+    ///
+    /// The batch-level object carries the trusted per-turn scope and the
+    /// approval grant for this tool call, so members inherit them by
+    /// construction — a member cannot be spawned with a scope or a grant the
+    /// batch request did not already have. `action`/`tasks` are dropped because
+    /// they describe the batch, not a member, and every remaining batch-level
+    /// key acts as a default that the member entry may override.
+    fn batch_member_args(
+        batch_args: &serde_json::Value,
+        entry: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let mut member = batch_args
+            .as_object()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("sessions_spawn arguments must be a JSON object"))?;
+        member.remove("action");
+        member.remove("tasks");
+        match entry {
+            // A bare string is the common case ("run these three tasks") and
+            // means exactly `{"task": "..."}`.
+            serde_json::Value::String(task) => {
+                member.insert("task".to_string(), json!(task));
+            }
+            serde_json::Value::Object(fields) => {
+                for (key, value) in fields {
+                    member.insert(key.clone(), value.clone());
+                }
+            }
+            other => anyhow::bail!("each entry of 'tasks' must be a string or an object, got: {other}"),
+        }
+        Ok(serde_json::Value::Object(member))
+    }
+
+    /// Fan out: start every task in `tasks` and label them with one batch id.
+    ///
+    /// Every member starts immediately — there is no concurrency cap, no
+    /// staging, and no queue. Each member goes through [`Self::execute_spawn`],
+    /// so it is registered, gated and announced exactly as a standalone
+    /// `spawn` would be; the only difference is the `batch_id` on its row.
+    ///
+    /// A member that cannot be started is reported in `rejected` rather than
+    /// aborting the fan-out: the caller asked for N independent tasks, and one
+    /// unusable agent name is not a reason to withhold the other N-1.
+    async fn execute_spawn_batch(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let Some(entries) = args.get("tasks").and_then(|value| value.as_array()) else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Missing 'tasks' array for spawn_batch action".into()),
+            });
+        };
+        if entries.is_empty() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("'tasks' must contain at least one task for spawn_batch action".into()),
+            });
+        }
+
+        let batch_id = format!("batch-{}", Uuid::new_v4());
+        let mut member_args = Vec::with_capacity(entries.len());
+        let mut rejected = Vec::new();
+        for entry in entries {
+            match Self::batch_member_args(args, entry) {
+                Ok(built) => member_args.push(built),
+                Err(error) => rejected.push(json!({"task": entry, "error": error.to_string()})),
+            }
+        }
+
+        // Launched together rather than one after another: `execute_spawn`
+        // awaits (memory events, config hashing for process mode) before it
+        // returns, and a caller that asked for a fan-out should not pay for
+        // those serially. All of these futures are polled on *this* task, which
+        // is what keeps `child_beat`'s task-local parent link intact.
+        let outcomes = futures_util::future::join_all(
+            member_args
+                .iter()
+                .map(|member| self.execute_spawn(member, Some(&batch_id))),
+        )
+        .await;
+
+        let mut spawned = Vec::new();
+        for (member, outcome) in member_args.iter().zip(outcomes) {
+            let task = member.get("task").cloned().unwrap_or(serde_json::Value::Null);
+            match outcome {
+                Ok(outcome) => match outcome.run_id {
+                    Some(run_id) => spawned.push(json!({"run_id": run_id, "task": task})),
+                    None => rejected.push(json!({
+                        "task": task,
+                        "error": outcome.result.error.unwrap_or_else(|| "sub-agent was not started".to_string()),
+                    })),
+                },
+                Err(error) => rejected.push(json!({"task": task, "error": error.to_string()})),
+            }
+        }
+
+        let started = spawned.len();
+        let payload = json!({
+            "batch_id": batch_id,
+            "requested": entries.len(),
+            "started": started,
+            "spawned": spawned,
+            "rejected": rejected,
+        });
+        Ok(ToolResult {
+            success: started > 0,
+            output: serde_json::to_string_pretty(&payload)?,
+            error: (started == 0).then(|| format!("no sub-agent in batch {batch_id} could be started")),
+        })
+    }
+
+    /// Converge: block until every member of `batch_id` has finished, then
+    /// report all of them.
+    ///
+    /// Partial success is data, not a tool failure — a batch where one member
+    /// was killed still returns `success: true` with that member in `killed`,
+    /// because the caller's next decision depends on seeing all four buckets at
+    /// once. Nothing is hidden: [`join_summary`] accounts for every member
+    /// exactly once and `total` is the sum of the buckets.
+    async fn execute_join(&self, batch_id: &str) -> anyhow::Result<ToolResult> {
+        let members: Vec<String> = {
+            let runs = self.active_runs.read().await;
+            runs.iter()
+                .filter(|run| run.batch_id.as_deref() == Some(batch_id))
+                .map(|run| run.id.clone())
+                .collect()
+        };
+        if members.is_empty() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Unknown batch '{batch_id}': no sub-agent run in this session carries that batch id."
+                )),
+            });
+        }
+
+        let settled = join_batch_members(&self.active_runs, &members).await;
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&join_summary(batch_id, &settled))?,
+            error: None,
+        })
+    }
+
+    /// Launch exactly one sub-agent run and return as soon as it is registered
+    /// and its driver task is running.
+    ///
+    /// Split out of [`Tool::execute`] so `spawn_batch` starts its members
+    /// through the *same* path a single `spawn` takes — same approval gate,
+    /// same registry row, same announce wiring — rather than a parallel
+    /// implementation that would drift.
+    ///
+    /// Must be called from the task that owns the requesting turn:
+    /// [`crate::agent::idle::child_beat`] reads a task-local, so a run started
+    /// from a detached task would silently lose the parent link that keeps a
+    /// joining caller alive.
+    ///
+    /// `batch_id` stamps the run's registry row so `join`, `sessions_list`, and
+    /// the control plane can address the whole fan-out as one unit.
+    async fn execute_spawn(&self, args: &serde_json::Value, batch_id: Option<&str>) -> anyhow::Result<SpawnOutcome> {
         let task = args
             .get("task")
             .and_then(|v| v.as_str())
@@ -1413,11 +1888,7 @@ impl Tool for SessionsSpawnTool {
             .ok_or_else(|| anyhow::anyhow!("Missing 'task' parameter"))?;
 
         if task.is_empty() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("'task' parameter must not be empty".into()),
-            });
+            return Ok(SpawnOutcome::rejected("'task' parameter must not be empty".into()));
         }
 
         let timeout_secs = args
@@ -1432,11 +1903,9 @@ impl Tool for SessionsSpawnTool {
             .unwrap_or(self.spawn_config.default_mode.as_str())
             .to_ascii_lowercase();
         if mode != "task" && mode != "process" {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Invalid 'mode' value '{mode}'. Expected 'task' or 'process'.")),
-            });
+            return Ok(SpawnOutcome::rejected(format!(
+                "Invalid 'mode' value '{mode}'. Expected 'task' or 'process'."
+            )));
         }
         let process_memory_strategy = if mode == "process" {
             normalize_process_memory_strategy(&self.spawn_config.process_memory_strategy)?.to_string()
@@ -1470,7 +1939,7 @@ impl Tool for SessionsSpawnTool {
             .and_then(|v| v.as_str())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let spawn_scope = parse_spawn_scope(&args);
+        let spawn_scope = parse_spawn_scope(args);
         let parent_exec_ctx = current_spawn_execution_context();
         // D8-4: a turn-root context represents the turn itself (zero spawn
         // nesting so far), so its first child reports depth 0 — identical to the
@@ -1504,18 +1973,14 @@ impl Tool for SessionsSpawnTool {
         // consumes resources and carries a potential sandbox-escape surface,
         // so it is a Medium-risk side effect (requires an approval grant under
         // supervised autonomy; denied outright under read-only) rather than Low.
-        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), args);
         if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
             self.name(),
             "sessions_spawn:spawn",
             ResourceRiskLevel::Medium,
             approval_grant.as_ref(),
         ) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(error),
-            });
+            return Ok(SpawnOutcome::rejected(error));
         }
 
         let run_id = Uuid::new_v4().to_string();
@@ -1524,13 +1989,9 @@ impl Tool for SessionsSpawnTool {
             Some(name) => match self.agents.get(name) {
                 Some(cfg) => {
                     if !cfg.spawn_enabled.unwrap_or(true) {
-                        return Ok(ToolResult {
-                            success: false,
-                            output: String::new(),
-                            error: Some(format!(
-                                "Agent '{name}' is not allowed for sessions_spawn (spawn_enabled=false)."
-                            )),
-                        });
+                        return Ok(SpawnOutcome::rejected(format!(
+                            "Agent '{name}' is not allowed for sessions_spawn (spawn_enabled=false)."
+                        )));
                     }
                     Some((name.to_string(), cfg.clone()))
                 }
@@ -1542,18 +2003,14 @@ impl Tool for SessionsSpawnTool {
                         .map(|(name, _)| name.as_str())
                         .collect::<Vec<_>>();
                     available.sort_unstable();
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!(
-                            "Unknown agent '{name}'. Available agents: {}",
-                            if available.is_empty() {
-                                "(none configured)".to_string()
-                            } else {
-                                available.join(", ")
-                            }
-                        )),
-                    });
+                    return Ok(SpawnOutcome::rejected(format!(
+                        "Unknown agent '{name}'. Available agents: {}",
+                        if available.is_empty() {
+                            "(none configured)".to_string()
+                        } else {
+                            available.join(", ")
+                        }
+                    )));
                 }
             },
             None => None,
@@ -1692,6 +2149,7 @@ impl Tool for SessionsSpawnTool {
                     session_scope_key: session_scope_key.clone(),
                     spawn_depth,
                     progress: Arc::clone(&process_progress),
+                    batch_id: batch_id.map(str::to_string),
                 }));
             }
 
@@ -1961,13 +2419,10 @@ impl Tool for SessionsSpawnTool {
             // a future registry abort) can still reach the tool-plane row.
             watch_process_mode_monitor(jh, monitor_active_runs, run_id.clone(), process_control.clone());
 
-            return Ok(ToolResult {
-                success: true,
-                output: format!(
-                    "Sub-agent spawned in process mode (run_id: {run_id}). Will announce result when complete."
-                ),
-                error: None,
-            });
+            return Ok(SpawnOutcome::started(
+                run_id.clone(),
+                format!("Sub-agent spawned in process mode (run_id: {run_id}). Will announce result when complete."),
+            ));
         }
 
         // Create shared history and steer channel for this run
@@ -2007,6 +2462,7 @@ impl Tool for SessionsSpawnTool {
                 spawn_depth,
                 token_usage_records: Vec::new(),
                 progress: Arc::clone(&task_progress),
+                batch_id: batch_id.map(str::to_string),
             });
         }
 
@@ -2032,13 +2488,9 @@ impl Tool for SessionsSpawnTool {
             ) {
                 Ok(provider) => provider,
                 Err(error) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!(
-                            "Failed to create provider '{provider_name}' for sessions_spawn: {error}"
-                        )),
-                    });
+                    return Ok(SpawnOutcome::rejected(format!(
+                        "Failed to create provider '{provider_name}' for sessions_spawn: {error}"
+                    )));
                 }
             }
         } else {
@@ -2342,22 +2794,11 @@ impl Tool for SessionsSpawnTool {
         // this run's row.
         watch_task_mode_monitor(jh, self.active_runs.clone(), run_id.clone());
 
-        Ok(ToolResult {
-            success: true,
-            output: format!("Sub-agent spawned (run_id: {run_id}). Will announce result when complete."),
-            error: None,
-        })
+        Ok(SpawnOutcome::started(
+            run_id.clone(),
+            format!("Sub-agent spawned (run_id: {run_id}). Will announce result when complete."),
+        ))
     }
-    fn tier(&self) -> ToolTier {
-        ToolTier::Extended
-    }
-
-    fn categories(&self) -> &'static [ToolCategory] {
-        &[ToolCategory::Automation]
-    }
-}
-
-impl SessionsSpawnTool {
     fn memory_fabric(&self) -> Option<MemoryFabric> {
         self.memory.as_ref().map(|memory| {
             MemoryFabric::new(memory.clone(), self.workspace_dir.to_string_lossy())
@@ -2478,7 +2919,7 @@ impl SessionsSpawnTool {
                                     let channel_name = run.channel_name.clone();
                                     let rid = run.id.clone();
                                     run.finished_at = Some(Utc::now());
-                                    run.status = SubAgentStatus::Failed("killed by user".into());
+                                    run.status = SubAgentStatus::Failed(KILLED_BY_USER_REASON.into());
                                     run.steer_tx = None;
                                     (None, Some((recipient, channel_name, rid, run.clone())))
                                 }
@@ -2513,7 +2954,7 @@ impl SessionsSpawnTool {
             };
 
         if let Some(control) = process_control {
-            return match control.request_termination("killed by user").await {
+            return match control.request_termination(KILLED_BY_USER_REASON).await {
                 ProcessTerminationRequestResult::Finalized(ProcessFinalization::Terminated) => Ok(ToolResult {
                     success: true,
                     output: format!("Sub-agent `{run_id}` has been killed."),
@@ -6238,6 +6679,7 @@ mod tests {
             let mut runs = tool.active_runs.write().await;
             runs.push(SubAgentRun {
                 progress: crate::agent::idle::child_beat(),
+                batch_id: None,
                 id: "run-1".to_string(),
                 task: "task".to_string(),
                 owner_id: Some("owner-a".to_string()),
@@ -6537,6 +6979,7 @@ mod tests {
         };
         let run = new_process_mode_run(ProcessModeRunSeed {
             progress: crate::agent::idle::child_beat(),
+            batch_id: None,
             id: "run-process-steer".to_string(),
             task: "long task".to_string(),
             lineage: &lineage,
@@ -6721,6 +7164,7 @@ mod tests {
             let mut runs = tool.active_runs.write().await;
             runs.push(SubAgentRun {
                 progress: crate::agent::idle::child_beat(),
+                batch_id: None,
                 id: "run-backpressure".to_string(),
                 task: "task".to_string(),
                 owner_id: None,
@@ -6804,6 +7248,7 @@ mod tests {
             let mut runs = tool.active_runs.write().await;
             runs.push(SubAgentRun {
                 progress: crate::agent::idle::child_beat(),
+                batch_id: None,
                 id: "run-steer".to_string(),
                 task: "task".to_string(),
                 owner_id: Some("owner-a".to_string()),
@@ -6919,6 +7364,7 @@ mod tests {
             let mut runs = tool.active_runs.write().await;
             runs.push(SubAgentRun {
                 progress: crate::agent::idle::child_beat(),
+                batch_id: None,
                 id: "run-history-tail".to_string(),
                 task: "task".to_string(),
                 owner_id: None,
@@ -7924,6 +8370,7 @@ mod tests {
     fn restore_test_run(id: &str, status: SubAgentStatus) -> SubAgentRun {
         SubAgentRun {
             progress: crate::agent::idle::child_beat(),
+            batch_id: None,
             id: id.to_string(),
             task: "t".to_string(),
             owner_id: None,
@@ -8336,5 +8783,558 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("run '{run_id}' never reached a terminal status: it is still reported as running");
+    }
+
+    // ── b2: fan-out / join ───────────────────────────────────────
+
+    /// A registry row with a batch label and a beat that nobody ever stamps —
+    /// the shape of a healthy process-mode member, whose worker produces no
+    /// byte on any pipe until the moment it is finished.
+    fn batch_test_run(id: &str, batch_id: &str, status: SubAgentStatus) -> SubAgentRun {
+        let mut run = restore_test_run(id, status);
+        run.task = format!("task for {id}");
+        run.batch_id = Some(batch_id.to_string());
+        run
+    }
+
+    fn parse_json(output: &str) -> serde_json::Value {
+        serde_json::from_str(output).unwrap_or_else(|error| panic!("tool output must be JSON: {error}\n{output}"))
+    }
+
+    fn batch_run_ids(payload: &serde_json::Value) -> Vec<String> {
+        payload["spawned"]
+            .as_array()
+            .expect("spawn_batch reports what it started")
+            .iter()
+            .map(|entry| {
+                entry["run_id"]
+                    .as_str()
+                    .expect("every started member has a run id")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Core evidence 1: one request starts three sub-agents, and a join on the
+    /// batch hands the caller all three results.
+    #[tokio::test]
+    async fn one_request_fans_out_to_three_subtasks_and_joins_all_three_results() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+
+        let spawned = tool
+            .execute(with_spawn_grant(json!({
+                "action": "spawn_batch",
+                "tasks": ["survey the crate", "check the tests", {"task": "read the config"}],
+            })))
+            .await
+            .expect("spawn_batch tool call");
+        assert!(spawned.success, "{spawned:?}");
+        let payload = parse_json(&spawned.output);
+        let batch_id = payload["batch_id"].as_str().expect("a batch id").to_string();
+        assert_eq!(payload["started"], 3, "{payload}");
+        assert_eq!(batch_run_ids(&payload).len(), 3);
+
+        // Every member carries the batch label on its own registry row; that is
+        // the only thing join, sessions_list and a cascade kill select on.
+        {
+            let runs = tool.active_runs_snapshot().await;
+            assert_eq!(runs.len(), 3);
+            assert!(
+                runs.iter()
+                    .all(|run| run.batch_id.as_deref() == Some(batch_id.as_str()))
+            );
+        }
+
+        let joined = tool
+            .execute(json!({"action": "join", "batch_id": batch_id}))
+            .await
+            .expect("join tool call");
+        assert!(joined.success, "{joined:?}");
+        let summary = parse_json(&joined.output);
+        assert_eq!(summary["total"], 3, "{summary}");
+        assert_eq!(
+            summary["completed"].as_array().map(Vec::len),
+            Some(3),
+            "a join must return one result per member: {summary}"
+        );
+        assert!(summary["failed"].as_array().is_some_and(Vec::is_empty));
+        assert!(summary["killed"].as_array().is_some_and(Vec::is_empty));
+        assert!(summary["no_result"].as_array().is_some_and(Vec::is_empty));
+    }
+
+    /// Core evidence 2: a member killed from outside — `registry::kill`, the
+    /// call behind `prx tasks kill` and behind the idle detector's
+    /// `kill_turn_subtree` — must not strand the join. It returns, and the
+    /// killed member is reported as killed rather than as a task that failed.
+    ///
+    /// This is the b1 propagation seen from the caller's side: without it the
+    /// killed row would stay `Running` and this join would never return.
+    ///
+    /// MUTATION GUARD: make `failure_is_kill` return `false` and the killed
+    /// member lands in `failed`, which is the assertion below.
+    #[tokio::test]
+    async fn a_member_killed_from_outside_still_lets_the_join_return_and_is_reported_as_killed() {
+        let (ch, _) = RecordingChannel::new();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let tool = make_tool(
+            Arc::new(ch),
+            Arc::new(GatedProvider {
+                gate: Arc::clone(&gate),
+            }),
+        );
+
+        let spawned = tool
+            .execute(with_spawn_grant(json!({
+                "action": "spawn_batch",
+                "tasks": ["member one", "member two", "member three"],
+            })))
+            .await
+            .expect("spawn_batch tool call");
+        let payload = parse_json(&spawned.output);
+        let batch_id = payload["batch_id"].as_str().expect("a batch id").to_string();
+        let run_ids = batch_run_ids(&payload);
+        assert_eq!(run_ids.len(), 3);
+
+        let victim = run_ids.first().expect("three members were started").clone();
+        let work_id = crate::runtime::registry::resolve_address(&victim)
+            .expect("a spawned run must be addressable in the work registry");
+        let _ = crate::runtime::registry::kill(work_id, true).await;
+        // The survivors are released; the killed one no longer has a monitor to
+        // consume a permit.
+        gate.add_permits(8);
+
+        let joined = tool
+            .execute(json!({"action": "join", "batch_id": batch_id}))
+            .await
+            .expect("join tool call");
+        let summary = parse_json(&joined.output);
+        assert_eq!(summary["total"], 3, "{summary}");
+        let killed = summary["killed"].as_array().expect("a killed bucket");
+        assert_eq!(
+            killed.len(),
+            1,
+            "the killed member must be reported as killed: {summary}"
+        );
+        assert_eq!(killed[0]["run_id"].as_str(), Some(victim.as_str()));
+        assert_eq!(
+            summary["completed"].as_array().map(Vec::len),
+            Some(2),
+            "killing one member must not disturb the others: {summary}"
+        );
+        assert!(summary["failed"].as_array().is_some_and(Vec::is_empty), "{summary}");
+    }
+
+    /// Core evidence 3, through the real hang detector: a turn parked on a
+    /// member that emits nothing at all survives an idle window several times
+    /// shorter than the wait.
+    ///
+    /// This is the one limitation b1 left behind, seen from the join's side: a
+    /// process-mode member's only in-band signal is the bytes its worker
+    /// writes, and a healthy `session-worker` writes exactly one line, at the
+    /// very end. The run modelled here therefore never stamps its beat — and
+    /// the joining turn must still not be judged wedged.
+    ///
+    /// MUTATION GUARD: delete the `ProgressKind::SubtaskAlive` line in
+    /// `join_batch_members` and `run_guarded` terminates this turn after 300ms
+    /// with `IdleHangTerminated`.
+    #[tokio::test]
+    async fn a_join_on_a_member_that_emits_nothing_is_not_mistaken_for_a_hang() {
+        let active_runs: Arc<RwLock<Vec<SubAgentRun>>> = Arc::new(RwLock::new(vec![batch_test_run(
+            "silent-worker",
+            "batch-silent",
+            SubAgentStatus::Running,
+        )]));
+        let finisher = Arc::clone(&active_runs);
+        tokio::spawn(async move {
+            // Far beyond the idle window below, and with not one progress event
+            // in between.
+            tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+            let mut runs = finisher.write().await;
+            if let Some(run) = runs.iter_mut().find(|run| run.id == "silent-worker") {
+                run.finished_at = Some(Utc::now());
+                run.status = SubAgentStatus::Completed("worker result".to_string());
+            }
+        });
+
+        let guard = crate::agent::idle::IdleGuard {
+            idle: Some(std::time::Duration::from_millis(300)),
+            max_total: None,
+        };
+        let members = vec!["silent-worker".to_string()];
+        let joined = crate::agent::idle::run_guarded(guard, "turn joining a silent batch", None, async {
+            Ok(join_batch_members(&active_runs, &members).await)
+        })
+        .await
+        .expect("a turn parked on a working sub-agent must never be terminated as hung");
+
+        assert!(
+            matches!(
+                joined.first().map(|member| &member.verdict),
+                Some(JoinedVerdict::Completed(output)) if output == "worker result"
+            ),
+            "the join must return the member's real result"
+        );
+    }
+
+    /// Core evidence 3 against a **real OS process**: a genuinely silent child
+    /// — a separate process that writes not one byte for its whole life, which
+    /// is exactly what a healthy `session-worker` does — is joined to
+    /// completion, and the joining turn survives an idle window four times
+    /// shorter than the wait.
+    ///
+    /// The member's beat is fed by [`drain_worker_stream`], the same function
+    /// the production process-mode path uses, so the silence measured here is
+    /// the production silence and not a stand-in for it. The assertion that the
+    /// beat recorded **zero** events is the limitation itself, stated as a
+    /// number: there is no in-band signal to have, which is why the join has to
+    /// supply the evidence out of band.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_join_survives_a_real_child_process_that_never_writes_anything() {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("exec sleep 2")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().expect("stand-in worker spawns");
+        let stdout = child.stdout.take().expect("worker stdout");
+
+        let run = batch_test_run("silent-child", "batch-real", SubAgentStatus::Running);
+        let member_beat = Arc::clone(&run.progress);
+        let active_runs: Arc<RwLock<Vec<SubAgentRun>>> = Arc::new(RwLock::new(vec![run]));
+
+        // The production shape: one task owns the child, stamps the run's beat
+        // from the worker's output stream, and commits a terminal status at EOF.
+        let monitor_runs = Arc::clone(&active_runs);
+        let monitor_beat = Arc::clone(&member_beat);
+        tokio::spawn(async move {
+            let drained = drain_worker_stream(stdout, "stdout", Some(monitor_beat)).await;
+            let _ = child.wait().await;
+            let mut runs = monitor_runs.write().await;
+            if let Some(run) = runs.iter_mut().find(|run| run.id == "silent-child") {
+                run.finished_at = Some(Utc::now());
+                run.status = match drained {
+                    Ok(_) => SubAgentStatus::Completed("child exited".to_string()),
+                    Err(error) => SubAgentStatus::Failed(error.to_string()),
+                };
+            }
+        });
+
+        let guard = crate::agent::idle::IdleGuard {
+            idle: Some(std::time::Duration::from_millis(500)),
+            max_total: None,
+        };
+        let members = vec!["silent-child".to_string()];
+        let joined = crate::agent::idle::run_guarded(guard, "turn joining a real silent child", None, async {
+            Ok(join_batch_members(&active_runs, &members).await)
+        })
+        .await
+        .expect("a turn joining a live child process must not be terminated as hung");
+
+        assert!(
+            matches!(
+                joined.first().map(|member| &member.verdict),
+                Some(JoinedVerdict::Completed(output)) if output == "child exited"
+            ),
+            "the join must observe the child's real ending"
+        );
+        assert_eq!(
+            member_beat.events(),
+            0,
+            "the limitation, measured: a silent process-mode member has no in-band progress signal at all"
+        );
+    }
+
+    /// The complement of the test above: the liveness evidence is recorded on
+    /// the *caller's* beat, and only while a member is genuinely non-terminal.
+    /// Once the batch settles the join stops vouching for anything.
+    #[tokio::test]
+    async fn join_liveness_is_recorded_on_the_caller_and_stops_when_the_batch_settles() {
+        let active_runs: Arc<RwLock<Vec<SubAgentRun>>> = Arc::new(RwLock::new(vec![batch_test_run(
+            "member",
+            "batch-liveness",
+            SubAgentStatus::Running,
+        )]));
+        let caller_beat = crate::agent::idle::child_beat();
+        let finisher = Arc::clone(&active_runs);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            let mut runs = finisher.write().await;
+            if let Some(run) = runs.iter_mut().find(|run| run.id == "member") {
+                run.status = SubAgentStatus::Completed("done".to_string());
+            }
+        });
+
+        let members = vec!["member".to_string()];
+        let settled = crate::agent::idle::scope_beat(
+            Some(Arc::clone(&caller_beat)),
+            join_batch_members(&active_runs, &members),
+        )
+        .await;
+        assert_eq!(settled.len(), 1);
+
+        let events_at_return = caller_beat.events();
+        assert!(
+            events_at_return > 0,
+            "waiting on a live member must refresh the caller's window"
+        );
+        assert_eq!(
+            caller_beat.last_kind(),
+            crate::agent::idle::ProgressKind::SubtaskAlive,
+            "the evidence must name itself for the operator"
+        );
+
+        // Nothing is vouched for after the batch settles.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert_eq!(
+            caller_beat.events(),
+            events_at_return,
+            "a settled batch must stop refreshing the caller"
+        );
+    }
+
+    /// Core evidence 4: killing the *parent* turn cascades onto every member of
+    /// the batch it started, because the members are ordinary children of that
+    /// turn in the work registry. This is `prx tasks kill <parent>`.
+    #[tokio::test]
+    async fn killing_the_parent_turn_terminates_the_whole_batch() {
+        let (ch, _) = RecordingChannel::new();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let tool = make_tool(
+            Arc::new(ch),
+            Arc::new(GatedProvider {
+                gate: Arc::clone(&gate),
+            }),
+        );
+
+        let turn = crate::runtime::registry::register_turn("parent turn", "parent-turn-run", None);
+        let parent_id = turn.id();
+        let (batch_id, run_ids) = crate::runtime::registry::scoped(turn, async {
+            let spawned = tool
+                .execute(with_spawn_grant(json!({
+                    "action": "spawn_batch",
+                    "tasks": ["one", "two", "three"],
+                })))
+                .await
+                .expect("spawn_batch tool call");
+            let payload = parse_json(&spawned.output);
+            let batch_id = payload["batch_id"].as_str().expect("a batch id").to_string();
+            let run_ids = batch_run_ids(&payload);
+
+            let _ = crate::runtime::registry::kill(parent_id, true).await;
+            (batch_id, run_ids)
+        })
+        .await;
+        assert_eq!(run_ids.len(), 3);
+
+        for run_id in &run_ids {
+            let reason = await_terminal_reason(&tool.active_runs, run_id).await;
+            assert!(
+                reason.contains("terminated before it could report a result"),
+                "a cascade kill of the parent must reach every batch member, got: {reason}"
+            );
+        }
+
+        let joined = tool
+            .execute(json!({"action": "join", "batch_id": batch_id}))
+            .await
+            .expect("join tool call");
+        let summary = parse_json(&joined.output);
+        assert_eq!(summary["total"], 3, "{summary}");
+        assert_eq!(summary["killed"].as_array().map(Vec::len), Some(3), "{summary}");
+        gate.add_permits(8);
+    }
+
+    /// Core evidence 5: the join has no deadline.
+    ///
+    /// Time is paused, so the runtime advances its clock as fast as the tasks
+    /// allow: this batch is waited on across a *virtual hour* and the join must
+    /// still return the member's real result. Any deadline shorter than an hour
+    /// — which is to say any deadline anyone would plausibly add — makes this
+    /// fail, and it costs milliseconds of real time to prove it.
+    ///
+    /// MUTATION GUARD: wrap the `join_batch_members` call in a
+    /// `tokio::time::timeout` of any length and this test goes red.
+    #[tokio::test(start_paused = true)]
+    async fn a_join_survives_an_hour_of_waiting_because_it_has_no_deadline() {
+        let active_runs: Arc<RwLock<Vec<SubAgentRun>>> = Arc::new(RwLock::new(vec![batch_test_run(
+            "long-hauler",
+            "batch-long",
+            SubAgentStatus::Running,
+        )]));
+        let finisher = Arc::clone(&active_runs);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_hours(1)).await;
+            let mut runs = finisher.write().await;
+            if let Some(run) = runs.iter_mut().find(|run| run.id == "long-hauler") {
+                run.status = SubAgentStatus::Completed("an hour of honest work".to_string());
+            }
+        });
+
+        let members = vec!["long-hauler".to_string()];
+        let settled = join_batch_members(&active_runs, &members).await;
+
+        assert!(
+            matches!(
+                settled.first().map(|member| &member.verdict),
+                Some(JoinedVerdict::Completed(output)) if output == "an hour of honest work"
+            ),
+            "a batch that takes an hour must still be joined, not abandoned"
+        );
+    }
+
+    /// A member whose registry row is gone reports the absence instead of
+    /// hanging the join on a row that will never change again.
+    #[tokio::test]
+    async fn a_member_whose_row_disappeared_is_reported_rather_than_waited_on() {
+        let active_runs: Arc<RwLock<Vec<SubAgentRun>>> = Arc::new(RwLock::new(vec![batch_test_run(
+            "present",
+            "batch-gap",
+            SubAgentStatus::Completed("fine".to_string()),
+        )]));
+        let members = vec!["present".to_string(), "vanished".to_string()];
+        let settled = join_batch_members(&active_runs, &members).await;
+        let summary = join_summary("batch-gap", &settled);
+        assert_eq!(summary["total"], 2, "{summary}");
+        assert_eq!(summary["completed"].as_array().map(Vec::len), Some(1), "{summary}");
+        assert_eq!(summary["no_result"].as_array().map(Vec::len), Some(1), "{summary}");
+    }
+
+    /// Both wordings a kill can arrive as are classified as kills, and a
+    /// genuine task failure is not.
+    #[test]
+    fn a_kill_is_never_reported_as_an_ordinary_failure() {
+        assert!(failure_is_kill(KILLED_BY_USER_REASON));
+        assert!(failure_is_kill(&vanished_monitor_reason(
+            &cancelled_join_error(),
+            "sub-agent run"
+        )));
+        assert!(!failure_is_kill("the compiler rejected the patch"));
+        assert!(!failure_is_kill("worker exited without result (killed by signal 9)"));
+    }
+
+    /// Every member of a joined batch appears in exactly one bucket.
+    #[test]
+    fn a_join_summary_accounts_for_every_member_exactly_once() {
+        let settled = vec![
+            JoinedMember {
+                run_id: "a".to_string(),
+                task: "a".to_string(),
+                verdict: JoinedVerdict::Completed("out".to_string()),
+            },
+            JoinedMember {
+                run_id: "b".to_string(),
+                task: "b".to_string(),
+                verdict: JoinedVerdict::Failed("boom".to_string()),
+            },
+            JoinedMember {
+                run_id: "c".to_string(),
+                task: "c".to_string(),
+                verdict: JoinedVerdict::Killed(KILLED_BY_USER_REASON.to_string()),
+            },
+            JoinedMember {
+                run_id: "d".to_string(),
+                task: "d".to_string(),
+                verdict: JoinedVerdict::NoResult("gone".to_string()),
+            },
+        ];
+        let summary = join_summary("batch-x", &settled);
+        assert_eq!(summary["total"], 4);
+        let counted = ["completed", "failed", "killed", "no_result"]
+            .iter()
+            .filter_map(|bucket| summary[*bucket].as_array().map(Vec::len))
+            .sum::<usize>();
+        assert_eq!(counted, 4, "{summary}");
+    }
+
+    /// A cancelled `JoinHandle` error, for the classification test above.
+    fn cancelled_join_error() -> tokio::task::JoinError {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let handle = tokio::spawn(std::future::pending::<()>());
+            handle.abort();
+            handle.await.expect_err("an aborted task reports a cancellation")
+        })
+    }
+
+    /// Batch entries inherit the batch-level defaults and may override them,
+    /// and the trusted per-turn scope travels with every member.
+    #[test]
+    fn batch_entries_inherit_batch_defaults_and_may_override_them() {
+        let batch_args = json!({
+            "action": "spawn_batch",
+            "tasks": ["ignored"],
+            "mode": "task",
+            "model": "batch-model",
+            "_zc_scope": {"channel": "signal", "chat_id": "+100"},
+        });
+        let member = SessionsSpawnTool::batch_member_args(&batch_args, &json!({"task": "t", "model": "member-model"}))
+            .expect("a well-formed entry");
+        assert_eq!(member["task"], "t");
+        assert_eq!(member["model"], "member-model", "an entry overrides the batch default");
+        assert_eq!(member["mode"], "task", "an entry inherits the batch default");
+        assert_eq!(
+            member["_zc_scope"], batch_args["_zc_scope"],
+            "the trusted scope must travel with every member"
+        );
+        assert!(member.get("action").is_none() && member.get("tasks").is_none());
+
+        let bare = SessionsSpawnTool::batch_member_args(&batch_args, &json!("just a string"))
+            .expect("a bare task string is a valid entry");
+        assert_eq!(bare["task"], "just a string");
+        assert!(SessionsSpawnTool::batch_member_args(&batch_args, &json!(7)).is_err());
+    }
+
+    /// Argument validation for the two new actions.
+    #[tokio::test]
+    async fn the_new_actions_reject_malformed_requests_without_starting_anything() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+
+        let missing = tool
+            .execute(with_spawn_grant(json!({"action": "spawn_batch"})))
+            .await
+            .expect("tool call");
+        assert!(!missing.success);
+        let empty = tool
+            .execute(with_spawn_grant(json!({"action": "spawn_batch", "tasks": []})))
+            .await
+            .expect("tool call");
+        assert!(!empty.success);
+
+        let no_batch = tool.execute(json!({"action": "join"})).await;
+        assert!(no_batch.is_err(), "join without a batch_id is a caller error");
+        let unknown = tool
+            .execute(json!({"action": "join", "batch_id": "batch-does-not-exist"}))
+            .await
+            .expect("tool call");
+        assert!(!unknown.success, "{unknown:?}");
+        assert!(tool.active_runs_snapshot().await.is_empty());
+    }
+
+    /// The two new actions must be discoverable, or the model can never use
+    /// them.
+    #[test]
+    fn schema_advertises_the_fan_out_and_join_actions() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+        let schema = tool.parameters_schema();
+        let actions = schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("the action enum")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(actions.contains(&"spawn_batch"), "{actions:?}");
+        assert!(actions.contains(&"join"), "{actions:?}");
+        assert!(schema["properties"]["tasks"].is_object());
+        assert!(schema["properties"]["batch_id"].is_object());
+        assert!(tool.description().contains("spawn_batch") && tool.description().contains("join"));
     }
 }

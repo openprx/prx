@@ -444,6 +444,7 @@ mod tests {
     fn make_run(id: &str, status: SubAgentStatus) -> SubAgentRun {
         SubAgentRun {
             progress: crate::agent::idle::child_beat(),
+            batch_id: None,
             id: id.to_string(),
             task: "test-task".to_string(),
             owner_id: None,
@@ -669,6 +670,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(crate::tools::sessions_spawn::STEER_CHANNEL_CAPACITY);
         let run = SubAgentRun {
             progress: crate::agent::idle::child_beat(),
+            batch_id: None,
             id: "run-2".into(),
             task: "task".into(),
             owner_id: None,
@@ -705,6 +707,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(crate::tools::sessions_spawn::STEER_CHANNEL_CAPACITY);
         let run = SubAgentRun {
             progress: crate::agent::idle::child_beat(),
+            batch_id: None,
             id: "run-steer-ledger".into(),
             task: "task".into(),
             owner_id: Some("owner-b".to_string()),

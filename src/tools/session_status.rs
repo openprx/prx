@@ -229,6 +229,7 @@ mod tests {
         let runs = vec![
             SubAgentRun {
                 progress: crate::agent::idle::child_beat(),
+                batch_id: None,
                 id: "r1".into(),
                 task: "t1".into(),
                 owner_id: None,
@@ -250,6 +251,7 @@ mod tests {
             },
             SubAgentRun {
                 progress: crate::agent::idle::child_beat(),
+                batch_id: None,
                 id: "r2".into(),
                 task: "t2".into(),
                 owner_id: None,
@@ -271,6 +273,7 @@ mod tests {
             },
             SubAgentRun {
                 progress: crate::agent::idle::child_beat(),
+                batch_id: None,
                 id: "r3".into(),
                 task: "t3".into(),
                 owner_id: None,

@@ -117,7 +117,7 @@ impl Tool for SessionsListTool {
             });
         }
 
-        let mut lines: Vec<String> = filtered
+        let rendered: Vec<String> = filtered
             .iter()
             .enumerate()
             .map(|(idx, r)| {
@@ -138,13 +138,19 @@ impl Tool for SessionsListTool {
                 let agent_index_hint = idx.saturating_add(1);
                 let usage = format_run_usage(&r.token_usage_records);
                 let liveness = format_run_liveness(r);
+                let batch = r
+                    .batch_id
+                    .as_deref()
+                    .map(|batch_id| format!(", batch={batch_id}"))
+                    .unwrap_or_default();
                 format!(
-                    "• `{}` [agent_index_hint=#{agent_index_hint}, source=runtime, manageable=true, origin={origin}, usage={usage}, {age}s ago{liveness}] {status}\n  task: {}",
+                    "• `{}` [agent_index_hint=#{agent_index_hint}, source=runtime, manageable=true, origin={origin}, usage={usage}, {age}s ago{liveness}{batch}] {status}\n  task: {}",
                     r.id, r.task
                 )
             })
             .collect();
 
+        let mut lines = group_lines_by_batch(&filtered, &rendered);
         let mut recovered_lines = recovered.iter().map(format_recovered_run).collect::<Vec<_>>();
         lines.append(&mut recovered_lines);
 
@@ -166,6 +172,60 @@ impl Tool for SessionsListTool {
     fn categories(&self) -> &'static [ToolCategory] {
         &[ToolCategory::Automation]
     }
+}
+
+/// Lay the rendered run lines out so the members of one `spawn_batch` fan-out
+/// read as one unit.
+///
+/// A batch's members are otherwise scattered through the list by spawn order
+/// and indistinguishable from unrelated runs, which makes the single question
+/// an operator actually has — "is that fan-out done, and did any of it fail?" —
+/// unanswerable without reading every line. Grouping is presentation only: the
+/// same runs appear, exactly once each, with their `agent_index_hint` computed
+/// from the unsorted list so a hint still means the same run it did before.
+///
+/// A batch header is emitted at the position of its *first* member, so a
+/// batchless list is byte-for-byte what it always was.
+fn group_lines_by_batch(runs: &[&SubAgentRun], rendered: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(rendered.len());
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (run, line) in runs.iter().zip(rendered) {
+        let Some(batch_id) = run.batch_id.as_deref() else {
+            out.push(line.clone());
+            continue;
+        };
+        if !seen.insert(batch_id) {
+            // Already emitted with its batch, below its header.
+            continue;
+        }
+        let members: Vec<(&&SubAgentRun, &String)> = runs
+            .iter()
+            .zip(rendered)
+            .filter(|(candidate, _)| candidate.batch_id.as_deref() == Some(batch_id))
+            .collect();
+        out.push(format!(
+            "▣ batch `{batch_id}` — {}",
+            summarize_batch(members.iter().map(|(run, _)| **run))
+        ));
+        for (_, member_line) in members {
+            out.push(member_line.clone());
+        }
+    }
+    out
+}
+
+/// One-line tally of a batch, so its header answers "is it done?" on its own.
+fn summarize_batch<'a>(members: impl Iterator<Item = &'a SubAgentRun>) -> String {
+    let (mut running, mut completed, mut failed, mut total) = (0_usize, 0_usize, 0_usize, 0_usize);
+    for member in members {
+        total = total.saturating_add(1);
+        match member.status {
+            SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => running = running.saturating_add(1),
+            SubAgentStatus::Completed(_) => completed = completed.saturating_add(1),
+            SubAgentStatus::Failed(_) => failed = failed.saturating_add(1),
+        }
+    }
+    format!("{total} run(s): {running} running, {completed} completed, {failed} failed")
 }
 
 /// Liveness of a run that has not reported a terminal status yet.
@@ -287,6 +347,7 @@ mod tests {
     fn make_run(id: &str, status: SubAgentStatus, task: &str) -> SubAgentRun {
         SubAgentRun {
             progress: crate::agent::idle::child_beat(),
+            batch_id: None,
             id: id.to_string(),
             task: task.to_string(),
             owner_id: None,
@@ -372,6 +433,62 @@ mod tests {
         let result = tool.execute(json!({})).await.unwrap();
 
         assert!(!result.output.contains("last progress"), "{}", result.output);
+    }
+
+    /// A fan-out started by one `spawn_batch` must read as one unit: a header
+    /// that answers "is it done?" and its members underneath it, even though
+    /// the runs are interleaved with unrelated ones in the registry.
+    #[tokio::test]
+    async fn batch_members_are_grouped_under_one_header() {
+        let mut first = make_run("m1", SubAgentStatus::Running, "member one");
+        first.batch_id = Some("batch-42".to_string());
+        let loner = make_run("solo", SubAgentStatus::Running, "unrelated");
+        let mut second = make_run("m2", SubAgentStatus::Completed("done".into()), "member two");
+        second.batch_id = Some("batch-42".to_string());
+
+        let runs = Arc::new(RwLock::new(vec![first, loner, second]));
+        let tool = SessionsListTool::new(runs);
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(result.success);
+
+        let output = result.output;
+        assert!(
+            output.contains("▣ batch `batch-42` — 2 run(s): 1 running, 1 completed, 0 failed"),
+            "{output}"
+        );
+        let header = output.find("batch-42` \u{2014}").expect("the batch header");
+        let m1 = output.find("`m1`").expect("member one is listed");
+        let m2 = output.find("`m2`").expect("member two is listed");
+        let solo = output.find("`solo`").expect("the unrelated run is still listed");
+        // The header takes the place of the batch's first member, and the rest
+        // of the batch is pulled up under it; everything else keeps its order.
+        assert!(header < m1 && m1 < m2, "members must follow their header: {output}");
+        assert!(
+            m2 < solo,
+            "an unrelated run must not be swallowed by the batch: {output}"
+        );
+        assert!(output.contains("batch=batch-42"), "{output}");
+        let solo_line = output
+            .lines()
+            .find(|line| line.contains("`solo`"))
+            .expect("the unrelated run is listed");
+        assert!(
+            !solo_line.contains("batch="),
+            "a run outside any batch must not be labelled with one: {solo_line}"
+        );
+    }
+
+    /// A list with no batches must render exactly as it always did.
+    #[tokio::test]
+    async fn a_list_without_batches_gains_no_grouping() {
+        let runs = Arc::new(RwLock::new(vec![
+            make_run("aaa", SubAgentStatus::Running, "task A"),
+            make_run("bbb", SubAgentStatus::Running, "task B"),
+        ]));
+        let tool = SessionsListTool::new(runs);
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.output.contains("▣ batch"), "{}", result.output);
+        assert!(!result.output.contains("batch="), "{}", result.output);
     }
 
     #[tokio::test]

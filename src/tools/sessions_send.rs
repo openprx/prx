@@ -234,6 +234,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(crate::tools::sessions_spawn::STEER_CHANNEL_CAPACITY);
         let run = SubAgentRun {
             progress: crate::agent::idle::child_beat(),
+            batch_id: None,
             id: id.to_string(),
             task: "some task".to_string(),
             owner_id: None,
@@ -391,6 +392,7 @@ mod tests {
     async fn completed_session_returns_failure() {
         let run = SubAgentRun {
             progress: crate::agent::idle::child_beat(),
+            batch_id: None,
             id: "done-run".to_string(),
             task: "finished task".to_string(),
             owner_id: None,
