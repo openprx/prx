@@ -1345,6 +1345,11 @@ pub async fn run_gateway(
         registry.insert(nc.name().to_string(), nc.clone() as Arc<dyn Channel>);
     }
     let channels_registry = Arc::new(registry);
+    // Publish it process-wide for as long as this gateway runs, so
+    // `POST /api/channels/{name}/send` can address the channels the gateway
+    // itself constructed. The channels supervisor publishes its own (larger)
+    // registry alongside this one; the two are merged at lookup time.
+    let _outbound_publication = crate::channels::outbound_registry::publish(Arc::clone(&channels_registry));
 
     // Register message_send tool backed by Signal when the channel is configured.
     // For other channels (WhatsApp, Linq, etc.) we register a generic sender without

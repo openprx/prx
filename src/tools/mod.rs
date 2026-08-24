@@ -91,7 +91,7 @@ pub use memory_recall::MemoryRecallTool;
 pub use memory_reindex::MemoryReindexTool;
 pub use memory_search::MemorySearchTool;
 pub use memory_store::MemoryStoreTool;
-pub use message_send::MessageSendTool;
+pub use message_send::{DaemonMessageSendTool, MessageSendTool};
 pub use nodes::NodesTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
