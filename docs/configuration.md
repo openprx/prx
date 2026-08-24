@@ -280,6 +280,12 @@ A rule carries two independent ACLs:
 | `tools_allow` / `tools_deny` | which tools may run | `tools_deny` first, then `tools_allow` (empty = no whitelist) |
 | `send_allow` / `send_deny` | which recipients `message_send` may reach | `send_deny` first, then `send_allow` (empty = no whitelist) |
 
+When no rule matches, or a matching rule sets no `send_allow`, the destination
+channel decides: sending on the turn's **own** channel is allowed (the
+long-standing behaviour), and `message_send`'s explicit `channel` argument
+pointing anywhere else is denied. Cross-channel sending is therefore opt-in per
+sender, and a denial is never retried on the current channel.
+
 Outbound entries are `{channel}:{recipient}`; a bare `"*"` matches every
 destination and either segment may be `"*"`. The entry is split at its first
 colon, so recipients that contain colons themselves (JIDs, group ids) stay

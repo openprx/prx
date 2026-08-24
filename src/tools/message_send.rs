@@ -14,6 +14,7 @@ use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
 use crate::security::{SecurityPolicy, SideEffectGate};
 use async_trait::async_trait;
 use serde_json::json;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -149,6 +150,17 @@ fn trusted_outbound_identity(args: &serde_json::Value) -> (String, String) {
     (field("sender"), field("chat_type"))
 }
 
+/// The explicitly requested destination channel, if any.
+///
+/// Blank strings are treated as absent so an empty argument keeps the
+/// pre-existing single-channel behaviour instead of failing the lookup.
+fn requested_channel(args: &serde_json::Value) -> Option<&str> {
+    args.get("channel")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
 pub struct MessageSendTool {
     /// Active channel — updated per-message via `set_active_channel` so that
     /// replies are always routed back on the same channel the message arrived on
@@ -161,6 +173,12 @@ pub struct MessageSendTool {
     /// Stored in an `RwLock` so the gateway can update it per-message.
     default_recipient: Arc<tokio::sync::RwLock<Option<String>>>,
     security: Arc<SecurityPolicy>,
+    /// Every configured channel, keyed by [`Channel::name`] — the registry the
+    /// optional `channel` argument resolves against. Shared with
+    /// `sessions_spawn`'s announce/kill routing registry so both tools address
+    /// exactly the same set of channels. Empty when no registry was injected,
+    /// in which case only the turn's own channel is addressable.
+    channels: Arc<HashMap<String, Arc<dyn Channel>>>,
 }
 
 impl MessageSendTool {
@@ -171,6 +189,7 @@ impl MessageSendTool {
             signal: None,
             default_recipient: Arc::new(tokio::sync::RwLock::new(None)),
             security,
+            channels: Arc::new(HashMap::new()),
         }
     }
 
@@ -181,7 +200,21 @@ impl MessageSendTool {
             signal: Some(channel),
             default_recipient: Arc::new(tokio::sync::RwLock::new(None)),
             security,
+            channels: Arc::new(HashMap::new()),
         }
+    }
+
+    /// Attach the full set of configured channels, keyed by [`Channel::name`].
+    ///
+    /// This is what makes the optional `channel` argument resolvable. Callers
+    /// pass the very same `Arc` they hand to `sessions_spawn`, so a channel that
+    /// can receive a sub-agent announcement is exactly a channel `message_send`
+    /// can address, and vice versa. Without it the tool stays single-channel:
+    /// only the turn's own channel is addressable.
+    #[must_use]
+    pub fn with_channels(mut self, channels: Arc<HashMap<String, Arc<dyn Channel>>>) -> Self {
+        self.channels = channels;
+        self
     }
 
     /// Return a shareable handle to the default-recipient slot so callers can update
@@ -195,13 +228,89 @@ impl MessageSendTool {
         *self.default_recipient.write().await = recipient;
     }
 
+    /// Channel names this tool can address, for the "unknown channel" error.
+    ///
+    /// The turn's own channel is always addressable even when no registry was
+    /// injected, so it is unioned in rather than assumed to be a registry key.
+    fn addressable_channel_names(&self, current: &str) -> Vec<String> {
+        let mut names: Vec<String> = self.channels.keys().cloned().collect();
+        if !names.iter().any(|name| name == current) {
+            names.push(current.to_string());
+        }
+        names.sort_unstable();
+        names
+    }
+
+    /// Cross-channel delivery carries text only.
+    ///
+    /// [`SendMessage`] has no attachment field: media travels as a `[KIND:path]`
+    /// marker that the *originating* channel resolves against paths it owns.
+    /// Handing such a marker to a different channel would neither reliably
+    /// deliver the file nor stay inside that channel's media ownership — it
+    /// turns an outbound text send into "read this local path". So a request
+    /// that both names another channel and embeds (or asks to synthesise) media
+    /// is refused outright rather than silently downgraded to plain text.
+    fn reject_cross_channel_media(args: &serde_json::Value, dst_channel: &str) -> Result<(), String> {
+        let message = args.get("message").and_then(serde_json::Value::as_str).unwrap_or("");
+        let (_, media) = crate::channels::traits::extract_outgoing_media(message);
+        if let Some((marker, _)) = media.first() {
+            return Err(format!(
+                "Cross-channel delivery to '{dst_channel}' is text-only, but this message embeds a \
+                 [{marker}:] media marker. Attachments are local paths owned by the originating \
+                 channel and cannot be handed to another channel. Send the text across channels, \
+                 or send the media on the current channel."
+            ));
+        }
+        if args
+            .get("as_voice")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Err(format!(
+                "Cross-channel delivery to '{dst_channel}' is text-only, so as_voice=true cannot be \
+                 honoured: the synthesised voice note is a local file the destination channel does \
+                 not own. Drop as_voice, or send the voice note on the current channel."
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve which channel object actually carries this call.
+    ///
+    /// No `channel` argument — the overwhelmingly common case — returns the
+    /// turn's own channel unchanged, so every pre-existing behaviour is
+    /// bit-for-bit what it was. An explicit `channel` naming the turn's own
+    /// channel is likewise a no-op. Anything else must be found in the injected
+    /// registry; an unknown name is a hard error that lists what *is*
+    /// addressable, never a silent fallback to the current channel.
+    fn resolve_outbound_route(
+        &self,
+        args: &serde_json::Value,
+        current: &Arc<dyn Channel>,
+    ) -> Result<Arc<dyn Channel>, String> {
+        let Some(requested) = requested_channel(args) else {
+            return Ok(Arc::clone(current));
+        };
+        if requested == current.name() {
+            return Ok(Arc::clone(current));
+        }
+        let Some(target) = self.channels.get(requested) else {
+            return Err(format!(
+                "Unknown channel '{requested}'. Available channels: {}",
+                self.addressable_channel_names(current.name()).join(", ")
+            ));
+        };
+        Ok(Arc::clone(target))
+    }
+
     /// Outbound recipient authorization, applied to every action that reaches a
     /// recipient (`send`, `react`, `edit`, `delete`/`unsend`, `thread`).
     ///
     /// `src_channel` is the channel the turn is anchored to and `dst_channel`
-    /// the one the message actually leaves on; today they are always the same
-    /// object, which is what makes this a no-op unless an operator configures
-    /// `send_allow` / `send_deny`.
+    /// the one the message actually leaves on. They differ exactly when the
+    /// caller passed an explicit `channel`; with no `channel` argument they are
+    /// the same object, which is what keeps this a no-op unless an operator
+    /// configures `send_allow` / `send_deny`.
     ///
     /// The rejection message carries only the stable audit fingerprint of the
     /// destination, never the plaintext recipient.
@@ -225,6 +334,33 @@ impl MessageSendTool {
              '{dst_channel}' is not permitted by the configured scope rules"
         )))
     }
+
+    /// Decide which channel object carries this call, and clear it to do so.
+    ///
+    /// Three gates, in this order, for every recipient-bearing action except
+    /// `react` (whose delivery handle is fixed — see that arm):
+    ///
+    /// 1. resolve the requested channel, erroring on an unknown name;
+    /// 2. authorize the destination — a refusal here is final, the call is
+    ///    **never** retried on the turn's own channel, because falling back
+    ///    would report a denied cross-channel send as a delivered one;
+    /// 3. refuse cross-channel media, which cannot travel between channels.
+    ///
+    /// With no `channel` argument the destination is the turn's own channel and
+    /// gates 1 and 3 are inert, leaving exactly the pre-existing behaviour.
+    fn prepare_outbound(
+        &self,
+        args: &serde_json::Value,
+        current: &Arc<dyn Channel>,
+        recipient: &str,
+    ) -> Result<Arc<dyn Channel>, String> {
+        let destination = self.resolve_outbound_route(args, current)?;
+        self.authorize_outbound(args, current.name(), destination.name(), recipient)?;
+        if destination.name() != current.name() {
+            Self::reject_cross_channel_media(args, destination.name())?;
+        }
+        Ok(destination)
+    }
 }
 
 #[async_trait]
@@ -236,7 +372,8 @@ impl Tool for MessageSendTool {
     fn description(&self) -> &str {
         "Send a message through the active messaging channel (Signal, Telegram, etc.). \
          Supports text, file/image/voice attachments, emoji reactions, and quote replies. \
-         Use action='send' for messages and action='react' for emoji reactions."
+         Use action='send' for messages and action='react' for emoji reactions. \
+         Set 'channel' to deliver text on a different configured channel."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -255,6 +392,14 @@ impl Tool for MessageSendTool {
                     "type": "string",
                     "description": "Recipient identifier (phone number, group ID, Signal UUID, etc.). \
                                     Defaults to the current conversation's sender when omitted."
+                },
+                "channel": {
+                    "type": "string",
+                    "description": "Destination channel name (e.g. 'signal', 'telegram', 'wacli'). \
+                                    Omit to stay on the current conversation's channel. Naming another \
+                                    channel requires it to be permitted by the outbound scope rules and \
+                                    delivers text only — media markers and as_voice are refused. \
+                                    Not accepted for action='react'."
                 },
                 "message": {
                     "type": "string",
@@ -355,15 +500,18 @@ impl Tool for MessageSendTool {
                         });
                     }
                 };
-                if let Err(error) = self.authorize_outbound(&args, channel.name(), channel.name(), &recipient) {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(error),
-                    });
-                }
-                let recipient_ref = op_id::ref_for_channel_recipient(channel.name(), &recipient);
-                let operation_name = op_id::op_id(self.name(), "send", &[channel.name(), &recipient_ref]);
+                let destination = match self.prepare_outbound(&args, &channel, &recipient) {
+                    Ok(destination) => destination,
+                    Err(error) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(error),
+                        });
+                    }
+                };
+                let recipient_ref = op_id::ref_for_channel_recipient(destination.name(), &recipient);
+                let operation_name = op_id::op_id(self.name(), "send", &[destination.name(), &recipient_ref]);
                 let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
                 if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
                     self.name(),
@@ -415,7 +563,7 @@ impl Tool for MessageSendTool {
                     msg.quote_author = Some(author.to_owned());
                 }
 
-                match channel.send(&msg).await {
+                match destination.send(&msg).await {
                     Ok(()) => {
                         // Delayed cleanup for auto-generated TTS files (Bug 1 fix):
                         // signal-cli may read the file asynchronously after the RPC response,
@@ -461,6 +609,24 @@ impl Tool for MessageSendTool {
                     .signal
                     .as_ref()
                     .map_or_else(|| channel.name(), |signal| signal.name());
+                // `channel` would be ambiguous here: a reaction is not carried by
+                // the `Channel` object the argument resolves to, and no other
+                // channel exposes `send_reaction`. Rather than let the argument
+                // read as "route this reaction elsewhere" while it silently did
+                // nothing, refuse it unless it names the handle that really sends.
+                if let Some(requested) = requested_channel(&args)
+                    && requested != react_channel_name
+                {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Reactions cannot be redirected: action='react' is always delivered by the \
+                             '{react_channel_name}' handle, so channel='{requested}' cannot be honoured. \
+                             Drop 'channel', or use action='send' to reach '{requested}'."
+                        )),
+                    });
+                }
                 if let Err(error) = self.authorize_outbound(&args, react_channel_name, react_channel_name, &recipient) {
                     return Ok(ToolResult {
                         success: false,
@@ -543,13 +709,16 @@ impl Tool for MessageSendTool {
                         });
                     }
                 };
-                if let Err(error) = self.authorize_outbound(&args, channel.name(), channel.name(), &recipient) {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(error),
-                    });
-                }
+                let destination = match self.prepare_outbound(&args, &channel, &recipient) {
+                    Ok(destination) => destination,
+                    Err(error) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(error),
+                        });
+                    }
+                };
                 let message_id = match args.get("message_id").and_then(|v| v.as_str()) {
                     Some(id) if !id.is_empty() => id.to_owned(),
                     _ => {
@@ -561,7 +730,7 @@ impl Tool for MessageSendTool {
                     }
                 };
                 let new_text = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                match channel.edit_message(&recipient, &message_id, new_text).await {
+                match destination.edit_message(&recipient, &message_id, new_text).await {
                     Ok(()) => Ok(ToolResult {
                         success: true,
                         output: format!("Message {message_id} edited."),
@@ -587,13 +756,16 @@ impl Tool for MessageSendTool {
                         });
                     }
                 };
-                if let Err(error) = self.authorize_outbound(&args, channel.name(), channel.name(), &recipient) {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(error),
-                    });
-                }
+                let destination = match self.prepare_outbound(&args, &channel, &recipient) {
+                    Ok(destination) => destination,
+                    Err(error) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(error),
+                        });
+                    }
+                };
                 let message_id = match args.get("message_id").and_then(|v| v.as_str()) {
                     Some(id) if !id.is_empty() => id.to_owned(),
                     _ => {
@@ -604,7 +776,7 @@ impl Tool for MessageSendTool {
                         });
                     }
                 };
-                match channel.delete_message(&recipient, &message_id).await {
+                match destination.delete_message(&recipient, &message_id).await {
                     Ok(()) => Ok(ToolResult {
                         success: true,
                         output: format!("Message {message_id} deleted."),
@@ -630,13 +802,16 @@ impl Tool for MessageSendTool {
                         });
                     }
                 };
-                if let Err(error) = self.authorize_outbound(&args, channel.name(), channel.name(), &recipient) {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(error),
-                    });
-                }
+                let destination = match self.prepare_outbound(&args, &channel, &recipient) {
+                    Ok(destination) => destination,
+                    Err(error) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(error),
+                        });
+                    }
+                };
                 let thread_id = match args.get("thread_id").and_then(|v| v.as_str()) {
                     Some(id) if !id.is_empty() => id.to_owned(),
                     _ => {
@@ -648,7 +823,7 @@ impl Tool for MessageSendTool {
                     }
                 };
                 let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                match channel.send_thread_reply(&recipient, &thread_id, message).await {
+                match destination.send_thread_reply(&recipient, &thread_id, message).await {
                     Ok(()) => Ok(ToolResult {
                         success: true,
                         output: format!("Thread reply sent to thread {thread_id}."),
@@ -1122,6 +1297,332 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains(POLICY_ERROR_MARKER));
+    }
+
+    // ── Explicit destination channel (plan a2) ─────────────────────────────
+
+    /// Build the shared channel registry the way the runtime does: keyed by
+    /// [`Channel::name`], the same `Arc` `sessions_spawn` receives.
+    fn registry(channels: &[Arc<DummyChannel>]) -> Arc<HashMap<String, Arc<dyn Channel>>> {
+        Arc::new(
+            channels
+                .iter()
+                .map(|ch| (ch.name().to_string(), Arc::clone(ch) as Arc<dyn Channel>))
+                .collect(),
+        )
+    }
+
+    /// A turn channel plus a second configured channel, wired into one registry.
+    #[allow(clippy::type_complexity)]
+    fn two_channel_tool(
+        security: Arc<SecurityPolicy>,
+    ) -> (
+        MessageSendTool,
+        Arc<tokio::sync::Mutex<Vec<String>>>,
+        Arc<tokio::sync::Mutex<Vec<String>>>,
+        Arc<tokio::sync::Mutex<Vec<String>>>,
+    ) {
+        let (current, current_sent, _current_recipients) = DummyChannel::new_named("dummy");
+        let (other, other_sent, other_recipients) = DummyChannel::new_named("telegram");
+        let tool = MessageSendTool::new(Arc::clone(&current) as Arc<dyn Channel>, security)
+            .with_channels(registry(&[current, other]));
+        (tool, current_sent, other_sent, other_recipients)
+    }
+
+    /// Evidence 2: an authorized explicit `channel` really hands the message to
+    /// that channel object — and to no other.
+    #[tokio::test]
+    async fn explicit_channel_delivers_to_the_named_channel() {
+        let (tool, current_sent, other_sent, other_recipients) =
+            two_channel_tool(scoped_security(&["telegram:*"], &[]));
+
+        let result = tool
+            .execute(json!({
+                "action": "send", "channel": "telegram",
+                "target": "12345", "message": "across the wire"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+        assert_eq!(&*other_sent.lock().await, &["across the wire".to_string()]);
+        assert_eq!(&*other_recipients.lock().await, &["12345".to_string()]);
+        assert!(
+            current_sent.lock().await.is_empty(),
+            "the turn's own channel must not also receive a cross-channel send"
+        );
+    }
+
+    /// Evidence 3 — the load-bearing one. An unauthorized cross-channel send is
+    /// refused outright; nothing may leak onto the turn's own channel, because a
+    /// fallback would dress a denied send up as a delivered one.
+    #[tokio::test]
+    async fn unauthorized_cross_channel_send_never_falls_back_to_the_current_channel() {
+        // No scope rules at all: same-channel stays allowed, cross-channel denied.
+        let (tool, current_sent, other_sent, other_recipients) = two_channel_tool(test_security(AutonomyLevel::Full));
+
+        let result = tool
+            .execute(json!({
+                "action": "send", "channel": "telegram",
+                "target": "12345", "message": "must not be delivered"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "cross-channel send must be denied by default");
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains(POLICY_ERROR_MARKER), "got: {error}");
+        assert!(
+            current_sent.lock().await.is_empty(),
+            "denied cross-channel send must not fall back to the current channel"
+        );
+        assert!(other_sent.lock().await.is_empty());
+        assert!(other_recipients.lock().await.is_empty());
+    }
+
+    /// Same guarantee for every other recipient-bearing action that can be routed.
+    #[tokio::test]
+    async fn unauthorized_cross_channel_is_refused_for_every_routable_action() {
+        let (tool, current_sent, other_sent, _other_recipients) = two_channel_tool(test_security(AutonomyLevel::Full));
+
+        for args in [
+            json!({"action": "send", "channel": "telegram", "target": "1", "message": "x"}),
+            json!({"action": "edit", "channel": "telegram", "target": "1", "message_id": "9", "message": "x"}),
+            json!({"action": "delete", "channel": "telegram", "target": "1", "message_id": "9"}),
+            json!({"action": "unsend", "channel": "telegram", "target": "1", "message_id": "9"}),
+            json!({"action": "thread", "channel": "telegram", "target": "1", "thread_id": "t", "message": "x"}),
+        ] {
+            let action = args["action"].as_str().unwrap_or_default().to_string();
+            let result = tool.execute(args).await.unwrap();
+            assert!(!result.success, "action {action} must be denied");
+            let error = result.error.unwrap_or_default();
+            assert!(
+                error.contains(POLICY_ERROR_MARKER),
+                "action {action} must fail on the outbound policy, got: {error}"
+            );
+        }
+        assert!(current_sent.lock().await.is_empty());
+        assert!(other_sent.lock().await.is_empty());
+    }
+
+    /// Evidence 4: an unknown channel name is an error that names what *is*
+    /// addressable — never a silent send on the current channel.
+    #[tokio::test]
+    async fn unknown_channel_name_is_rejected_and_lists_the_available_channels() {
+        let (tool, current_sent, other_sent, _other_recipients) = two_channel_tool(scoped_security(&["*"], &[]));
+
+        let result = tool
+            .execute(json!({
+                "action": "send", "channel": "matrix", "target": "12345", "message": "hi"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("Unknown channel 'matrix'"), "got: {error}");
+        assert!(error.contains("Available channels: dummy, telegram"), "got: {error}");
+        assert!(
+            current_sent.lock().await.is_empty(),
+            "unknown channel must not fall back"
+        );
+        assert!(other_sent.lock().await.is_empty());
+    }
+
+    /// Without an injected registry only the turn's own channel is addressable,
+    /// and the error says so instead of pretending the send went out.
+    #[tokio::test]
+    async fn without_a_registry_only_the_turn_channel_is_addressable() {
+        let (ch, sent) = DummyChannel::new();
+        let tool = MessageSendTool::new(ch, scoped_security(&["*"], &[]));
+
+        let result = tool
+            .execute(json!({
+                "action": "send", "channel": "telegram", "target": "12345", "message": "hi"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("Unknown channel 'telegram'"), "got: {error}");
+        assert!(error.contains("Available channels: dummy"), "got: {error}");
+        assert!(sent.lock().await.is_empty());
+    }
+
+    /// Evidence 5: cross-channel carries text only. A media marker is refused
+    /// with the reason, not quietly stripped or shipped as a bare local path.
+    #[tokio::test]
+    async fn cross_channel_media_marker_is_refused_with_a_reason() {
+        let (tool, current_sent, other_sent, _other_recipients) = two_channel_tool(scoped_security(&["*"], &[]));
+
+        let result = tool
+            .execute(json!({
+                "action": "send", "channel": "telegram", "target": "12345",
+                "message": "look at this [IMAGE:/tmp/cat.png]"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "cross-channel media must be refused");
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("text-only"), "got: {error}");
+        assert!(error.contains("[IMAGE:]"), "got: {error}");
+        assert!(current_sent.lock().await.is_empty());
+        assert!(other_sent.lock().await.is_empty());
+    }
+
+    /// `as_voice` synthesises a local file, so it is media too.
+    #[tokio::test]
+    async fn cross_channel_as_voice_is_refused() {
+        let (tool, current_sent, other_sent, _other_recipients) = two_channel_tool(scoped_security(&["*"], &[]));
+
+        let result = tool
+            .execute(json!({
+                "action": "send", "channel": "telegram", "target": "12345",
+                "message": "read this out", "as_voice": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("as_voice"));
+        assert!(current_sent.lock().await.is_empty());
+        assert!(other_sent.lock().await.is_empty());
+    }
+
+    /// A media marker on the turn's *own* channel is untouched by the guard —
+    /// the restriction is about crossing channels, not about media.
+    #[tokio::test]
+    async fn same_channel_media_marker_is_unaffected() {
+        let (tool, current_sent, other_sent, _other_recipients) = two_channel_tool(test_security(AutonomyLevel::Full));
+
+        for args in [
+            json!({"action": "send", "target": "12345", "message": "pic [IMAGE:/tmp/cat.png]"}),
+            json!({"action": "send", "channel": "dummy", "target": "12345", "message": "pic [IMAGE:/tmp/cat.png]"}),
+        ] {
+            let result = tool.execute(args).await.unwrap();
+            assert!(result.success, "got: {:?}", result.error);
+        }
+        assert_eq!(current_sent.lock().await.len(), 2);
+        assert!(other_sent.lock().await.is_empty());
+    }
+
+    /// Evidence 1: with a registry injected but no `channel` argument, routing is
+    /// byte-for-byte what it was — and naming the turn's own channel is a no-op.
+    #[tokio::test]
+    async fn omitting_channel_keeps_the_existing_routing_verbatim() {
+        let (tool, current_sent, other_sent, other_recipients) = two_channel_tool(test_security(AutonomyLevel::Full));
+
+        for args in [
+            json!({"action": "send", "target": "12345", "message": "implicit"}),
+            json!({"action": "send", "channel": "dummy", "target": "12345", "message": "explicit-same"}),
+            json!({"action": "send", "channel": "", "target": "12345", "message": "blank-is-absent"}),
+        ] {
+            let result = tool.execute(args).await.unwrap();
+            assert!(result.success, "got: {:?}", result.error);
+        }
+
+        assert_eq!(
+            &*current_sent.lock().await,
+            &[
+                "implicit".to_string(),
+                "explicit-same".to_string(),
+                "blank-is-absent".to_string()
+            ]
+        );
+        assert!(other_sent.lock().await.is_empty());
+        assert!(other_recipients.lock().await.is_empty());
+    }
+
+    /// The turn's task-local channel — not the construction-time slot — is what
+    /// `channel` is measured against, so a concurrent turn cannot redefine what
+    /// "the current channel" means for this call.
+    #[tokio::test]
+    async fn explicit_channel_is_measured_against_the_task_local_turn_channel() {
+        let (current, current_sent, _r1) = DummyChannel::new_named("dummy");
+        let (other, other_sent, _r2) = DummyChannel::new_named("telegram");
+        let tool = MessageSendTool::new(
+            Arc::clone(&other) as Arc<dyn Channel>,
+            test_security(AutonomyLevel::Full),
+        )
+        .with_channels(registry(&[Arc::clone(&current), Arc::clone(&other)]));
+
+        // The turn is anchored to "dummy" even though the tool was built on
+        // "telegram"; asking for "dummy" must therefore stay same-channel.
+        let context =
+            MessageSendExecutionContext::new(Some("12345".to_string()), Arc::clone(&current) as Arc<dyn Channel>);
+        let result = MESSAGE_SEND_EXECUTION_CONTEXT
+            .scope(context, async {
+                tool.execute(json!({"action": "send", "channel": "dummy", "message": "in-turn"}))
+                    .await
+            })
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+        assert_eq!(&*current_sent.lock().await, &["in-turn".to_string()]);
+        assert!(other_sent.lock().await.is_empty());
+    }
+
+    /// `react` is delivered by the Signal handle, not by the resolved channel
+    /// object, so an explicit `channel` naming anything else is refused rather
+    /// than accepted and ignored.
+    #[tokio::test]
+    async fn react_refuses_an_explicit_channel_it_cannot_honour() {
+        let (tool, current_sent, other_sent, _other_recipients) = two_channel_tool(test_security(AutonomyLevel::Full));
+
+        let result = tool
+            .execute(json!({
+                "action": "react", "channel": "telegram", "target": "12345",
+                "emoji": "\u{1F44D}", "target_author": "+19998887777",
+                "target_timestamp": 1_700_000_000_000u64
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("Reactions cannot be redirected"), "got: {error}");
+        assert!(error.contains("telegram"), "got: {error}");
+        assert!(current_sent.lock().await.is_empty());
+        assert!(other_sent.lock().await.is_empty());
+
+        // Naming the handle that really delivers is accepted (and then fails on
+        // the pre-existing "no Signal channel" path, unchanged).
+        let same = tool
+            .execute(json!({
+                "action": "react", "channel": "dummy", "target": "12345",
+                "emoji": "\u{1F44D}", "target_author": "+19998887777",
+                "target_timestamp": 1_700_000_000_000u64
+            }))
+            .await
+            .unwrap();
+        assert!(!same.success);
+        assert!(same.error.unwrap_or_default().contains("Signal"));
+    }
+
+    /// An explicit channel routes `edit`/`delete`/`thread` too, once authorized.
+    #[tokio::test]
+    async fn explicit_channel_routes_the_other_recipient_actions() {
+        let (tool, _current_sent, _other_sent, _other_recipients) = two_channel_tool(scoped_security(&["*"], &[]));
+
+        // DummyChannel does not implement these verbs, so success is not the
+        // observable here; what matters is that the call reached the *named*
+        // channel's default implementation rather than the policy or router.
+        for args in [
+            json!({"action": "edit", "channel": "telegram", "target": "1", "message_id": "9", "message": "x"}),
+            json!({"action": "delete", "channel": "telegram", "target": "1", "message_id": "9"}),
+            json!({"action": "thread", "channel": "telegram", "target": "1", "thread_id": "t", "message": "x"}),
+        ] {
+            let action = args["action"].as_str().unwrap_or_default().to_string();
+            let result = tool.execute(args).await.unwrap();
+            let error = result.error.unwrap_or_default();
+            assert!(
+                !error.contains(POLICY_ERROR_MARKER) && !error.contains("Unknown channel"),
+                "action {action} must have been routed, got: {error}"
+            );
+        }
     }
 
     #[tokio::test]

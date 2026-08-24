@@ -18,6 +18,18 @@
 
 `cron` schedules with `kind: "at"` are one-shot regardless of physical retention: after their final success or failure they expose a typed terminal state and are never due again. `delete_after_run` atomically removes the job with its successful terminal commit; failures remain visible for run and event audit. The cron tool's update action can re-arm a retained terminal job with a new future `at` schedule; setting `enabled: true` alone does not, and an in-flight `at` schedule cannot be replaced. Manual `run` remains available for paused or terminal jobs; only a nonterminal `at` is consumed into terminal state. The CLI supports creating and displaying `at` jobs but does not expose an `at`-schedule update flag.
 
+`message_send` normally replies on the channel the turn arrived on. An optional
+`channel` argument names a different configured channel instead — resolved
+against the same channel registry `sessions_spawn` announces into, so an
+unknown name is an error that lists what is addressable rather than a silent
+reply on the current channel. Cross-channel delivery must be permitted by
+`send_allow` (see [Scope rules](configuration.md#scope-rules); the default for a
+destination channel other than the turn's own is **deny**) and carries **text
+only**: `[IMAGE:]` / `[VOICE:]` / `[DOCUMENT:]` markers and `as_voice` are
+refused, because an attachment is a local path owned by the originating channel.
+`action="react"` cannot be redirected — reactions are always delivered by the
+Signal handle — so it rejects a `channel` naming anything else.
+
 Agentic `delegate` configurations require an explicit non-empty
 `allowed_tools`. A named list is intersected with the eligible parent registry;
 unknown or ineligible names fail before the provider turn starts. The exclusive

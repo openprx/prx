@@ -5719,6 +5719,7 @@ pub async fn start_channels_with_config(
                 bot_jid: wc.bot_jid.clone(),
                 bot_number: wc.bot_number.clone(),
                 bot_lid: wc.bot_lid.clone(),
+                outbound_media_workspace_only: wc.outbound_media_workspace_only,
             })
             .with_media_artifacts(
                 crate::media::MediaArtifactOwner::for_workspace(&config.workspace_dir),
@@ -5779,6 +5780,17 @@ pub async fn start_channels_with_config(
         return Ok(());
     }
 
+    // Per-turn routing registry, keyed by `Channel::name`: one map shared by
+    // `message_send` (destination of an explicit `channel` argument) and
+    // `sessions_spawn` (announce/kill routing). Sharing it is what guarantees the
+    // two tools agree on exactly which channels exist.
+    let channels_registry = Arc::new(
+        channels
+            .iter()
+            .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
+            .collect::<HashMap<_, _>>(),
+    );
+
     // Register message_send tool backed by Signal (or first channel) for proactive messaging.
     // Always use SignalChannel (HTTP) pointing to the effective URL (local daemon in native mode,
     // external daemon in rest mode).  The daemon must be running by the time this tool is invoked.
@@ -5804,10 +5816,12 @@ pub async fn start_channels_with_config(
             )
             .with_artifact_owner(crate::media::MediaArtifactOwner::for_workspace(&config.workspace_dir)),
         );
-        let msg_send_tool = tools::MessageSendTool::new_signal(sig_chan, security.clone());
+        let msg_send_tool = tools::MessageSendTool::new_signal(sig_chan, security.clone())
+            .with_channels(Arc::clone(&channels_registry));
         tools_list.push(Box::new(msg_send_tool));
     } else if let Some(first_channel) = channels.first().cloned() {
-        let msg_send_tool = tools::MessageSendTool::new(first_channel, security.clone());
+        let msg_send_tool =
+            tools::MessageSendTool::new(first_channel, security.clone()).with_channels(Arc::clone(&channels_registry));
         tools_list.push(Box::new(msg_send_tool));
     }
 
@@ -5823,12 +5837,7 @@ pub async fn start_channels_with_config(
         // (from the launching message's scope) and resolves the channel object
         // from here at announce/kill time — so concurrent message processing can
         // never mis-route a sub-agent result to the wrong channel.
-        let spawn_channels_by_name = Arc::new(
-            channels
-                .iter()
-                .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
-                .collect::<HashMap<_, _>>(),
-        );
+        let spawn_channels_by_name = Arc::clone(&channels_registry);
         let spawn_tool = tools::SessionsSpawnTool::new(
             first_channel,
             Arc::clone(&provider),
@@ -5989,12 +5998,7 @@ pub async fn start_channels_with_config(
     }
     drop(tx); // Drop our copy so rx closes when all channels stop
 
-    let channels_by_name = Arc::new(
-        channels
-            .iter()
-            .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
-            .collect::<HashMap<_, _>>(),
-    );
+    let channels_by_name = Arc::clone(&channels_registry);
     // No cap: a wedged turn must not be able to stop the dispatch loop from
     // receiving. `prx tasks list` is where in-flight turns are counted now.
     println!("  🚦 In-flight messages: unbounded (inspect with `prx tasks list`)");

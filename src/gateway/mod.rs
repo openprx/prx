@@ -1081,28 +1081,33 @@ fn build_gateway_turn_runtime(
     let mut tools_list = tools_result.tools;
     let mcp_tool = tools_result.mcp_tool;
 
+    // One routing registry, keyed by `Channel::name`, shared by `message_send`
+    // (destination of an explicit `channel` argument) and `sessions_spawn`
+    // (announce/kill routing) so both address exactly the same channel set.
+    let mut registry: HashMap<String, Arc<dyn Channel>> = HashMap::new();
+    if let Some(channel) = &signal {
+        registry.insert(channel.name().to_string(), Arc::clone(channel) as Arc<dyn Channel>);
+    }
+    if let Some(channel) = &whatsapp {
+        registry.insert(channel.name().to_string(), Arc::clone(channel) as Arc<dyn Channel>);
+    }
+    if let Some(channel) = &linq {
+        registry.insert(channel.name().to_string(), Arc::clone(channel) as Arc<dyn Channel>);
+    }
+    if let Some(channel) = &nextcloud_talk {
+        registry.insert(channel.name().to_string(), Arc::clone(channel) as Arc<dyn Channel>);
+    }
+    let channels_registry = Arc::new(registry);
+
     if let Some(signal_channel) = &signal {
-        tools_list.push(Box::new(tools::MessageSendTool::new_signal(
-            Arc::clone(signal_channel),
-            security.clone(),
-        )));
+        tools_list.push(Box::new(
+            tools::MessageSendTool::new_signal(Arc::clone(signal_channel), security.clone())
+                .with_channels(Arc::clone(&channels_registry)),
+        ));
     }
 
     let spawn_tools_handle = signal.as_ref().map(|signal_channel| {
-        let mut channels_by_name: HashMap<String, Arc<dyn Channel>> = HashMap::new();
-        channels_by_name.insert(
-            signal_channel.name().to_string(),
-            Arc::clone(signal_channel) as Arc<dyn Channel>,
-        );
-        if let Some(channel) = &whatsapp {
-            channels_by_name.insert(channel.name().to_string(), Arc::clone(channel) as Arc<dyn Channel>);
-        }
-        if let Some(channel) = &linq {
-            channels_by_name.insert(channel.name().to_string(), Arc::clone(channel) as Arc<dyn Channel>);
-        }
-        if let Some(channel) = &nextcloud_talk {
-            channels_by_name.insert(channel.name().to_string(), Arc::clone(channel) as Arc<dyn Channel>);
-        }
+        let channels_by_name = Arc::clone(&channels_registry);
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter").to_string();
         let spawn_tool = tools::SessionsSpawnTool::new(
             Arc::clone(signal_channel) as Arc<dyn Channel>,
@@ -1125,7 +1130,7 @@ fn build_gateway_turn_runtime(
             config.model_routes.clone(),
         ))
         .with_reliability(config.reliability.clone())
-        .with_channels(Arc::new(channels_by_name))
+        .with_channels(channels_by_name)
         .with_shared_memory(Arc::clone(&memory))
         .with_event_recording(config.memory.event_recording_config());
         let handle = spawn_tool.tools_handle();
@@ -1302,16 +1307,8 @@ pub async fn run_gateway(
         )
     });
 
-    // Register message_send tool backed by Signal when the channel is configured.
-    // For other channels (WhatsApp, Linq, etc.) we register a generic sender without
-    // reaction support so the tool is still available for text/file messages.
-    if let Some(ref sc) = signal_channel {
-        let msg_send_tool = tools::MessageSendTool::new_signal(sc.clone(), security.clone());
-        tools_list.push(Box::new(msg_send_tool));
-    }
-
-    // Linq channel (if configured). Built here (ahead of the spawn tool) so it can
-    // join the sessions_spawn per-turn announce/kill routing registry below.
+    // Linq channel (if configured). Built here (ahead of message_send and the spawn
+    // tool) so it can join the shared per-turn channel routing registry below.
     let linq_channel: Option<Arc<LinqChannel>> = config.channels_config.linq.as_ref().map(|lq| {
         Arc::new(LinqChannel::new(
             lq.api_token.clone(),
@@ -1320,8 +1317,8 @@ pub async fn run_gateway(
         ))
     });
 
-    // Nextcloud Talk channel (if configured). Built here (ahead of the spawn tool)
-    // so it can join the sessions_spawn per-turn announce/kill routing registry.
+    // Nextcloud Talk channel (if configured). Built here (ahead of message_send and
+    // the spawn tool) so it can join the shared per-turn channel routing registry.
     let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
         config.channels_config.nextcloud_talk.as_ref().map(|nc| {
             Arc::new(NextcloudTalkChannel::new(
@@ -1330,6 +1327,33 @@ pub async fn run_gateway(
                 nc.allowed_users.clone(),
             ))
         });
+
+    // One routing registry, keyed by `Channel::name`, shared by `message_send`
+    // (destination of an explicit `channel` argument) and `sessions_spawn`
+    // (announce/kill routing) so both address exactly the same channel set.
+    let mut registry: HashMap<String, Arc<dyn Channel>> = HashMap::new();
+    if let Some(ref sc) = signal_channel {
+        registry.insert(sc.name().to_string(), sc.clone() as Arc<dyn Channel>);
+    }
+    if let Some(ref wa) = whatsapp_channel {
+        registry.insert(wa.name().to_string(), wa.clone() as Arc<dyn Channel>);
+    }
+    if let Some(ref lq) = linq_channel {
+        registry.insert(lq.name().to_string(), lq.clone() as Arc<dyn Channel>);
+    }
+    if let Some(ref nc) = nextcloud_talk_channel {
+        registry.insert(nc.name().to_string(), nc.clone() as Arc<dyn Channel>);
+    }
+    let channels_registry = Arc::new(registry);
+
+    // Register message_send tool backed by Signal when the channel is configured.
+    // For other channels (WhatsApp, Linq, etc.) we register a generic sender without
+    // reaction support so the tool is still available for text/file messages.
+    if let Some(ref sc) = signal_channel {
+        let msg_send_tool = tools::MessageSendTool::new_signal(sc.clone(), security.clone())
+            .with_channels(Arc::clone(&channels_registry));
+        tools_list.push(Box::new(msg_send_tool));
+    }
 
     // Register sessions_spawn tool backed by Signal (if configured) so the LLM can
     // fire off async sub-agent tasks that announce their results when complete.
@@ -1341,17 +1365,7 @@ pub async fn run_gateway(
         // tool's per-turn scope; sessions_spawn binds that name to each run and
         // resolves the channel object from here at announce/kill time, so a result
         // is never mis-routed to the wrong channel under concurrent webhooks.
-        let mut spawn_channels_by_name: HashMap<String, Arc<dyn Channel>> = HashMap::new();
-        spawn_channels_by_name.insert(sc.name().to_string(), sc.clone() as Arc<dyn Channel>);
-        if let Some(ref wa) = whatsapp_channel {
-            spawn_channels_by_name.insert(wa.name().to_string(), wa.clone() as Arc<dyn Channel>);
-        }
-        if let Some(ref lq) = linq_channel {
-            spawn_channels_by_name.insert(lq.name().to_string(), lq.clone() as Arc<dyn Channel>);
-        }
-        if let Some(ref nc) = nextcloud_talk_channel {
-            spawn_channels_by_name.insert(nc.name().to_string(), nc.clone() as Arc<dyn Channel>);
-        }
+        let spawn_channels_by_name = Arc::clone(&channels_registry);
         let spawn_tool = tools::SessionsSpawnTool::new(
             sc.clone() as Arc<dyn Channel>,
             Arc::clone(&provider),
@@ -1373,7 +1387,7 @@ pub async fn run_gateway(
             config.model_routes.clone(),
         ))
         .with_reliability(config.reliability.clone())
-        .with_channels(Arc::new(spawn_channels_by_name))
+        .with_channels(spawn_channels_by_name)
         .with_shared_memory(Arc::clone(&mem))
         .with_event_recording(config.memory.event_recording_config());
         let handle = spawn_tool.tools_handle();
