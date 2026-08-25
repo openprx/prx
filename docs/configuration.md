@@ -365,6 +365,23 @@ channel = "api"
 # Let a chat session message this one WhatsApp number through the daemon.
 send_allow = ["wacli:15550001111@s.whatsapp.net"]
 ```
+
+A turn driven by the gateway's webhook surface is the same story from the other
+side. It owns no messaging channel of its own — its replies leave through
+whichever channel handle the daemon registered — so scope rules are matched
+against the channel the turn actually **came from**: `webhook` for
+`POST /webhook`, and the platform's own name (`whatsapp`, `linq`, …) for a
+channel webhook. The same-channel default still measures against the handle the
+turn replies through, so naming the origin only brings more rules into play; it
+never mutes a turn that no rule constrains.
+
+```toml
+[[autonomy.scopes.rules]]
+channel = "webhook"
+# A generic webhook turn may answer, but never reach out to anyone else.
+send_deny = ["telegram:*", "signal:*"]
+```
+
 ### `[chat.daemon]`
 
 `prx chat` deliberately opens no IM connection: a second listener on the same

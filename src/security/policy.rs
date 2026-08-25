@@ -1913,6 +1913,30 @@ impl SecurityPolicy {
         dst_channel: &str,
         dst_recipient: &str,
     ) -> bool {
+        self.is_outbound_allowed_for_turn(sender, src_channel, src_channel, chat_type, dst_channel, dst_recipient)
+    }
+
+    /// [`is_outbound_allowed`](Self::is_outbound_allowed) with the turn's
+    /// *origin* and its *implicit reply channel* told apart.
+    ///
+    /// They coincide for every channel-driven turn, which is why the five-argument
+    /// form above exists and is what most callers want. They differ on surfaces
+    /// that run an agent turn without owning a messaging channel — the gateway
+    /// webhook path, whose turn originates on `webhook`/`gateway` yet still
+    /// replies through whichever channel handle the daemon registered. Matching
+    /// scope rules against the *origin* is what lets an operator write a rule for
+    /// that surface at all; keeping the same-channel default measured against the
+    /// *reply channel* is what keeps the fix from silently muting those turns.
+    #[must_use]
+    pub fn is_outbound_allowed_for_turn(
+        &self,
+        sender: &str,
+        src_channel: &str,
+        reply_channel: &str,
+        chat_type: &str,
+        dst_channel: &str,
+        dst_recipient: &str,
+    ) -> bool {
         let mut whitelist: Option<&crate::config::ScopeRule> = None;
 
         for rule in &self.scope_rules {
@@ -1943,7 +1967,7 @@ impl SecurityPolicy {
         whitelist.map_or(
             // No rule constrains this turn's recipients: the channel the turn
             // already replies on stays reachable, anything else needs an opt-in.
-            dst_channel == src_channel,
+            dst_channel == reply_channel,
             // Matched exactly, with none of `send_deny`'s alias folding: folding
             // is a guess about who two spellings refer to, and a wrong guess must
             // never be what grants reach to a recipient.

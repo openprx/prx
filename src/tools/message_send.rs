@@ -126,6 +126,38 @@ fn current_message_send_execution_context() -> Option<MessageSendExecutionContex
     MESSAGE_SEND_EXECUTION_CONTEXT.try_with(Clone::clone).ok()
 }
 
+tokio::task_local! {
+    /// The channel a turn *originates* on, for surfaces that run an agent turn
+    /// without owning a messaging channel.
+    static OUTBOUND_ORIGIN_CHANNEL: Arc<str>;
+}
+
+/// Run `future` with the turn's origin channel recorded for outbound scope
+/// matching.
+///
+/// A channel-driven turn does not need this: the channel it arrived on is the
+/// channel it replies through, so the reply handle already names the origin.
+/// The gateway is different — it runs webhook turns against whichever channel
+/// handle the daemon happened to register (a Signal handle, in practice), so
+/// without this the origin of *every* gateway turn reads as that handle's name
+/// and an operator's `channel = "whatsapp"` rule can never match one. Naming
+/// the origin here keeps the reply routing exactly as it is and only changes
+/// which scope rules are consulted.
+pub async fn with_outbound_origin_channel<F>(channel: &str, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    OUTBOUND_ORIGIN_CHANNEL.scope(Arc::from(channel), future).await
+}
+
+/// The origin channel of the turn in scope, if one was named.
+///
+/// Visible to the crate so a surface that installs an origin can assert it is
+/// actually in scope for the turn it wraps.
+pub(crate) fn current_outbound_origin_channel() -> Option<Arc<str>> {
+    OUTBOUND_ORIGIN_CHANNEL.try_with(Arc::clone).ok()
+}
+
 /// Sender / chat-type identity for the outbound authorization decision.
 ///
 /// Read only from the runtime-injected trusted scope (`crate::tools::execution`
@@ -421,26 +453,39 @@ impl MessageSendTool {
     /// Outbound recipient authorization, applied to every action that reaches a
     /// recipient (`send`, `react`, `edit`, `delete`/`unsend`, `thread`).
     ///
-    /// `src_channel` is the channel the turn is anchored to and `dst_channel`
+    /// `reply_channel` is the channel this turn replies through and `dst_channel`
     /// the one the message actually leaves on. They differ exactly when the
     /// caller passed an explicit `channel`; with no `channel` argument they are
     /// the same object, which is what keeps this a no-op unless an operator
     /// configures `send_allow` / `send_deny`.
+    ///
+    /// Scope rules are matched against the turn's *origin* instead, which is the
+    /// reply channel for every channel-driven turn and the channel named by
+    /// [`with_outbound_origin_channel`] on the gateway's webhook surface. The
+    /// same-channel default keeps measuring against `reply_channel`, so naming
+    /// an origin can only bring more rules into play — never mute a turn that
+    /// no rule constrains.
     ///
     /// The rejection message carries only the stable audit fingerprint of the
     /// destination, never the plaintext recipient.
     fn authorize_outbound(
         &self,
         args: &serde_json::Value,
-        src_channel: &str,
+        reply_channel: &str,
         dst_channel: &str,
         recipient: &str,
     ) -> Result<(), String> {
         let (sender, chat_type) = trusted_outbound_identity(args);
-        if self
-            .security
-            .is_outbound_allowed(&sender, src_channel, &chat_type, dst_channel, recipient)
-        {
+        let origin = current_outbound_origin_channel();
+        let src_channel = origin.as_deref().unwrap_or(reply_channel);
+        if self.security.is_outbound_allowed_for_turn(
+            &sender,
+            src_channel,
+            reply_channel,
+            &chat_type,
+            dst_channel,
+            recipient,
+        ) {
             return Ok(());
         }
         let recipient_ref = op_id::ref_for_channel_recipient(dst_channel, recipient);
@@ -1456,6 +1501,89 @@ mod tests {
             );
         }
         assert!(sent.lock().await.is_empty(), "no message may reach the channel");
+    }
+
+    // ── R3: the turn's origin channel on channel-less surfaces ─────────────
+
+    fn origin_scoped_security(channel: &str, send_deny: &[&str]) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            scope_rules: vec![crate::config::ScopeRule {
+                user: None,
+                channel: Some(channel.to_string()),
+                chat_type: None,
+                tools_allow: vec![],
+                tools_deny: vec![],
+                send_allow: vec![],
+                send_deny: send_deny.iter().map(|s| (*s).to_string()).collect(),
+            }],
+            ..SecurityPolicy::default()
+        })
+    }
+
+    /// A gateway webhook turn replies through whichever channel handle the
+    /// daemon registered — `signal` in production. Without an origin, a rule
+    /// written for the surface the message really came from never matches.
+    #[tokio::test]
+    async fn named_origin_channel_brings_that_channel_s_rules_into_play() {
+        let (reply_handle, sent, _recipients) = DummyChannel::new_named("signal");
+        let tool = MessageSendTool::new(reply_handle, origin_scoped_security("whatsapp", &["*:+15550001111"]));
+        let args = json!({"action": "send", "target": "+15550001111", "message": "hi"});
+
+        // Without the origin the turn reads as a signal turn and the whatsapp
+        // rule is never consulted.
+        let unnamed = tool.execute(args.clone()).await.unwrap();
+        assert!(
+            unnamed.success,
+            "baseline: the rule does not match a signal-origin turn"
+        );
+        sent.lock().await.clear();
+
+        let named = with_outbound_origin_channel("whatsapp", tool.execute(args))
+            .await
+            .unwrap();
+        assert!(!named.success, "a whatsapp-origin turn must hit the whatsapp rule");
+        let error = named.error.unwrap_or_default();
+        assert!(error.contains(POLICY_ERROR_MARKER), "got: {error}");
+        assert!(sent.lock().await.is_empty(), "no message may reach the channel");
+    }
+
+    /// Zero-regression guard for R3: naming an origin that differs from the
+    /// reply handle must not mute a turn no rule constrains. The same-channel
+    /// default keeps measuring against the channel the turn replies through.
+    #[tokio::test]
+    async fn named_origin_channel_does_not_mute_an_unconstrained_turn() {
+        let (reply_handle, sent, _recipients) = DummyChannel::new_named("signal");
+        let tool = MessageSendTool::new(reply_handle, test_security(AutonomyLevel::Full));
+
+        for args in denied_recipient_actions() {
+            let action = args["action"].as_str().unwrap().to_string();
+            let result = with_outbound_origin_channel("webhook", tool.execute(args))
+                .await
+                .unwrap();
+            let error = result.error.unwrap_or_default();
+            assert!(
+                !error.contains(POLICY_ERROR_MARKER),
+                "action {action} must not be refused by the outbound policy: {error}"
+            );
+        }
+        assert!(!sent.lock().await.is_empty(), "the send must still reach the channel");
+    }
+
+    /// The same holds with a rule present that simply does not constrain the
+    /// destination: a `webhook`-origin turn still reaches its reply channel.
+    #[tokio::test]
+    async fn named_origin_channel_still_reaches_the_reply_channel() {
+        let (reply_handle, sent, _recipients) = DummyChannel::new_named("signal");
+        let tool = MessageSendTool::new(reply_handle, origin_scoped_security("webhook", &["telegram:*"]));
+        let args = json!({"action": "send", "target": "+15550001111", "message": "hi"});
+
+        let result = with_outbound_origin_channel("webhook", tool.execute(args))
+            .await
+            .unwrap();
+        assert!(result.success, "got: {:?}", result.error);
+        assert_eq!(sent.lock().await.len(), 1);
     }
 
     /// Zero-regression guard: with no scope rules configured, not one action

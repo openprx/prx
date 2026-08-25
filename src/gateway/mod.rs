@@ -2032,38 +2032,47 @@ async fn run_gateway_chat_with_multimodal(
         !turn_runtime.tools_registry.is_empty(),
         false,
     );
-    let loop_result = run_tool_call_loop_traced(
-        turn_runtime.provider.as_ref(),
-        &mut history,
-        Arc::clone(&turn_runtime.tools_registry),
-        &noop_observer,
-        state.hooks.as_ref(),
-        provider_label,
-        &turn_runtime.model,
-        turn_runtime.temperature,
-        true, // silent
-        None, // no approval manager
-        "webhook",
-        &multimodal_config,
-        max_tool_iterations,
-        config_snapshot.agent.read_only_tool_concurrency_window,
-        config_snapshot.agent.priority_scheduling_enabled,
-        config_snapshot.agent.low_priority_tools.clone(),
-        None,
-        None,                     // no cancellation token
-        None,                     // no streaming delta sender
-        Some(&gateway_scope_ctx), // P1-a: gateway turns now route through decide()
-        None,                     // no tool call notifications
-        Some(&config_snapshot.tool_tiering),
-        crate::agent::loop_::ToolLoopMemory::new(
-            &state.mem,
-            &config_snapshot.workspace_dir,
-            Some(DocumentIngestRuntime::from_envelope(
-                state.mem.clone(),
-                &runtime_envelope,
-            )),
+    // R3: name this turn's real origin before any tool runs. The gateway owns no
+    // channel of its own — `message_send` falls back to whichever handle the
+    // daemon registered — so without this every webhook turn's outbound scope
+    // reads as that handle's channel and a rule written for the surface the
+    // message actually came from can never match. Reply routing is untouched;
+    // only rule matching changes.
+    let loop_result = crate::tools::message_send::with_outbound_origin_channel(
+        fabric_ctx.channel.as_str(),
+        run_tool_call_loop_traced(
+            turn_runtime.provider.as_ref(),
+            &mut history,
+            Arc::clone(&turn_runtime.tools_registry),
+            &noop_observer,
+            state.hooks.as_ref(),
+            provider_label,
+            &turn_runtime.model,
+            turn_runtime.temperature,
+            true, // silent
+            None, // no approval manager
+            "webhook",
+            &multimodal_config,
+            max_tool_iterations,
+            config_snapshot.agent.read_only_tool_concurrency_window,
+            config_snapshot.agent.priority_scheduling_enabled,
+            config_snapshot.agent.low_priority_tools.clone(),
+            None,
+            None,                     // no cancellation token
+            None,                     // no streaming delta sender
+            Some(&gateway_scope_ctx), // P1-a: gateway turns now route through decide()
+            None,                     // no tool call notifications
+            Some(&config_snapshot.tool_tiering),
+            crate::agent::loop_::ToolLoopMemory::new(
+                &state.mem,
+                &config_snapshot.workspace_dir,
+                Some(DocumentIngestRuntime::from_envelope(
+                    state.mem.clone(),
+                    &runtime_envelope,
+                )),
+            ),
+            crate::agent::loop_::ChatMode::default(),
         ),
-        crate::agent::loop_::ChatMode::default(),
     )
     .await;
     let (response, trace) = match loop_result {
@@ -3711,6 +3720,29 @@ mod tests {
         }
     }
 
+    /// Records the outbound origin channel visible from inside a turn.
+    #[derive(Default)]
+    struct OriginRecordingProvider {
+        calls: AtomicUsize,
+        origin: parking_lot::Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl Provider for OriginRecordingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.origin.lock() =
+                crate::tools::message_send::current_outbound_origin_channel().map(|channel| channel.to_string());
+            Ok("ok".into())
+        }
+    }
+
     #[derive(Default)]
     struct FailFirstProvider {
         calls: AtomicUsize,
@@ -3874,6 +3906,41 @@ mod tests {
             #[cfg(feature = "wasm-plugins")]
             plugin_runtime: None,
         }
+    }
+
+    /// R3: a webhook turn owns no channel of its own, so `message_send` falls
+    /// back to whichever handle the daemon registered — a Signal handle in
+    /// production. The turn must therefore name its real origin, or every
+    /// outbound scope rule written for this surface is unreachable and every
+    /// rule written for Signal is applied to it by accident.
+    #[tokio::test]
+    async fn a_webhook_turn_names_its_origin_channel_for_outbound_scope() {
+        let provider_impl = Arc::new(OriginRecordingProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let state = webhook_test_state(provider);
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            test_uri(),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"message":"hello"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert_eq!(
+            provider_impl.calls.load(Ordering::SeqCst),
+            1,
+            "the turn must have reached the provider"
+        );
+        let observed = provider_impl.origin.lock().clone();
+        assert_eq!(
+            observed,
+            Some("webhook".to_string()),
+            "the turn must run with its own origin channel in scope"
+        );
     }
 
     #[tokio::test]
