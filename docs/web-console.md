@@ -71,6 +71,16 @@ steering channel — an agent turn, a tool call, a job — answer `409` rather t
 accepting a message nobody will read, and a busy target parks the caller
 instead of timing out.
 
+A `200` reports `outcome: "queued"`, and the word is exact: **queued is not
+read**. The endpoint can see that the message was accepted onto the target's
+steering queue; it cannot see whether the run ever takes it off again, and
+nothing in this runtime expires to make that visible later. The `409` above
+only rules out targets with no channel at all — a run that registers a
+steering channel and then never drains it (a task-mode sub-agent running
+without tools does exactly this) accepts the message and consumes it never.
+Treat a `200` as "handed over", not as "acted on", and confirm the effect by
+watching the target rather than by reading the response.
+
 ## Batches in the task listing
 
 A `spawn_batch` fan-out shows up in `prx tasks list` as one unit. Its members

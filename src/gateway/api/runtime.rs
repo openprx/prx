@@ -169,6 +169,28 @@ pub(super) struct TaskMessageRequest {
     message: String,
 }
 
+/// What a successful `POST /api/runtime/tasks/{id}/message` actually claims.
+///
+/// Deliberately **not** `delivered`. All this endpoint can observe is that the
+/// message was accepted onto the target's bounded steering queue; whether the
+/// run ever takes it off that queue is the run's business and is not visible
+/// from here. The gap is real rather than theoretical: a task-mode no-tools
+/// sub-agent registers a steering sender and never polls the receiver, so the
+/// send succeeds and the message is read by nobody, forever. Reporting that as
+/// `delivered` told an operator their instruction had landed and left them
+/// waiting on a target that was never going to act on it.
+///
+/// There is no honest way to close the gap from this side: an mpsc sender
+/// cannot see whether its receiver is being polled, and waiting for an
+/// acknowledgement would mean a wall clock, which this runtime does not have.
+/// So the word states the guarantee that exists — accepted onto the queue —
+/// and nothing beyond it.
+///
+/// MUTATION GUARD: put `"delivered"` back and
+/// `a_send_to_a_target_that_never_reads_its_queue_does_not_claim_delivery`
+/// fails.
+const QUEUED_OUTCOME: &str = "queued";
+
 #[derive(Serialize)]
 pub(super) struct TaskMessageResponse {
     /// The address as supplied by the caller.
@@ -180,7 +202,17 @@ pub(super) struct TaskMessageResponse {
     run_id: Option<String>,
     kind: &'static str,
     name: String,
+    /// What happened, in one stable tag: [`QUEUED_OUTCOME`] on success, or a
+    /// [`registry::SteerRejection`] tag alongside the `409` when the message
+    /// was refused outright.
     outcome: &'static str,
+    /// What the success tag does and does not promise, spelled out for the
+    /// operator reading the response rather than the source.
+    ///
+    /// Carried in the body because the two renderers on the far side of this
+    /// API print `outcome` as a bare word, and "queued" on its own is easy to
+    /// read as a synonym for "delivered".
+    note: &'static str,
 }
 
 /// Inject an operator message into a running task.
@@ -189,6 +221,12 @@ pub(super) struct TaskMessageResponse {
 /// same run, reached by run id from a different entry point. Nothing here is
 /// bounded by a clock — a busy target parks the caller, which is the intended
 /// backpressure and not a failure.
+///
+/// A `200` means the message is **on** the target's steering queue, not that
+/// the target has read it — see [`QUEUED_OUTCOME`] for why that is the
+/// strongest claim this endpoint can honestly make. A target that exposes no
+/// steering channel at all is refused with `409`, but the converse does not
+/// hold: having a channel is not evidence that anybody drains it.
 pub async fn post_task_message(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -287,7 +325,8 @@ pub async fn post_task_message(
         run_id: target.run_id.map(|run_id| run_id.to_string()),
         kind: target.kind.as_str(),
         name: target.name.to_string(),
-        outcome: "delivered",
+        outcome: QUEUED_OUTCOME,
+        note: "the message is on the target's steering queue; a run that does not read its queue never consumes it",
     }))
 }
 
@@ -565,7 +604,7 @@ mod tests {
             .await
             .expect("test: the control plane must accept the message");
 
-        assert_eq!(report.outcome, "delivered");
+        assert_eq!(report.outcome, QUEUED_OUTCOME);
         assert_eq!(report.run_id.as_deref(), Some(run_id.as_str()));
         assert_eq!(report.requested, run_id);
 
@@ -774,6 +813,67 @@ mod tests {
         (guard, run_id, rx)
     }
 
+    /// Register a run that exposes a steering channel and never reads it.
+    ///
+    /// This is not a contrived shape: a task-mode no-tools sub-agent registers
+    /// a steering sender and then drives a turn that never polls the receiver.
+    /// The queue has room, so the send succeeds immediately — the message is
+    /// accepted and consumed by nobody, which is precisely the case a
+    /// `delivered` outcome used to misreport.
+    ///
+    /// The receiver is returned so the channel stays open for the whole test;
+    /// dropping it would turn the send into a `ChannelClosed` rejection and
+    /// test the wrong path entirely.
+    async fn target_that_never_reads_its_queue() -> (registry::WorkGuard, String, tokio::sync::mpsc::Receiver<String>) {
+        let run_id = format!("unread-{}", uuid::Uuid::new_v4());
+        let guard = registry::register_sub_agent("unread run", &run_id, None, None, None);
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(4);
+        registry::attach_steer_sender(guard.id(), tx);
+        (guard, run_id, rx)
+    }
+
+    /// A `200` must not tell an operator the target read the message when all
+    /// that is known is that the message was accepted onto its queue.
+    ///
+    /// The distinction has teeth: the operator's next move after "delivered"
+    /// is to wait for the run to change course, and against a target that
+    /// never drains its queue that wait never ends and nothing ever expires to
+    /// break it. "queued" is the strongest claim this endpoint can support,
+    /// and it is the claim that leaves the operator able to act.
+    ///
+    /// MUTATION GUARD: restore `outcome: "delivered"` in `post_task_message`,
+    /// or change `QUEUED_OUTCOME` to `"delivered"`, and this fails.
+    #[tokio::test]
+    async fn a_send_to_a_target_that_never_reads_its_queue_does_not_claim_delivery() {
+        let workspace = tempfile::TempDir::new().expect("test: tempdir");
+        let (guard, run_id, receiver) = target_that_never_reads_its_queue().await;
+
+        let (endpoint, server) = serve(test_app_state(AutonomyLevel::Full, workspace.path())).await;
+        let report = tasks_cli::request_message(&endpoint, &run_id, "nobody is going to read this")
+            .await
+            .expect("test: a queue with room accepts the message");
+
+        assert_ne!(
+            report.outcome, "delivered",
+            "nothing here observed the target reading the message, so the response must not claim delivery"
+        );
+        assert_eq!(
+            report.outcome, QUEUED_OUTCOME,
+            "the response must name the guarantee it actually has: accepted onto the steering queue"
+        );
+
+        // The message really is sitting in the queue, unread: the outcome is
+        // understating nothing, it is stating the exact truth.
+        assert_eq!(
+            receiver.len(),
+            1,
+            "the message must be on the queue, waiting for a reader"
+        );
+
+        drop(guard);
+        server.abort();
+    }
+
     /// Find the registry row a parked delivery to `target` registered, if any.
     fn delivery_row(target: registry::WorkId) -> Option<registry::WorkSnapshot> {
         let needle = format!("steer → {target} ");
@@ -830,7 +930,7 @@ mod tests {
             .await
             .expect("test: the delivery task must not panic")
             .expect("test: the delivery must succeed once the queue drains");
-        assert_eq!(report.outcome, "delivered");
+        assert_eq!(report.outcome, QUEUED_OUTCOME);
         assert_eq!(rx.recv().await.as_deref(), Some("you will have to wait"));
 
         // And it stops being visible the moment it settles: the row is a report
