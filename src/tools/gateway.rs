@@ -167,7 +167,9 @@ impl Tool for GatewayTool {
          Actions: 'config.get' (read current config), 'config.patch' (merge patch config), \
          'status' (uptime/model/channels), 'version' (build version), \
          'components' (active channels/providers/memory/tools), \
-         'restart' (send SIGHUP for graceful restart)."
+         'restart' (send SIGHUP for graceful restart). \
+         'config.patch' and 'restart' are available only to the local operator in the terminal UI; \
+         they are refused for remote channels, gateway/webhook, console and external MCP callers."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -202,8 +204,27 @@ impl Tool for GatewayTool {
             }
         };
 
-        // Destructive actions require a trusted scope marker to prevent
-        // unauthorized callers from mutating config or restarting the daemon.
+        // Destructive actions are gated twice, and the two gates answer
+        // different questions.
+        //
+        // Gate 1 (here) — *who asked*. `_prx_scope_trusted` is injected by
+        // `tools::execution::normalize_arguments` from
+        // `ToolExecutionContext::is_local_operator`, and is true only for a turn
+        // driven by the human at this machine's terminal UI. A remote IM user, a
+        // gateway/webhook client, the console UI, cron and every spawned worker
+        // get `false`; the MCP HTTP surface never gets the key at all, because
+        // `gateway::compat::inject_trusted_scope` strips the `_prx_` prefix and
+        // re-injects only `_zc_` scope. The value can never come from the
+        // caller: `strip_runtime_only_args` drops any caller-supplied copy
+        // before the runtime writes the authoritative one.
+        //
+        // Gate 2 (below) — *is it approved*. `SideEffectGate` demands a runtime
+        // approval grant, but only at `AutonomyLevel::Supervised`; at the
+        // default `Full` it passes medium-risk operations unconditionally
+        // (`SecurityPolicy::decide` returns `Allow`, so no approval is ever even
+        // requested). Gate 1 is therefore the *only* thing separating a remote
+        // WhatsApp message from a daemon restart on a default install — do not
+        // remove it on the assumption that gate 2 covers it.
         if action == "config.patch" || action == "restart" {
             let trusted = args
                 .get("_prx_scope_trusted")
@@ -213,9 +234,11 @@ impl Tool for GatewayTool {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(
-                        "Destructive gateway action requires trusted scope (_prx_scope_trusted=true)".to_string(),
-                    ),
+                    error: Some(format!(
+                        "Destructive gateway action '{action}' is restricted to the local operator \
+                         (the terminal UI session); it is not available to remote channels, \
+                         the gateway/webhook surface, the console, or external MCP clients."
+                    )),
                 });
             }
 
@@ -584,7 +607,55 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("trusted scope"));
+        // `make_tool` leaves autonomy at the default `Full`, where
+        // `SideEffectGate` waves medium-risk operations through. So this denial
+        // is produced by gate 1 alone — which is exactly the property that makes
+        // the local-operator marker load-bearing rather than decorative.
+        assert!(
+            result.error.unwrap_or_default().contains("restricted to the local operator"),
+            "gate 1 must deny a non-operator config.patch at the default autonomy level"
+        );
+    }
+
+    /// Pins the fact that motivates gate 1 (audit G12): at the default
+    /// `AutonomyLevel::Full` the second gate authorizes medium-risk resource
+    /// operations unconditionally, with no approval grant present. Deleting gate
+    /// 1 and "relying on SideEffectGate" would therefore hand `config.patch` /
+    /// `restart` to every remote channel. If this test ever starts failing
+    /// because `Full` grew a real check, gate 1 can be revisited — not before.
+    #[tokio::test]
+    async fn second_gate_does_not_block_at_default_autonomy() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let cfg = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: config_path.clone(),
+            ..Config::default()
+        };
+        cfg.save().await.unwrap();
+        let tool = GatewayTool::new(new_shared(cfg), "anthropic", "claude-sonnet-4-6", vec![])
+            .with_security(Arc::new(SecurityPolicy::default()));
+        assert_eq!(
+            SecurityPolicy::default().autonomy,
+            crate::security::AutonomyLevel::Full,
+            "this test is only meaningful while Full is the default"
+        );
+
+        // No `_zc_approval_grant` anywhere in the arguments.
+        let result = tool
+            .execute(json!({
+                "action": "config.patch",
+                "_prx_scope_trusted": true,
+                "patch": { "gateway": { "port": 3301 } }
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "SideEffectGate is a no-op for medium risk at Full: {:?}",
+            result.error
+        );
     }
 
     #[tokio::test]
@@ -627,6 +698,9 @@ mod tests {
         let tool = make_tool(&tmp);
         let result = tool.execute(json!({ "action": "restart" })).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("trusted scope"));
+        assert!(
+            result.error.unwrap_or_default().contains("restricted to the local operator"),
+            "a restart from a non-operator scope must be refused"
+        );
     }
 }

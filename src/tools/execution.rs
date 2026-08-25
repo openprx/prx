@@ -271,7 +271,64 @@ impl ToolExecutionContext {
     fn channel(&self) -> &str {
         self.envelope.channel.as_deref().unwrap_or("unknown")
     }
+
+    /// Whether this turn was initiated by the **local machine operator** — the
+    /// human sitting at the PRX terminal UI — as opposed to a remote IM user, a
+    /// gateway/webhook client, the console web UI, cron, or a spawned worker.
+    ///
+    /// This is the authority behind the runtime-injected `_prx_scope_trusted`
+    /// marker that guards destructive `gateway` actions (`config.patch`,
+    /// `restart`). It answers *who asked*, which at the default
+    /// [`AutonomyLevel::Full`] is the only thing standing between a remote
+    /// WhatsApp/Telegram message and a daemon restart: `SecurityPolicy::decide`
+    /// returns `Allow` for every side-effecting tool at `Full`, so no approval
+    /// is ever requested and `SideEffectGate::authorize_resource_operation`
+    /// passes medium-risk operations unconditionally. The second gate only
+    /// bites at `Supervised`; this one is what bites at the default.
+    ///
+    /// **Why the whole tuple and not `envelope.source`.** Every agent tool loop
+    /// builds its envelope with [`RuntimeEnvelope::chat_terminal`] regardless of
+    /// origin (see `agent_tool_execution_context` in `src/agent/loop_.rs`), so
+    /// `source` is `Chat` even for a Telegram turn and carries no signal at all.
+    /// The discriminating fields are the scope strings, and they are checked as
+    /// a set so that no single one has to be trusted alone:
+    ///
+    /// | origin | channel | sender | chat_id | chat_type |
+    /// |---|---|---|---|---|
+    /// | local terminal UI | `terminal` | `user` | `terminal:user` | `private` |
+    /// | IM channel | adapter name | remote user id | reply target | inferred |
+    /// | gateway / webhook | `webhook` / adapter | client id | `gateway:…` | `gateway` |
+    /// | console web UI | `console` | `console-user` | session key | `private` |
+    ///
+    /// The gateway surface cannot forge this even in principle: its `chat_id` is
+    /// `GatewayFabricContext`'s `session_key`, which is always built with a
+    /// literal `gateway:` prefix (`src/gateway/mod.rs:149,159`), so it can never
+    /// equal `terminal:user`.
+    ///
+    /// **Fail-closed by construction.** The predicate is an allowlist of one
+    /// exact tuple; anything unrecognised — a new runtime source, a renamed
+    /// channel, a missing envelope field (`sender()`/`channel()` fall back to
+    /// `"unknown"`) — lands on `false`, i.e. denied. It is never derived from
+    /// caller input: the two production sites that produce this tuple hardcode
+    /// every field (`src/chat/dispatcher.rs:2072-2090` and `src/chat/mod.rs:7142`).
+    #[must_use]
+    pub fn is_local_operator(&self) -> bool {
+        self.envelope.source == crate::runtime::envelope::RuntimeSource::Chat
+            && self.channel() == LOCAL_OPERATOR_CHANNEL
+            && self.sender() == LOCAL_OPERATOR_SENDER
+            && self.chat_id == LOCAL_OPERATOR_CHAT_ID
+            && self.chat_type == LOCAL_OPERATOR_CHAT_TYPE
+    }
 }
+
+/// The exact scope tuple the local terminal UI stamps on every turn it drives.
+///
+/// Kept as constants next to [`ToolExecutionContext::is_local_operator`] so the
+/// allowlist is one grep away from the sites that mint it.
+const LOCAL_OPERATOR_CHANNEL: &str = "terminal";
+const LOCAL_OPERATOR_SENDER: &str = "user";
+const LOCAL_OPERATOR_CHAT_ID: &str = "terminal:user";
+const LOCAL_OPERATOR_CHAT_TYPE: &str = "private";
 
 /// Typed policy decision used independently of the legacy policy enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1853,7 +1910,17 @@ fn normalize_arguments(
     }
     root.insert("_zc_scope".to_string(), scope);
     root.insert("_zc_scope_trusted".to_string(), serde_json::Value::Bool(true));
-    root.insert("_prx_scope_trusted".to_string(), serde_json::Value::Bool(false));
+    // Local-operator origin marker (T18). Unlike `_zc_scope_trusted` — which
+    // asserts "the `_zc_scope` block above was written by the runtime", and is
+    // therefore always true here — this one asserts "*a human at this machine's
+    // terminal* drove this turn". It is the guard on destructive `gateway`
+    // actions. Authored here and only here: the caller-supplied value was
+    // already dropped by `strip_runtime_only_args` above, so whatever the model
+    // or an HTTP body asked for is irrelevant either way.
+    root.insert(
+        "_prx_scope_trusted".to_string(),
+        serde_json::Value::Bool(context.is_local_operator()),
+    );
     root.insert(
         RUNTIME_APPROVAL_GRANTED_ARG.to_string(),
         serde_json::Value::Bool(runtime_approval_granted),
@@ -3076,5 +3143,194 @@ mod tests {
         assert_eq!(outcome.status, ToolExecutionStatus::Cancelled);
         assert_eq!(&*fixture.stages.lock(), &["policy", "preparation", "audit"]);
         assert_eq!(fixture.records.lock().len(), 1);
+    }
+}
+
+/// T18 — local-operator origin marker (`_prx_scope_trusted`).
+///
+/// These tests pin the one property the destructive `gateway` guard rests on:
+/// the marker is authored by the runtime from the turn's origin, and a caller
+/// (model, IM user, HTTP body) can neither set it nor clear it.
+#[cfg(test)]
+mod local_operator_scope_tests {
+    use super::*;
+    use crate::runtime::envelope::RuntimeSource;
+
+    /// Mirrors exactly what the terminal UI stamps on a turn: see
+    /// `chat_tool_execution_context` (`src/chat/dispatcher.rs:2072-2090`) and
+    /// the legacy `ScopeContext` at `src/chat/mod.rs:7142`.
+    fn local_operator_context() -> ToolExecutionContext {
+        ToolExecutionContext::new(
+            RuntimeEnvelope::chat_terminal("workspace-a", "chat:redux:draft-1", crate::memory::MemoryVisibility::Workspace)
+                .with_sender("user")
+                .with_channel("terminal"),
+            "private",
+        )
+        .with_chat_id("terminal:user")
+    }
+
+    /// Every remote ingress flattens into a `chat_terminal` envelope via
+    /// `agent_tool_execution_context` (`src/agent/loop_.rs:4932-4964`), so these
+    /// differ from the local operator only in the scope strings — which is
+    /// precisely why `is_local_operator` checks the whole tuple.
+    fn remote_context(channel: &str, sender: &str, chat_type: &str, chat_id: &str) -> ToolExecutionContext {
+        ToolExecutionContext::new(
+            RuntimeEnvelope::chat_terminal("workspace-a", "session-a", crate::memory::MemoryVisibility::Workspace)
+                .with_sender(sender)
+                .with_channel(channel),
+            chat_type,
+        )
+        .with_chat_id(chat_id)
+    }
+
+    fn descriptor() -> ToolDescriptor {
+        ToolDescriptor {
+            public_name: "gateway".to_string(),
+            backend_name: "gateway".to_string(),
+            description: "gateway".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+            tier: ToolTier::Core,
+            categories: Vec::new(),
+            effect: ToolEffect::Act,
+            adapter: ToolAdapterKind::Native,
+            availability: CapabilityAvailability::ready("test"),
+        }
+    }
+
+    /// Run the real injection path and read back the marker the tool would see.
+    fn injected_trust(context: &ToolExecutionContext, caller_args: serde_json::Value) -> bool {
+        let normalized = normalize_arguments(&caller_args, &descriptor(), context, false, None)
+            .expect("normalize_arguments accepts a JSON object");
+        normalized
+            .get("_prx_scope_trusted")
+            .and_then(serde_json::Value::as_bool)
+            .expect("the runtime always authors _prx_scope_trusted")
+    }
+
+    #[test]
+    fn local_terminal_operator_is_trusted() {
+        assert!(
+            local_operator_context().is_local_operator(),
+            "the terminal UI tuple must be recognised as the local operator, or \
+             gateway config.patch/restart is unreachable for everyone"
+        );
+        assert!(injected_trust(&local_operator_context(), serde_json::json!({"action": "restart"})));
+    }
+
+    #[test]
+    fn remote_ingress_is_never_trusted() {
+        // channel, sender, chat_type, chat_id per the real ScopeContext sites.
+        let remote = [
+            // src/channels/mod.rs:3692 — IM adapters.
+            ("telegram", "1234567", "private", "1234567"),
+            ("whatsapp", "995551518602@s.whatsapp.net", "group", "120363@g.us"),
+            // src/gateway/mod.rs:2006 — webhook / fabric turns.
+            ("webhook", "webhook-client", "gateway", "gateway:webhook:webhook-client"),
+            ("telegram", "1234567", "gateway", "gateway:telegram:1234567"),
+            // src/gateway/api/sessions.rs:316 — console web UI.
+            ("console", "console-user", "private", "console-session-1"),
+            // src/agent/loop_.rs:4941 — `prx agent` CLI with no scope.
+            ("cli", "agent", "private", "agent:local"),
+        ];
+        for (channel, sender, chat_type, chat_id) in remote {
+            let context = remote_context(channel, sender, chat_type, chat_id);
+            assert!(
+                !context.is_local_operator(),
+                "{channel}/{sender} must not be treated as the local operator"
+            );
+            assert!(
+                !injected_trust(&context, serde_json::json!({"action": "restart"})),
+                "{channel}/{sender} must not receive _prx_scope_trusted=true"
+            );
+        }
+    }
+
+    /// The allowlist is a conjunction: flipping any single field must deny.
+    /// This is what keeps the predicate fail-closed against a renamed channel,
+    /// a new runtime source, or a partially-forged scope.
+    #[test]
+    fn every_single_field_deviation_denies() {
+        let base = local_operator_context();
+        assert!(base.is_local_operator(), "sanity: the unmodified tuple is trusted");
+
+        let mut wrong_channel = local_operator_context();
+        wrong_channel.envelope = wrong_channel.envelope.with_channel("terminal-x");
+        assert!(!wrong_channel.is_local_operator(), "channel must match exactly");
+
+        let mut wrong_sender = local_operator_context();
+        wrong_sender.envelope = wrong_sender.envelope.with_sender("local-user");
+        assert!(
+            !wrong_sender.is_local_operator(),
+            "sender must be the terminal UI's literal 'user', not the envelope default"
+        );
+
+        let wrong_chat_id = local_operator_context().with_chat_id("terminal:user:extra");
+        assert!(!wrong_chat_id.is_local_operator(), "chat_id must match exactly");
+
+        let mut wrong_chat_type = local_operator_context();
+        wrong_chat_type.chat_type = "group".to_string();
+        assert!(!wrong_chat_type.is_local_operator(), "chat_type must match exactly");
+
+        let mut wrong_source = local_operator_context();
+        wrong_source.envelope.source = RuntimeSource::Gateway;
+        assert!(!wrong_source.is_local_operator(), "runtime source must be Chat");
+    }
+
+    /// A missing envelope field falls back to `"unknown"` and must deny rather
+    /// than accidentally match.
+    #[test]
+    fn absent_scope_fields_deny() {
+        let mut context = local_operator_context();
+        context.envelope.channel = None;
+        context.envelope.sender = None;
+        assert!(!context.is_local_operator());
+        assert!(!injected_trust(&context, serde_json::json!({"action": "restart"})));
+    }
+
+    /// T14 prefix stripping stays in force: the caller's own value is dropped,
+    /// never merged. Asserted in *both* directions so the test proves runtime
+    /// authorship rather than mere agreement with the caller.
+    #[test]
+    fn caller_supplied_marker_is_ignored_in_both_directions() {
+        // A remote caller claiming trust gains nothing.
+        let remote = remote_context("telegram", "1234567", "private", "1234567");
+        assert!(
+            !injected_trust(
+                &remote,
+                serde_json::json!({"action": "restart", "_prx_scope_trusted": true}),
+            ),
+            "a forged _prx_scope_trusted=true must not survive stripping"
+        );
+
+        // ...and a caller claiming *un*trust cannot suppress the real marker,
+        // which shows the value is authored, not merely filtered.
+        assert!(
+            injected_trust(
+                &local_operator_context(),
+                serde_json::json!({"action": "restart", "_prx_scope_trusted": false}),
+            ),
+            "the runtime, not the caller, decides the marker"
+        );
+
+        // The whole runtime prefix range stays caller-proof.
+        let normalized = normalize_arguments(
+            &serde_json::json!({
+                "action": "restart",
+                "_prx_scope_trusted": true,
+                "_prx_anything_else": "forged",
+                "_zc_approval_granted": true,
+            }),
+            &descriptor(),
+            &remote,
+            false,
+            None,
+        )
+        .expect("normalize_arguments accepts a JSON object");
+        assert!(normalized.get("_prx_anything_else").is_none(), "forged _prx_ key survived");
+        assert_eq!(
+            normalized.get("_zc_approval_granted").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "forged approval flag must be overwritten by the runtime"
+        );
     }
 }
