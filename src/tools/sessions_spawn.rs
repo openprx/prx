@@ -134,12 +134,29 @@ pub struct SubAgentRun {
     /// Fan-out batch this run belongs to, when it was started by
     /// `action: "spawn_batch"`.
     ///
-    /// A plain label rather than a separate batch registry: the runs *are* the
-    /// batch, so there is no second structure that can disagree with
-    /// `active_runs` about which members exist or what state they are in. It is
-    /// what `action: "join"` selects on, what `sessions_list` groups by, and —
-    /// because a batch's members are all registered under the requesting turn —
-    /// what makes `prx tasks kill <parent>` a batch kill for free.
+    /// A label carried by each member rather than a lineage relationship,
+    /// because the lineage does not survive: a batch's members are *siblings*
+    /// whose common parent is the `sessions_spawn` tool call that launched
+    /// them, and `ToolExecutionService` retires that registry row the moment
+    /// the call returns — long before the members finish.
+    /// [`crate::runtime::registry::register_sub_agent`] records this field for
+    /// exactly that reason.
+    ///
+    /// So `prx tasks kill <parent-turn>` is **not** a batch kill, and neither is
+    /// the idle detector's `kill_turn_subtree`: both walk parent links down from
+    /// the turn and stop at the retired tool-call row, so the members are not
+    /// among the targets. That is the intended shape rather than a gap — a
+    /// sub-agent outlives the turn that launched it on purpose, which is what
+    /// lets a spawn announce its result after that turn has ended. Killing a
+    /// whole fan-out is `prx tasks kill <batch-id>`
+    /// ([`crate::runtime::registry::kill_batch`]), which resolves this label to
+    /// the member rows and applies the same per-member cascade `kill` would.
+    ///
+    /// It is what `action: "join"` selects on and what `sessions_list` groups
+    /// by. `join` takes the batch's *membership* from the roster `spawn_batch`
+    /// recorded rather than from this label, because a member's row can be
+    /// retired out of `active_runs` before the join reads it — see
+    /// [`SessionsSpawnTool::batch_members`].
     pub batch_id: Option<String>,
 }
 
@@ -10490,11 +10507,27 @@ mod tests {
         );
     }
 
-    /// Core evidence 4: killing the *parent* turn cascades onto every member of
-    /// the batch it started, because the members are ordinary children of that
-    /// turn in the work registry. This is `prx tasks kill <parent>`.
+    /// Core evidence 4: what a kill of the parent *turn* reaches, and what it
+    /// does not.
+    ///
+    /// The members are not children of the turn. Their registry parent is the
+    /// `sessions_spawn` tool call that launched them, and `ToolExecutionService`
+    /// retires that row when the call returns — so `collect_lineage` walking
+    /// down from the turn never reaches them. This test reproduces that shape
+    /// rather than asserting around it: the spawn runs inside a tool-call row
+    /// that is dropped before the kill, exactly as production does.
+    ///
+    /// This used to be asserted the other way round, and passed only because the
+    /// test called `Tool::execute` directly and so left the turn itself as the
+    /// members' registry parent — a lineage that no production call ever has.
+    /// The batch kill is `prx tasks kill <batch-id>`, and that is the half of
+    /// this test that terminates anything.
+    ///
+    /// MUTATION GUARD: drop the `register_tool_call` scope below and the members
+    /// become direct children of the turn again, so the first half goes red — a
+    /// green assertion about a lineage production never builds.
     #[tokio::test]
-    async fn killing_the_parent_turn_terminates_the_whole_batch() {
+    async fn a_batch_outlives_a_kill_of_its_parent_turn_and_dies_on_its_batch_id() {
         let (ch, _) = RecordingChannel::new();
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         let tool = make_tool(
@@ -10507,28 +10540,61 @@ mod tests {
         let turn = crate::runtime::registry::register_turn("parent turn", "parent-turn-run", None);
         let parent_id = turn.id();
         let (batch_id, run_ids) = crate::runtime::registry::scoped(turn, async {
-            let spawned = tool
-                .execute(with_spawn_grant(json!({
+            // The production shape: every tool call gets its own registry row,
+            // scoped so what it starts resolves it as the parent, and retired
+            // when the call returns. `registry::scoped` is the same helper
+            // `ToolExecutionService` uses, and dropping the guard here is the
+            // link that breaks.
+            let call = crate::runtime::registry::register_tool_call("sessions_spawn", None, None);
+            let spawned = crate::runtime::registry::scoped(
+                call,
+                tool.execute(with_spawn_grant(json!({
                     "action": "spawn_batch",
                     "tasks": ["one", "two", "three"],
-                })))
-                .await
-                .expect("spawn_batch tool call");
+                }))),
+            )
+            .await
+            .expect("spawn_batch tool call");
             let payload = parse_json(&spawned.output);
             let batch_id = payload["batch_id"].as_str().expect("a batch id").to_string();
             let run_ids = batch_run_ids(&payload);
 
-            let _ = crate::runtime::registry::kill(parent_id, true).await;
+            let killed = crate::runtime::registry::kill(parent_id, true).await;
+            assert!(
+                !killed
+                    .iter()
+                    .any(|result| result.kind == crate::runtime::registry::WorkKind::SubAgent),
+                "the turn's lineage cannot contain the members: {killed:?}"
+            );
             (batch_id, run_ids)
         })
         .await;
         assert_eq!(run_ids.len(), 3);
 
+        // The members survive their launching turn, which is what makes a spawn
+        // able to report back after the turn that asked for it has ended.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        {
+            let runs = tool.active_runs_snapshot().await;
+            assert_eq!(
+                runs.iter()
+                    .filter(|run| matches!(run.status, SubAgentStatus::Running))
+                    .count(),
+                3,
+                "a kill of the parent turn must not reach rows that are not in its lineage"
+            );
+        }
+
+        // The batch label is the address that does reach them: `prx tasks kill
+        // <batch-id>`, which resolves the label to the member rows.
+        let killed = crate::runtime::registry::kill_batch(&batch_id, true).await;
+        assert_eq!(killed.len(), 3, "every member must be a target: {killed:?}");
+
         for run_id in &run_ids {
             let reason = await_terminal_reason(&tool.active_runs, run_id).await;
             assert!(
                 reason.contains("terminated before it could report a result"),
-                "a cascade kill of the parent must reach every batch member, got: {reason}"
+                "a batch kill must reach every batch member, got: {reason}"
             );
         }
 
