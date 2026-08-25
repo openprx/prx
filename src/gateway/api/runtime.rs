@@ -281,17 +281,18 @@ pub async fn post_task_message(
     let delivery_name = format!("steer → {work_id} {}", target.name);
     let delivery =
         registry::register_tool_call(&delivery_name, target.run_id.as_deref(), Some(delivery_cancel.clone()));
-    let delivered = tokio::select! {
+    let accepted = tokio::select! {
         biased;
-        // A completed send wins a tie: once the message is in the queue it has
-        // been delivered, and reporting it as killed would be a lie the caller
-        // could act on by sending it twice.
+        // A completed send wins a tie: once the message is on the queue it is
+        // out of this endpoint's hands, and reporting it as killed would be a
+        // lie the caller could act on by sending it twice. "On the queue" is
+        // the whole claim — see [`QUEUED_OUTCOME`].
         result = registry::steer(work_id, message.to_string()) => Some(result),
         () = delivery_cancel.cancelled() => None,
     };
     drop(delivery);
 
-    let Some(outcome) = delivered else {
+    let Some(outcome) = accepted else {
         return Err((
             StatusCode::CONFLICT,
             Json(serde_json::json!({
