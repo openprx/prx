@@ -23,9 +23,20 @@
 //! - **Failure degrades, it does not hide.** When the daemon cannot be
 //!   reached, a listing still reports what this chat itself is running, with
 //!   the reason the daemon part is missing stated first.
+//! - **In flight means visible and killable.** Running off the input loop is
+//!   what keeps the TUI responsive, but a request whose daemon accepted the
+//!   connection and then said nothing would otherwise be a task nobody can see
+//!   or end — the exact shape of stall this runtime refuses to paper over with
+//!   a clock. Every request is therefore registered in [`InFlightRegistry`]
+//!   while it runs, listed by `/sessions`, and endable by address with
+//!   `/kill --daemon d<N>`.
 
 use crate::config::Config;
 use crate::runtime::tasks_cli::{self, KillReport, MessageReport, TasksEndpoint, TasksListing, WorkItem};
+use parking_lot::Mutex;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 /// One daemon-scoped request, parsed from a `--daemon` session command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +47,170 @@ pub enum DaemonRequest {
     Kill { address: String },
     /// `/steer --daemon <address> <message>`
     Steer { address: String, message: String },
+}
+
+/// One daemon request handed to a task and not yet answered.
+///
+/// The row exists for exactly as long as the task does: [`register_in_flight`]
+/// creates it, and the [`InFlightGuard`] the task carries removes it on drop,
+/// whichever way the task ends.
+pub struct InFlightDaemonRequest {
+    id: u64,
+    label: String,
+    base_url: String,
+    started: Instant,
+    cancel: CancellationToken,
+}
+
+/// Rows plus the id counter that hands out their `d<N>` addresses.
+///
+/// Ids are per registry and monotonic: an address an operator read out of
+/// `/sessions` can never later denote a different request.
+#[derive(Default)]
+pub struct InFlightState {
+    next_id: u64,
+    rows: Vec<InFlightDaemonRequest>,
+}
+
+/// Shared registry of the daemon requests this chat is waiting on.
+///
+/// `parking_lot::Mutex` (synchronous, never held across `.await`), matching the
+/// shell and PTY registries next door: every critical section here is a push, a
+/// retain, or a scan over short owned rows.
+pub type InFlightRegistry = Arc<Mutex<InFlightState>>;
+
+/// A fresh, empty registry. One per [`ChatSessionsHandle`], so a test owns its
+/// own and concurrent tests cannot see each other's rows.
+///
+/// [`ChatSessionsHandle`]: super::runtime::ChatSessionsHandle
+#[must_use]
+pub fn new_in_flight_registry() -> InFlightRegistry {
+    Arc::new(Mutex::new(InFlightState::default()))
+}
+
+/// Removes its row when dropped. The spawned request task owns one, so a
+/// finished, failed, or cancelled request stops being listed without anyone
+/// having to remember to deregister it.
+pub struct InFlightGuard {
+    registry: InFlightRegistry,
+    id: u64,
+}
+
+impl InFlightGuard {
+    /// The `d<N>` address this request is listed and killed under.
+    #[must_use]
+    pub fn address(&self) -> String {
+        format!("d{}", self.id)
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.registry.lock().rows.retain(|row| row.id != self.id);
+    }
+}
+
+/// Publish one request as in flight, returning the guard that retires it.
+///
+/// `cancel` is the token the request task selects on; cancelling it is what
+/// makes `/kill --daemon d<N>` able to end a request the daemon is never going
+/// to answer. Nothing here imposes a deadline — the request runs until it
+/// answers or until an operator ends it.
+#[must_use]
+pub fn register_in_flight(
+    registry: &InFlightRegistry,
+    request: &DaemonRequest,
+    base_url: &str,
+    cancel: CancellationToken,
+) -> InFlightGuard {
+    let mut state = registry.lock();
+    state.next_id += 1;
+    let id = state.next_id;
+    state.rows.push(InFlightDaemonRequest {
+        id,
+        label: request_label(request),
+        base_url: base_url.to_string(),
+        started: Instant::now(),
+        cancel,
+    });
+    drop(state);
+    InFlightGuard {
+        registry: Arc::clone(registry),
+        id,
+    }
+}
+
+/// Render the in-flight requests for `/sessions`, or `None` when there are none.
+#[must_use]
+pub fn in_flight_report(registry: &InFlightRegistry) -> Option<String> {
+    let now = Instant::now();
+    let rows: Vec<String> = registry
+        .lock()
+        .rows
+        .iter()
+        .map(|row| {
+            format!(
+                "  d{} {} {} {}",
+                row.id,
+                row.label,
+                row.base_url,
+                tasks_cli::format_elapsed(now.saturating_duration_since(row.started).as_secs())
+            )
+        })
+        .collect();
+    if rows.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Daemon requests in flight ({}):\n{}\nA daemon that accepted the connection and never \
+         answered leaves its request here; /kill --daemon d<N> ends one without waiting on it.",
+        rows.len(),
+        rows.join("\n")
+    ))
+}
+
+/// Stop waiting on one of *this chat's* requests, addressed as `d<N>`.
+///
+/// Returns `None` when the address is not a `d<N>` at all, which is the signal
+/// to forward it to the daemon: every other address space (a run id, the
+/// daemon's own `w42`) belongs to the daemon, and chat forwards those verbatim.
+#[must_use]
+pub fn cancel_in_flight(registry: &InFlightRegistry, address: &str) -> Option<String> {
+    let id = parse_in_flight_address(address)?;
+    let state = registry.lock();
+    let Some(row) = state.rows.iter().find(|row| row.id == id) else {
+        return Some(format!("No daemon request d{id} is in flight from this chat."));
+    };
+    row.cancel.cancel();
+    Some(format!(
+        "Stopped waiting on daemon request d{id} ({} at {}). Only this chat stopped waiting — the \
+         daemon was never asked to undo anything, so /sessions --daemon still tells the truth \
+         about it.",
+        row.label, row.base_url
+    ))
+}
+
+fn parse_in_flight_address(address: &str) -> Option<u64> {
+    let trimmed = address.trim();
+    let digits = trimmed.strip_prefix('d').or_else(|| trimmed.strip_prefix('D'))?;
+    digits.parse::<u64>().ok().filter(|id| *id > 0)
+}
+
+/// What a request ended from this chat reports back to the transcript.
+#[must_use]
+pub fn cancelled_notice(request: &DaemonRequest, base_url: &str) -> String {
+    format!(
+        "Daemon request `{}` to {base_url} was ended from this chat before the daemon answered.",
+        request_label(request)
+    )
+}
+
+fn request_label(request: &DaemonRequest) -> String {
+    match request {
+        DaemonRequest::List => "list".to_string(),
+        DaemonRequest::Kill { address } => format!("kill {address}"),
+        DaemonRequest::Steer { address, .. } => format!("steer {address}"),
+    }
 }
 
 /// Where chat reaches the daemon, and how it authenticates.
@@ -233,6 +408,72 @@ pub fn render_listing_failure(error: &anyhow::Error, local_fallback: Option<&str
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// A request that has been handed to a task must be listed while it runs:
+    /// a daemon that accepted the connection and then said nothing is exactly
+    /// the case where the only recourse is seeing it and ending it.
+    #[test]
+    fn an_in_flight_request_is_listed_while_it_runs() {
+        let registry = new_in_flight_registry();
+        assert!(in_flight_report(&registry).is_none(), "nothing in flight yet");
+
+        let request = DaemonRequest::Kill {
+            address: "w42".to_string(),
+        };
+        let guard = register_in_flight(&registry, &request, "http://127.0.0.1:9", CancellationToken::new());
+        assert_eq!(guard.address(), "d1");
+
+        let report = in_flight_report(&registry).expect("test: the request must be listed");
+        assert!(report.contains("Daemon requests in flight (1)"), "{report}");
+        assert!(report.contains("d1 kill w42 http://127.0.0.1:9"), "{report}");
+        assert!(
+            report.contains("/kill --daemon d<N>"),
+            "the way out must be stated: {report}"
+        );
+
+        drop(guard);
+        assert!(
+            in_flight_report(&registry).is_none(),
+            "a finished request stops being listed"
+        );
+    }
+
+    /// Ending one is a cancellation of the waiting task, not a deadline: the
+    /// row goes away because its task ended, and the daemon is not pretended
+    /// to have been told anything.
+    #[test]
+    fn a_stuck_request_can_be_ended_by_address() {
+        let registry = new_in_flight_registry();
+        let cancel = CancellationToken::new();
+        let _guard = register_in_flight(&registry, &DaemonRequest::List, "http://box:9000", cancel.clone());
+
+        let text = cancel_in_flight(&registry, "d1").expect("test: d1 is this chat's address space");
+
+        assert!(cancel.is_cancelled(), "ending must cancel the request task");
+        assert!(text.contains("Stopped waiting on daemon request d1"), "{text}");
+        assert!(text.contains("never asked to undo anything"), "{text}");
+    }
+
+    /// `d<N>` is the only address chat claims. Everything else — a run id, the
+    /// daemon's own `w42` — belongs to the daemon and must be forwarded, or
+    /// `/kill --daemon` would silently stop killing daemon work.
+    #[test]
+    fn only_the_d_address_space_is_handled_locally() {
+        let registry = new_in_flight_registry();
+        let _guard = register_in_flight(
+            &registry,
+            &DaemonRequest::List,
+            "http://box:9000",
+            CancellationToken::new(),
+        );
+
+        assert!(cancel_in_flight(&registry, "w42").is_none());
+        assert!(cancel_in_flight(&registry, "42").is_none());
+        assert!(cancel_in_flight(&registry, "3d1a7c4e-0000-4000-8000-000000000000").is_none());
+
+        let unknown = cancel_in_flight(&registry, "d7").expect("test: d7 is still this chat's space");
+        assert!(unknown.contains("No daemon request d7 is in flight"), "{unknown}");
+    }
 
     fn item(id: &str, name: &str, run_id: Option<&str>, parent: Option<&str>) -> WorkItem {
         WorkItem {

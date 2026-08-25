@@ -1131,6 +1131,17 @@ fn format_managed_sessions_list(views: &[crate::chat::sessions::model::ManagedSe
     out.trim_end().to_string()
 }
 
+/// Append this chat's in-flight daemon requests to a `/sessions` listing.
+fn append_in_flight_daemon_requests(
+    listing: String,
+    registry: &crate::chat::sessions::daemon::InFlightRegistry,
+) -> String {
+    match crate::chat::sessions::daemon::in_flight_report(registry) {
+        Some(report) => format!("{listing}\n\n{report}"),
+        None => listing,
+    }
+}
+
 async fn handle_local_session_command(
     action: &crate::chat::sessions::SessionCommand,
     chat_sessions: &mut crate::chat::sessions::ChatSessionsHandle,
@@ -1144,7 +1155,16 @@ async fn handle_local_session_command(
     match action {
         SessionCommand::Sessions => {
             let views = chat_sessions.snapshot().await;
-            Some(format_managed_sessions_list(&views))
+            // A daemon request is not a child session — nothing local is
+            // running for it — but it is in-flight work this chat is waiting
+            // on, and the whole point of listing it is that a daemon which
+            // accepted the connection and never answered must not be able to
+            // hide here. Appended rather than merged so the two remain
+            // visibly different kinds of thing.
+            Some(append_in_flight_daemon_requests(
+                format_managed_sessions_list(&views),
+                &chat_sessions.daemon_requests(),
+            ))
         }
         SessionCommand::Logs { seq } => {
             Some(format_local_session_logs(*seq, chat_sessions, session_rings, reaped_log_archive, reap_policy).await)
@@ -1826,20 +1846,126 @@ fn surface_active_turn_message(
 /// caller *before* the task starts: `chat_sessions` is loop-owned mutable state
 /// that cannot cross into a spawned task, so a listing that degrades on failure
 /// has to bring its fallback with it.
+///
+/// The task is published in `in_flight` for as long as it runs. Without that a
+/// daemon which accepts the connection and then answers nothing would leave a
+/// task nobody can see and nobody can end — and the answer to a stall in this
+/// runtime is being visible and killable, never a clock. The guard rides into
+/// the task, so the row is retired by any ending: answered, failed, or ended by
+/// an operator.
 fn spawn_daemon_session_request(
     request: crate::chat::sessions::daemon::DaemonRequest,
     endpoint: crate::runtime::tasks_cli::TasksEndpoint,
     local_fallback: Option<String>,
+    in_flight: &crate::chat::sessions::daemon::InFlightRegistry,
     dispatcher: &dispatcher::ChatDispatcher,
     redraw_tx: Option<&mpsc::Sender<()>>,
 ) {
+    let cancel = CancellationToken::new();
+    let guard =
+        crate::chat::sessions::daemon::register_in_flight(in_flight, &request, endpoint.base_url(), cancel.clone());
+    // Built before `request` is consumed by the call below.
+    let cancelled = crate::chat::sessions::daemon::cancelled_notice(&request, endpoint.base_url());
     let dispatcher = dispatcher.clone();
     let redraw_tx = redraw_tx.cloned();
     tokio::spawn(async move {
+        let _guard = guard;
         // `run` renders both outcomes, so there is no error path to drop here.
-        let text = crate::chat::sessions::daemon::run(&endpoint, request, local_fallback.as_deref()).await;
+        // Cancellation drops the in-flight HTTP request with it, which is what
+        // makes `/kill --daemon d<N>` an actual end rather than a hidden leak.
+        let text = tokio::select! {
+            () = cancel.cancelled() => cancelled,
+            text = crate::chat::sessions::daemon::run(&endpoint, request, local_fallback.as_deref()) => text,
+        };
         surface_session_message(&dispatcher, redraw_tx.as_ref(), &text);
     });
+}
+
+/// Everything a `--daemon`-scoped command needs to reach the daemon.
+///
+/// Bundled because the same three values have to reach both execution paths —
+/// the idle input loop and the active-turn one — and the active-turn signature
+/// is already long.
+#[derive(Clone, Copy)]
+struct DaemonControl<'a> {
+    config: &'a Config,
+    dispatcher: &'a dispatcher::ChatDispatcher,
+    redraw_tx: Option<&'a mpsc::Sender<()>>,
+}
+
+/// Start one `--daemon`-scoped session command, returning the line to show now.
+///
+/// `None` for any action that is not daemon-scoped, so a caller can use this as
+/// the daemon arm of its dispatch and fall through to the local handler.
+///
+/// This is the single execution point for the three `Daemon*` variants: chat
+/// reaches them from two places (the idle loop and, while a provider turn is in
+/// flight, the active-turn path), and a `--daemon` command that only worked in
+/// one of them would be missing exactly when it is most wanted — a long turn is
+/// running and the operator needs to look at, or end, what the daemon is doing.
+///
+/// `local_fallback` is only meaningful for a listing; the caller builds it
+/// because only the caller holds `chat_sessions`.
+fn start_daemon_session_command(
+    action: &crate::chat::sessions::SessionCommand,
+    local_fallback: Option<String>,
+    in_flight: &crate::chat::sessions::daemon::InFlightRegistry,
+    control: DaemonControl<'_>,
+) -> Option<String> {
+    use crate::chat::sessions::SessionCommand;
+
+    let request = match action {
+        // Chat sees the daemon's work as a local *operator*, not as the user
+        // whose sessions `/sessions` lists; the local listing rides along only
+        // as the fallback to show if the daemon turns out to be unreachable.
+        SessionCommand::DaemonSessions => crate::chat::sessions::daemon::DaemonRequest::List,
+        SessionCommand::DaemonKill { address } => {
+            // A `d<N>` address names one of *this chat's* own in-flight
+            // requests, which is the only address the daemon could not act on:
+            // it is this process that is waiting, not the daemon that is
+            // working. Every other address space belongs to the daemon and is
+            // forwarded verbatim.
+            if let Some(text) = crate::chat::sessions::daemon::cancel_in_flight(in_flight, address) {
+                return Some(text);
+            }
+            // No local fallback below: a kill either happened in the daemon or
+            // it did not, and this chat's own sessions are not a partial answer
+            // to that question.
+            crate::chat::sessions::daemon::DaemonRequest::Kill {
+                address: address.clone(),
+            }
+        }
+        // The daemon resolves the address and decides whether the target can be
+        // steered at all (a turn has no steer channel and is refused there), so
+        // chat does no kind dispatch of its own — unlike the local `/steer`,
+        // which owns its session kinds.
+        SessionCommand::DaemonSteer { address, message } => crate::chat::sessions::daemon::DaemonRequest::Steer {
+            address: address.clone(),
+            message: message.clone(),
+        },
+        _ => return None,
+    };
+    let endpoint = crate::chat::sessions::daemon::endpoint(control.config);
+    let notice = crate::chat::sessions::daemon::pending_notice(&request, endpoint.base_url());
+    spawn_daemon_session_request(
+        request,
+        endpoint,
+        local_fallback,
+        in_flight,
+        control.dispatcher,
+        control.redraw_tx,
+    );
+    Some(notice)
+}
+
+/// Whether an action is one of the three `--daemon`-scoped variants.
+const fn is_daemon_session_command(action: &crate::chat::sessions::SessionCommand) -> bool {
+    matches!(
+        action,
+        crate::chat::sessions::SessionCommand::DaemonSessions
+            | crate::chat::sessions::SessionCommand::DaemonKill { .. }
+            | crate::chat::sessions::SessionCommand::DaemonSteer { .. }
+    )
 }
 
 #[cfg(feature = "terminal-tui")]
@@ -4700,6 +4826,11 @@ pub async fn run(
                 if let Some(active_task_id) = per_turn_contexts.keys().next().copied() {
                     let mut emit_active_turn_output =
                         |text: &str| surface_active_turn_message(&chat_dispatcher, redraw_tx_for_main.as_ref(), text);
+                    let daemon_control = DaemonControl {
+                        config: &config,
+                        dispatcher: &chat_dispatcher,
+                        redraw_tx: redraw_tx_for_main.as_ref(),
+                    };
                     process_active_turn_input_batch(
                         msg,
                         &mut emit_active_turn_output,
@@ -4715,6 +4846,7 @@ pub async fn run(
                         &mut reaped_log_archive,
                         &reap_policy,
                         &tools_registry,
+                        daemon_control,
                     )
                     .await;
                     publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
@@ -6611,77 +6743,40 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             }
                             continue;
                         }
-                        SessionCommand::DaemonSessions => {
+                        SessionCommand::DaemonSessions
+                        | SessionCommand::DaemonKill { .. }
+                        | SessionCommand::DaemonSteer { .. } => {
                             // a5: the daemon's work registry lives in another
                             // process, so this is a control-API call, not a
-                            // registry read — and chat sees the daemon's work as
-                            // a local *operator*, not as the user whose sessions
-                            // `/sessions` lists. The local listing is built here,
-                            // on the loop where `chat_sessions` is reachable, and
-                            // handed to the request as the fallback to show if
+                            // registry read. The listing's local fallback is
+                            // built here, on the loop where `chat_sessions` is
+                            // reachable, and handed to the request to show if
                             // the daemon turns out to be unreachable.
-                            let local_fallback = handle_local_session_command(
-                                &SessionCommand::Sessions,
-                                &mut chat_sessions,
-                                &session_rings,
-                                &mut reaped_log_archive,
-                                &reap_policy,
-                                &tools_registry,
-                            )
-                            .await;
-                            let request = crate::chat::sessions::daemon::DaemonRequest::List;
-                            let endpoint = crate::chat::sessions::daemon::endpoint(&config);
-                            emit_chat_output(&crate::chat::sessions::daemon::pending_notice(
-                                &request,
-                                endpoint.base_url(),
-                            ));
-                            spawn_daemon_session_request(
-                                request,
-                                endpoint,
+                            let local_fallback = if matches!(action, SessionCommand::DaemonSessions) {
+                                handle_local_session_command(
+                                    &SessionCommand::Sessions,
+                                    &mut chat_sessions,
+                                    &session_rings,
+                                    &mut reaped_log_archive,
+                                    &reap_policy,
+                                    &tools_registry,
+                                )
+                                .await
+                            } else {
+                                None
+                            };
+                            if let Some(notice) = start_daemon_session_command(
+                                &action,
                                 local_fallback,
-                                &chat_dispatcher,
-                                redraw_tx_for_main.as_ref(),
-                            );
-                            continue;
-                        }
-                        SessionCommand::DaemonKill { address } => {
-                            // No local fallback: a kill either happened in the
-                            // daemon or it did not, and this chat's own sessions
-                            // are not a partial answer to that question.
-                            let request = crate::chat::sessions::daemon::DaemonRequest::Kill { address };
-                            let endpoint = crate::chat::sessions::daemon::endpoint(&config);
-                            emit_chat_output(&crate::chat::sessions::daemon::pending_notice(
-                                &request,
-                                endpoint.base_url(),
-                            ));
-                            spawn_daemon_session_request(
-                                request,
-                                endpoint,
-                                None,
-                                &chat_dispatcher,
-                                redraw_tx_for_main.as_ref(),
-                            );
-                            continue;
-                        }
-                        SessionCommand::DaemonSteer { address, message } => {
-                            // The daemon resolves the address and decides
-                            // whether the target can be steered at all (a turn
-                            // has no steer channel and is refused there), so
-                            // chat does no kind dispatch of its own — unlike the
-                            // local `/steer`, which owns its session kinds.
-                            let request = crate::chat::sessions::daemon::DaemonRequest::Steer { address, message };
-                            let endpoint = crate::chat::sessions::daemon::endpoint(&config);
-                            emit_chat_output(&crate::chat::sessions::daemon::pending_notice(
-                                &request,
-                                endpoint.base_url(),
-                            ));
-                            spawn_daemon_session_request(
-                                request,
-                                endpoint,
-                                None,
-                                &chat_dispatcher,
-                                redraw_tx_for_main.as_ref(),
-                            );
+                                &chat_sessions.daemon_requests(),
+                                DaemonControl {
+                                    config: &config,
+                                    dispatcher: &chat_dispatcher,
+                                    redraw_tx: redraw_tx_for_main.as_ref(),
+                                },
+                            ) {
+                                emit_chat_output(&notice);
+                            }
                             continue;
                         }
                     }
@@ -7444,6 +7539,11 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                 turn_input_open = false;
                                 continue;
                             };
+                            let daemon_control = DaemonControl {
+                                config: &config,
+                                dispatcher: &chat_dispatcher,
+                                redraw_tx: redraw_tx_for_main.as_ref(),
+                            };
                             process_active_turn_input_batch(
                                 msg,
                                 &mut emit_chat_output,
@@ -7459,6 +7559,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                 &mut reaped_log_archive,
                                 &reap_policy,
                                 &tools_registry,
+                                daemon_control,
                             )
                             .await;
                             publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
@@ -10854,6 +10955,7 @@ async fn active_turn_local_command_output(
     reaped_log_archive: &mut ReapedSessionLogArchive,
     reap_policy: &crate::chat::sessions::runtime::ReapPolicy,
     tools_registry: &[Box<dyn Tool>],
+    daemon: DaemonControl<'_>,
 ) -> Option<String> {
     let (_priority, content) = classify_input_priority(msg);
     if is_queue_command(&content) {
@@ -10868,6 +10970,22 @@ async fn active_turn_local_command_output(
         )));
     }
     if let Some(action) = local_session_command(&content) {
+        if is_daemon_session_command(&action) {
+            let local_fallback = if matches!(action, crate::chat::sessions::SessionCommand::DaemonSessions) {
+                handle_local_session_command(
+                    &crate::chat::sessions::SessionCommand::Sessions,
+                    chat_sessions,
+                    session_rings,
+                    reaped_log_archive,
+                    reap_policy,
+                    tools_registry,
+                )
+                .await
+            } else {
+                None
+            };
+            return start_daemon_session_command(&action, local_fallback, &chat_sessions.daemon_requests(), daemon);
+        }
         return handle_local_session_command(
             &action,
             chat_sessions,
@@ -10896,6 +11014,7 @@ async fn process_active_turn_input_message(
     reaped_log_archive: &mut ReapedSessionLogArchive,
     reap_policy: &crate::chat::sessions::runtime::ReapPolicy,
     tools_registry: &[Box<dyn Tool>],
+    daemon: DaemonControl<'_>,
 ) {
     if let Some((output, signal_cancel)) =
         active_turn_workers_cancel_output(&msg, scheduler, provider_turn_workers, provider_turn_task_id)
@@ -10916,6 +11035,7 @@ async fn process_active_turn_input_message(
         reaped_log_archive,
         reap_policy,
         tools_registry,
+        daemon,
     )
     .await
     {
@@ -10942,6 +11062,7 @@ async fn process_active_turn_input_batch(
     reaped_log_archive: &mut ReapedSessionLogArchive,
     reap_policy: &crate::chat::sessions::runtime::ReapPolicy,
     tools_registry: &[Box<dyn Tool>],
+    daemon: DaemonControl<'_>,
 ) {
     process_active_turn_input_message(
         msg,
@@ -10957,6 +11078,7 @@ async fn process_active_turn_input_batch(
         reaped_log_archive,
         reap_policy,
         tools_registry,
+        daemon,
     )
     .await;
     while let Ok(msg) = input_rx.try_recv() {
@@ -10974,6 +11096,7 @@ async fn process_active_turn_input_batch(
             reaped_log_archive,
             reap_policy,
             tools_registry,
+            daemon,
         )
         .await;
     }
@@ -11224,12 +11347,22 @@ fn format_worker_tokens_compact(tokens: u64) -> String {
     }
 }
 
+/// Session commands that stay answerable while a provider turn is in flight.
+///
+/// The three `Daemon*` variants are here for the same reason the local ones
+/// are, only more so: a `--daemon` command exists to look at, or end, work in
+/// another process, and the moment an operator needs that is precisely while a
+/// long turn is running here. Leaving them out queued them behind the very turn
+/// they were reached for. They cost the loop nothing — each one hands its
+/// request to a task and returns the acceptance line (see
+/// [`start_daemon_session_command`]).
 fn local_session_command(input: &str) -> Option<crate::chat::sessions::SessionCommand> {
     let action = crate::chat::sessions::parse_session_command(input)?;
     match action {
         crate::chat::sessions::SessionCommand::Sessions
         | crate::chat::sessions::SessionCommand::Logs { .. }
         | crate::chat::sessions::SessionCommand::Kill { .. } => Some(action),
+        _ if is_daemon_session_command(&action) => Some(action),
         _ => None,
     }
 }
@@ -17145,6 +17278,13 @@ mod p3_directional_switch_tests {
         let mut reaped_log_archive = ReapedSessionLogArchive::default();
         let reap_policy = crate::chat::sessions::runtime::ReapPolicy::default();
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let daemon_config = Config::default();
+        let (daemon_dispatcher, _daemon_action_rx) = dispatcher::ChatDispatcher::new();
+        let daemon_control = DaemonControl {
+            config: &daemon_config,
+            dispatcher: &daemon_dispatcher,
+            redraw_tx: None,
+        };
 
         let output = active_turn_local_command_output(
             &msg,
@@ -17157,6 +17297,7 @@ mod p3_directional_switch_tests {
             &mut reaped_log_archive,
             &reap_policy,
             &tools_registry,
+            daemon_control,
         )
         .await
         .expect("queue command output");
@@ -17182,6 +17323,13 @@ mod p3_directional_switch_tests {
         let mut reaped_log_archive = ReapedSessionLogArchive::default();
         let reap_policy = crate::chat::sessions::runtime::ReapPolicy::default();
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let daemon_config = Config::default();
+        let (daemon_dispatcher, _daemon_action_rx) = dispatcher::ChatDispatcher::new();
+        let daemon_control = DaemonControl {
+            config: &daemon_config,
+            dispatcher: &daemon_dispatcher,
+            redraw_tx: None,
+        };
 
         let output = active_turn_local_command_output(
             &msg,
@@ -17194,6 +17342,7 @@ mod p3_directional_switch_tests {
             &mut reaped_log_archive,
             &reap_policy,
             &tools_registry,
+            daemon_control,
         )
         .await
         .expect("cost command output");
@@ -17225,6 +17374,13 @@ mod p3_directional_switch_tests {
         let mut reaped_log_archive = ReapedSessionLogArchive::default();
         let reap_policy = crate::chat::sessions::runtime::ReapPolicy::default();
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let daemon_config = Config::default();
+        let (daemon_dispatcher, _daemon_action_rx) = dispatcher::ChatDispatcher::new();
+        let daemon_control = DaemonControl {
+            config: &daemon_config,
+            dispatcher: &daemon_dispatcher,
+            redraw_tx: None,
+        };
 
         let output = active_turn_local_command_output(
             &msg,
@@ -17237,6 +17393,7 @@ mod p3_directional_switch_tests {
             &mut reaped_log_archive,
             &reap_policy,
             &tools_registry,
+            daemon_control,
         )
         .await
         .expect("workers command output");
@@ -17450,6 +17607,13 @@ mod p3_directional_switch_tests {
         let mut reaped_log_archive = ReapedSessionLogArchive::default();
         let reap_policy = crate::chat::sessions::runtime::ReapPolicy::default();
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let daemon_config = Config::default();
+        let (daemon_dispatcher, _daemon_action_rx) = dispatcher::ChatDispatcher::new();
+        let daemon_control = DaemonControl {
+            config: &daemon_config,
+            dispatcher: &daemon_dispatcher,
+            redraw_tx: None,
+        };
 
         process_active_turn_input_batch(
             first_msg,
@@ -17466,6 +17630,7 @@ mod p3_directional_switch_tests {
             &mut reaped_log_archive,
             &reap_policy,
             &tools_registry,
+            daemon_control,
         )
         .await;
 
@@ -17516,6 +17681,13 @@ mod p3_directional_switch_tests {
         let mut reaped_log_archive = ReapedSessionLogArchive::default();
         let reap_policy = crate::chat::sessions::runtime::ReapPolicy::default();
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let daemon_config = Config::default();
+        let (daemon_dispatcher, _daemon_action_rx) = dispatcher::ChatDispatcher::new();
+        let daemon_control = DaemonControl {
+            config: &daemon_config,
+            dispatcher: &daemon_dispatcher,
+            redraw_tx: None,
+        };
 
         process_active_turn_input_message(
             input_msg("/exit"),
@@ -17531,6 +17703,7 @@ mod p3_directional_switch_tests {
             &mut reaped_log_archive,
             &reap_policy,
             &tools_registry,
+            daemon_control,
         )
         .await;
 
@@ -19859,6 +20032,13 @@ mod p3_directional_switch_tests {
         let mut reaped_log_archive = ReapedSessionLogArchive::default();
         let reap_policy = crate::chat::sessions::runtime::ReapPolicy::default();
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let daemon_config = Config::default();
+        let (daemon_dispatcher, _daemon_action_rx) = dispatcher::ChatDispatcher::new();
+        let daemon_control = DaemonControl {
+            config: &daemon_config,
+            dispatcher: &daemon_dispatcher,
+            redraw_tx: None,
+        };
 
         let output = active_turn_local_command_output(
             &msg,
@@ -19871,12 +20051,223 @@ mod p3_directional_switch_tests {
             &mut reaped_log_archive,
             &reap_policy,
             &tools_registry,
+            daemon_control,
         )
         .await
         .expect("sessions command output");
 
         assert_eq!(output, "No child TUI sessions.");
         assert_eq!(backlog.len(), 1, "read-only sessions command must not mutate backlog");
+    }
+
+    /// A `--daemon` command exists to look at, or end, work in another
+    /// process — and the moment an operator reaches for one is precisely while
+    /// a long turn is running here. Queueing them behind that turn made the
+    /// feature unavailable exactly when it was wanted, so both entry points
+    /// have to answer: the whitelist that decides what stays answerable, and
+    /// the dispatch that actually runs it.
+    #[tokio::test]
+    async fn active_turn_daemon_commands_run_instead_of_queueing() {
+        let mut daemon_config = Config::default();
+        // A closed port: the request fails on its own, promptly, in its task.
+        daemon_config.chat.daemon.url = "http://127.0.0.1:1".to_string();
+        let (daemon_dispatcher, _daemon_action_rx) = dispatcher::ChatDispatcher::new();
+        let daemon_control = DaemonControl {
+            config: &daemon_config,
+            dispatcher: &daemon_dispatcher,
+            redraw_tx: None,
+        };
+
+        for (command, expected) in [
+            ("/sessions --daemon", "Listing daemon work at http://127.0.0.1:1"),
+            (
+                "/kill --daemon w42",
+                "Asking the daemon at http://127.0.0.1:1 to kill w42",
+            ),
+            (
+                "/steer --daemon w42 change course",
+                "Sending a message to daemon task w42 at http://127.0.0.1:1",
+            ),
+        ] {
+            assert!(
+                is_active_turn_local_command(command),
+                "{command} must stay answerable while a turn is in flight"
+            );
+
+            let mut backlog = std::collections::VecDeque::new();
+            enqueue_input_message(&mut backlog, input_msg("normal one"));
+            let scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+            let chat_session = session::ChatSession::new("p", "m");
+            let provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+            let mut chat_sessions = crate::chat::sessions::ChatSessionsHandle::new(std::sync::Arc::new(
+                tokio::sync::RwLock::new(Vec::new()),
+            ));
+            let session_rings = std::collections::HashMap::new();
+            let mut reaped_log_archive = ReapedSessionLogArchive::default();
+            let reap_policy = crate::chat::sessions::runtime::ReapPolicy::default();
+            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+
+            let output = active_turn_local_command_output(
+                &input_msg(command),
+                &backlog,
+                &scheduler,
+                &chat_session,
+                &provider_turn_workers,
+                &mut chat_sessions,
+                &session_rings,
+                &mut reaped_log_archive,
+                &reap_policy,
+                &tools_registry,
+                daemon_control,
+            )
+            .await
+            .unwrap_or_else(|| panic!("{command} must be answered during a turn, not queued"));
+
+            assert!(output.contains(expected), "{command}: {output}");
+            assert_eq!(backlog.len(), 1, "{command} must not be enqueued behind the turn");
+        }
+    }
+
+    /// The idle loop runs the same three commands through
+    /// `start_daemon_session_command`, so the two entry points cannot drift
+    /// apart again: this is the whole of what the loop's `Daemon*` arm does.
+    #[tokio::test]
+    async fn the_idle_loop_entry_point_starts_the_same_three_commands() {
+        let mut daemon_config = Config::default();
+        daemon_config.chat.daemon.url = "http://127.0.0.1:1".to_string();
+        let (daemon_dispatcher, _daemon_action_rx) = dispatcher::ChatDispatcher::new();
+        let control = DaemonControl {
+            config: &daemon_config,
+            dispatcher: &daemon_dispatcher,
+            redraw_tx: None,
+        };
+        let in_flight = crate::chat::sessions::daemon::new_in_flight_registry();
+
+        for (action, expected) in [
+            (
+                crate::chat::sessions::SessionCommand::DaemonSessions,
+                "Listing daemon work at http://127.0.0.1:1",
+            ),
+            (
+                crate::chat::sessions::SessionCommand::DaemonKill {
+                    address: "w42".to_string(),
+                },
+                "Asking the daemon at http://127.0.0.1:1 to kill w42",
+            ),
+            (
+                crate::chat::sessions::SessionCommand::DaemonSteer {
+                    address: "w42".to_string(),
+                    message: "change course".to_string(),
+                },
+                "Sending a message to daemon task w42 at http://127.0.0.1:1",
+            ),
+        ] {
+            let notice = start_daemon_session_command(&action, None, &in_flight, control)
+                .unwrap_or_else(|| panic!("{action:?} must start a daemon request"));
+            assert!(notice.contains(expected), "{action:?}: {notice}");
+        }
+
+        // A local `/sessions` is not daemon-scoped and must fall through to the
+        // local handler rather than being swallowed here.
+        assert!(
+            start_daemon_session_command(
+                &crate::chat::sessions::SessionCommand::Sessions,
+                None,
+                &in_flight,
+                control
+            )
+            .is_none()
+        );
+    }
+
+    /// §7-2's own argument, applied to chat's own cross-process call: in a
+    /// runtime with no wall clock, the fallback for something stuck is being
+    /// seen and being killed. A daemon that accepts the connection and then
+    /// answers nothing used to leave a spawned task that was neither.
+    #[cfg(feature = "terminal-tui")]
+    #[tokio::test]
+    async fn a_stuck_daemon_request_is_listed_and_can_be_ended() {
+        // A daemon that accepts the connection and then never answers. Nothing
+        // here expires: the request stays outstanding until it is ended.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test: bind ephemeral port");
+        let addr = listener.local_addr().expect("test: local addr");
+        let silent_daemon = tokio::spawn(async move {
+            let held = listener.accept().await;
+            std::future::pending::<()>().await;
+            drop(held);
+        });
+
+        let mut daemon_config = Config::default();
+        daemon_config.chat.daemon.url = format!("http://{addr}");
+        let (daemon_dispatcher, mut daemon_action_rx) = dispatcher::ChatDispatcher::new();
+        let control = DaemonControl {
+            config: &daemon_config,
+            dispatcher: &daemon_dispatcher,
+            redraw_tx: None,
+        };
+        let mut chat_sessions =
+            crate::chat::sessions::ChatSessionsHandle::new(std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())));
+        let in_flight = chat_sessions.daemon_requests();
+        let session_rings = std::collections::HashMap::new();
+        let mut reaped_log_archive = ReapedSessionLogArchive::default();
+        let reap_policy = crate::chat::sessions::runtime::ReapPolicy::default();
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+
+        let notice = start_daemon_session_command(
+            &crate::chat::sessions::SessionCommand::DaemonSessions,
+            None,
+            &in_flight,
+            control,
+        )
+        .expect("test: the listing request starts");
+        assert!(notice.contains("Listing daemon work at"), "{notice}");
+
+        // Visible: the hung request shows up in this chat's own `/sessions`.
+        let listing = handle_local_session_command(
+            &crate::chat::sessions::SessionCommand::Sessions,
+            &mut chat_sessions,
+            &session_rings,
+            &mut reaped_log_archive,
+            &reap_policy,
+            &tools_registry,
+        )
+        .await
+        .expect("test: /sessions renders");
+        assert!(listing.contains("Daemon requests in flight (1)"), "{listing}");
+        assert!(listing.contains("d1 list"), "{listing}");
+
+        // Killable: ending it by address stops the task, which then reports
+        // back instead of hanging on a daemon that will never answer.
+        let killed = start_daemon_session_command(
+            &crate::chat::sessions::SessionCommand::DaemonKill {
+                address: "d1".to_string(),
+            },
+            None,
+            &in_flight,
+            control,
+        )
+        .expect("test: d1 is this chat's own address space");
+        assert!(killed.contains("Stopped waiting on daemon request d1"), "{killed}");
+
+        let reported = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match daemon_action_rx.recv().await {
+                    Some(crate::chat::action::Action::SystemMessageAdded { text }) => return text,
+                    Some(_) => (),
+                    None => return String::new(),
+                }
+            }
+        })
+        .await
+        .expect("test: an ended request must report back rather than leak");
+        assert!(
+            reported.contains("was ended from this chat before the daemon answered"),
+            "{reported}"
+        );
+
+        silent_daemon.abort();
     }
 
     #[tokio::test]
@@ -19893,6 +20284,13 @@ mod p3_directional_switch_tests {
         let mut reaped_log_archive = ReapedSessionLogArchive::default();
         let reap_policy = crate::chat::sessions::runtime::ReapPolicy::default();
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let daemon_config = Config::default();
+        let (daemon_dispatcher, _daemon_action_rx) = dispatcher::ChatDispatcher::new();
+        let daemon_control = DaemonControl {
+            config: &daemon_config,
+            dispatcher: &daemon_dispatcher,
+            redraw_tx: None,
+        };
 
         let output = active_turn_local_command_output(
             &msg,
@@ -19905,6 +20303,7 @@ mod p3_directional_switch_tests {
             &mut reaped_log_archive,
             &reap_policy,
             &tools_registry,
+            daemon_control,
         )
         .await
         .expect("logs command output");
@@ -19927,6 +20326,13 @@ mod p3_directional_switch_tests {
         let mut reaped_log_archive = ReapedSessionLogArchive::default();
         let reap_policy = crate::chat::sessions::runtime::ReapPolicy::default();
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let daemon_config = Config::default();
+        let (daemon_dispatcher, _daemon_action_rx) = dispatcher::ChatDispatcher::new();
+        let daemon_control = DaemonControl {
+            config: &daemon_config,
+            dispatcher: &daemon_dispatcher,
+            redraw_tx: None,
+        };
 
         let output = active_turn_local_command_output(
             &msg,
@@ -19939,6 +20345,7 @@ mod p3_directional_switch_tests {
             &mut reaped_log_archive,
             &reap_policy,
             &tools_registry,
+            daemon_control,
         )
         .await
         .expect("kill command output");

@@ -181,6 +181,11 @@ pub struct ChatSessionsHandle {
     /// `/logs #N` distinguish "was reaped" from "never existed" after the full
     /// bounded archive ages out.
     reaped_sessions: Vec<ReapedSession>,
+    /// Daemon-scoped requests this chat has handed to a task and is still
+    /// waiting on. They are not child sessions — nothing local is running — but
+    /// they are in-flight work of this process, so `/sessions` lists them and
+    /// `/kill --daemon d<N>` ends them.
+    daemon_requests: super::daemon::InFlightRegistry,
 }
 
 impl ChatSessionsHandle {
@@ -197,7 +202,17 @@ impl ChatSessionsHandle {
             next_seq: 1,
             pty_terminal_seen_at: HashMap::new(),
             reaped_sessions: Vec::new(),
+            daemon_requests: super::daemon::new_in_flight_registry(),
         }
+    }
+
+    /// The in-flight daemon-request registry, so the chat loop can publish a
+    /// request before spawning it and end one by address afterwards. Cheap
+    /// `Arc` clone, which is what lets the spawned task hold its own handle
+    /// while the loop keeps `&mut Self`.
+    #[must_use]
+    pub fn daemon_requests(&self) -> super::daemon::InFlightRegistry {
+        Arc::clone(&self.daemon_requests)
     }
 
     /// The PTY registry Arc, so the chat exit path can `kill` all interactive
