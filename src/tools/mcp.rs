@@ -167,6 +167,26 @@ impl McpTool {
         format!("{prefix}__{server}__{tool}")
     }
 
+    /// Strip PRX's runtime-only arguments off an argument object about to be
+    /// forwarded to a third-party MCP server.
+    ///
+    /// The alias form of this tool forwards its whole root argument object, and
+    /// by the time a tool runs the runtime has injected `_zc_scope` (workspace,
+    /// owner and principal ids), `_zc_scope_trusted` and the approval grant. An
+    /// external MCP server is an untrusted process: handing it PRX's internal
+    /// identity leaks it, and handing it a grant hands over a replayable
+    /// authorization token. `strip_runtime_only_args` is the single source of
+    /// truth for which keys those are, so a runtime key added later is covered
+    /// here for free.
+    fn scrub_forwarded_arguments(
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        arguments.map(|mut arguments| {
+            crate::tools::execution::strip_runtime_only_args(&mut arguments);
+            arguments
+        })
+    }
+
     fn parse_alias_name(cfg: &McpConfig, name: &str) -> Option<(String, String)> {
         for (server_name, server_cfg) in &cfg.servers {
             let prefix = format!("{}__{}__", server_cfg.tool_name_prefix, server_name);
@@ -886,6 +906,10 @@ impl Tool for McpTool {
             (server_name, tool_name, Some(arguments))
         };
 
+        // `args` itself is left intact — the SideEffectGate below still reads
+        // the runtime approval grant out of it.
+        let arguments = Self::scrub_forwarded_arguments(arguments);
+
         // SideEffectGate: forwarding a tool call to an external MCP server runs
         // arbitrary, potentially irreversible side effects on an untrusted
         // process/endpoint — the largest un-gated surface (reaudit P0-C). Gate it
@@ -945,6 +969,73 @@ mod tests {
     )]
     use super::*;
     use crate::config::McpServerConfig;
+
+    // ── forwarded-argument scrubbing ──────────────────────────
+
+    /// Forwarding an alias call hands the whole root argument object to a
+    /// third-party server. PRX's workspace/owner/principal ids and the runtime
+    /// approval grant must never be part of that payload.
+    #[test]
+    fn scrub_forwarded_arguments_removes_internal_identity_and_grant() {
+        let grant = crate::security::policy::ApprovalGrant::for_command("mcp", "call", "approval_manager", None);
+        let args = serde_json::json!({
+            "query": "hello",
+            "_zc_scope": {
+                "workspace_id": "ws-secret",
+                "owner_id": "owner:ws-secret:agent",
+                "principal_id": "agent:internal",
+                "session_key": "mcp:internal",
+            },
+            "_zc_scope_trusted": true,
+            "_prx_scope_trusted": false,
+            "_zc_approval_granted": true,
+            "_zc_principal": "agent:internal",
+            crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                serde_json::to_value(&grant).expect("grant serializes"),
+        });
+        let root = args.as_object().expect("object args").clone();
+
+        let forwarded = McpTool::scrub_forwarded_arguments(Some(root)).expect("some arguments");
+
+        assert_eq!(
+            forwarded.get("query").and_then(serde_json::Value::as_str),
+            Some("hello"),
+            "real tool arguments must still be forwarded"
+        );
+        for key in [
+            "_zc_scope",
+            "_zc_scope_trusted",
+            "_prx_scope_trusted",
+            "_zc_approval_granted",
+            "_zc_approval_grant",
+            "_zc_principal",
+        ] {
+            assert!(
+                forwarded.get(key).is_none(),
+                "{key} must not be forwarded to a third-party MCP server"
+            );
+        }
+
+        // Nothing that even looks like internal identity survives.
+        let wire = serde_json::to_string(&forwarded).expect("forwarded args serialize");
+        assert!(
+            !wire.contains("ws-secret"),
+            "workspace id leaked to third party: {wire}"
+        );
+        assert!(
+            !wire.contains("agent:internal"),
+            "principal id leaked to third party: {wire}"
+        );
+        assert!(
+            !wire.contains("approval_manager"),
+            "approval grant leaked to third party: {wire}"
+        );
+    }
+
+    #[test]
+    fn scrub_forwarded_arguments_passes_through_absent_arguments() {
+        assert!(McpTool::scrub_forwarded_arguments(None).is_none());
+    }
 
     // ── tool_allowed rules ────────────────────────────────────
 
