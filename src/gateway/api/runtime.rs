@@ -290,10 +290,26 @@ pub async fn post_task_message(
     //
     // The guard is dropped the instant the send settles, so a delivery that
     // does not park never lingers in the listing.
+    //
+    // Registered as a *child of the target* rather than as a lineage root: the
+    // row carries the target's run id, and `registry::resolve_address` answers
+    // a run id with the lineage root, so a root would be visible under an
+    // address that could never reach it. An operator killing by the run id
+    // they read out of `prx tasks list` would end the target — destroying work
+    // they had not aimed at — and leave the delivery parked. As a child it is
+    // inside the cascade that a run-id kill already performs, and its own
+    // `w<id>` address still ends it alone.
+    //
+    // MUTATION GUARD: register this as `register_tool_call` again and
+    // `a_parked_delivery_is_killable_by_the_run_id_an_operator_can_read` fails.
     let delivery_cancel = tokio_util::sync::CancellationToken::new();
     let delivery_name = format!("steer → {work_id} {}", target.name);
-    let delivery =
-        registry::register_tool_call(&delivery_name, target.run_id.as_deref(), Some(delivery_cancel.clone()));
+    let delivery = registry::register_delivery(
+        &delivery_name,
+        work_id,
+        target.run_id.as_deref(),
+        Some(delivery_cancel.clone()),
+    );
     let accepted = tokio::select! {
         biased;
         // A completed send wins a tie: once the message is on the queue it is
@@ -914,7 +930,7 @@ mod tests {
     /// queue would otherwise be invisible everywhere at once: the target looks
     /// idle, the caller is a different process, and no timeout will ever end it.
     ///
-    /// MUTATION GUARD: delete the `register_tool_call` in `post_task_message`
+    /// MUTATION GUARD: delete the `register_delivery` in `post_task_message`
     /// and this test fails — the row never appears.
     #[tokio::test]
     async fn a_parked_delivery_is_visible_while_it_parks_and_gone_once_it_lands() {
@@ -1003,6 +1019,68 @@ mod tests {
         // The queue still holds only what was there before: a killed delivery
         // delivered nothing.
         assert_eq!(rx.recv().await.as_deref(), Some("already queued"));
+
+        drop(guard);
+        server.abort();
+    }
+
+    /// Killable by the address an operator actually has.
+    ///
+    /// The `w<id>` the test above uses is a process-local counter; the run id
+    /// is the only address that means anything outside this process, and it is
+    /// the one printed against every row in `prx tasks list`. A parked delivery
+    /// that could only be ended by `w<id>` was half a backstop: an operator
+    /// reading the row and killing by the run id on it hit the *target* — one
+    /// resolve_address away, since a run id answers with the lineage root —
+    /// destroying live work they had not aimed at while the delivery they meant
+    /// to end kept parking, with nothing left to expire it.
+    #[tokio::test]
+    async fn a_parked_delivery_is_killable_by_the_run_id_an_operator_can_read() {
+        let workspace = tempfile::TempDir::new().expect("test: tempdir");
+        let (guard, run_id, mut rx) = wedged_target().await;
+        let target = guard.id();
+
+        let (endpoint, server) = serve(test_app_state(AutonomyLevel::Full, workspace.path())).await;
+        let endpoint = Arc::new(endpoint);
+        let call = tokio::spawn({
+            let endpoint = Arc::clone(&endpoint);
+            let run_id = run_id.clone();
+            async move { tasks_cli::request_message(&endpoint, &run_id, "end me by run id").await }
+        });
+
+        let row = await_delivery_row(target).await;
+
+        // Exactly what an operator types: the run id off the listing, with the
+        // default cascade.
+        let report = tasks_cli::request_kill(&endpoint, &run_id, true)
+            .await
+            .expect("test: a run id is a valid kill address");
+        assert!(
+            report.targets.iter().any(|item| item.id == row.id.to_string()),
+            "killing the run id must reach the delivery parked on it: {report:?}"
+        );
+        // The mechanism, stated so a future change cannot satisfy the assertion
+        // above by widening what a run-id kill sweeps up.
+        assert_eq!(
+            row.parent,
+            Some(target),
+            "the delivery must hang off the run it is aimed at, not be found by some broader sweep"
+        );
+
+        let error = call
+            .await
+            .expect("test: the delivery task must not panic")
+            .expect_err("test: a killed delivery must report failure, never a silent success");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("409") && rendered.contains("ended by an operator"),
+            "the caller must be told the delivery was ended, got: {rendered}"
+        );
+        assert_eq!(
+            rx.recv().await.as_deref(),
+            Some("already queued"),
+            "a killed delivery must not have handed anything to the target"
+        );
 
         drop(guard);
         server.abort();

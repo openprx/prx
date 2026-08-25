@@ -458,6 +458,45 @@ pub fn register_tool_call(name: &str, run_id: Option<&str>, cancel: Option<Cance
     )
 }
 
+/// Register work aimed *at* an already-registered item, as that item's child.
+///
+/// The one case is a cross-entry-point steering delivery: the gateway resolves
+/// a run by address and then parks on that run's bounded queue, and the parked
+/// send is registered so it can be seen and ended. `parent` is passed
+/// explicitly because such a delivery runs on a request task that inherits no
+/// task-locals from the target, so [`current_work_id`] would make it a lineage
+/// *root*.
+///
+/// Being a root is what broke addressing. The row carries the target's
+/// `run_id`, but [`resolve_address`] answers a `run_id` with the lineage root —
+/// the target — so an operator killing by the only portable address reached the
+/// run and never the delivery hanging off it, while the delivery kept parking.
+/// Worse, that kill destroyed live work the operator had not aimed at. Making
+/// the delivery a child restores the invariant every other row already keeps:
+/// **everything sharing a `run_id` is inside that run's lineage**, so the
+/// cascade a `run_id` kill already performs reaches it.
+///
+/// The direct [`WorkId`] address keeps working unchanged, and a delivery that
+/// never parks is dropped before anyone can see it either way.
+#[must_use]
+pub fn register_delivery(
+    name: &str,
+    target: WorkId,
+    run_id: Option<&str>,
+    cancel: Option<CancellationToken>,
+) -> WorkGuard {
+    register(
+        WorkKind::ToolCall,
+        Arc::from(name),
+        Some(target),
+        run_id.map(Arc::from),
+        None,
+        cancel,
+        None,
+        None,
+    )
+}
+
 /// Register a sub-agent run or background session.
 ///
 /// `parent` is passed explicitly because the run executes in a freshly spawned
@@ -561,10 +600,15 @@ pub fn attach_steer_sender(id: WorkId, sender: tokio::sync::mpsc::Sender<String>
 /// cannot collide, but resolving the portable address first keeps that true by
 /// construction rather than by luck.
 ///
-/// Several rows can share one `run_id` — a sub-agent run and every tool call
-/// made inside it. The lineage root is returned: ids are handed out
-/// monotonically and the run is registered before anything it starts, so the
-/// lowest matching id is the ancestor of the rest. Preferring [`WorkKind::Turn`]
+/// Several rows can share one `run_id` — a sub-agent run, every tool call made
+/// inside it, and any cross-entry delivery parked on its steering queue. The
+/// lineage root is returned: ids are handed out monotonically and the run is
+/// registered before anything it starts, so the lowest matching id is the
+/// ancestor of the rest. That answer is only usable because every one of those
+/// rows really is in the root's lineage — which is why a delivery, whose task
+/// inherits no task-locals from the target, is parented explicitly by
+/// [`register_delivery`] rather than left to become a second root under the
+/// same address. Preferring [`WorkKind::Turn`]
 /// and [`WorkKind::SubAgent`] rows first keeps that intent explicit rather than
 /// relying on the ordering alone.
 #[must_use]
