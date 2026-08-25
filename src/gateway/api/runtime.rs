@@ -25,6 +25,8 @@ pub(super) struct WorkItemResponse {
     state: &'static str,
     parent: Option<String>,
     run_id: Option<String>,
+    /// Fan-out this item belongs to, when it was started by `spawn_batch`.
+    batch_id: Option<String>,
     started_at_unix_ms: u64,
     elapsed_secs: u64,
     elapsed_ms: u128,
@@ -41,6 +43,7 @@ impl From<registry::WorkSnapshot> for WorkItemResponse {
             state: snapshot.state.as_str(),
             parent: snapshot.parent.map(|parent| parent.to_string()),
             run_id: snapshot.run_id.map(|run_id| run_id.to_string()),
+            batch_id: snapshot.batch_id.map(|batch_id| batch_id.to_string()),
             started_at_unix_ms: snapshot.started_at_unix_ms,
             elapsed_secs: snapshot.elapsed.as_secs(),
             elapsed_ms: snapshot.elapsed.as_millis(),
@@ -111,17 +114,18 @@ pub async fn post_task_kill(
     // counter, so it is only meaningful to an operator on this box; a caller
     // that reached this endpoint from another process has nothing but the
     // run id, and until now a kill could not be aimed with one.
-    let Some(work_id) = resolve_task_address(&id)? else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("no running work item with id '{id}'")})),
-        ));
-    };
     let cascade = query.cascade.unwrap_or(true);
-    let results = registry::kill(work_id, cascade).await;
-    if results
-        .iter()
-        .all(|result| result.outcome == registry::KillOutcome::Unknown)
+    let (requested, results) = match resolve_task_address(&id)? {
+        Some(work_id) => (work_id.to_string(), registry::kill(work_id, cascade).await),
+        // A third address: a `spawn_batch` id. It denotes a *set* of sibling
+        // roots rather than one item, so it cannot resolve to a `WorkId`; the
+        // registry ends the whole fan-out with the same per-member cascade.
+        None => (id.trim().to_string(), registry::kill_batch(id.trim(), cascade).await),
+    };
+    if results.is_empty()
+        || results
+            .iter()
+            .all(|result| result.outcome == registry::KillOutcome::Unknown)
     {
         return Err((
             StatusCode::NOT_FOUND,
@@ -130,7 +134,7 @@ pub async fn post_task_kill(
     }
 
     Ok(Json(KillResponse {
-        requested: work_id.to_string(),
+        requested,
         cascade,
         targets: results
             .into_iter()
@@ -221,7 +225,47 @@ pub async fn post_task_message(
         ));
     };
 
-    if let Err(rejection) = registry::steer(work_id, message.to_string()).await {
+    // Register the delivery itself, for its whole duration.
+    //
+    // The target's steering queue is bounded and this runtime has no wall
+    // clock, so a send to a busy — or wedged — run legitimately parks with no
+    // upper bound. Without a row of its own, that parked delivery is invisible
+    // everywhere: it is not the target (which looks idle), it is not the
+    // caller's turn (the caller is another process), and no timeout will ever
+    // end it. Since a manual kill is the only backstop left once nothing
+    // expires by itself, being *seen* is the precondition for being ended, and
+    // the cancellation token below is what makes the seen row actually
+    // killable rather than merely observable.
+    //
+    // The guard is dropped the instant the send settles, so a delivery that
+    // does not park never lingers in the listing.
+    let delivery_cancel = tokio_util::sync::CancellationToken::new();
+    let delivery_name = format!("steer → {work_id} {}", target.name);
+    let delivery =
+        registry::register_tool_call(&delivery_name, target.run_id.as_deref(), Some(delivery_cancel.clone()));
+    let delivered = tokio::select! {
+        biased;
+        // A completed send wins a tie: once the message is in the queue it has
+        // been delivered, and reporting it as killed would be a lie the caller
+        // could act on by sending it twice.
+        result = registry::steer(work_id, message.to_string()) => Some(result),
+        () = delivery_cancel.cancelled() => None,
+    };
+    drop(delivery);
+
+    let Some(outcome) = delivered else {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "delivery to work item '{work_id}' was ended by an operator before the message was accepted"
+                ),
+                "outcome": "killed",
+            })),
+        ));
+    };
+
+    if let Err(rejection) = outcome {
         let detail = match rejection {
             registry::SteerRejection::NotSteerable => format!(
                 "work item '{work_id}' ({}) exposes no message channel; only sub-agent runs can be steered",
@@ -708,6 +752,231 @@ mod tests {
         assert!(rendered.contains("no message channel"), "got: {rendered}");
 
         drop(guard);
+        server.abort();
+    }
+
+    /// Register a run whose steering queue is already full and whose receiver is
+    /// never drained, so the next delivery genuinely parks on backpressure.
+    ///
+    /// The receiver is returned rather than dropped: dropping it would close the
+    /// channel and turn the parked send into an immediate `ChannelClosed`, which
+    /// is the opposite of what these tests need to observe.
+    async fn wedged_target() -> (registry::WorkGuard, String, tokio::sync::mpsc::Receiver<String>) {
+        let run_id = format!("wedged-{}", uuid::Uuid::new_v4());
+        let guard = registry::register_sub_agent("wedged run", &run_id, None, None, None);
+        // Capacity one, already occupied: the queue is full by construction, the
+        // same state a real run reaches when it stops draining.
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(1);
+        tx.send("already queued".to_string())
+            .await
+            .expect("test: the first message fits in the queue");
+        registry::attach_steer_sender(guard.id(), tx);
+        (guard, run_id, rx)
+    }
+
+    /// Find the registry row a parked delivery to `target` registered, if any.
+    fn delivery_row(target: registry::WorkId) -> Option<registry::WorkSnapshot> {
+        let needle = format!("steer → {target} ");
+        registry::snapshot_all()
+            .into_iter()
+            .find(|snapshot| snapshot.name.starts_with(&needle))
+    }
+
+    async fn await_delivery_row(target: registry::WorkId) -> registry::WorkSnapshot {
+        for _ in 0..400 {
+            if let Some(row) = delivery_row(target) {
+                return row;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("test: a parked delivery to {target} never appeared in the work registry");
+    }
+
+    /// Core evidence for §7.2: a cross-entry delivery that parks on backpressure
+    /// is **visible** for exactly as long as it parks.
+    ///
+    /// This is the blind spot the registration exists to close. Nothing in this
+    /// runtime expires on a clock, so a delivery wedged behind a full steering
+    /// queue would otherwise be invisible everywhere at once: the target looks
+    /// idle, the caller is a different process, and no timeout will ever end it.
+    ///
+    /// MUTATION GUARD: delete the `register_tool_call` in `post_task_message`
+    /// and this test fails — the row never appears.
+    #[tokio::test]
+    async fn a_parked_delivery_is_visible_while_it_parks_and_gone_once_it_lands() {
+        let workspace = tempfile::TempDir::new().expect("test: tempdir");
+        let (guard, run_id, mut rx) = wedged_target().await;
+        let target = guard.id();
+
+        let (endpoint, server) = serve(test_app_state(AutonomyLevel::Full, workspace.path())).await;
+        let endpoint = Arc::new(endpoint);
+        let call = tokio::spawn({
+            let endpoint = Arc::clone(&endpoint);
+            let run_id = run_id.clone();
+            async move { tasks_cli::request_message(&endpoint, &run_id, "you will have to wait").await }
+        });
+
+        let row = await_delivery_row(target).await;
+        assert_eq!(
+            row.run_id.as_deref(),
+            Some(run_id.as_str()),
+            "the delivery row must carry the target's run id so an operator can tell what it is waiting on"
+        );
+        assert_eq!(row.kind, registry::WorkKind::ToolCall);
+
+        // Drain one slot: the parked send now completes.
+        assert_eq!(rx.recv().await.as_deref(), Some("already queued"));
+        let report = call
+            .await
+            .expect("test: the delivery task must not panic")
+            .expect("test: the delivery must succeed once the queue drains");
+        assert_eq!(report.outcome, "delivered");
+        assert_eq!(rx.recv().await.as_deref(), Some("you will have to wait"));
+
+        // And it stops being visible the moment it settles: the row is a report
+        // of work in flight, not a log.
+        for _ in 0..400 {
+            if delivery_row(target).is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            delivery_row(target).is_none(),
+            "a settled delivery must not linger in the listing"
+        );
+
+        drop(guard);
+        server.abort();
+    }
+
+    /// Being seen is only half a backstop: the visible row must also be the
+    /// thing an operator can end. Killing the delivery row releases the caller
+    /// without the message ever reaching the target.
+    #[tokio::test]
+    async fn a_parked_delivery_can_be_killed_by_the_operator() {
+        let workspace = tempfile::TempDir::new().expect("test: tempdir");
+        let (guard, run_id, mut rx) = wedged_target().await;
+        let target = guard.id();
+
+        let (endpoint, server) = serve(test_app_state(AutonomyLevel::Full, workspace.path())).await;
+        let endpoint = Arc::new(endpoint);
+        let call = tokio::spawn({
+            let endpoint = Arc::clone(&endpoint);
+            let run_id = run_id.clone();
+            async move { tasks_cli::request_message(&endpoint, &run_id, "abandon me").await }
+        });
+
+        let row = await_delivery_row(target).await;
+        let report = tasks_cli::request_kill(&endpoint, &row.id.to_string(), false)
+            .await
+            .expect("test: the delivery row must be killable like any other work item");
+        assert!(
+            report.targets.iter().any(|item| item.id == row.id.to_string()),
+            "the kill must have named the delivery row: {report:?}"
+        );
+
+        let error = call
+            .await
+            .expect("test: the delivery task must not panic")
+            .expect_err("test: a killed delivery must report failure, never a silent success");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("409") && rendered.contains("ended by an operator"),
+            "the caller must be told the delivery was ended, got: {rendered}"
+        );
+
+        // The queue still holds only what was there before: a killed delivery
+        // delivered nothing.
+        assert_eq!(rx.recv().await.as_deref(), Some("already queued"));
+
+        drop(guard);
+        server.abort();
+    }
+
+    /// §7.1 end to end: a `spawn_batch` fan-out is visible as a batch through
+    /// the very listing `prx tasks list` renders, and the batch id is a kill
+    /// address that ends every member.
+    #[tokio::test]
+    async fn a_batch_is_listed_as_one_unit_and_killable_by_its_batch_id() {
+        let workspace = tempfile::TempDir::new().expect("test: tempdir");
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (tool, _) = spawn_long_running_sub_agent(workspace.path(), &gate).await;
+
+        let spawned = tool
+            .execute(serde_json::json!({
+                "action": "spawn_batch",
+                "tasks": ["alpha", "beta", "gamma"],
+                "_zc_scope_trusted": true,
+                "_zc_scope": {
+                    "sender": "operator",
+                    "channel": "silent",
+                    "chat_type": "direct",
+                    "chat_id": "chat-1"
+                }
+            }))
+            .await
+            .expect("test: spawn_batch must be accepted");
+        let payload: serde_json::Value =
+            serde_json::from_str(&spawned.output).expect("test: spawn_batch output must be JSON");
+        let batch_id = payload
+            .get("batch_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("test: spawn_batch must return a batch id")
+            .to_string();
+
+        let (endpoint, server) = serve(test_app_state(AutonomyLevel::Full, workspace.path())).await;
+
+        // Wait for all three rows to be registered, then read the listing the
+        // CLI reads.
+        let mut listing = tasks_cli::fetch_tasks(&endpoint).await.expect("test: listing");
+        for _ in 0..400 {
+            if listing
+                .running
+                .iter()
+                .filter(|item| item.batch_id.as_deref() == Some(batch_id.as_str()))
+                .count()
+                == 3
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            listing = tasks_cli::fetch_tasks(&endpoint).await.expect("test: listing");
+        }
+        let members: Vec<_> = listing
+            .running
+            .iter()
+            .filter(|item| item.batch_id.as_deref() == Some(batch_id.as_str()))
+            .collect();
+        assert_eq!(
+            members.len(),
+            3,
+            "every batch member must report its batch in the operator listing: {:?}",
+            listing.running
+        );
+
+        // And the CLI's grouping puts them under one heading.
+        let groups = tasks_cli::group_by_batch(&listing.running);
+        let batch_group = groups
+            .iter()
+            .find(|(id, _)| *id == Some(batch_id.as_str()))
+            .expect("test: the batch must form a group of its own");
+        assert_eq!(batch_group.1.len(), 3);
+
+        // The batch id is a third kill address, and it reaches every member.
+        let report = tasks_cli::request_kill(&endpoint, &batch_id, true)
+            .await
+            .expect("test: a batch id must be a valid kill address");
+        assert_eq!(report.requested, batch_id);
+        for member in &members {
+            assert!(
+                report.targets.iter().any(|target| target.id == member.id),
+                "the batch kill must have reached {}: {report:?}",
+                member.id
+            );
+        }
+
+        gate.add_permits(64);
         server.abort();
     }
 }

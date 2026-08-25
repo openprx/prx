@@ -242,6 +242,7 @@ mod tests {
             state: "running".to_string(),
             parent: parent.map(ToString::to_string),
             run_id: run_id.map(ToString::to_string),
+            batch_id: None,
             elapsed_secs: 75,
             pid: None,
             pgid: None,

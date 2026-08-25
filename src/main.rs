@@ -679,6 +679,7 @@ Examples:
   prx tasks kill w42                  # kill w42 and everything it started
   prx tasks kill w42 --no-cascade     # kill only w42
   prx tasks kill <run-id>             # same, addressed by run id
+  prx tasks kill <batch-id>           # end every member of a spawn_batch fan-out
   prx tasks send <run-id> \"also check Y\"  # steer a running task mid-flight
   prx tasks pools                     # connection-pool saturation")]
     Tasks {
@@ -860,7 +861,8 @@ enum TasksCommands {
     },
     /// Terminate one work item by id
     Kill {
-        /// Run id, or work item id as printed by `prx tasks list` (`w42` or `42`)
+        /// Run id, work item id as printed by `prx tasks list` (`w42` or `42`),
+        /// or the batch id of a `spawn_batch` fan-out (ends the whole batch)
         id: String,
         /// Kill only this item, leaving the tools and processes it started
         /// running. Cascading is the default because nothing else will clean
@@ -1460,34 +1462,55 @@ async fn handle_tasks_command(command: TasksCommands, config: &Config) -> anyhow
 }
 
 /// Render one work-item table, shared by the running and unreaped sections.
+///
+/// Members of one `spawn_batch` fan-out are pulled together under a header at
+/// the position of the batch's first member: they are siblings rather than a
+/// lineage, so nothing else in the table says they belong to one another. A
+/// listing with no batches renders exactly as it always did.
 fn print_work_items(items: &[openprx::runtime::tasks_cli::WorkItem]) {
     println!(
         "{:<8} {:<10} {:>10}  {:<14} {:<}",
         "ID", "KIND", "ELAPSED", "STATE", "NAME"
     );
-    for item in items {
-        let mut name = item.name.clone();
-        if let Some(parent) = &item.parent {
-            name.push_str(&format!("  (parent {parent})"));
+    for (batch_id, members) in openprx::runtime::tasks_cli::group_by_batch(items) {
+        if let Some(batch_id) = batch_id {
+            println!("  batch {batch_id} — {} member(s):", members.len());
         }
-        if let Some(run_id) = &item.run_id {
-            name.push_str(&format!("  (run {run_id})"));
+        for item in members {
+            print_work_item(item, batch_id.is_some());
         }
-        if let Some(pid) = item.pid {
-            name.push_str(&format!("  (pid {pid}"));
-            match item.pgid {
-                Some(pgid) => name.push_str(&format!(", pgid {pgid})")),
-                None => name.push(')'),
-            }
-        }
-        println!(
-            "{:<8} {:<10} {:>10}  {:<14} {name}",
-            item.id,
-            item.kind,
-            openprx::runtime::tasks_cli::format_elapsed(item.elapsed_secs),
-            item.state
-        );
     }
+}
+
+/// Render one row. `indented` marks a row as belonging to the batch header
+/// above it.
+fn print_work_item(item: &openprx::runtime::tasks_cli::WorkItem, indented: bool) {
+    let mut name = item.name.clone();
+    if let Some(parent) = &item.parent {
+        name.push_str(&format!("  (parent {parent})"));
+    }
+    if let Some(run_id) = &item.run_id {
+        name.push_str(&format!("  (run {run_id})"));
+    }
+    if let Some(pid) = item.pid {
+        name.push_str(&format!("  (pid {pid}"));
+        match item.pgid {
+            Some(pgid) => name.push_str(&format!(", pgid {pgid})")),
+            None => name.push(')'),
+        }
+    }
+    let id = if indented {
+        format!("  {}", item.id)
+    } else {
+        item.id.clone()
+    };
+    println!(
+        "{:<8} {:<10} {:>10}  {:<14} {name}",
+        id,
+        item.kind,
+        openprx::runtime::tasks_cli::format_elapsed(item.elapsed_secs),
+        item.state
+    );
 }
 
 async fn handle_memory_command(command: MemoryCommands, config: &Config) -> anyhow::Result<()> {

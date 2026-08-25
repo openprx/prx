@@ -186,6 +186,11 @@ pub struct WorkSnapshot {
     pub parent: Option<WorkId>,
     /// Correlating run id from `SPAWN_EXECUTION_CONTEXT`, when known.
     pub run_id: Option<Arc<str>>,
+    /// Fan-out this item belongs to, when it was started as one member of a
+    /// `sessions_spawn` batch. Members of one batch are otherwise
+    /// indistinguishable from unrelated concurrent runs, because they are
+    /// siblings rather than descendants of one another.
+    pub batch_id: Option<Arc<str>>,
     /// Wall-clock start, milliseconds since the Unix epoch.
     pub started_at_unix_ms: u64,
     /// How long the item has been running.
@@ -202,6 +207,8 @@ struct Slot {
     name: Arc<str>,
     parent: Option<u64>,
     run_id: Option<Arc<str>>,
+    /// Immutable batch membership; see [`WorkSnapshot::batch_id`].
+    batch_id: Option<Arc<str>>,
     started: Instant,
     started_wall: SystemTime,
     state: AtomicU8,
@@ -255,6 +262,7 @@ impl Slot {
             name: Arc::clone(&self.name),
             parent: self.parent.map(WorkId),
             run_id: self.run_id.clone(),
+            batch_id: self.batch_id.clone(),
             started_at_unix_ms: self
                 .started_wall
                 .duration_since(UNIX_EPOCH)
@@ -379,6 +387,7 @@ fn register(
     name: Arc<str>,
     parent: Option<WorkId>,
     run_id: Option<Arc<str>>,
+    batch_id: Option<Arc<str>>,
     cancel: Option<CancellationToken>,
     pid: Option<u32>,
     pgid: Option<i32>,
@@ -390,6 +399,7 @@ fn register(
         name,
         parent: parent.map(WorkId::raw),
         run_id,
+        batch_id,
         started: Instant::now(),
         started_wall: SystemTime::now(),
         state: AtomicU8::new(STATE_RUNNING),
@@ -423,6 +433,7 @@ pub fn register_turn(name: &str, run_id: &str, cancel: Option<CancellationToken>
         Arc::from(name),
         current_work_id(),
         Some(Arc::from(run_id)),
+        None,
         cancel,
         None,
         None,
@@ -440,6 +451,7 @@ pub fn register_tool_call(name: &str, run_id: Option<&str>, cancel: Option<Cance
         Arc::from(name),
         current_work_id(),
         run_id.map(Arc::from),
+        None,
         cancel,
         None,
         None,
@@ -451,11 +463,19 @@ pub fn register_tool_call(name: &str, run_id: Option<&str>, cancel: Option<Cance
 /// `parent` is passed explicitly because the run executes in a freshly spawned
 /// task, which does not inherit the spawner's task-locals; callers capture
 /// [`current_work_id`] before `tokio::spawn`.
+///
+/// `batch_id` is `Some` only for a member of a `sessions_spawn` fan-out. It is
+/// recorded here rather than derived from the lineage because a batch's members
+/// are *siblings*: the tool call that launched them is their common parent, and
+/// that row is retired the moment the launching call returns, which is long
+/// before the members finish. Without this field the fan-out is unrecoverable
+/// from the registry alone.
 #[must_use]
 pub fn register_sub_agent(
     name: &str,
     run_id: &str,
     parent: Option<WorkId>,
+    batch_id: Option<&str>,
     cancel: Option<CancellationToken>,
 ) -> WorkGuard {
     register(
@@ -463,6 +483,7 @@ pub fn register_sub_agent(
         Arc::from(name),
         parent,
         Some(Arc::from(run_id)),
+        batch_id.map(Arc::from),
         cancel,
         None,
         None,
@@ -481,6 +502,7 @@ pub fn register_process(command: &str, pid: Option<u32>, pgid: Option<i32>) -> W
         WorkKind::Process,
         Arc::from(command),
         current_work_id(),
+        None,
         None,
         None,
         pid,
@@ -745,6 +767,48 @@ pub async fn kill(id: WorkId, cascade: bool) -> Vec<KillResult> {
     } else {
         vec![root]
     };
+
+    let mut issued = Vec::with_capacity(targets.len());
+    for slot in &targets {
+        slot.state.store(STATE_KILL_REQUESTED, Ordering::Relaxed);
+        issued.push(request_termination(slot));
+    }
+
+    verify_terminated(&targets, &issued).await
+}
+
+/// Terminate every member of one `sessions_spawn` fan-out, each with the same
+/// lineage cascade a single [`kill`] applies.
+///
+/// This is not a second termination mechanism: it resolves the batch to its
+/// member rows and then reuses [`collect_lineage`] and [`request_termination`]
+/// unchanged. It exists because a batch is a set of *sibling* roots, so there is
+/// no single id whose lineage covers it — the launching tool call, which was
+/// their common parent, is deregistered as soon as it returns, while the members
+/// it started keep running.
+///
+/// Every target is signalled before any is verified, so ending a fan-out of any
+/// width costs one verification window rather than one per member.
+///
+/// An empty result means no live work carries that batch id.
+pub async fn kill_batch(batch_id: &str, cascade: bool) -> Vec<KillResult> {
+    let all = REGISTRY.slots();
+    let mut targets: Vec<Arc<Slot>> = Vec::new();
+    for root in all.iter().filter(|slot| slot.batch_id.as_deref() == Some(batch_id)) {
+        let lineage = if cascade {
+            collect_lineage(&all, root.id)
+        } else {
+            vec![Arc::clone(root)]
+        };
+        for slot in lineage {
+            if !targets.iter().any(|chosen| chosen.id == slot.id) {
+                targets.push(slot);
+            }
+        }
+    }
+    if targets.is_empty() {
+        return Vec::new();
+    }
 
     let mut issued = Vec::with_capacity(targets.len());
     for slot in &targets {
@@ -1199,7 +1263,7 @@ mod tests {
     #[tokio::test]
     async fn a_run_is_addressable_by_run_id_and_by_work_id_alike() {
         let run_id = unique_run_id("both-addresses");
-        let guard = register_sub_agent("addressable", &run_id, None, None);
+        let guard = register_sub_agent("addressable", &run_id, None, None, None);
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         attach_steer_sender(guard.id(), tx);
 
@@ -1213,7 +1277,7 @@ mod tests {
     #[tokio::test]
     async fn a_shared_run_id_resolves_to_the_lineage_root() {
         let run_id = unique_run_id("shared");
-        let root = register_sub_agent("root run", &run_id, None, None);
+        let root = register_sub_agent("root run", &run_id, None, None, None);
         // A tool call inside the run carries the same correlating run id.
         let _child = register_tool_call("shell", Some(&run_id), None);
 
@@ -1244,7 +1308,7 @@ mod tests {
     #[tokio::test]
     async fn a_closed_receiver_is_reported_instead_of_silently_succeeding() {
         let run_id = unique_run_id("closed");
-        let guard = register_sub_agent("ending run", &run_id, None, None);
+        let guard = register_sub_agent("ending run", &run_id, None, None, None);
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         attach_steer_sender(guard.id(), tx);
         drop(rx);
@@ -1258,7 +1322,7 @@ mod tests {
     async fn a_finished_run_stops_being_addressable() {
         let run_id = unique_run_id("finished");
         let id = {
-            let guard = register_sub_agent("short run", &run_id, None, None);
+            let guard = register_sub_agent("short run", &run_id, None, None, None);
             let (tx, _rx) = tokio::sync::mpsc::channel(4);
             attach_steer_sender(guard.id(), tx);
             assert_eq!(resolve_address(&run_id), Some(guard.id()));
@@ -1277,7 +1341,7 @@ mod tests {
     #[tokio::test]
     async fn a_full_queue_parks_the_sender_instead_of_dropping_the_message() {
         let run_id = unique_run_id("backpressure");
-        let guard = register_sub_agent("busy run", &run_id, None, None);
+        let guard = register_sub_agent("busy run", &run_id, None, None, None);
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         attach_steer_sender(guard.id(), tx);
 
@@ -1390,13 +1454,137 @@ mod tests {
         assert!(snapshot(id).is_none());
     }
 
+    /// A batch member's registry row carries the fan-out it belongs to, which
+    /// is the only thing that ties siblings together once the launching tool
+    /// call has returned and its row is gone.
+    #[test]
+    fn a_batch_member_reports_its_batch_in_the_snapshot() {
+        let run_id = format!("run-{}", uuid::Uuid::new_v4());
+        let batch_id = format!("batch-{}", uuid::Uuid::new_v4());
+        let guard = register_sub_agent("batched run", &run_id, None, Some(&batch_id), None);
+        let listed = snapshot(guard.id()).expect("test: the row must be listed");
+        assert_eq!(listed.batch_id.as_deref(), Some(batch_id.as_str()));
+
+        let solo = register_sub_agent("solo run", &format!("run-{}", uuid::Uuid::new_v4()), None, None, None);
+        assert!(
+            snapshot(solo.id()).and_then(|row| row.batch_id).is_none(),
+            "a run outside any batch must not be labelled with one"
+        );
+    }
+
+    /// Killing by batch id reaches every member *and* what each member started:
+    /// the per-member cascade is the existing one, applied once per root.
+    #[tokio::test]
+    async fn killing_a_batch_reaches_every_member_and_their_lineage() {
+        let batch_id = format!("batch-{}", uuid::Uuid::new_v4());
+        let first_token = CancellationToken::new();
+        let second_token = CancellationToken::new();
+        let first = register_sub_agent(
+            "batch_member_one_marker",
+            &format!("run-{}", uuid::Uuid::new_v4()),
+            None,
+            Some(&batch_id),
+            Some(first_token.clone()),
+        );
+        let second = register_sub_agent(
+            "batch_member_two_marker",
+            &format!("run-{}", uuid::Uuid::new_v4()),
+            None,
+            Some(&batch_id),
+            Some(second_token.clone()),
+        );
+        let first_id = first.id();
+        let second_id = second.id();
+
+        let child_token = CancellationToken::new();
+        let child = register(
+            WorkKind::ToolCall,
+            Arc::from("batch_member_tool_marker"),
+            Some(first_id),
+            None,
+            None,
+            Some(child_token.clone()),
+            None,
+            None,
+        );
+        let child_id = child.id();
+
+        let running_first = tokio::spawn(scoped(first, async move { first_token.cancelled().await }));
+        let running_second = tokio::spawn(scoped(second, async move { second_token.cancelled().await }));
+        let running_child = tokio::spawn(scoped(child, async move { child_token.cancelled().await }));
+
+        let results = kill_batch(&batch_id, true).await;
+        let ids: Vec<WorkId> = results.iter().map(|result| result.id).collect();
+        assert!(ids.contains(&first_id), "batch kill missed a member: {ids:?}");
+        assert!(ids.contains(&second_id), "batch kill missed a member: {ids:?}");
+        assert!(
+            ids.contains(&child_id),
+            "batch kill must cascade into what a member started: {ids:?}"
+        );
+
+        let _ = running_first.await;
+        let _ = running_second.await;
+        let _ = running_child.await;
+        assert!(find_by_name("batch_member_one_marker").is_none());
+        assert!(find_by_name("batch_member_two_marker").is_none());
+        assert!(find_by_name("batch_member_tool_marker").is_none());
+    }
+
+    /// An unknown batch matches nothing, which is what lets the HTTP layer tell
+    /// "no such batch" apart from "the batch is already finished" — both are a
+    /// 404, and neither is a silent success.
+    #[tokio::test]
+    async fn an_unknown_batch_kills_nothing() {
+        let results = kill_batch(&format!("batch-{}", uuid::Uuid::new_v4()), true).await;
+        assert!(results.is_empty(), "an unknown batch must match no work: {results:?}");
+    }
+
+    /// Cascade off narrows a batch kill to the members themselves, leaving what
+    /// they started running — the same narrowing `kill` offers for one item.
+    #[tokio::test]
+    async fn a_batch_kill_without_cascade_spares_what_the_members_started() {
+        let batch_id = format!("batch-{}", uuid::Uuid::new_v4());
+        let member_token = CancellationToken::new();
+        let member = register_sub_agent(
+            "narrow_batch_member_marker",
+            &format!("run-{}", uuid::Uuid::new_v4()),
+            None,
+            Some(&batch_id),
+            Some(member_token.clone()),
+        );
+        let member_id = member.id();
+        let child = register(
+            WorkKind::ToolCall,
+            Arc::from("narrow_batch_tool_marker"),
+            Some(member_id),
+            None,
+            None,
+            Some(CancellationToken::new()),
+            None,
+            None,
+        );
+
+        let running = tokio::spawn(scoped(member, async move { member_token.cancelled().await }));
+        let results = kill_batch(&batch_id, false).await;
+        assert_eq!(results.len(), 1, "cascade off must target exactly the members");
+        assert_eq!(results.first().map(|result| result.id), Some(member_id));
+
+        let _ = running.await;
+        assert!(
+            find_by_name("narrow_batch_tool_marker").is_some(),
+            "cascade off must leave the member's child registered"
+        );
+        drop(child);
+    }
+
     #[test]
     fn lineage_collects_transitive_descendants() {
-        let agent = register_sub_agent("agent", "run-1", None, None);
+        let agent = register_sub_agent("agent", "run-1", None, None, None);
         let tool = register(
             WorkKind::ToolCall,
             Arc::from("shell"),
             Some(agent.id()),
+            None,
             None,
             None,
             None,
@@ -1406,6 +1594,7 @@ mod tests {
             WorkKind::Process,
             Arc::from("sleep"),
             Some(tool.id()),
+            None,
             None,
             None,
             None,
@@ -1559,7 +1748,13 @@ mod tests {
     #[tokio::test]
     async fn cascade_kill_takes_down_the_agent_lineage() {
         let agent_token = CancellationToken::new();
-        let agent = register_sub_agent("cascade_agent_marker", "run-cascade", None, Some(agent_token.clone()));
+        let agent = register_sub_agent(
+            "cascade_agent_marker",
+            "run-cascade",
+            None,
+            None,
+            Some(agent_token.clone()),
+        );
         let agent_id = agent.id();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<u32>();
 
@@ -1661,12 +1856,13 @@ mod tests {
     #[tokio::test]
     async fn non_cascading_kill_leaves_the_children_alone() {
         let agent_token = CancellationToken::new();
-        let agent = register_sub_agent("solo_agent_marker", "run-solo", None, Some(agent_token.clone()));
+        let agent = register_sub_agent("solo_agent_marker", "run-solo", None, None, Some(agent_token.clone()));
         let agent_id = agent.id();
         let child_guard = register(
             WorkKind::ToolCall,
             Arc::from("solo_tool_marker"),
             Some(agent_id),
+            None,
             None,
             Some(CancellationToken::new()),
             None,

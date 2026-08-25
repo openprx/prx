@@ -824,7 +824,8 @@ mod tests {
     #[tokio::test]
     async fn hung_turn_is_terminated_and_its_child_process_group_is_killed() {
         let turn_token = CancellationToken::new();
-        let turn = registry::register_sub_agent("idle-test-turn", "idle-test-run", None, Some(turn_token.clone()));
+        let turn =
+            registry::register_sub_agent("idle-test-turn", "idle-test-run", None, None, Some(turn_token.clone()));
 
         let observed_pid = Arc::new(AtomicU64::new(0));
         let pid_sink = Arc::clone(&observed_pid);
@@ -998,7 +999,7 @@ mod tests {
     #[tokio::test]
     async fn long_task_warning_warns_without_terminating_anything() {
         let token = CancellationToken::new();
-        let work = registry::register_sub_agent("warn-only-item", "warn-run", None, Some(token.clone()));
+        let work = registry::register_sub_agent("warn-only-item", "warn-run", None, None, Some(token.clone()));
         let id = work.id();
 
         // A zero threshold makes every live item "long", which is the strongest

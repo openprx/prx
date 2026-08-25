@@ -75,6 +75,11 @@ pub struct WorkItem {
     pub parent: Option<String>,
     #[serde(default)]
     pub run_id: Option<String>,
+    /// Fan-out this item belongs to, when it was started by `spawn_batch`.
+    /// Absent on every other kind of work, and on daemons older than this
+    /// field — hence `default` rather than a required key.
+    #[serde(default)]
+    pub batch_id: Option<String>,
     pub elapsed_secs: u64,
     #[serde(default)]
     pub pid: Option<u32>,
@@ -279,6 +284,37 @@ pub async fn fetch_pools(endpoint: &TasksEndpoint) -> Result<PoolsReport> {
     decode(response, "runtime pool metrics").await
 }
 
+/// Lay a work listing out so the members of one `spawn_batch` fan-out read as
+/// one unit.
+///
+/// Returns the items regrouped, never filtered: each entry is a batch id (or
+/// `None` for work that belongs to no batch) together with the items under it.
+/// A batch takes the position of its *first* member, so a listing without any
+/// batches comes back in exactly the order the daemon sent it and renders
+/// byte-for-byte as it always did.
+///
+/// Grouping is needed because batch members are *siblings*, not a lineage: the
+/// tool call that launched them is deregistered as soon as it returns, so
+/// without this they are scattered through the table by spawn order with
+/// nothing tying them together.
+///
+/// This lives here rather than in the binary because it is an ordering
+/// decision, not a rendering one — and an ordering decision is testable.
+#[must_use]
+pub fn group_by_batch(items: &[WorkItem]) -> Vec<(Option<&str>, Vec<&WorkItem>)> {
+    let mut groups: Vec<(Option<&str>, Vec<&WorkItem>)> = Vec::new();
+    for item in items {
+        match item.batch_id.as_deref() {
+            None => groups.push((None, vec![item])),
+            Some(batch_id) => match groups.iter_mut().find(|(existing, _)| *existing == Some(batch_id)) {
+                Some((_, members)) => members.push(item),
+                None => groups.push((Some(batch_id), vec![item])),
+            },
+        }
+    }
+    groups
+}
+
 /// Render an elapsed duration the way an operator scans it.
 #[must_use]
 pub fn format_elapsed(secs: u64) -> String {
@@ -328,6 +364,80 @@ mod tests {
         let config = Config::default();
         let endpoint = TasksEndpoint::resolve(&config, None, Some("   ".to_string()));
         assert!(endpoint.token.is_none());
+    }
+
+    fn item(id: &str, batch_id: Option<&str>) -> WorkItem {
+        WorkItem {
+            id: id.to_string(),
+            kind: "sub_agent".to_string(),
+            name: format!("run {id}"),
+            state: "running".to_string(),
+            parent: None,
+            run_id: None,
+            batch_id: batch_id.map(ToString::to_string),
+            elapsed_secs: 3,
+            pid: None,
+            pgid: None,
+        }
+    }
+
+    /// A listing with no batches must come back exactly as it went in: one
+    /// group per item, in the daemon's order.
+    #[test]
+    fn a_listing_without_batches_is_left_alone() {
+        let items = vec![item("w1", None), item("w2", None)];
+        let groups = group_by_batch(&items);
+        assert_eq!(groups.len(), 2);
+        assert!(
+            groups
+                .iter()
+                .all(|(batch, members)| batch.is_none() && members.len() == 1)
+        );
+        let ids: Vec<&str> = groups
+            .iter()
+            .flat_map(|(_, members)| members.iter().map(|item| item.id.as_str()))
+            .collect();
+        assert_eq!(ids, vec!["w1", "w2"]);
+    }
+
+    /// Members of one fan-out are pulled together at the position of the first
+    /// of them, and unrelated work keeps its place rather than being swallowed.
+    #[test]
+    fn batch_members_are_gathered_under_one_group() {
+        let items = vec![
+            item("w1", None),
+            item("w2", Some("batch-a")),
+            item("w3", None),
+            item("w4", Some("batch-a")),
+            item("w5", Some("batch-b")),
+        ];
+        let groups = group_by_batch(&items);
+        let shape: Vec<(Option<&str>, Vec<&str>)> = groups
+            .iter()
+            .map(|(batch, members)| (*batch, members.iter().map(|item| item.id.as_str()).collect()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (None, vec!["w1"]),
+                (Some("batch-a"), vec!["w2", "w4"]),
+                (None, vec!["w3"]),
+                (Some("batch-b"), vec!["w5"]),
+            ]
+        );
+    }
+
+    /// Grouping regroups, it never drops: every item appears exactly once.
+    #[test]
+    fn grouping_never_loses_an_item() {
+        let items = vec![
+            item("w1", Some("batch-a")),
+            item("w2", None),
+            item("w3", Some("batch-a")),
+            item("w4", Some("batch-b")),
+        ];
+        let grouped: usize = group_by_batch(&items).iter().map(|(_, members)| members.len()).sum();
+        assert_eq!(grouped, items.len());
     }
 
     #[test]

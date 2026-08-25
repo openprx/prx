@@ -252,6 +252,8 @@ fn spawn_due_jobs(
             &label,
             &job.id,
             crate::runtime::registry::current_work_id(),
+            // A cron job is not part of any fan-out.
+            None,
             Some(cancel.clone()),
         );
         let work_id = guard.id();

@@ -2347,7 +2347,7 @@ impl SessionsSpawnTool {
                 .clone()
                 .unwrap_or_else(|| "sub-agent (process)".to_string());
             let sub_agent_work =
-                crate::runtime::registry::register_sub_agent(&sub_agent_label, &rid, sub_agent_parent, None);
+                crate::runtime::registry::register_sub_agent(&sub_agent_label, &rid, sub_agent_parent, batch_id, None);
             // Publish this run's steering channel on its registry row so the
             // control plane can address it by run id from another entry point.
             // Same sender, same bounded queue as `sessions_send` — only the
@@ -2703,7 +2703,7 @@ impl SessionsSpawnTool {
         let sub_agent_parent = crate::runtime::registry::current_work_id();
         let sub_agent_label = agent_label_for_registry.unwrap_or_else(|| "sub-agent".to_string());
         let sub_agent_work =
-            crate::runtime::registry::register_sub_agent(&sub_agent_label, &rid, sub_agent_parent, None);
+            crate::runtime::registry::register_sub_agent(&sub_agent_label, &rid, sub_agent_parent, batch_id, None);
         let sub_agent_work_id = sub_agent_work.id();
         // As in the process branch: the control plane resolves `run_id` through
         // the process-wide work registry, so the run's existing steer sender is

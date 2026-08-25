@@ -317,7 +317,14 @@ where
     // Registration happens before the spawn so the work id is known
     // synchronously and can be handed back in the 202 body; the guard itself
     // moves into the task, so the row disappears exactly when the work does.
-    let guard = registry::register_sub_agent(&label, &job_ref, registry::current_work_id(), Some(cancel.clone()));
+    // A detached HTTP job is not part of any `sessions_spawn` fan-out.
+    let guard = registry::register_sub_agent(
+        &label,
+        &job_ref,
+        registry::current_work_id(),
+        None,
+        Some(cancel.clone()),
+    );
     let work_id = guard.id();
     let (phase_tx, phase_rx) = watch::channel(JobPhase::Running);
 
