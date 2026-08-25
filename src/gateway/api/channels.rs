@@ -216,15 +216,76 @@ pub async fn post_channel_send(
     // ambient turn's channel would silently become the *source* of this send —
     // turning a cross-channel decision into a same-channel one.
     let context = MessageSendExecutionContext::new(None, Arc::clone(&operator_plane));
-    let result = MESSAGE_SEND_EXECUTION_CONTEXT
-        .scope(context, tool.execute(args))
-        .await
-        .map_err(|error| {
-            refusal(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("outbound send failed: {error}"),
-            )
-        })?;
+
+    // Register the send itself, for exactly as long as it runs.
+    //
+    // Everything past this point is the destination's: a channel implementation
+    // talking to a platform over a socket this process does not control. This
+    // runtime has no wall clock, so a peer that accepts the connection and then
+    // never answers parks the send with no upper bound — and until it was
+    // registered, that parked send was invisible everywhere. It is not a turn
+    // (there is no inbound conversation behind an operator-plane send), it is
+    // not a job (this handler runs the work inline), and it never reached
+    // `ToolExecutor::execute`, which is where every in-process tool call gets
+    // its row. `prx tasks list` showed nothing at all while the caller hung.
+    //
+    // Once nothing expires by itself, being *seen* is the precondition for
+    // being ended, and the token below is what turns the seen row into a
+    // killable one: cancelling drops the send future, which drops the
+    // channel's in-flight request, so a kill really stops the send instead of
+    // just retiring its row while the socket stays busy.
+    //
+    // Registered as a plain tool call — a lineage *root* with no run id — and
+    // deliberately not as a `register_delivery`: there is no target work item
+    // here. Nothing is being handed to an already-registered run; the daemon is
+    // originating an outbound message of its own, so it has no parent to hang
+    // off and no run id to be confused with. Carrying a borrowed run id would
+    // be actively harmful, because `registry::resolve_address` answers a run id
+    // with that run's lineage root, and a kill aimed at this send would land on
+    // unrelated live work. `w<id>` from the listing is its address.
+    //
+    // Scoped so a channel that shells out registers its child underneath this
+    // row, which puts the child inside the cascade a kill of it performs.
+    //
+    // MUTATION GUARD: drop the registration or the `select!` and
+    // `a_wedged_outbound_send_is_listed_and_a_kill_really_stops_it` fails.
+    let send_cancel = tokio_util::sync::CancellationToken::new();
+    let work_name = format!("channel_send → {channel_name} {}", short_recipient(&recipient));
+    let work = crate::runtime::registry::register_tool_call(&work_name, None, Some(send_cancel.clone()));
+    let work_id = work.id();
+    let settled = tokio::select! {
+        biased;
+        // A finished send wins a tie: once the channel has answered, the
+        // message is already out of this process and reporting it as stopped
+        // would invite the operator to send it again.
+        outcome = crate::runtime::registry::scope_current(
+            work_id,
+            MESSAGE_SEND_EXECUTION_CONTEXT.scope(context, tool.execute(args)),
+        ) => Some(outcome),
+        () = send_cancel.cancelled() => None,
+    };
+    drop(work);
+
+    let Some(outcome) = settled else {
+        // Deliberately not reported as "not sent". The send was interrupted
+        // while the channel had it, so whether any bytes reached the platform
+        // is unknowable from here, and claiming either way would be a lie the
+        // operator could act on.
+        return Err(refusal(
+            StatusCode::CONFLICT,
+            format!(
+                "the send on channel '{channel_name}' was ended by an operator (work item '{work_id}') \
+                 while the channel had it; whether the message left this process is unknown"
+            ),
+        ));
+    };
+
+    let result = outcome.map_err(|error| {
+        refusal(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("outbound send failed: {error}"),
+        )
+    })?;
 
     if result.success {
         return Ok(Json(ChannelSendResponse {
@@ -252,6 +313,24 @@ pub async fn post_channel_send(
     Err(refusal(status, detail))
 }
 
+/// Longest recipient echoed into the registry row name.
+///
+/// [`MAX_RECIPIENT_LEN`] is generous on purpose — it exists so the destination,
+/// not this endpoint, refuses a malformed address — but `prx tasks list` prints
+/// the name last and unwrapped, so a single half-kilobyte recipient would push
+/// every other row off the terminal. The row only has to say *which* send is
+/// parked, which a prefix does.
+const RECIPIENT_IN_WORK_NAME: usize = 48;
+
+/// Recipient, shortened for a registry row name. Cuts on a character boundary.
+fn short_recipient(recipient: &str) -> String {
+    let mut short: String = recipient.chars().take(RECIPIENT_IN_WORK_NAME).collect();
+    if short.len() < recipient.len() {
+        short.push('…');
+    }
+    short
+}
+
 /// Sender and chat type behind an operator-plane send.
 ///
 /// There is no inbound message here, so there is no sender to speak of. Scope
@@ -274,6 +353,7 @@ mod tests {
     use crate::tools::DaemonMessageSendTool;
     use serial_test::serial;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
     use tokio::sync::broadcast;
@@ -911,6 +991,183 @@ mod tests {
         .await;
 
         assert_eq!(status, 404, "test: body was {body}");
+        server.abort();
+    }
+
+    // ── Evidence: a send the destination never answers is seen, and endable ──
+
+    /// Channel that takes the message and then never answers.
+    ///
+    /// This is not a contrived shape: it is every peer that completes a TCP
+    /// handshake and then stops — a wedged local bridge, a platform holding the
+    /// connection open, a proxy that never replies. Nothing in this runtime
+    /// expires, so the send waits forever, which is exactly the state an
+    /// operator has to be able to see and end.
+    struct WedgingChannel {
+        entered: Arc<AtomicBool>,
+        /// Set by a drop guard *inside* `send`, so "the kill really stopped it"
+        /// is observed at the channel rather than inferred from the 409.
+        abandoned: Arc<AtomicBool>,
+        /// Only ever set if the send runs to completion, which it cannot here.
+        completed: Arc<AtomicBool>,
+    }
+
+    /// Records that the send future was dropped mid-flight.
+    struct AbandonedMidSend(Arc<AtomicBool>);
+
+    impl Drop for AbandonedMidSend {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl WedgingChannel {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                entered: Arc::new(AtomicBool::new(false)),
+                abandoned: Arc::new(AtomicBool::new(false)),
+                completed: Arc::new(AtomicBool::new(false)),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Channel for WedgingChannel {
+        fn name(&self) -> &str {
+            CHANNEL
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            let _abandoned = AbandonedMidSend(Arc::clone(&self.abandoned));
+            self.entered.store(true, Ordering::SeqCst);
+            // No timeout, on purpose: an operator kill is the only way out.
+            std::future::pending::<()>().await;
+            self.completed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn capabilities(&self) -> ChannelCapabilities {
+            ChannelCapabilities::default()
+        }
+    }
+
+    fn publish_wedging(channel: &Arc<WedgingChannel>) -> outbound_registry::OutboundChannelsPublication {
+        let mut registry: HashMap<String, Arc<dyn Channel>> = HashMap::new();
+        registry.insert(CHANNEL.to_string(), Arc::clone(channel) as Arc<dyn Channel>);
+        outbound_registry::publish(Arc::new(registry))
+    }
+
+    /// The registry row this endpoint registers for one in-flight send.
+    fn outbound_row() -> Option<crate::runtime::registry::WorkSnapshot> {
+        let needle = format!("channel_send → {CHANNEL} ");
+        crate::runtime::registry::snapshot_all()
+            .into_iter()
+            .find(|snapshot| snapshot.name.starts_with(&needle))
+    }
+
+    async fn await_outbound_row() -> crate::runtime::registry::WorkSnapshot {
+        for _ in 0..400 {
+            if let Some(row) = outbound_row() {
+                return row;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("test: an in-flight outbound send never appeared in the work registry");
+    }
+
+    /// The blind spot this registration closes, end to end over the real route.
+    ///
+    /// A send whose destination never answers used to be invisible everywhere
+    /// at once — no turn, no job, no tool-executor row — while the HTTP caller
+    /// hung and no clock existed to end either side. Both halves are asserted
+    /// here, because either alone is worthless: the row has to be *listed*
+    /// (nothing can be aimed at what is not shown) and the kill has to reach
+    /// the channel (retiring a row while the socket stays busy would be a
+    /// visible lie rather than an invisible hang).
+    ///
+    /// MUTATION GUARD: delete the `register_tool_call` in `post_channel_send`
+    /// and the listing assertion fails; delete the `select!` on the token and
+    /// the kill no longer reaches the channel.
+    #[tokio::test]
+    #[serial(outbound_channels)]
+    async fn a_wedged_outbound_send_is_listed_and_a_kill_really_stops_it() {
+        let workspace = TempDir::new().expect("test: workspace");
+        let channel = WedgingChannel::new();
+        let _publication = publish_wedging(&channel);
+        let config = scoped_config(workspace.path(), &[&format!("{CHANNEL}:*")], None);
+        let (base_url, _port, server) = serve(test_app_state(config)).await;
+
+        let caller = tokio::spawn(async move {
+            post_raw(
+                &base_url,
+                CHANNEL,
+                Some(TOKEN),
+                serde_json::json!({"recipient": RECIPIENT, "message": "into the void"}),
+            )
+            .await
+        });
+
+        // Visible: the row exists while the send is parked in the channel.
+        let row = await_outbound_row().await;
+        assert!(
+            channel.entered.load(Ordering::SeqCst),
+            "test: the channel must actually be holding the send"
+        );
+        assert!(
+            row.name.contains(RECIPIENT),
+            "test: the row must say which send is parked, got: {}",
+            row.name
+        );
+        assert!(
+            row.run_id.is_none(),
+            "test: this send belongs to no run, so it must not borrow a run id a kill could be aimed at"
+        );
+
+        // Endable: the address an operator reads out of the listing ends it.
+        let killed = crate::runtime::registry::kill(row.id, true).await;
+        assert!(
+            killed.iter().any(|result| result.id == row.id
+                && matches!(
+                    result.outcome,
+                    crate::runtime::registry::KillOutcome::Killed | crate::runtime::registry::KillOutcome::Requested
+                )),
+            "test: the kill must reach the send, got: {killed:?}"
+        );
+
+        // Bounded here and nowhere else: production has no clock, but a test
+        // that hangs forever reports nothing. Exceeding this means the kill did
+        // not reach the channel and the caller is still waiting on a send that
+        // was reported ended — which is the failure worth naming.
+        let (status, body) = tokio::time::timeout(Duration::from_secs(30), caller)
+            .await
+            .expect("test: the kill did not reach the channel; the caller is still waiting on the send")
+            .expect("test: the caller task must finish");
+        assert_eq!(status, 409, "test: body was {body}");
+        assert!(body.contains("ended by an operator"), "test: body was {body}");
+        assert!(
+            body.contains("unknown"),
+            "test: an interrupted send must not claim it was or was not delivered, body was {body}"
+        );
+
+        // The send really stopped: the channel's future was dropped mid-flight
+        // and never completed.
+        assert!(
+            channel.abandoned.load(Ordering::SeqCst),
+            "test: the channel's send future must have been dropped, not left running"
+        );
+        assert!(
+            !channel.completed.load(Ordering::SeqCst),
+            "test: a killed send must not go on to complete"
+        );
+        assert!(
+            outbound_row().is_none(),
+            "test: the row must be gone once the send is over"
+        );
+
         server.abort();
     }
 }
