@@ -5,7 +5,9 @@
 //! - kill: terminate a running sub-agent
 //! - steer: send a message to a running sub-agent
 
-use super::sessions_spawn::{ProcessFinalization, ProcessTerminationRequestResult, SubAgentRun, SubAgentStatus};
+use super::sessions_spawn::{
+    KILLED_BY_USER_REASON, ProcessFinalization, ProcessTerminationRequestResult, SubAgentRun, SubAgentStatus,
+};
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MessageEventScope};
 use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
@@ -167,7 +169,18 @@ impl SubagentsTool {
                 }
                 if let Some(control) = run.process_control.clone() {
                     drop(runs);
-                    return match control.request_termination("killed by operator").await {
+                    // The shared constant, not a wording of this tool's own:
+                    // the reason string is the *only* carrier of "an operator
+                    // ended this" through to `join`'s classification, and this
+                    // tool writes into the same `active_runs` that `join`
+                    // reads. Any private phrasing here lands the member in
+                    // `failed`, telling the model its sub-task gave up when in
+                    // fact somebody killed it.
+                    //
+                    // MUTATION GUARD: put a literal back here and
+                    // `a_kill_from_this_tool_is_joined_as_killed_not_failed`
+                    // fails.
+                    return match control.request_termination(KILLED_BY_USER_REASON).await {
                         ProcessTerminationRequestResult::Finalized(ProcessFinalization::Terminated) => Ok(ToolResult {
                             success: true,
                             output: format!("Subagent `{run_id}` terminated."),
@@ -201,7 +214,10 @@ impl SubagentsTool {
                 if let Some(ref abort_handle) = run.abort_handle {
                     abort_handle.abort();
                 }
-                run.status = SubAgentStatus::Failed("killed by operator".into());
+                // Same shared constant as the process path above, for the
+                // same reason: `join` tells a kill from a failure by this
+                // string and nothing else.
+                run.status = SubAgentStatus::Failed(KILLED_BY_USER_REASON.into());
                 run.steer_tx = None;
                 let event_run = run.clone();
                 drop(runs);
@@ -437,8 +453,9 @@ impl Tool for SubagentsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
     use crate::memory::{MemoryPrincipal, SqliteMemory};
-    use crate::tools::sessions_spawn::ProcessRunControl;
+    use crate::tools::sessions_spawn::{ProcessRunControl, SessionsSpawnTool};
     use chrono::Utc;
 
     fn make_run(id: &str, status: SubAgentStatus) -> SubAgentRun {
@@ -464,6 +481,126 @@ mod tests {
             spawn_depth: 0,
             token_usage_records: Vec::new(),
         }
+    }
+
+    /// A channel that swallows everything: this tool never sends on it, and the
+    /// `sessions_spawn` tool built below is only ever asked to `join`.
+    struct SilentChannel;
+
+    #[async_trait::async_trait]
+    impl Channel for SilentChannel {
+        fn name(&self) -> &str {
+            "silent"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A provider that is never called: `join` reads `active_runs` and nothing
+    /// else, so no turn is ever driven in these tests.
+    struct UnusedProvider;
+
+    #[async_trait::async_trait]
+    impl crate::providers::Provider for UnusedProvider {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    /// A `sessions_spawn` tool sharing one `active_runs` registry, so a kill
+    /// written by `SubagentsTool` is read back by the real `join` classifier
+    /// rather than by a re-implementation of it in the test.
+    fn join_capable_spawn_tool() -> SessionsSpawnTool {
+        SessionsSpawnTool::new(
+            Arc::new(SilentChannel),
+            Arc::new(UnusedProvider),
+            "test-provider",
+            "test-model",
+            0.7,
+            Arc::new(crate::security::SecurityPolicy::default()),
+            std::path::PathBuf::from("/tmp"),
+            crate::config::MultimodalConfig::default(),
+            crate::config::AgentCompactionConfig::default(),
+            std::collections::HashMap::new(),
+            None,
+            crate::providers::ProviderRuntimeOptions::default(),
+            crate::config::SessionsSpawnConfig::default(),
+        )
+    }
+
+    fn kill_grant(run_id: &str) -> serde_json::Value {
+        serde_json::to_value(ApprovalGrant::for_resource_operation(
+            "subagents",
+            &format!("subagents:kill:{run_id}"),
+            "test",
+            None,
+        ))
+        .expect("test: a grant serializes")
+    }
+
+    /// A run this tool kills must land in `join`'s **killed** bucket, never in
+    /// **failed**.
+    ///
+    /// `SubagentsTool` and `SessionsSpawnTool` share one `active_runs`, and the
+    /// only thing that crosses that hand-off is the reason string. The two
+    /// buckets mean opposite things to the model that spawned the batch:
+    /// `failed` says the sub-task concluded the work could not be done, while
+    /// `killed` says a person ended a run that was otherwise fine. Retrying is
+    /// right for exactly one of them.
+    ///
+    /// MUTATION GUARD: write a literal of this tool's own at either kill site
+    /// instead of `KILLED_BY_USER_REASON` and the member below moves to
+    /// `failed`.
+    #[tokio::test]
+    async fn a_kill_from_this_tool_is_joined_as_killed_not_failed() {
+        let spawn_tool = join_capable_spawn_tool();
+        let runs = spawn_tool.active_runs_arc();
+        {
+            let mut guard = runs.write().await;
+            let mut run = make_run("batch-victim", SubAgentStatus::Running);
+            run.batch_id = Some("batch-1".to_string());
+            guard.push(run);
+        }
+
+        let subagents = SubagentsTool::new(runs.clone());
+        let killed = subagents
+            .execute(json!({
+                "action": "kill",
+                "run_id": "batch-victim",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG: kill_grant("batch-victim"),
+            }))
+            .await
+            .expect("test: the kill tool call must not error");
+        assert!(killed.success, "{killed:?}");
+
+        let joined = spawn_tool
+            .execute(json!({"action": "join", "batch_id": "batch-1"}))
+            .await
+            .expect("test: the join tool call must not error");
+        assert!(joined.success, "{joined:?}");
+        let summary: serde_json::Value =
+            serde_json::from_str(&joined.output).expect("test: join returns a json summary");
+        assert_eq!(
+            summary["killed"].as_array().map(Vec::len),
+            Some(1),
+            "a member ended through subagents.kill must be reported as killed: {summary}"
+        );
+        assert!(
+            summary["failed"].as_array().is_some_and(Vec::is_empty),
+            "a killed member must never be reported as a task that failed on its own terms: {summary}"
+        );
     }
 
     #[test]
@@ -525,7 +662,7 @@ mod tests {
             let runs = runs.clone();
             tokio::spawn(async move {
                 let reason = control.wait_for_termination_for_test().await;
-                assert_eq!(reason, "killed by operator");
+                assert_eq!(reason, KILLED_BY_USER_REASON);
                 runs.write().await[0].status = SubAgentStatus::Failed(reason);
                 control.finalize_for_test(ProcessFinalization::Terminated);
             })
