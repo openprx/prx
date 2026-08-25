@@ -155,7 +155,11 @@ fn client() -> Result<reqwest::Client> {
         .context("failed to build HTTP client for the runtime control API")
 }
 
-async fn decode<T: serde::de::DeserializeOwned>(response: reqwest::Response, what: &str) -> Result<T> {
+async fn decode<T: serde::de::DeserializeOwned>(
+    endpoint: &TasksEndpoint,
+    response: reqwest::Response,
+    what: &str,
+) -> Result<T> {
     let status = response.status();
     let body = response
         .text()
@@ -171,9 +175,46 @@ async fn decode<T: serde::de::DeserializeOwned>(response: reqwest::Response, wha
                     .map(ToString::to_string)
             })
             .unwrap_or(body);
+        if matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            anyhow::bail!("{}", auth_hint(endpoint, status, what, &detail));
+        }
         anyhow::bail!("{what} failed with HTTP {status}: {detail}");
     }
     serde_json::from_str::<T>(&body).with_context(|| format!("failed to parse {what} response"))
+}
+
+/// Turn a rejected credential into something the operator can act on.
+///
+/// An unreachable gateway already says what to do about it; a 401 said only
+/// "HTTP 401" and left the operator to guess. It is the *first* thing anyone
+/// meets, too: `gateway.require_pairing` defaults to on and `chat.daemon.token`
+/// defaults to empty, so an out-of-the-box `/sessions --daemon` is a 401 by
+/// construction. The two causes need different advice — no credential was sent
+/// at all, or one was sent and refused — so they are separated here rather than
+/// merged into one hedged sentence.
+#[must_use]
+fn auth_hint(endpoint: &TasksEndpoint, status: reqwest::StatusCode, what: &str, detail: &str) -> String {
+    let cause = if endpoint.token.is_some() {
+        "A bearer token was sent and the daemon refused it. Note that `gateway.paired_tokens` \
+         stores SHA-256 hashes of paired tokens: only the plaintext token authenticates, and \
+         handing back a stored hash never will."
+    } else {
+        "No bearer token was sent, and the daemon requires one \
+         (`gateway.require_pairing` is on by default)."
+    };
+    format!(
+        "{what} failed with HTTP {status}: {detail}\n\
+         {cause}\n\
+         Set `chat.daemon.token` (under `[chat.daemon]` in the PRX config) to a token the daemon \
+         at {} accepts — or pass `--token` to `prx tasks`, or put the token in \
+         `gateway.paired_tokens` when chat and the daemon share a config dir. A token is minted \
+         by pairing: `POST /pair` with header `X-Pairing-Code: <code>`, using the one-time code \
+         the daemon prints at startup.",
+        endpoint.base_url()
+    )
 }
 
 fn unreachable_hint(endpoint: &TasksEndpoint, error: &reqwest::Error) -> anyhow::Error {
@@ -194,7 +235,7 @@ pub async fn fetch_tasks(endpoint: &TasksEndpoint) -> Result<TasksListing> {
         .send()
         .await
         .map_err(|error| unreachable_hint(endpoint, &error))?;
-    decode(response, "runtime task listing").await
+    decode(endpoint, response, "runtime task listing").await
 }
 
 /// Ask the running process to terminate one work item.
@@ -208,7 +249,7 @@ pub async fn request_kill(endpoint: &TasksEndpoint, id: &str, cascade: bool) -> 
         .send()
         .await
         .map_err(|error| unreachable_hint(endpoint, &error))?;
-    decode(response, "runtime task kill").await
+    decode(endpoint, response, "runtime task kill").await
 }
 
 /// Hand a message to one running task, addressed by run id or work id.
@@ -226,7 +267,7 @@ pub async fn request_message(endpoint: &TasksEndpoint, id: &str, message: &str) 
         .send()
         .await
         .map_err(|error| unreachable_hint(endpoint, &error))?;
-    decode(response, "runtime task message").await
+    decode(endpoint, response, "runtime task message").await
 }
 
 /// Outcome of an outbound send performed by the daemon on the caller's behalf.
@@ -270,7 +311,7 @@ pub async fn request_channel_send(
         .send()
         .await
         .map_err(|error| unreachable_hint(endpoint, &error))?;
-    decode(response, "channel send").await
+    decode(endpoint, response, "channel send").await
 }
 
 /// Fetch connection-pool occupancy and saturation counters.
@@ -281,7 +322,7 @@ pub async fn fetch_pools(endpoint: &TasksEndpoint) -> Result<PoolsReport> {
         .send()
         .await
         .map_err(|error| unreachable_hint(endpoint, &error))?;
-    decode(response, "runtime pool metrics").await
+    decode(endpoint, response, "runtime pool metrics").await
 }
 
 /// Lay a work listing out so the members of one `spawn_batch` fan-out read as
@@ -331,8 +372,69 @@ pub fn format_elapsed(secs: u64) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// A gateway that answers exactly one request with the given status line
+    /// and JSON body, then closes. Enough to exercise the client's decoding of
+    /// a refusal without standing up the real gateway.
+    async fn refusing_gateway(status_line: &'static str, body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test: bind ephemeral port");
+        let addr = listener.local_addr().expect("test: local addr");
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0_u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let response = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// `gateway.require_pairing` is on by default and `chat.daemon.token` is
+    /// empty by default, so the very first `/sessions --daemon` an operator
+    /// runs is a 401. It has to say which key to set, the way the unreachable
+    /// case already says which process to start.
+    #[tokio::test]
+    async fn a_401_names_the_config_key_that_fixes_it() {
+        let url = refusing_gateway("HTTP/1.1 401 Unauthorized", r#"{"error":"unauthorized"}"#).await;
+        let endpoint = TasksEndpoint::resolve(&Config::default(), Some(url), None);
+
+        let error = fetch_tasks(&endpoint).await.expect_err("test: a 401 is an error");
+        let text = format!("{error:#}");
+
+        assert!(text.contains("401"), "the status is still reported: {text}");
+        assert!(text.contains("chat.daemon.token"), "no key to set: {text}");
+        assert!(text.contains("gateway.require_pairing"), "no cause named: {text}");
+        assert!(text.contains("No bearer token was sent"), "wrong cause: {text}");
+    }
+
+    /// A token that was sent and refused is a different problem from no token
+    /// at all — most often a stored hash pasted back as a bearer — so it gets
+    /// its own advice rather than being told to set a key it already set.
+    #[tokio::test]
+    async fn a_rejected_token_is_told_apart_from_a_missing_one() {
+        let url = refusing_gateway("HTTP/1.1 403 Forbidden", r#"{"error":"forbidden"}"#).await;
+        let endpoint = TasksEndpoint::resolve(&Config::default(), Some(url), Some("zc_wrong".to_string()));
+
+        let error = fetch_tasks(&endpoint).await.expect_err("test: a 403 is an error");
+        let text = format!("{error:#}");
+
+        assert!(text.contains("refused it"), "{text}");
+        assert!(text.contains("gateway.paired_tokens"), "{text}");
+        assert!(text.contains("chat.daemon.token"), "{text}");
+        assert!(!text.contains("No bearer token was sent"), "{text}");
+    }
 
     #[test]
     fn endpoint_defaults_to_the_configured_gateway() {
