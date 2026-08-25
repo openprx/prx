@@ -249,28 +249,44 @@ pub enum ProgressKind {
     /// child processes appeared or went away, which only happens when something
     /// is running.
     RuntimeSubtree,
-    /// This turn is parked on sub-agent runs that are still executing.
+    /// This turn is parked on sub-agent runs that are still executing *and*
+    /// that the supervisor can still account for.
     ///
     /// The one kind whose evidence is *out of band*: it is not something the
     /// turn emitted, it is something a supervisor confirmed about the runs the
     /// turn is waiting on. It exists because a fan-out member can be a separate
     /// OS process whose only in-band signal is the bytes it writes, and a
-    /// healthy `session-worker` writes nothing until it is finished — so a
-    /// parent blocked on one would go silent while its child works perfectly,
-    /// which is precisely the misdiagnosis this module's header forbids.
+    /// healthy `session-worker` writes nothing on either pipe until it is
+    /// finished — so a parent blocked on one would go silent while its child
+    /// works perfectly, which is precisely the misdiagnosis this module's
+    /// header forbids.
     ///
-    /// Recording it is bounded, not a licence to run forever:
+    /// Being out of band also makes it the easiest evidence to forge, and the
+    /// forgery has a name: recording it because a member's row *has not been
+    /// marked terminal yet* records the absence of an ending, not the presence
+    /// of work. A window refreshed by that is not a window — it disarms this
+    /// detector for the entire join, in a runtime where this detector is the
+    /// only automatic recovery there is. So the supervisor has to look at each
+    /// member and may record this only for one it can still vouch for:
     ///
-    /// * it is recorded only while a member is *provably* non-terminal, and
-    ///   every way a member can end now commits a terminal status (see
-    ///   `crate::tools::sessions_spawn`), so "still running" is an observation
-    ///   rather than a stale default;
-    /// * each member carries its own idle detection — a task-mode member runs
-    ///   under [`run_guarded`], a process-mode member's worker installs these
-    ///   same thresholds in its own process — so a wedged member is ended by
-    ///   its own watchdog and the wait then finishes;
-    /// * [`IdleGuard::max_total`] is unaffected, so the joining turn still has
-    ///   an absolute ceiling.
+    /// * a member whose progress the parent **can** observe — a task-mode run,
+    ///   whose beat lives in this process — vouches for the waiter only while
+    ///   its *own* idle window has not yet come due. Past that point the
+    ///   member's own watchdog was supposed to have ended it; that it did not
+    ///   is exactly the fault this module exists to catch, so the join stops
+    ///   vouching and lets the verdict be reached.
+    /// * a member blocked on a human decision (`AwaitingInput`) vouches for the
+    ///   waiter unconditionally: a pending approval is a positive statement
+    ///   about where the run is, not silence.
+    /// * a member whose progress the parent **cannot** observe — a process-mode
+    ///   run, byte-silent by construction — is still vouched for on its
+    ///   non-terminal status alone. That is a known blind spot rather than a
+    ///   design: closing it needs a liveness frame on the worker's stdout
+    ///   protocol, which today carries exactly one line. Until then such a
+    ///   member is bounded only by the worker's own in-process watchdog and by
+    ///   [`IdleGuard::max_total`].
+    ///
+    /// The rule as code is `crate::tools::sessions_spawn::member_vouches_for_the_waiter`.
     SubtaskAlive,
 }
 

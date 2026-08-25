@@ -1672,39 +1672,114 @@ fn settled_verdict(status: &SubAgentStatus) -> Option<JoinedVerdict> {
 /// the last member ends, this returns; there is no third outcome to time out
 /// on.
 ///
-/// # Why it stamps the caller's beat
+/// # Why it stamps the caller's beat, and why not on every poll
 ///
 /// The caller is parked here, so it emits nothing of its own, and its own hang
 /// detector would eventually judge it wedged. For task-mode members that never
-/// happens — their beats are parented on the caller's, so their progress is the
-/// caller's progress. A process-mode member has no such link that works in
-/// practice: the only signal that crosses the process boundary is the bytes the
-/// worker writes, and a healthy `session-worker` writes exactly one line, at the
-/// very end. Waiting on one would therefore look identical to hanging.
+/// happens while they work — their beats are parented on the caller's, so their
+/// progress is the caller's progress — but that link only exists when the same
+/// turn both spawned and joined, so the wait re-reads their beats rather than
+/// relying on it. A process-mode member has no such link at all: the only signal
+/// that crosses the process boundary is the bytes the worker writes, and a
+/// healthy `session-worker` writes nothing on either pipe until the single
+/// result line at the very end. Waiting on one is indistinguishable from
+/// hanging.
 ///
 /// So the wait itself supplies the evidence, as
-/// [`crate::agent::idle::ProgressKind::SubtaskAlive`] — recorded only on an
-/// iteration where a member is *observed* non-terminal, never on a timer alone.
-/// See that variant's documentation for why this cannot make a turn immortal.
+/// [`crate::agent::idle::ProgressKind::SubtaskAlive`]. What it must *not* do is
+/// supply it merely because some member's row has not been stamped terminal
+/// yet: that is the absence of an ending, not the presence of work, and a turn
+/// whose window is refreshed by it is immortal for as long as one member fails
+/// to die — which in a runtime with no wall-clock turn budget means the idle
+/// detector, the only automatic recovery there is, is switched off for the whole
+/// join. [`member_vouches_for_the_waiter`] is the rule that keeps the evidence
+/// honest; when no member satisfies it, this loop keeps polling but records
+/// nothing, and the caller's own detector is free to reach its verdict.
 async fn join_batch_members(active_runs: &Arc<RwLock<Vec<SubAgentRun>>>, members: &[String]) -> Vec<JoinedMember> {
+    // Read once per join rather than per poll: this is the same source a
+    // task-mode member's own `run_guarded` resolves its window from, so the two
+    // cannot disagree about when that member was due to be judged.
+    let window = crate::agent::idle::configured().idle;
     loop {
         // The guard is bound and dropped inside this block: the wait below must
         // never hold the registry lock, or a member trying to publish its own
         // terminal status would be blocked by the very join waiting for it.
-        let settled = {
+        let vouched = {
             let runs = active_runs.read().await;
-            settled_batch(&runs, members)
+            if let Some(settled) = settled_batch(&runs, members) {
+                return settled;
+            }
+            batch_vouches_for_the_waiter(&runs, members, window)
         };
-        if let Some(settled) = settled {
-            return settled;
+        if vouched {
+            // MUTATION GUARD: this line is the whole reason a turn joining a
+            // process-mode fan-out is not killed as hung. Remove it and a batch
+            // whose members produce no in-band signal takes the joining turn
+            // down with it after `[runtime] idle_hang_secs`.
+            crate::agent::idle::beat(crate::agent::idle::ProgressKind::SubtaskAlive);
         }
-        // MUTATION GUARD: this line is the whole reason a turn joining a
-        // process-mode fan-out is not killed as hung. Remove it and a batch
-        // whose members produce no in-band signal takes the joining turn down
-        // with it after `[runtime] idle_hang_secs`.
-        crate::agent::idle::beat(crate::agent::idle::ProgressKind::SubtaskAlive);
         tokio::time::sleep(JOIN_POLL_INTERVAL).await;
     }
+}
+
+/// Whether any member of the batch is still evidence that the waiting turn is
+/// alive.
+///
+/// A member whose row has vanished contributes nothing: it is not something the
+/// join is waiting on, it is something [`settled_batch`] already reports as
+/// having no result.
+fn batch_vouches_for_the_waiter(runs: &[SubAgentRun], members: &[String], window: Option<std::time::Duration>) -> bool {
+    members.iter().any(|run_id| {
+        runs.iter()
+            .find(|run| &run.id == run_id)
+            .is_some_and(|run| member_vouches_for_the_waiter(run, window))
+    })
+}
+
+/// Whether this member may be recorded as
+/// [`crate::agent::idle::ProgressKind::SubtaskAlive`] on the waiting turn's
+/// beat.
+///
+/// The question is deliberately *not* "is this member still running": every row
+/// starts `Running` and stays that way until somebody commits an ending, so
+/// answering yes to that is answering "nobody has told me it stopped", and a
+/// turn kept alive by that is kept alive by silence. The question asked here is
+/// "can I still account for this member", and it has three answers:
+///
+/// * **Blocked on a human.** `AwaitingInput` is a positive statement about
+///   where the run is — an operator has been asked something and has not
+///   answered — so it vouches. A join that gave up on a pending approval would
+///   be terminating a turn for the operator's slowness.
+/// * **Observable, and within its own window.** A task-mode member runs in this
+///   process under [`crate::agent::idle::run_guarded`] with the same `window`,
+///   and every provider chunk, tool call and compaction stamps the beat this
+///   reads. While that beat is fresher than the window, the member is visibly
+///   working. Once it is not, the member's own watchdog was due and did not
+///   fire, so the premise that "every member is bounded on its own terms" is
+///   false for this member and the join must stop underwriting it. `window` of
+///   `None` means idle detection is switched off process-wide, so there is no
+///   verdict to protect and nothing to withhold.
+/// * **Not observable at all.** A process-mode member is byte-silent by
+///   construction, so its beat's age says nothing and applying the rule above
+///   would kill the parents of perfectly healthy fan-outs. It vouches on its
+///   non-terminal status — the one place this function still trusts an absence.
+///   That blind spot is bounded by the worker's own in-process watchdog and by
+///   `idle_hang_max_total_secs`, and closing it properly needs a liveness frame
+///   the worker's one-line stdout protocol does not carry today.
+///
+/// MUTATION GUARD: return `true` unconditionally and
+/// `a_join_stops_vouching_for_an_observable_member_that_went_silent` goes green
+/// on a turn that should have been terminated; return `false` for the
+/// process-mode arm and `a_join_survives_a_real_child_process_that_never_writes_anything`
+/// kills a turn whose child is working.
+fn member_vouches_for_the_waiter(run: &SubAgentRun, window: Option<std::time::Duration>) -> bool {
+    if matches!(run.status, SubAgentStatus::AwaitingInput { .. }) {
+        return true;
+    }
+    if run.process_control.is_some() {
+        return true;
+    }
+    window.is_none_or(|window| run.idle_for() < window)
 }
 
 /// The batch's verdicts, or `None` while any member is still working.
@@ -9725,7 +9800,20 @@ mod tests {
     /// A registry row with a batch label and a beat that nobody ever stamps —
     /// the shape of a healthy process-mode member, whose worker produces no
     /// byte on any pipe until the moment it is finished.
+    ///
+    /// The `process_control` is what makes it that shape rather than merely
+    /// claiming to be: it is the field `member_vouches_for_the_waiter` reads to
+    /// tell a member whose progress the parent can observe from one whose
+    /// progress lives in another process entirely.
     fn batch_test_run(id: &str, batch_id: &str, status: SubAgentStatus) -> SubAgentRun {
+        let mut run = task_mode_batch_test_run(id, batch_id, status);
+        run.process_control = Some(ProcessRunControl::new());
+        run
+    }
+
+    /// The other shape: a member that runs as a task inside this process, so
+    /// its beat is a real progress signal the join can read.
+    fn task_mode_batch_test_run(id: &str, batch_id: &str, status: SubAgentStatus) -> SubAgentRun {
         let mut run = restore_test_run(id, status);
         run.task = format!("task for {id}");
         run.batch_id = Some(batch_id.to_string());
@@ -10085,6 +10173,98 @@ mod tests {
             member_beat.events(),
             0,
             "the limitation, measured: a silent process-mode member has no in-band progress signal at all"
+        );
+    }
+
+    /// The tightening, stated as the case it exists for: a member whose
+    /// progress the parent *can* read went silent for longer than its own idle
+    /// window, and its own watchdog did not end it. The premise that every
+    /// member is bounded on its own terms is false for that member, so the join
+    /// stops vouching and the caller's detector reaches the verdict it exists
+    /// to reach.
+    ///
+    /// Before this rule the join stamped `SubtaskAlive` on every poll for as
+    /// long as any member's row was not terminal, which made the caller
+    /// immortal for as long as one member failed to die — the one thing an
+    /// unbounded runtime cannot afford, because the idle detector is its only
+    /// automatic recovery.
+    ///
+    /// MUTATION GUARD: make `member_vouches_for_the_waiter` return `true`
+    /// unconditionally and this test hangs until its own `max_total` fires
+    /// instead of reporting a hang.
+    #[tokio::test]
+    async fn a_join_stops_vouching_for_an_observable_member_that_went_silent() {
+        let active_runs: Arc<RwLock<Vec<SubAgentRun>>> = Arc::new(RwLock::new(vec![task_mode_batch_test_run(
+            "wedged-task-member",
+            "batch-wedged",
+            SubAgentStatus::Running,
+        )]));
+
+        let guard = crate::agent::idle::IdleGuard {
+            idle: Some(std::time::Duration::from_millis(300)),
+            max_total: Some(std::time::Duration::from_secs(20)),
+        };
+        let members = vec!["wedged-task-member".to_string()];
+        // `with_guard` installs the same thresholds the member's own
+        // `run_guarded` would resolve, which is what the join reads to decide
+        // when that member was due to be judged.
+        let outcome: anyhow::Result<Vec<JoinedMember>> = crate::agent::idle::with_guard(guard, async {
+            crate::agent::idle::run_guarded(guard, "turn joining a wedged task member", None, async {
+                Ok(join_batch_members(&active_runs, &members).await)
+            })
+            .await
+        })
+        .await;
+
+        let error = outcome
+            .err()
+            .expect("a join underwritten by nothing must not run forever");
+        let terminated = error
+            .downcast_ref::<crate::agent::idle::IdleHangTerminated>()
+            .expect("the turn must end as a hang, not as a task failure");
+        assert_eq!(terminated.reason, crate::agent::idle::HangReason::NoProgress);
+    }
+
+    /// The same member, still silent, but blocked on an operator decision. A
+    /// pending approval is a positive statement about where the run is, so the
+    /// join keeps vouching and the caller survives an idle window many times
+    /// shorter than the wait.
+    #[tokio::test]
+    async fn a_member_awaiting_an_operator_decision_still_vouches_for_the_waiter() {
+        let mut awaiting = task_mode_batch_test_run("needs-approval", "batch-approval", SubAgentStatus::Running);
+        awaiting.status = SubAgentStatus::AwaitingInput {
+            prompt: "may I write the file?".to_string(),
+        };
+        let active_runs: Arc<RwLock<Vec<SubAgentRun>>> = Arc::new(RwLock::new(vec![awaiting]));
+        let finisher = Arc::clone(&active_runs);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+            let mut runs = finisher.write().await;
+            if let Some(run) = runs.iter_mut().find(|run| run.id == "needs-approval") {
+                run.status = SubAgentStatus::Completed("approved and finished".to_string());
+            }
+        });
+
+        let guard = crate::agent::idle::IdleGuard {
+            idle: Some(std::time::Duration::from_millis(300)),
+            max_total: None,
+        };
+        let members = vec!["needs-approval".to_string()];
+        let joined = crate::agent::idle::with_guard(guard, async {
+            crate::agent::idle::run_guarded(guard, "turn joining a member awaiting input", None, async {
+                Ok(join_batch_members(&active_runs, &members).await)
+            })
+            .await
+        })
+        .await
+        .expect("a turn waiting on an operator decision must not be terminated as hung");
+
+        assert!(
+            matches!(
+                joined.first().map(|member| &member.verdict),
+                Some(JoinedVerdict::Completed(output)) if output == "approved and finished"
+            ),
+            "the join must return the member's real result"
         );
     }
 
