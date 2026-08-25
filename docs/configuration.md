@@ -269,16 +269,25 @@ warns when all four unrestricted choices are active together.
 ### Scope rules
 
 `[[autonomy.scopes.rules]]` narrows what a given sender / channel / chat type
-may do. Rules are evaluated top-to-bottom and the **first** rule whose
-`user`, `channel`, and `chat_type` criteria all match decides; an unset
-criterion matches anything, and `"*"` matches explicitly.
+may do. A rule matches when its `user`, `channel`, and `chat_type` criteria all
+match; an unset criterion matches anything, and `"*"` matches explicitly.
 
-A rule carries two independent ACLs:
+A rule carries two independent ACLs, and they are **evaluated differently**:
 
-| Field | Governs | Deny/allow order |
-|---|---|---|
-| `tools_allow` / `tools_deny` | which tools may run | `tools_deny` first, then `tools_allow` (empty = no whitelist) |
-| `send_allow` / `send_deny` | which recipients `message_send` may reach | `send_deny` first, then `send_allow` (empty = no whitelist) |
+| Field | Governs | Deny/allow order | Rule ordering |
+|---|---|---|---|
+| `tools_allow` / `tools_deny` | which tools may run | `tools_deny` first, then `tools_allow` (empty = no whitelist) | first matching rule decides |
+| `send_allow` / `send_deny` | which recipients `message_send` may reach | `send_deny` first, then `send_allow` (empty = no whitelist) | every matching rule that carries an outbound entry is consulted |
+
+The outbound half is not first-match-wins on purpose. A rule with neither
+`send_allow` nor `send_deny` says nothing about recipients and is skipped
+entirely, and `send_deny` is checked against **every** matching rule. Without
+that, a rule written for some unrelated reason — a `tools_deny`-only rule over
+the same scope, say — would match first and silently disable every `send_deny`
+below it, with no error and no denial. Only `send_allow` still depends on
+order: the first matching rule with a non-empty whitelist is the one that
+applies, and a whitelist that an earlier rule already shadows is a hard config
+error rather than dead configuration.
 
 When no rule matches, or a matching rule sets no `send_allow`, the destination
 channel decides: sending on the turn's **own** channel is allowed (the
@@ -326,7 +335,6 @@ channel = "api"
 # Let a chat session message this one WhatsApp number through the daemon.
 send_allow = ["wacli:15550001111@s.whatsapp.net"]
 ```
-
 ### `[chat.daemon]`
 
 `prx chat` deliberately opens no IM connection: a second listener on the same

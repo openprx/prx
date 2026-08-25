@@ -3248,9 +3248,16 @@ impl Default for ObservabilityConfig {
 
 /// A single scope rule for tool access control.
 ///
-/// Rules are evaluated top-to-bottom; the first matching rule wins.
-/// Deny always takes priority over allow within a rule.
 /// A rule matches when ALL specified criteria match (logical AND).
+/// Deny always takes priority over allow within a rule.
+///
+/// The two halves of a rule are evaluated differently, on purpose:
+/// * `tools_allow` / `tools_deny` are **first-match-wins** — the first matching
+///   rule decides tool access and later rules are not consulted.
+/// * `send_allow` / `send_deny` are evaluated over **every** matching rule that
+///   carries at least one outbound entry, so a rule written for some unrelated
+///   reason (a `tools_deny`-only rule, say) can never silently swallow a later
+///   rule's `send_deny`. See `SecurityPolicy::is_outbound_allowed`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ScopeRule {
     /// Match by sender identity: UUID (e.g. "uuid:xxx"), phone number, or "*" for any sender.
@@ -3271,12 +3278,17 @@ pub struct ScopeRule {
     /// `"wacli:1234@s.whatsapp.net"`); a bare `"*"` matches every destination.
     /// Empty (the default) means this rule imposes no whitelist, so the
     /// same-channel / cross-channel default decides.
+    ///
+    /// The first matching rule with a non-empty `send_allow` is the one that
+    /// applies; `validate` rejects a rule whose `send_allow` an earlier rule
+    /// would shadow, so this never fails silently.
     #[serde(default)]
     pub send_allow: Vec<String>,
     /// Outbound recipient blacklist, in the same `{channel}:{recipient}` form.
     ///
     /// Evaluated before `send_allow`, mirroring how `tools_deny` outranks
-    /// `tools_allow`.
+    /// `tools_allow`, and evaluated across *every* matching rule so it can
+    /// never be shadowed by an earlier one.
     #[serde(default)]
     pub send_deny: Vec<String>,
 }
@@ -3329,9 +3341,17 @@ impl Default for ScopeConfig {
 impl ScopeConfig {
     /// Validate the outbound recipient ACL entries of every rule.
     ///
-    /// An entry that is neither `"*"` nor a well-formed `{channel}:{recipient}`
-    /// pair could never match anything, which for a `send_deny` entry would be
-    /// a silent fail-open. Reject it at load time instead.
+    /// Two shapes of silently-ineffective configuration are rejected here:
+    ///
+    /// 1. An entry that is neither `"*"` nor a well-formed `{channel}:{recipient}`
+    ///    pair could never match anything, which for a `send_deny` entry would be
+    ///    a silent fail-open.
+    /// 2. A `send_allow` whitelist that an earlier rule's whitelist already
+    ///    shadows. `send_deny` sweeps every matching rule and so cannot be
+    ///    shadowed, but only the first matching `send_allow` applies — an
+    ///    operator who adds a narrower rule below a broader one would otherwise
+    ///    get no effect and no error. Reorder the rules, or fold the entries
+    ///    into the rule that shadows them.
     pub fn validate(&self) -> Result<()> {
         for (index, rule) in self.rules.iter().enumerate() {
             for (field, entries) in [("send_allow", &rule.send_allow), ("send_deny", &rule.send_deny)] {
@@ -3340,8 +3360,45 @@ impl ScopeConfig {
                 }
             }
         }
+        self.validate_no_shadowed_send_allow()
+    }
+
+    /// Reject a `send_allow` whitelist an earlier rule makes unreachable.
+    fn validate_no_shadowed_send_allow(&self) -> Result<()> {
+        for (index, rule) in self.rules.iter().enumerate() {
+            if rule.send_allow.is_empty() {
+                continue;
+            }
+            let shadow = self
+                .rules
+                .iter()
+                .take(index)
+                .position(|earlier| !earlier.send_allow.is_empty() && scope_criteria_cover(earlier, rule));
+            if let Some(shadow) = shadow {
+                anyhow::bail!(
+                    "autonomy.scopes.rules[{index}].send_allow can never apply: rules[{shadow}]                      matches every context rules[{index}] matches and already carries a send_allow                      whitelist, so only that earlier whitelist is ever consulted. Move                      rules[{index}] above rules[{shadow}], narrow rules[{shadow}], or merge the                      entries into rules[{shadow}].send_allow."
+                );
+            }
+        }
         Ok(())
     }
+}
+
+/// Whether `outer` matches every request context `inner` matches.
+///
+/// Conservative on purpose: a criterion covers another only when it is absent
+/// (or `"*"`, which is the same thing) or literally equal, so this never claims
+/// a shadow that is not really there.
+fn scope_criteria_cover(outer: &ScopeRule, inner: &ScopeRule) -> bool {
+    fn covers(outer: Option<&String>, inner: Option<&String>) -> bool {
+        match outer.map(String::as_str) {
+            None | Some("*") => true,
+            Some(criterion) => inner.map(String::as_str) == Some(criterion),
+        }
+    }
+    covers(outer.user.as_ref(), inner.user.as_ref())
+        && covers(outer.channel.as_ref(), inner.channel.as_ref())
+        && covers(outer.chat_type.as_ref(), inner.chat_type.as_ref())
 }
 
 /// Reject an outbound ACL entry that cannot match any destination.
@@ -9616,6 +9673,75 @@ classifier_timeout_secs = 8
                 ..ScopeRule::default()
             }],
         }
+    }
+
+    fn scope_rule_with(channel: Option<&str>, chat_type: Option<&str>, send_allow: &[&str]) -> ScopeRule {
+        ScopeRule {
+            channel: channel.map(str::to_string),
+            chat_type: chat_type.map(str::to_string),
+            send_allow: send_allow.iter().map(|s| (*s).to_string()).collect(),
+            ..ScopeRule::default()
+        }
+    }
+
+    /// R2 visibility: only the first matching `send_allow` is ever consulted, so
+    /// a whitelist an earlier rule already covers is dead configuration. Say so
+    /// at load time rather than letting the operator find out by a refused send.
+    #[test]
+    async fn scope_config_rejects_a_shadowed_send_allow() {
+        let cfg = ScopeConfig {
+            default: "allow".into(),
+            rules: vec![
+                scope_rule_with(None, None, &["telegram:*"]),
+                scope_rule_with(Some("wacli"), None, &["wacli:1234@s.whatsapp.net"]),
+            ],
+        };
+        let error = cfg.validate().expect_err("a shadowed send_allow must be rejected");
+        let error = error.to_string();
+        assert!(error.contains("rules[1].send_allow"), "{error}");
+        assert!(error.contains("rules[0]"), "{error}");
+    }
+
+    /// The shadow test is conservative: a rule that only *sometimes* matches
+    /// what a later rule matches shadows nothing.
+    #[test]
+    async fn scope_config_accepts_a_narrower_rule_that_is_not_shadowed() {
+        let ordered = ScopeConfig {
+            default: "allow".into(),
+            rules: vec![
+                scope_rule_with(Some("wacli"), None, &["wacli:*"]),
+                scope_rule_with(Some("telegram"), None, &["telegram:*"]),
+            ],
+        };
+        ordered.validate().expect("disjoint criteria never shadow");
+
+        let narrowing = ScopeConfig {
+            default: "allow".into(),
+            rules: vec![
+                scope_rule_with(Some("wacli"), Some("group"), &["wacli:*"]),
+                scope_rule_with(Some("wacli"), None, &["wacli:1234@s.whatsapp.net"]),
+            ],
+        };
+        narrowing
+            .validate()
+            .expect("a chat_type-scoped rule does not cover the unscoped one below it");
+    }
+
+    /// A rule carrying no `send_allow` shadows nothing — it is not an outbound
+    /// rule, and `is_outbound_allowed` skips it for exactly that reason.
+    #[test]
+    async fn scope_config_accepts_a_send_allow_below_a_tools_only_rule() {
+        let cfg = ScopeConfig {
+            default: "allow".into(),
+            rules: vec![
+                ScopeRule {
+                    tools_deny: vec!["shell".into()],
+                    ..ScopeRule::default()
+                },
+                scope_rule_with(None, None, &["telegram:*"]),
+            ],
+        };
+        cfg.validate().expect("a tools-only rule does not shadow a send_allow");
     }
 
     #[test]

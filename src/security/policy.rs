@@ -1881,13 +1881,21 @@ impl SecurityPolicy {
     /// reply would implicitly go out on. `dst_channel` / `dst_recipient` are the
     /// destination actually being addressed.
     ///
-    /// Evaluation order (deliberately identical in shape to `is_tool_allowed`):
-    /// 1. Walk the scope rules top-to-bottom; the first rule whose
-    ///    `user`/`channel`/`chat_type` criteria match wins.
-    /// 2. Within that rule, `send_deny` is checked first and always wins.
-    /// 3. A non-empty `send_allow` then acts as a whitelist.
-    /// 4. An empty `send_allow`, or no matching rule at all, falls back to the
-    ///    channel default below.
+    /// Evaluation order. Unlike `is_tool_allowed`, this is deliberately **not**
+    /// first-match-wins: a rule that carries no `send_allow`/`send_deny` entry
+    /// expresses nothing about outbound messaging and must not be able to
+    /// shadow a later rule that does (see the module note on rule shadowing).
+    /// 1. Skip every rule with both `send_allow` and `send_deny` empty — a
+    ///    `tools_deny`-only rule is not an outbound rule.
+    /// 2. Walk the remaining matching rules **in full**; if any one of them
+    ///    denies the destination, the answer is deny. `send_deny` can therefore
+    ///    never be silently shadowed by an earlier rule.
+    /// 3. The first matching rule with a non-empty `send_allow` acts as the
+    ///    whitelist (`ScopeConfig::validate` rejects a later rule whose
+    ///    `send_allow` that first one would shadow, so this cannot silently
+    ///    discard an operator's intent either).
+    /// 4. No matching outbound rule with a whitelist falls back to the channel
+    ///    default below.
     ///
     /// The channel default is what keeps this a zero-regression addition:
     /// sending to the channel the turn already owns stays allowed (exactly
@@ -1905,13 +1913,21 @@ impl SecurityPolicy {
         dst_channel: &str,
         dst_recipient: &str,
     ) -> bool {
-        let same_channel = dst_channel == src_channel;
+        let mut whitelist: Option<&crate::config::ScopeRule> = None;
 
         for rule in &self.scope_rules {
+            // A rule with no outbound entries says nothing about recipients.
+            // Skipping it here is what stops a `tools_deny`-only rule from
+            // consuming the decision and silently disabling every later
+            // `send_deny` that matches the same scope.
+            if rule.send_allow.is_empty() && rule.send_deny.is_empty() {
+                continue;
+            }
             if !rule_matches(rule, sender, src_channel, chat_type) {
                 continue;
             }
-            // Rule matched — deny first, then allow, mirroring tools_deny/tools_allow.
+            // Deny sweeps every matching rule, not just the first one, so a
+            // later `send_deny` is always reachable.
             if rule
                 .send_deny
                 .iter()
@@ -1919,16 +1935,21 @@ impl SecurityPolicy {
             {
                 return false;
             }
-            if rule.send_allow.is_empty() {
-                return same_channel;
+            if whitelist.is_none() && !rule.send_allow.is_empty() {
+                whitelist = Some(rule);
             }
-            return rule
-                .send_allow
-                .iter()
-                .any(|entry| outbound_entry_matches(entry, dst_channel, dst_recipient));
         }
 
-        same_channel
+        whitelist.map_or(
+            // No rule constrains this turn's recipients: the channel the turn
+            // already replies on stays reachable, anything else needs an opt-in.
+            dst_channel == src_channel,
+            |rule| {
+                rule.send_allow
+                    .iter()
+                    .any(|entry| outbound_entry_matches(entry, dst_channel, dst_recipient))
+            },
+        )
     }
 
     /// Unified tool-authorization decision point (permission-model Phase 1).
@@ -3574,17 +3595,64 @@ mod tests {
         assert!(p.is_outbound_allowed("alice", "wacli", "direct", "telegram", "67890"));
     }
 
+    /// R2: a rule carrying no outbound entry is not an outbound rule and must
+    /// not consume the decision. Before the fix the first matching rule won
+    /// outright, so an unrelated rule matching the same scope disabled every
+    /// later `send_deny` silently — the operator saw no error and no denial.
     #[test]
-    fn outbound_first_matching_rule_wins() {
+    fn outbound_rule_without_send_entries_does_not_shadow_a_later_send_deny() {
+        let mut tools_only = outbound_rule(Some("wacli"), &[], &[]);
+        tools_only.tools_deny = vec!["shell".to_string()];
+        let p = make_scope_policy(vec![tools_only, outbound_rule(None, &[], &["*"])], true);
+        // The `tools_deny`-only rule matches first but says nothing about
+        // recipients, so the deny-everything rule below it still applies.
+        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "+1"));
+        // Its tool semantics are untouched: first-match-wins still governs those.
+        assert!(!p.is_tool_allowed("shell", "alice", "wacli", "direct"));
+    }
+
+    /// R2: `send_deny` sweeps every matching rule, so an earlier rule that does
+    /// carry outbound entries cannot shadow a later denial either.
+    #[test]
+    fn outbound_send_deny_is_reachable_behind_an_earlier_outbound_rule() {
         let p = make_scope_policy(
-            vec![outbound_rule(Some("wacli"), &[], &[]), outbound_rule(None, &[], &["*"])],
+            vec![
+                outbound_rule(Some("wacli"), &["wacli:*"], &[]),
+                outbound_rule(None, &[], &["wacli:+15550001111"]),
+            ],
             true,
         );
-        // The wacli rule matches first and imposes nothing, so the later
-        // deny-everything rule is never reached.
+        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "+15550001111"));
+        // Everything else still rides the first rule's whitelist.
+        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "+15550002222"));
+    }
+
+    /// R2 zero-regression: rule ordering still decides which whitelist applies,
+    /// and a rule whose criteria do not match is still skipped entirely.
+    #[test]
+    fn outbound_first_matching_whitelist_still_decides() {
+        let p = make_scope_policy(
+            vec![
+                outbound_rule(Some("wacli"), &["telegram:*"], &[]),
+                outbound_rule(None, &["*"], &[]),
+            ],
+            true,
+        );
+        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "telegram", "12345"));
+        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "discord", "99"));
+        // A telegram turn skips the first rule and lands on the wildcard one.
+        assert!(p.is_outbound_allowed("alice", "telegram", "direct", "discord", "99"));
+    }
+
+    /// R2 zero-regression: with no `send_*` entry configured anywhere, every
+    /// rule is skipped and the same-channel default is exactly today's answer.
+    #[test]
+    fn outbound_rules_without_send_entries_leave_the_default_untouched() {
+        let mut tools_only = outbound_rule(None, &[], &[]);
+        tools_only.tools_deny = vec!["*".to_string()];
+        let p = make_scope_policy(vec![tools_only], true);
         assert!(p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "+1"));
-        // A telegram turn skips the first rule and hits the deny-all rule.
-        assert!(!p.is_outbound_allowed("alice", "telegram", "direct", "telegram", "+1"));
+        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "telegram", "+1"));
     }
 
     #[test]
