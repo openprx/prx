@@ -397,8 +397,8 @@ pub async fn wait_until_ready() {
 /// It reaches the **daemon state file** and nothing else. `GET /health` is a
 /// different code path (`gateway::health_response`) that serializes the plain
 /// [`snapshot`] and never calls this function, so the doc that used to say the
-/// block was answerable "from `/health`" was wrong. Anything added here shows
-/// up in `daemon_state.json` only.
+/// block was answerable "from `/health`" was wrong. No gateway route calls this
+/// at all: anything added here shows up in `daemon_state.json` only.
 pub fn snapshot_json() -> serde_json::Value {
     let mut value = serde_json::to_value(snapshot()).unwrap_or_else(|_| {
         serde_json::json!({

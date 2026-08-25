@@ -112,8 +112,8 @@ explicit signal from the upstream.
   `Retry-After` honored, recovered, exhausted, gate deferrals) and a per-model
   breakdown. It is **not** on `GET /health`, which this page claimed until it
   was checked: that endpoint serializes `status`, `paired`, `readiness` and
-  `runtime` only. The block is attached by `health::snapshot_json()`, and every
-  caller of that function is the daemon writing its state file.
+  `runtime` only. The block is attached by `health::snapshot_json()`, which no
+  gateway route calls: the daemon's state writer is what puts it on disk.
 
 ## OpenAI Codex notes
 
