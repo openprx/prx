@@ -150,9 +150,22 @@ pub async fn post_task_kill(
 
 /// Resolve a path id that may be either a run id or a [`registry::WorkId`].
 ///
-/// `Ok(None)` means "well-formed but nothing is running under it", which the
-/// callers report as 404. `Err` is reserved for an address that cannot denote a
-/// work item in either space, so a typo is never mistaken for a finished task.
+/// `Ok(None)` means "nothing is running under this address", which the callers
+/// report as `404`. That covers a typo exactly as it covers a run that finished
+/// a second ago, and the two are not separated here because this process cannot
+/// separate them: [`registry::resolve_address`] matches a run id by string
+/// equality against live rows and otherwise parses a `w42` counter, so an
+/// address in neither space is merely absent. Run ids are opaque strings with
+/// no syntax to validate against, and a finished run's id is well-formed and
+/// unresolvable in precisely the way a typo is.
+///
+/// `Err` is therefore reserved for the one input that is a client bug whatever
+/// is running — an empty id, answered `400`.
+///
+/// This doc used to promise that `Err` covered any address that could not
+/// denote a work item, "so a typo is never mistaken for a finished task". No
+/// such check ever existed; the behavior described above is the behavior
+/// there has always been.
 fn resolve_task_address(id: &str) -> Result<Option<registry::WorkId>, (StatusCode, Json<serde_json::Value>)> {
     if id.trim().is_empty() {
         return Err((

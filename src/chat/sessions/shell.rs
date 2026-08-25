@@ -307,12 +307,22 @@ pub fn spawn_shell_with_origin(
         *pgid_cell.lock() = Some(pid as i32);
     }
 
-    // Publish the child to the process-wide runtime registry, so a background
-    // chat shell is listed by `prx tasks list` and can be ended with
-    // `prx tasks kill` like any other child process. The guard is handed to the
-    // reaper task below: it is the only owner of the `Child`, so the ledger row
-    // lives exactly as long as the process it describes. Registration is by
-    // *group* id, matching the `killpg` semantics this module already uses.
+    // Publish the child to the process-wide runtime registry, so the shell is a
+    // row in the same ledger as turns, sub-agents and tool calls rather than a
+    // process only this module knows about. Registration is by *group* id,
+    // matching the `killpg` semantics this module already uses, so whatever
+    // ends the row ends the whole group. The guard is handed to the reaper task
+    // below: it is the only owner of the `Child`, so the ledger row lives
+    // exactly as long as the process it describes.
+    //
+    // That ledger is process-local, and this comment used to overstate what the
+    // registration buys. Reading the registry from another process means the
+    // gateway's control API, and `prx chat` runs no gateway — so a shell
+    // started inside a chat is **not** in `prx tasks list` and **not** killable
+    // with `prx tasks kill`, both of which read the *daemon's* registry. Inside
+    // the chat it stays listed and killable through `/sessions` and `/kill`,
+    // which read this process's own session store. `docs/web-console.md`
+    // records the whole one-way visibility story.
     let registration =
         crate::runtime::registry::register_process(&registry_label(command), child.id(), *pgid_cell.lock());
 

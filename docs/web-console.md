@@ -148,7 +148,10 @@ delivery as ended, without the message ever reaching the target.
 (`/sessions --daemon`, `/kill --daemon`, `/steer --daemon`) all read the work
 registry of the **daemon** process through this control API. That gives an
 operator one view across entry points: a run started by a Signal message, by a
-webhook, by MCP, or by another `prx` all appear in the same listing.
+webhook or by MCP all appear in the same listing, and so does work another
+`prx` process creates *inside* the daemon through this API — the steer delivery
+row above is exactly that. Work that another `prx` process runs itself does not
+appear: that process has its own registry, which nothing here reads.
 
 Two limits are deliberate, and neither is fixed by this API.
 
@@ -169,7 +172,11 @@ control API of its own and no registry anyone else can read. Concretely:
 | Cron jobs, detached HTTP jobs | yes |
 | A turn running inside `prx chat` | **no** |
 | A `/bg` sub-agent started inside `prx chat` | **no** |
-| A shell child process started inside `prx chat` | in *that chat's* `/sessions`, not the daemon's |
+| A shell child process started inside `prx chat` | **no** |
+| A run in another `prx` process that is not this daemon | **no** |
+
+The column answers only the daemon's listing; the paragraph below says where
+chat's own work *is* visible.
 
 So the arrow points one way: chat can see and steer the daemon, the daemon
 cannot see chat. Chat sessions are still visible and killable from **inside that

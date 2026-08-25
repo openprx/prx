@@ -107,9 +107,13 @@ explicit signal from the upstream.
   bare one. The pinned vendor is respected: `reliability.fallback_providers` and
   the rotation `reliability.api_keys` are dropped for those chains, while the
   retry budget, backoff and `model_fallbacks` carry over.
-- **Telemetry.** `/health` and the daemon state file expose a `rate_limits`
-  block with per-provider counters (total, streaming, `Retry-After` honored,
-  recovered, exhausted, gate deferrals) and a per-model breakdown.
+- **Telemetry.** The daemon's state file (`daemon_state.json`) carries a
+  `rate_limits` block with per-provider counters (total, streaming,
+  `Retry-After` honored, recovered, exhausted, gate deferrals) and a per-model
+  breakdown. It is **not** on `GET /health`, which this page claimed until it
+  was checked: that endpoint serializes `status`, `paired`, `readiness` and
+  `runtime` only. The block is attached by `health::snapshot_json()`, and every
+  caller of that function is the daemon writing its state file.
 
 ## OpenAI Codex notes
 

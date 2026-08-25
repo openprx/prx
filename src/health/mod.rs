@@ -390,9 +390,15 @@ pub async fn wait_until_ready() {
 /// Health snapshot as JSON, with provider rate-limit telemetry attached.
 ///
 /// The `rate_limits` block answers "how often did upstreams throttle us, on
-/// which model, did we recover" from `/health` and the daemon state file —
-/// without it no 429 strategy change can be evaluated after the fact, because
-/// the only other trace is unaggregated log lines.
+/// which model, did we recover" — without it no 429 strategy change can be
+/// evaluated after the fact, because the only other trace is unaggregated log
+/// lines.
+///
+/// It reaches the **daemon state file** and nothing else. `GET /health` is a
+/// different code path (`gateway::health_response`) that serializes the plain
+/// [`snapshot`] and never calls this function, so the doc that used to say the
+/// block was answerable "from `/health`" was wrong. Anything added here shows
+/// up in `daemon_state.json` only.
 pub fn snapshot_json() -> serde_json::Value {
     let mut value = serde_json::to_value(snapshot()).unwrap_or_else(|_| {
         serde_json::json!({

@@ -45,11 +45,25 @@ fn write_worker_result(result: &WorkerResult) -> Result<()> {
 /// the tokio blocking pool and not on `tokio::io::stdin`, for three reasons:
 ///
 /// * A `tokio::io::stdin` read that is pending when the worker finishes parks a
-///   blocking-pool thread, and runtime drop joins it — the process then never
-///   exits, because the parent deliberately keeps the write end of the pipe
-///   open for the whole run. A detached OS thread is simply torn down at
-///   process exit, so the single-line stdout `WorkerResult` protocol still ends
-///   the process the moment it is written.
+///   blocking-pool thread that nothing can wake: the parent deliberately keeps
+///   the write end of the pipe open for the whole run, and a blocking read
+///   observes no `CancellationToken`. Runtime drop joins blocking threads, so
+///   that read is on the critical path of exit. It does **not** hang the
+///   process — `main` shuts the runtime down with `RUNTIME_SHUTDOWN_TIMEOUT`
+///   (2 s, `src/main.rs`), which caps the join — but the cap is the only thing
+///   that ends it, so every process-mode worker would spend those 2 seconds
+///   waiting after its `WorkerResult` line was already written and its answer
+///   was already in the parent's hands. A detached OS thread is torn down at
+///   process exit instead, so the single-line stdout protocol still ends the
+///   process the moment the result is flushed.
+///
+///   (This bullet, and the commit message that introduced it, originally said
+///   the process would "never exit". That was wrong in exactly the way that
+///   matters for a future reader deciding whether the thread is still needed:
+///   the shutdown cap was already in place, so the real cost is a fixed 2 s
+///   tax on every worker exit, not a wedged process. The design decision is
+///   unchanged — a 2 s tax per sub-agent is reason enough — only the stated
+///   reason is corrected.)
 /// * It leaves the configured blocking pool (`[runtime] max_blocking_threads`,
 ///   the process's last implicit concurrency gate) untouched.
 /// * It reads the same global buffered `std::io::Stdin` handle the manifest was
@@ -988,10 +1002,12 @@ async fn run_manifest_with_capability_env(
 ///
 /// `read_stdin_control_frames` asks for the post-manifest stdin reader. It is
 /// started **after** `scrub_capability_env`, never before: that scrub uses
-/// `unsafe { remove_var }`, whose soundness argument is that the worker is
-/// still single-threaded at that point. Starting the reader earlier would break
-/// exactly that invariant, so the steering protocol stays strictly downstream
-/// of authentication.
+/// `unsafe { remove_var }`, whose soundness argument is that nothing else in
+/// this process can be reading the environment while it runs (see the SAFETY
+/// note on `scrub_capability_env` for what actually holds — the worker is
+/// emphatically *not* single-threaded here). The reader is the first thread
+/// this path starts, so starting it earlier would break exactly that argument,
+/// and the steering protocol stays strictly downstream of authentication.
 async fn run_manifest(
     manifest: WorkerManifest,
     read_stdin_control_frames: bool,
@@ -1014,11 +1030,35 @@ async fn run_manifest(
 /// Remove the capability-bearing environment variables after validation.
 fn scrub_capability_env() {
     // SAFETY: `remove_var` is unsafe on edition 2024 because mutating the
-    // process environment races with concurrent `getenv` on other threads. This
-    // runs once during single-threaded session-worker boot — immediately after
-    // the manifest's capability has been read and validated, and before any
-    // worker threads that read the environment are spawned — so no concurrent
-    // access can occur.
+    // process environment races with a concurrent `getenv` on another thread.
+    // The obligation is therefore "no other thread touches the environment for
+    // the duration of this call", which is *not* the same as the process being
+    // single-threaded — and single-threaded is what this comment used to claim
+    // and is plainly false: `main` builds a multi-threaded tokio runtime before
+    // `async_main` runs, so scheduler threads already exist by the time any of
+    // this executes.
+    //
+    // What actually holds is an ordering property of the session-worker entry
+    // path, and all of it is on one task:
+    //
+    // * `async_main` dispatches to `Commands::SessionWorker` (`src/main.rs`)
+    //   having done nothing but install the rustls provider and parse the CLI:
+    //   no `tokio::spawn`, no `spawn_blocking`, no tracing subscriber. The
+    //   runtime's worker threads therefore hold no work at all and sit in the
+    //   scheduler park loop, which reads no environment.
+    // * `run_from_stdin` reads and validates the manifest inline on this task.
+    //   The one environment read on that stretch — the capability and its
+    //   expiry — happens on this same thread, before this call.
+    // * Every thread and process this worker later creates is created after
+    //   this point: `spawn_stdin_control_reader` (deliberately sequenced after
+    //   the scrub), everything `run_validated_manifest` builds, and any
+    //   grandchild that would otherwise inherit the capability.
+    //
+    // So the safety is positional, not structural: it rests on nothing being
+    // spawned earlier on this path, and no compiler check enforces that. Work
+    // added to `async_main` ahead of the `SessionWorker` branch — a subscriber,
+    // a background task, an eager pool — would reintroduce the race silently,
+    // which is the reason the ordering is written down here rather than assumed.
     #[allow(unsafe_code)]
     unsafe {
         std::env::remove_var("OPENPRX_SESSION_WORKER_CAPABILITY");
