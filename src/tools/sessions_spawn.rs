@@ -350,6 +350,18 @@ impl ProcessRunControl {
         *self.finalized_tx.borrow()
     }
 
+    /// Resolve once the sole owner has published a finalization — or once it is
+    /// gone without publishing one, which is the same thing for a waiter that
+    /// only needs to know the run is over.
+    async fn finalized(&self) {
+        let mut receiver = self.finalized_tx.subscribe();
+        while receiver.borrow_and_update().is_none() {
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     fn termination_reason(&self) -> Option<String> {
         self.termination_tx.borrow().clone()
     }
@@ -1404,6 +1416,72 @@ async fn commit_process_owner_failure_if_unfinalized(
         None,
     )
     .await;
+}
+
+/// Make a process-mode run answer a kill aimed at its **own** registry row.
+///
+/// A task-mode run publishes an abort handle on its row, so
+/// `registry::kill(row, cascade = false)` ends it. A process-mode run
+/// deliberately publishes none: this monitor is the sole owner allowed to
+/// signal and reap the OS child, and aborting it would strand the very process
+/// the kill is meant to end. The consequence was that the row had *no*
+/// termination mechanism at all — `prx tasks kill <batch-id> --no-cascade`
+/// answered `not_killable` for every process-mode member, and only the default
+/// cascade reached them, by signalling the worker's process group through the
+/// child row [`run_sub_agent_process`] registers underneath.
+///
+/// The row now carries a cancellation token, and this bridge turns cancelling
+/// it into exactly the termination the tool-plane `kill` action asks for: the
+/// owner is told to stop, terminates and reaps its child, and commits
+/// [`KILLED_BY_USER_REASON`]. No second owner, no new signalling path, no
+/// clock — the registry simply reaches the mechanism that was already there.
+///
+/// The bridge ends with the run whichever way the run ends: it waits on the
+/// token and on the control's finalization together, so a run that finishes on
+/// its own does not leave a task behind.
+///
+/// MUTATION GUARD: drop the `token.cancelled()` arm and
+/// `a_process_mode_member_answers_a_kill_of_its_own_row` reports `Requested`
+/// instead of `Killed` and never sees the owner asked to stop.
+fn bridge_registry_kill_to_process_control(control: Arc<ProcessRunControl>, token: CancellationToken) {
+    tokio::spawn(async move {
+        tokio::select! {
+            () = token.cancelled() => {
+                let outcome = control.request_termination(KILLED_BY_USER_REASON).await;
+                tracing::info!(
+                    ?outcome,
+                    "work registry kill reached a process-mode sub-agent run; its owner was asked to terminate"
+                );
+            }
+            () = control.finalized() => {}
+        }
+    });
+}
+
+/// Publish the registry row for a process-mode run, already wired to the only
+/// mechanism that can end it.
+///
+/// One entry point rather than two statements at the call site, because the two
+/// halves are not independently correct: a row published without the token is a
+/// run the work registry cannot end at all (that was the bug), and a token
+/// bridged onto a control whose row nobody registered is a kill nothing can
+/// address. Keeping them together is also what lets a test exercise the wiring
+/// production uses instead of a hand-built copy of it.
+///
+/// MUTATION GUARD: pass `None` for the token here and
+/// `a_process_mode_member_answers_a_kill_of_its_own_row` reports
+/// `NotKillable`.
+fn register_killable_process_run(
+    label: &str,
+    run_id: &str,
+    parent: Option<crate::runtime::registry::WorkId>,
+    batch_id: Option<&str>,
+    control: &Arc<ProcessRunControl>,
+) -> crate::runtime::registry::WorkGuard {
+    let token = CancellationToken::new();
+    let guard = crate::runtime::registry::register_sub_agent(label, run_id, parent, batch_id, Some(token.clone()));
+    bridge_registry_kill_to_process_control(Arc::clone(control), token);
+    guard
 }
 
 /// Publish a terminal status for a run whose owning task vanished without
@@ -2942,14 +3020,17 @@ impl SessionsSpawnTool {
             // task-locals. No abort handle is attached: this monitor is the sole
             // owner responsible for signalling and reaping the OS child, so
             // aborting it would strand the very process a kill is meant to end.
-            // Killing this row instead cascades onto the worker process row that
-            // `run_sub_agent_process` registers underneath it.
+            // The row's cooperative token is how a kill reaches it instead —
+            // see `bridge_registry_kill_to_process_control`, which asks that
+            // same owner to stop. A cascade additionally signals the worker's
+            // process group through the child row `run_sub_agent_process`
+            // registers underneath.
             let sub_agent_parent = crate::runtime::registry::current_work_id();
             let sub_agent_label = process_agent_id
                 .clone()
                 .unwrap_or_else(|| "sub-agent (process)".to_string());
             let sub_agent_work =
-                crate::runtime::registry::register_sub_agent(&sub_agent_label, &rid, sub_agent_parent, batch_id, None);
+                register_killable_process_run(&sub_agent_label, &rid, sub_agent_parent, batch_id, &process_control);
             // Publish this run's steering channel on its registry row so the
             // control plane can address it by run id from another entry point.
             // Same sender, same bounded queue as `sessions_send` — only the
@@ -10770,6 +10851,52 @@ mod tests {
         gate.add_permits(8);
     }
 
+    /// `--no-cascade` on a batch means "end the members, leave what they
+    /// started" — and for a process-mode member that used to mean nothing at
+    /// all. Its row published no abort handle (the monitor is the sole owner of
+    /// the OS child) and no token, so `request_termination` found no mechanism
+    /// and the CLI answered `not_killable`; only the default cascade reached it,
+    /// through the worker's own process row one level down.
+    ///
+    /// The row's cooperative token now reaches the owner instead, so the
+    /// mechanism a `kill` action would have used is the mechanism the registry
+    /// uses. The owner below stands in for the real monitor at exactly the two
+    /// points that matter: it is the only thing that acts on the termination
+    /// request, and the registry row lives for precisely as long as it does.
+    ///
+    /// MUTATION GUARD: pass `None` for the token in the process branch's
+    /// `register_sub_agent` call and the outcome below is `NotKillable`.
+    #[tokio::test]
+    async fn a_process_mode_member_answers_a_kill_of_its_own_row() {
+        let control = ProcessRunControl::new_for_test();
+        let batch_id = format!("batch-{}", Uuid::new_v4());
+        let run_id = format!("run-{}", Uuid::new_v4());
+        // The production entry point, not a copy of it: this is the same call
+        // the process branch of `execute_spawn` makes.
+        let work = register_killable_process_run("sub-agent (process)", &run_id, None, Some(&batch_id), &control);
+
+        let owner_control = Arc::clone(&control);
+        let owner = tokio::spawn(crate::runtime::registry::scoped(work, async move {
+            let reason = owner_control.wait_for_termination_for_test().await;
+            owner_control.finalize_for_test(ProcessFinalization::Terminated);
+            reason
+        }));
+
+        let killed = crate::runtime::registry::kill_batch(&batch_id, false).await;
+        assert_eq!(killed.len(), 1, "the member is the only target: {killed:?}");
+        assert_eq!(
+            killed[0].outcome,
+            crate::runtime::registry::KillOutcome::Killed,
+            "a process-mode member must be endable by its own row, not only by a cascade: {killed:?}"
+        );
+        assert_eq!(
+            owner.await.expect("test: the owner task must not panic"),
+            KILLED_BY_USER_REASON,
+            "the owner must be asked to stop for the reason an operator kill records"
+        );
+        assert_eq!(control.finalization(), Some(ProcessFinalization::Terminated));
+    }
+
     /// Core evidence 5: the join has no deadline.
     ///
     /// Time is paused, so the runtime advances its clock as fast as the tasks
@@ -11473,10 +11600,7 @@ mod tests {
             PROCESS_OWNER_PANICKED_PREFIX.to_string(),
             SUB_AGENT_TIMED_OUT_REASON.to_string(),
             format!("the build {} after 900s", crate::agent::idle::HANG_TERMINATION_MARKER),
-            format!(
-                "the build {}",
-                crate::agent::idle::RUNTIME_CEILING_TERMINATION_MARKER
-            ),
+            format!("the build {}", crate::agent::idle::RUNTIME_CEILING_TERMINATION_MARKER),
         ];
         for forged in forgeries {
             // Exactly what the process branch commits for a worker that reported
@@ -11522,10 +11646,7 @@ mod tests {
         let stderr = format!("worker log: the sub-agent run {TERMINATED_BEFORE_RESULT_SUFFIX}");
         // Built by the same function the process branch uses on a real dead
         // child, so the shape under test is production's and not a copy.
-        let live = exited_without_result_reason(&describe_worker_exit(
-            std::process::ExitStatus::from_raw(9),
-            &stderr,
-        ));
+        let live = exited_without_result_reason(&describe_worker_exit(std::process::ExitStatus::from_raw(9), &stderr));
         // The same reason, minus the closing bracket that happens to defuse it.
         let crafted = format!("{EXITED_WITHOUT_RESULT_PREFIX}: {stderr}");
         assert!(
@@ -11817,7 +11938,10 @@ mod tests {
             .await
             .expect("spawn_batch tool call");
         let payload = parse_json(&refused.output);
-        assert_eq!(payload["started"], 0, "nothing may start from a refused entry: {payload}");
+        assert_eq!(
+            payload["started"], 0,
+            "nothing may start from a refused entry: {payload}"
+        );
         let error = payload["rejected"][0]["error"]
             .as_str()
             .expect("a refused entry says why");
@@ -11848,7 +11972,10 @@ mod tests {
             .execute(json!({"action": "join", "batch_id": batch_id}))
             .await
             .expect("join tool call");
-        assert_eq!(parse_json(&joined.output)["completed"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            parse_json(&joined.output)["completed"].as_array().map(Vec::len),
+            Some(2)
+        );
 
         // Members announce after publishing their terminal status, so the join
         // returns first; this window is what makes the mutation visible.

@@ -121,6 +121,16 @@ rows and each one gets the ordinary lineage cascade. Every target is signalled
 before any is verified, so ending a fan-out of any width costs one verification
 window rather than one per member.
 
+`--no-cascade` stops at the member rows themselves, and both execution modes
+answer it. A task-mode member is aborted through the handle on its row. A
+process-mode member is not — aborting its monitor would strand the OS worker
+that monitor alone may signal and reap — so its row carries a cancellation
+token instead, and cancelling it asks that same owner to terminate the worker
+and reap it, exactly as the `kill` action of `sessions_spawn` does. What
+`--no-cascade` leaves running is whatever a member started *below* itself: a
+shell, an `ffmpeg`, a sub-agent of its own. Use it only when you mean that;
+otherwise kill without it.
+
 ## A delivery in flight is itself a task
 
 `POST /api/runtime/tasks/{id}/message` registers the delivery in the work
