@@ -1,6 +1,6 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use super::traits::{Channel, ChannelMessage, ChatKind, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChatKind, OutboundAttachment, SendMessage};
 use crate::config::{Config, StreamMode};
 use crate::security::pairing::PairingGuard;
 use anyhow::Context;
@@ -121,6 +121,18 @@ impl TelegramAttachmentKind {
         }
     }
 
+    /// Canonical marker spelling for this kind, for messages that must name the
+    /// kind without echoing the target path.
+    const fn marker_name(self) -> &'static str {
+        match self {
+            Self::Image => "IMAGE",
+            Self::Document => "DOCUMENT",
+            Self::Video => "VIDEO",
+            Self::Audio => "AUDIO",
+            Self::Voice => "VOICE",
+        }
+    }
+
     fn from_marker(marker: &str) -> Option<Self> {
         match marker.trim().to_ascii_uppercase().as_str() {
             "IMAGE" | "PHOTO" => Some(Self::Image),
@@ -175,7 +187,14 @@ fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentK
     TelegramAttachmentKind::from_media_type(crate::media::type_id::from_file_name(target)?)
 }
 
-fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
+/// The path-or-URL token a message consists of, before anything is asked about
+/// what it points at.
+///
+/// Split out of [`parse_path_only_attachment`] so the cross-channel gate can
+/// reuse the exact same shape test without inheriting the existence check: the
+/// gate must refuse a path that is absent when it runs and present when the
+/// send runs.
+fn path_only_attachment_candidate(message: &str) -> Option<&str> {
     let trimmed = message.trim();
     if trimmed.is_empty() || trimmed.contains('\n') {
         return None;
@@ -186,7 +205,11 @@ fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
         return None;
     }
 
-    let candidate = candidate.strip_prefix("file://").unwrap_or(candidate);
+    Some(candidate.strip_prefix("file://").unwrap_or(candidate))
+}
+
+fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
+    let candidate = path_only_attachment_candidate(message)?;
     let kind = infer_attachment_kind_from_target(candidate)?;
 
     if !is_http_url(candidate) && !Path::new(candidate).exists() {
@@ -197,6 +220,22 @@ fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
         kind,
         target: candidate.to_string(),
     })
+}
+
+/// Telegram's own answer to "would this text leave as a file upload?".
+///
+/// Retraces [`Channel::send`] step for step — the same tag stripping, the same
+/// marker parser, the same path-only reading — so the answer cannot disagree
+/// with what the send actually does. It is stricter in exactly one place: the
+/// path-only branch does not require the file to exist, because between the
+/// question and the send it might start to.
+fn parsed_outbound_attachment(message: &str) -> Option<OutboundAttachment> {
+    let content = strip_tool_call_tags(message);
+    if let Some(attachment) = parse_attachment_markers(&content).1.first() {
+        return Some(OutboundAttachment::Marker(attachment.kind.marker_name()));
+    }
+    let candidate = path_only_attachment_candidate(&content)?;
+    infer_attachment_kind_from_target(candidate).map(|_| OutboundAttachment::BarePath)
 }
 
 /// Strip tool_call XML-style tags from message text.
@@ -1552,6 +1591,13 @@ impl Channel for TelegramChannel {
         "telegram"
     }
 
+    /// Telegram reads attachments far more liberally than the shared marker
+    /// regex does — case-insensitive kinds, the `PHOTO`/`FILE` aliases, and a
+    /// bare path with no marker at all — so it must answer this itself.
+    fn outbound_attachment(&self, text: &str) -> Option<OutboundAttachment> {
+        parsed_outbound_attachment(text)
+    }
+
     /// One `getUpdates` round-trip per long-poll window, plus slack.
     ///
     /// Report-only (see `channels::activity`): exceeding it must never abort or
@@ -2296,6 +2342,86 @@ mod tests {
         assert_eq!(attachments[0].target, "/tmp/a.png");
         assert_eq!(attachments[1].kind, TelegramAttachmentKind::Document);
         assert_eq!(attachments[1].target, "https://example.com/a.pdf");
+    }
+
+    /// The cross-channel gate asks Telegram what it would upload, and Telegram
+    /// answers with the parser it actually sends through: kinds are matched
+    /// case-insensitively and `PHOTO`/`FILE` are accepted, none of which the
+    /// shared `[KIND:path]` regex sees.
+    #[test]
+    fn outbound_attachment_reports_every_marker_spelling_telegram_accepts() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
+        for (message, expected) in [
+            ("look [IMAGE:/tmp/a.png]", "IMAGE"),
+            ("look [image:/tmp/a.png]", "IMAGE"),
+            ("look [ImAgE:/tmp/a.png]", "IMAGE"),
+            ("look [photo:/tmp/a.png]", "IMAGE"),
+            ("look [PHOTO:/tmp/a.png]", "IMAGE"),
+            ("look [file:/etc/shadow]", "DOCUMENT"),
+            ("look [FILE:/etc/shadow]", "DOCUMENT"),
+            ("look [voice:/tmp/a.ogg]", "VOICE"),
+            ("look [video:/tmp/a.mp4]", "VIDEO"),
+            ("look [audio:/tmp/a.mp3]", "AUDIO"),
+        ] {
+            assert_eq!(
+                ch.outbound_attachment(message),
+                Some(OutboundAttachment::Marker(expected)),
+                "telegram would upload a file for {message}"
+            );
+        }
+    }
+
+    /// A bare path carries no marker at all, so no marker-shaped gate can see
+    /// it — but Telegram still uploads it.
+    #[test]
+    fn outbound_attachment_reports_bare_paths_telegram_would_upload() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
+        for message in [
+            "/etc/hosts.png",
+            "  /tmp/secret.pdf  ",
+            "`/tmp/secret.pdf`",
+            "\"/tmp/secret.pdf\"",
+            "file:///tmp/secret.pdf",
+            "https://example.com/a.pdf",
+        ] {
+            assert_eq!(
+                ch.outbound_attachment(message),
+                Some(OutboundAttachment::BarePath),
+                "telegram would upload a file for {message}"
+            );
+        }
+    }
+
+    /// The bare-path answer must not depend on what is on disk when it is
+    /// asked: the file may appear between the gate and the send.
+    #[test]
+    fn outbound_attachment_ignores_whether_the_bare_path_exists() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
+        let absent = "/tmp/definitely-not-here-4d9f2c.png";
+        assert!(!Path::new(absent).exists());
+        assert_eq!(ch.outbound_attachment(absent), Some(OutboundAttachment::BarePath));
+        // The send path itself is unchanged: it still refuses to upload a file
+        // that is not there.
+        assert_eq!(parse_path_only_attachment(absent), None);
+    }
+
+    /// Plain prose stays plain: the gate must not refuse ordinary text.
+    #[test]
+    fn outbound_attachment_leaves_plain_text_alone() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
+        for message in [
+            "hello there",
+            "the build is green",
+            "see [UNKNOWN:/tmp/a.bin]",
+            "an [IMAGE:] with no target",
+            "",
+        ] {
+            assert_eq!(
+                ch.outbound_attachment(message),
+                None,
+                "unexpected refusal for {message}"
+            );
+        }
     }
 
     #[test]

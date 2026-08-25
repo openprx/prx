@@ -167,6 +167,24 @@ pub trait Channel: Send + Sync {
         true
     }
 
+    /// What *this* channel's outbound parser would turn into a file upload.
+    ///
+    /// Single source of truth for the cross-channel "text only" gate. The gate
+    /// asks the destination channel rather than re-deriving the answer from a
+    /// regex of its own, so it can never drift narrower than what the channel
+    /// actually does with the same bytes — which is exactly how a marker the
+    /// gate spelled one way and Telegram spelled another slipped through.
+    ///
+    /// The default is [`conservative_outbound_attachment`], the shared floor.
+    /// A channel that accepts more — extra kind aliases, case-insensitive
+    /// kinds, bare paths, a syntax of its own — must override this and answer
+    /// with its real parser. Answering `None` when the channel would in fact
+    /// upload something re-opens an arbitrary-file-read path, so when in doubt
+    /// an implementation reports the risk.
+    fn outbound_attachment(&self, text: &str) -> Option<OutboundAttachment> {
+        conservative_outbound_attachment(text)
+    }
+
     /// How this channel proves that its receive path is still alive.
     ///
     /// Read by the listener supervisor when `listen()` starts, so a wedged
@@ -322,6 +340,120 @@ pub fn outgoing_marker_category(marker: &str) -> Option<crate::media::MediaCateg
         "VOICE" | "AUDIO" => MediaCategory::Audio,
         _ => return None,
     })
+}
+
+/// Marker kinds that *some* channel's outbound parser turns into a file upload.
+///
+/// Deliberately a union, not the vocabulary of any single channel:
+/// [`extract_outgoing_media`] knows five kinds, Telegram additionally accepts
+/// `PHOTO`/`FILE` and matches case-insensitively, and a channel added tomorrow
+/// may know more. Widening this list can only ever widen a *refusal*, never a
+/// delivery, so erring long is the safe direction.
+const ATTACHMENT_MARKER_KINDS: &[&str] = &[
+    "IMAGE",
+    "PHOTO",
+    "PICTURE",
+    "DOCUMENT",
+    "FILE",
+    "ATTACHMENT",
+    "AUDIO",
+    "VOICE",
+    "VIDEO",
+    "GIF",
+    "STICKER",
+];
+
+/// The part of an outbound text that a channel would resolve into a file upload
+/// instead of printing as words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundAttachment {
+    /// A `[KIND:target]` marker. Carries the canonical upper-case kind only —
+    /// never the target, which is a local path and must not be echoed back into
+    /// an error message.
+    Marker(&'static str),
+    /// The whole message is a lone path or URL that a channel may upload as-is,
+    /// with no marker syntax involved at all.
+    BarePath,
+}
+
+/// The conservative, channel-agnostic reading of "would this become a file?".
+///
+/// This is the floor every channel is held to, and a strict superset of
+/// [`extract_outgoing_media`]: kinds match case-insensitively, the alias list is
+/// the union of every channel's vocabulary, and a lone path-shaped message
+/// counts even without marker syntax. Channels whose own parser accepts more
+/// override [`Channel::outbound_attachment`] and answer for themselves.
+#[must_use]
+pub fn conservative_outbound_attachment(text: &str) -> Option<OutboundAttachment> {
+    if let Some(kind) = first_attachment_marker_kind(text) {
+        return Some(OutboundAttachment::Marker(kind));
+    }
+    if looks_like_bare_path_message(text) {
+        return Some(OutboundAttachment::BarePath);
+    }
+    None
+}
+
+/// First `[KIND:target]` marker whose kind is in [`ATTACHMENT_MARKER_KINDS`].
+///
+/// Every `[` is tried as an opener, not just the ones a previous match did not
+/// consume, so a marker nested behind an unrelated bracket — `[note [IMAGE:/x]`
+/// — is still seen. A bracket-scanning parser that resumes past the first `]`
+/// misses exactly that case; the shared regex does not, and this must not be
+/// narrower than either.
+fn first_attachment_marker_kind(text: &str) -> Option<&'static str> {
+    for (open, _) in text.match_indices('[') {
+        let Some(rest) = text.get(open + 1..) else {
+            continue;
+        };
+        let Some(close) = rest.find(']') else {
+            continue;
+        };
+        let Some(body) = rest.get(..close) else {
+            continue;
+        };
+        let Some((kind, target)) = body.split_once(':') else {
+            continue;
+        };
+        if target.is_empty() {
+            continue;
+        }
+        let kind = kind.trim();
+        if let Some(known) = ATTACHMENT_MARKER_KINDS
+            .iter()
+            .find(|known| kind.eq_ignore_ascii_case(known))
+        {
+            return Some(known);
+        }
+    }
+    None
+}
+
+/// Whether the message is nothing but a path or URL.
+///
+/// Mirrors the shape Telegram's path-only reading accepts (single token, quote
+/// and `file://` stripped) but drops both its file-extension requirement and
+/// its existence check: the gate must not depend on what happens to be on disk
+/// at the moment it runs.
+fn looks_like_bare_path_message(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') {
+        return false;
+    }
+    let candidate = trimmed.trim_matches(|c| matches!(c, '`' | '"' | '\''));
+    if candidate.is_empty() || candidate.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let candidate = candidate.strip_prefix("file://").unwrap_or(candidate);
+    candidate.contains('/') || candidate.contains('\\') || has_file_extension(candidate)
+}
+
+/// A trailing `.ext` short enough and plain enough to be a real file suffix.
+fn has_file_extension(candidate: &str) -> bool {
+    let Some((stem, ext)) = candidate.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty() && !ext.is_empty() && ext.len() <= 8 && ext.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 #[cfg(test)]

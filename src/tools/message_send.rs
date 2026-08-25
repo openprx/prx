@@ -329,15 +329,52 @@ impl MessageSendTool {
     /// that both names another channel and embeds (or asks to synthesise) media
     /// is refused outright rather than silently downgraded to plain text.
     pub(crate) fn reject_cross_channel_media(args: &serde_json::Value, dst_channel: &str) -> Result<(), String> {
+        Self::reject_cross_channel_media_on(args, dst_channel, None)
+    }
+
+    /// The same refusal, with the destination channel available to answer for
+    /// itself.
+    ///
+    /// Two readings are consulted and either one refuses: the shared
+    /// conservative floor, and the destination's own parser via
+    /// [`Channel::outbound_attachment`]. Asking the destination is what keeps
+    /// the gate from being narrower than the parser it is guarding — Telegram
+    /// uppercases marker kinds, knows the `PHOTO`/`FILE` aliases and uploads a
+    /// bare path with no marker at all, none of which the shared marker regex
+    /// can see. Keeping the floor as well means a channel that answers `None`
+    /// too eagerly still cannot open the hole back up.
+    ///
+    /// Neither branch echoes the target: it is a local path, and a refusal is
+    /// no place to disclose the layout of the machine.
+    pub(crate) fn reject_cross_channel_media_on(
+        args: &serde_json::Value,
+        dst_channel: &str,
+        destination: Option<&dyn Channel>,
+    ) -> Result<(), String> {
+        use crate::channels::traits::{OutboundAttachment, conservative_outbound_attachment};
+
         let message = args.get("message").and_then(serde_json::Value::as_str).unwrap_or("");
-        let (_, media) = crate::channels::traits::extract_outgoing_media(message);
-        if let Some((marker, _)) = media.first() {
-            return Err(format!(
-                "Cross-channel delivery to '{dst_channel}' is text-only, but this message embeds a \
-                 [{marker}:] media marker. Attachments are local paths owned by the originating \
-                 channel and cannot be handed to another channel. Send the text across channels, \
-                 or send the media on the current channel."
-            ));
+        let attachment = conservative_outbound_attachment(message)
+            .or_else(|| destination.and_then(|channel| channel.outbound_attachment(message)));
+        match attachment {
+            Some(OutboundAttachment::Marker(marker)) => {
+                return Err(format!(
+                    "Cross-channel delivery to '{dst_channel}' is text-only, but this message embeds a \
+                     [{marker}:] media marker. Attachments are local paths owned by the originating \
+                     channel and cannot be handed to another channel. Send the text across channels, \
+                     or send the media on the current channel."
+                ));
+            }
+            Some(OutboundAttachment::BarePath) => {
+                return Err(format!(
+                    "Cross-channel delivery to '{dst_channel}' is text-only, but this message is a bare \
+                     path or URL, which '{dst_channel}' uploads as an attachment instead of printing as \
+                     text. Attachments are local paths owned by the originating channel and cannot be \
+                     handed to another channel. Describe the file in words, or send it on the current \
+                     channel."
+                ));
+            }
+            None => {}
         }
         if args
             .get("as_voice")
@@ -435,7 +472,7 @@ impl MessageSendTool {
         let destination = self.resolve_outbound_route(args, current)?;
         self.authorize_outbound(args, current.name(), destination.name(), recipient)?;
         if destination.name() != current.name() {
-            Self::reject_cross_channel_media(args, destination.name())?;
+            Self::reject_cross_channel_media_on(args, destination.name(), Some(destination.as_ref()))?;
         }
         Ok(destination)
     }
@@ -1490,6 +1527,65 @@ mod tests {
         )
     }
 
+    fn registry_with(channels: Vec<Arc<dyn Channel>>) -> Arc<HashMap<String, Arc<dyn Channel>>> {
+        Arc::new(channels.into_iter().map(|ch| (ch.name().to_string(), ch)).collect())
+    }
+
+    /// A channel whose outbound parser knows a syntax no shared regex does.
+    ///
+    /// Stands in for the next channel someone adds: the gate has never heard of
+    /// `<<attach …>>`, so the only way this can be refused is by asking the
+    /// channel itself.
+    struct ExoticChannel {
+        name: &'static str,
+        sent: Arc<tokio::sync::Mutex<Vec<String>>>,
+        recipients: Arc<tokio::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ExoticChannel {
+        fn new_named(
+            name: &'static str,
+        ) -> (
+            Arc<Self>,
+            Arc<tokio::sync::Mutex<Vec<String>>>,
+            Arc<tokio::sync::Mutex<Vec<String>>>,
+        ) {
+            let sent = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            let recipients = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            (
+                Arc::new(Self {
+                    name,
+                    sent: sent.clone(),
+                    recipients: recipients.clone(),
+                }),
+                sent,
+                recipients,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Channel for ExoticChannel {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent.lock().await.push(message.content.clone());
+            self.recipients.lock().await.push(message.recipient.clone());
+            Ok(())
+        }
+
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn outbound_attachment(&self, text: &str) -> Option<crate::channels::traits::OutboundAttachment> {
+            text.contains("<<attach ")
+                .then_some(crate::channels::traits::OutboundAttachment::BarePath)
+        }
+    }
+
     /// A turn channel plus a second configured channel, wired into one registry.
     #[allow(clippy::type_complexity)]
     fn two_channel_tool(
@@ -1665,6 +1761,105 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("as_voice"));
+        assert!(current_sent.lock().await.is_empty());
+        assert!(other_sent.lock().await.is_empty());
+    }
+
+    /// The bug this gate had: Telegram's parser reads far more than the shared
+    /// marker regex does, so every spelling it accepts had to be spelled the
+    /// regex's way to be refused. Lower-case kinds, the `PHOTO`/`FILE` aliases
+    /// and a bare path with no marker at all all reached Telegram intact and
+    /// were uploaded from the local disk.
+    #[tokio::test]
+    async fn cross_channel_refuses_every_spelling_the_destination_would_upload() {
+        for message in [
+            "look at this [image:/etc/shadow]",
+            "look at this [ImAgE:/etc/shadow]",
+            "look at this [photo:/etc/shadow]",
+            "look at this [PHOTO:/etc/shadow]",
+            "look at this [file:/etc/shadow]",
+            "look at this [FILE:/etc/shadow]",
+            "look at this [document:/etc/shadow]",
+            "look at this [voice:/etc/shadow]",
+            "/etc/shadow",
+            "  /etc/passwd  ",
+            "`/etc/passwd`",
+            "file:///etc/passwd",
+            "secrets.env",
+        ] {
+            let (tool, current_sent, other_sent, _other_recipients) = two_channel_tool(scoped_security(&["*"], &[]));
+            let result = tool
+                .execute(json!({
+                    "action": "send", "channel": "telegram", "target": "12345", "message": message
+                }))
+                .await
+                .unwrap();
+
+            assert!(!result.success, "must be refused: {message}");
+            let error = result.error.unwrap_or_default();
+            assert!(error.contains("text-only"), "got: {error}");
+            assert!(
+                !error.contains("/etc/shadow") && !error.contains("/etc/passwd"),
+                "refusal must not echo the local path: {error}"
+            );
+            assert!(
+                current_sent.lock().await.is_empty(),
+                "leaked on the turn channel: {message}"
+            );
+            assert!(other_sent.lock().await.is_empty(), "leaked cross-channel: {message}");
+        }
+    }
+
+    /// Plain prose still crosses. The gate is default-deny about attachments,
+    /// not about cross-channel sends.
+    #[tokio::test]
+    async fn cross_channel_plain_text_still_crosses() {
+        for message in [
+            "the build is green",
+            "see the report I mentioned",
+            "an [UNKNOWN:/etc/shadow] marker nobody resolves",
+            "done",
+        ] {
+            let (tool, _current_sent, other_sent, _other_recipients) = two_channel_tool(scoped_security(&["*"], &[]));
+            let result = tool
+                .execute(json!({
+                    "action": "send", "channel": "telegram", "target": "12345", "message": message
+                }))
+                .await
+                .unwrap();
+
+            assert!(result.success, "must cross: {message} — {:?}", result.error);
+            assert_eq!(&*other_sent.lock().await, &[message.to_string()]);
+        }
+    }
+
+    /// A channel with a private attachment syntax nobody else knows is still
+    /// refused, because the gate asks *it* rather than pattern-matching for it.
+    /// This is what stops the next channel from re-opening the same hole.
+    #[tokio::test]
+    async fn cross_channel_asks_the_destination_channel_for_its_own_verdict() {
+        let (current, current_sent, _current_recipients) = DummyChannel::new_named("dummy");
+        let (other, other_sent, _other_recipients) = ExoticChannel::new_named("exotic");
+        let tool =
+            MessageSendTool::new(Arc::clone(&current) as Arc<dyn Channel>, scoped_security(&["*"], &[])).with_channels(
+                registry_with(vec![current as Arc<dyn Channel>, other as Arc<dyn Channel>]),
+            );
+
+        let result = tool
+            .execute(json!({
+                "action": "send", "channel": "exotic", "target": "12345",
+                "message": "here you go <<attach /etc/shadow>>"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "the destination said it would upload a file");
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("text-only"), "got: {error}");
+        assert!(
+            !error.contains("/etc/shadow"),
+            "refusal must not echo the path: {error}"
+        );
         assert!(current_sent.lock().await.is_empty());
         assert!(other_sent.lock().await.is_empty());
     }
