@@ -247,10 +247,27 @@ pub async fn post_channel_send(
     // Scoped so a channel that shells out registers its child underneath this
     // row, which puts the child inside the cascade a kill of it performs.
     //
+    // The row names the *channel* in the clear and the recipient only as the
+    // fingerprint `op_id::ref_for_channel_recipient` produces. That is the same
+    // function, over the same two inputs, that the outbound refusal on this
+    // very send already uses, so one recipient reads identically wherever this
+    // runtime mentions it. Writing the address out here instead would have made
+    // the operator plane the one place a recipient leaks in plaintext —
+    // `GET /api/runtime/tasks` hands the whole registry to any caller the
+    // pairing check lets through, and that check is off by default — while the
+    // refusal for the same send stayed redacted. The channel name is kept
+    // readable on purpose: it is not sensitive, and without it the row could not
+    // say *where* the parked send is going.
+    //
     // MUTATION GUARD: drop the registration or the `select!` and
-    // `a_wedged_outbound_send_is_listed_and_a_kill_really_stops_it` fails.
+    // `a_wedged_outbound_send_is_listed_and_a_kill_really_stops_it` fails;
+    // put the recipient back in the clear and
+    // `a_registered_send_names_the_channel_but_fingerprints_the_recipient` fails.
     let send_cancel = tokio_util::sync::CancellationToken::new();
-    let work_name = format!("channel_send → {channel_name} {}", short_recipient(&recipient));
+    let work_name = format!(
+        "channel_send → {channel_name} {}",
+        crate::security::op_id::ref_for_channel_recipient(&channel_name, &recipient)
+    );
     let work = crate::runtime::registry::register_tool_call(&work_name, None, Some(send_cancel.clone()));
     let work_id = work.id();
     let settled = tokio::select! {
@@ -311,24 +328,6 @@ pub async fn post_channel_send(
         StatusCode::BAD_GATEWAY
     };
     Err(refusal(status, detail))
-}
-
-/// Longest recipient echoed into the registry row name.
-///
-/// [`MAX_RECIPIENT_LEN`] is generous on purpose — it exists so the destination,
-/// not this endpoint, refuses a malformed address — but `prx tasks list` prints
-/// the name last and unwrapped, so a single half-kilobyte recipient would push
-/// every other row off the terminal. The row only has to say *which* send is
-/// parked, which a prefix does.
-const RECIPIENT_IN_WORK_NAME: usize = 48;
-
-/// Recipient, shortened for a registry row name. Cuts on a character boundary.
-fn short_recipient(recipient: &str) -> String {
-    let mut short: String = recipient.chars().take(RECIPIENT_IN_WORK_NAME).collect();
-    if short.len() < recipient.len() {
-        short.push('…');
-    }
-    short
 }
 
 /// Sender and chat type behind an operator-plane send.
@@ -1118,7 +1117,8 @@ mod tests {
             "test: the channel must actually be holding the send"
         );
         assert!(
-            row.name.contains(RECIPIENT),
+            row.name
+                .contains(&crate::security::op_id::ref_for_channel_recipient(CHANNEL, RECIPIENT)),
             "test: the row must say which send is parked, got: {}",
             row.name
         );
@@ -1168,6 +1168,95 @@ mod tests {
             "test: the row must be gone once the send is over"
         );
 
+        server.abort();
+    }
+
+    /// The registry row and the refusal must name one recipient the same way.
+    ///
+    /// Being *visible* was bought at the price of being *readable*: the row this
+    /// endpoint registers is handed out verbatim by `GET /api/runtime/tasks`,
+    /// so whatever it names, the operator plane distributes. The refusal path
+    /// for the very same send has always fingerprinted the recipient, and a row
+    /// that spelled it out would have made one address plaintext in one place
+    /// and redacted in the other — the same recipient, two answers, and the
+    /// plaintext one on the surface with the wider reach.
+    ///
+    /// So the assertion is not "the row looks redacted" but "both sites agree",
+    /// and it is written as a comparison against the refusal's own output rather
+    /// than against a hard-coded digest: a second hand-rolled truncation that
+    /// merely *looked* redacted is precisely how the two drifted apart, and only
+    /// sharing the function keeps them together. The channel name stays legible
+    /// in both — it is not sensitive, and it is what makes the row useful.
+    ///
+    /// MUTATION GUARD: interpolate `recipient` into `work_name` instead of its
+    /// `ref_for_channel_recipient` and both halves below fail.
+    #[tokio::test]
+    #[serial(outbound_channels)]
+    async fn a_registered_send_names_the_channel_but_fingerprints_the_recipient() {
+        // Half one: what the refusal says about this recipient, taken from the
+        // live route rather than assumed.
+        let denied_workspace = TempDir::new().expect("test: workspace");
+        let recorder = RecordingChannel::new(false);
+        let denied_publication = published(&recorder);
+        let denied_config = scoped_config(denied_workspace.path(), &[], None);
+        let (denied_url, _denied_port, denied_server) = serve(test_app_state(denied_config)).await;
+        let (denied_status, refusal_body) = post_raw(
+            &denied_url,
+            CHANNEL,
+            Some(TOKEN),
+            serde_json::json!({"recipient": RECIPIENT, "message": "should not arrive"}),
+        )
+        .await;
+        assert_eq!(denied_status, 403, "test: body was {refusal_body}");
+        denied_server.abort();
+        drop(denied_publication);
+
+        // Half two: what the registry row says about the same recipient, while
+        // a send to it is parked in the channel.
+        let workspace = TempDir::new().expect("test: workspace");
+        let channel = WedgingChannel::new();
+        let _publication = publish_wedging(&channel);
+        let config = scoped_config(workspace.path(), &[&format!("{CHANNEL}:*")], None);
+        let (base_url, _port, server) = serve(test_app_state(config)).await;
+        let caller = tokio::spawn(async move {
+            post_raw(
+                &base_url,
+                CHANNEL,
+                Some(TOKEN),
+                serde_json::json!({"recipient": RECIPIENT, "message": "into the void"}),
+            )
+            .await
+        });
+        let row = await_outbound_row().await;
+
+        // Not the plaintext address, in the row an unpaired reader can list.
+        assert!(
+            !row.name.contains(RECIPIENT),
+            "test: the registry row must not carry the plaintext recipient, got: {}",
+            row.name
+        );
+        // Still the channel, in the clear: a row that cannot say where the send
+        // is going is not worth listing.
+        assert!(
+            row.name.contains(CHANNEL),
+            "test: the row must still name the destination channel, got: {}",
+            row.name
+        );
+        // And the *same* fingerprint the refusal used, which is the whole claim.
+        let fingerprint = crate::security::op_id::ref_for_channel_recipient(CHANNEL, RECIPIENT);
+        assert!(
+            refusal_body.contains(&fingerprint),
+            "test: the refusal must identify the recipient by fingerprint, body was {refusal_body}"
+        );
+        assert!(
+            row.name.contains(&fingerprint),
+            "test: the row must use the refusal's own fingerprint, got: {}",
+            row.name
+        );
+
+        let killed = crate::runtime::registry::kill(row.id, true).await;
+        assert!(!killed.is_empty(), "test: the parked send must be killable");
+        let _ = tokio::time::timeout(Duration::from_secs(30), caller).await;
         server.abort();
     }
 }

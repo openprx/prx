@@ -2964,13 +2964,41 @@ fn spawn_scoped_typing_task(
 
 /// Registry label for one channel turn — enough to tell two live turns apart in
 /// `prx tasks list` without spilling message content into an operator listing.
+///
+/// The correspondent is named by the same fingerprint the outbound path uses
+/// ([`crate::security::op_id::ref_for_channel_recipient`]), never in plaintext.
+/// A sender on a messaging platform *is* an address — a phone number, a JID, a
+/// chat id — and this row is not a private note: it is what
+/// `GET /api/runtime/tasks` hands to every caller the pairing check admits, and
+/// pairing is off by default. Spelling the sender out here would have made the
+/// busiest row in the runtime, minted once per inbound message, the place a
+/// correspondent's address leaks, while every send *to* that same person was
+/// carefully fingerprinted.
+///
+/// Fingerprinting through that shared function rather than a local one is what
+/// makes the listing still useful: the digest of an inbound turn matches the
+/// digest of an outbound send to the same correspondent on the same channel, so
+/// "this turn and that send are the same person" survives the redaction, and
+/// the channel name — not sensitive, and the only part that says *where* — is
+/// left readable.
+///
+/// MUTATION GUARD: interpolate `msg.sender` or `msg.reply_target` directly and
+/// `a_channel_turn_label_fingerprints_the_correspondent` fails.
 fn channel_turn_label(msg: &traits::ChannelMessage) -> String {
     use std::fmt::Write as _;
-    let mut label = format!("channel:{}:{}", msg.channel, msg.sender);
+    let mut label = format!(
+        "channel:{}:{}",
+        msg.channel,
+        crate::security::op_id::ref_for_channel_recipient(&msg.channel, &msg.sender)
+    );
     if !msg.reply_target.is_empty() && msg.reply_target != msg.sender {
         // Writing into a String is infallible; the Result is discarded rather
         // than unwrapped so this stays panic-free by construction.
-        let _ = write!(label, " in {}", msg.reply_target);
+        let _ = write!(
+            label,
+            " in {}",
+            crate::security::op_id::ref_for_channel_recipient(&msg.channel, &msg.reply_target)
+        );
     }
     label
 }
@@ -6165,6 +6193,63 @@ mod tests {
             channel: "telegram".to_string(),
             ..Default::default()
         }
+    }
+
+    /// The busiest registry row in the runtime must not be where an address leaks.
+    ///
+    /// One of these labels is minted per inbound message, and
+    /// `GET /api/runtime/tasks` publishes it verbatim to any caller the pairing
+    /// check admits — which, with pairing off, is every process on the box. The
+    /// send path has always fingerprinted the correspondent; a turn row that
+    /// spelled the same person out would have made the redaction decorative.
+    ///
+    /// Compared against `ref_for_channel_recipient`'s own output rather than a
+    /// literal digest: a second hand-rolled shortening that merely *looked*
+    /// redacted is exactly how the two sides drifted apart before, so the test
+    /// asserts they share the function, not that they happen to agree today.
+    ///
+    /// MUTATION GUARD: interpolate `msg.sender` or `msg.reply_target` into
+    /// `channel_turn_label` and this fails.
+    #[test]
+    fn a_channel_turn_label_fingerprints_the_correspondent() {
+        let sender = "+15550001111@s.whatsapp.net";
+        let group = "120363000000000000@g.us";
+        let msg = traits::ChannelMessage {
+            sender: sender.to_string(),
+            reply_target: group.to_string(),
+            channel: "wacli".to_string(),
+            ..Default::default()
+        };
+        let label = channel_turn_label(&msg);
+
+        assert!(
+            !label.contains(sender),
+            "the sender must not appear in plaintext: {label}"
+        );
+        assert!(!label.contains(group), "the chat must not appear in plaintext: {label}");
+        // The channel is the part that says *where*, and it is not sensitive.
+        assert!(
+            label.contains("wacli"),
+            "the label must still name the channel: {label}"
+        );
+        // Same function as the outbound path, so one person reads the same in
+        // an inbound turn row and in a send row.
+        assert!(
+            label.contains(&crate::security::op_id::ref_for_channel_recipient("wacli", sender)),
+            "the sender must appear as the shared fingerprint: {label}"
+        );
+        assert!(
+            label.contains(&crate::security::op_id::ref_for_channel_recipient("wacli", group)),
+            "the chat must appear as the shared fingerprint: {label}"
+        );
+        // Two correspondents on one channel still tell apart.
+        let other = traits::ChannelMessage {
+            sender: "+15550002222@s.whatsapp.net".to_string(),
+            reply_target: group.to_string(),
+            channel: "wacli".to_string(),
+            ..Default::default()
+        };
+        assert_ne!(label, channel_turn_label(&other));
     }
 
     #[test]
@@ -13558,17 +13643,22 @@ After"#;
             CancellationToken::new(),
         ));
 
+        // Found by the correspondent's fingerprint, not by their address: the
+        // row names the sender the way the outbound path does, so this is the
+        // same lookup an operator does with what `prx tasks list` shows them.
+        let sender_ref = crate::security::op_id::ref_for_channel_recipient("test-channel", "turn-registry-probe-alice");
+        let room_ref = crate::security::op_id::ref_for_channel_recipient("test-channel", "turn-registry-probe-room");
         let turn_row = wait_for(|| {
             registry::snapshot_all()
                 .into_iter()
-                .find(|row| row.kind == registry::WorkKind::Turn && row.name.contains("turn-registry-probe-alice"))
+                .find(|row| row.kind == registry::WorkKind::Turn && row.name.contains(&sender_ref))
         })
         .await
         .expect("test: a live channel turn must be listed by the runtime registry");
 
         assert_eq!(turn_row.state, registry::WorkState::Running);
         assert!(
-            turn_row.name.contains("test-channel") && turn_row.name.contains("turn-registry-probe-room"),
+            turn_row.name.contains("test-channel") && turn_row.name.contains(&room_ref),
             "test: the turn row must identify channel, sender and conversation: {}",
             turn_row.name
         );
@@ -13723,10 +13813,24 @@ After"#;
              receiving and answering the next message"
         );
 
+        // The wedged turns are recognised by their senders' fingerprints — the
+        // rows name correspondents the way the send path does, so a plaintext
+        // prefix match would find nothing.
+        let stuck_refs: Vec<String> = (0..DISPATCH_GATE_STUCK_TURNS)
+            .map(|index| {
+                crate::security::op_id::ref_for_channel_recipient(
+                    "test-channel",
+                    &format!("dispatch-gate-stuck-{index}"),
+                )
+            })
+            .collect();
         let stuck_rows = wait_for(|| {
             let count = registry::snapshot_all()
                 .into_iter()
-                .filter(|row| row.kind == registry::WorkKind::Turn && row.name.contains("dispatch-gate-stuck-"))
+                .filter(|row| {
+                    row.kind == registry::WorkKind::Turn
+                        && stuck_refs.iter().any(|reference| row.name.contains(reference))
+                })
                 .count();
             (count >= DISPATCH_GATE_STUCK_TURNS).then_some(count)
         })

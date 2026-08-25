@@ -2633,6 +2633,31 @@ async fn run_webhook_job(
     }
 }
 
+/// Registry label for one accepted channel-webhook delivery.
+///
+/// Named the way every other registry row names a correspondent: the channel in
+/// the clear, the chat only as [`crate::security::op_id::ref_for_channel_recipient`]'s
+/// fingerprint. `reply_target` on this route is a platform address — a Telegram
+/// chat id, a WhatsApp JID — and this label is published verbatim by
+/// `GET /api/runtime/tasks`, so writing it out would leak through the operator
+/// plane the very address the send path takes care to fingerprint. Sharing that
+/// one function is also what keeps the digest here equal to the digest an
+/// outbound send to the same chat produces, so the two rows stay correlatable.
+///
+/// MUTATION GUARD: interpolate `reply_target` directly and
+/// `a_channel_webhook_job_label_fingerprints_the_chat` fails.
+fn channel_webhook_job_label(channel_key: &str, first: Option<&crate::channels::traits::ChannelMessage>) -> String {
+    first.map_or_else(
+        || format!("gateway:{channel_key}"),
+        |msg| {
+            format!(
+                "gateway:{channel_key}:{}",
+                crate::security::op_id::ref_for_channel_recipient(channel_key, &msg.reply_target)
+            )
+        },
+    )
+}
+
 /// Shared tail of the three platform-pushed channel webhooks.
 ///
 /// These routes differ from `POST /webhook` in one decisive way: the sender is a
@@ -2670,10 +2695,7 @@ fn accept_channel_webhook_delivery(
         }
     };
 
-    let label = messages.first().map_or_else(
-        || format!("gateway:{channel_key}"),
-        |msg| format!("gateway:{channel_key}:{}", msg.reply_target),
-    );
+    let label = channel_webhook_job_label(channel_key, messages.first());
     let job = jobs::submit(
         jobs::KIND_CHANNEL_WEBHOOK,
         label,
@@ -3079,6 +3101,42 @@ mod tests {
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
+
+    /// A platform webhook's job row must not publish the chat it came from.
+    ///
+    /// This label is the `prx tasks list` name of the detached turn, and
+    /// `GET /api/runtime/tasks` serves it to anyone the pairing check admits. On
+    /// this route `reply_target` is a real platform address, so leaving it in
+    /// the clear would have leaked through the operator plane exactly what the
+    /// outbound path fingerprints. Asserted against the shared function's own
+    /// output, because agreeing *by construction* is the property that broke
+    /// last time, not agreeing by coincidence.
+    ///
+    /// MUTATION GUARD: interpolate `reply_target` into
+    /// `channel_webhook_job_label` and this fails.
+    #[test]
+    fn a_channel_webhook_job_label_fingerprints_the_chat() {
+        let chat = "-1001234567890";
+        let msg = ChannelMessage {
+            reply_target: chat.to_string(),
+            channel: "telegram".to_string(),
+            ..Default::default()
+        };
+        let label = channel_webhook_job_label("telegram", Some(&msg));
+
+        assert!(!label.contains(chat), "the chat must not appear in plaintext: {label}");
+        assert!(
+            label.starts_with("gateway:telegram:"),
+            "the channel stays legible: {label}"
+        );
+        assert!(
+            label.contains(&crate::security::op_id::ref_for_channel_recipient("telegram", chat)),
+            "the chat must appear as the shared fingerprint: {label}"
+        );
+        // A delivery that carries no message has nothing to name, and must not
+        // grow a placeholder that looks like an address.
+        assert_eq!(channel_webhook_job_label("telegram", None), "gateway:telegram");
+    }
 
     struct TestConfigParticipant;
     struct TestPreparedConfig;
