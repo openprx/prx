@@ -372,14 +372,36 @@ pub fn render_kill(report: &KillReport) -> String {
     out.trim_end().to_string()
 }
 
-/// Render a steer delivery report.
+/// Render a steer report, claiming exactly what the daemon claimed.
+///
+/// The daemon answers `outcome: "queued"`, and queued is not read: handing a
+/// message to a run's bounded steering queue proves the queue had room and the
+/// receiver still exists, never that the run polls it. A task-mode sub-agent
+/// without tools registers a steering sender and never reads the receiver, so
+/// its messages sit there forever. The headline used to read "Delivered to
+/// daemon task ...", which told a chat operator the instruction had landed and
+/// left them waiting on a target that was never going to act on it.
+///
+/// So the tag is printed verbatim under its own label, and the daemon's note —
+/// the sentence that spells out what `queued` does not promise — is appended
+/// when the daemon sent one. Nothing is substituted when it did not: a gloss
+/// written here would be a client-side guess at a server-side guarantee.
+///
+/// MUTATION GUARD: put the "Delivered to daemon task" headline back and
+/// `a_steer_report_repeats_the_daemons_outcome_instead_of_claiming_delivery`
+/// fails.
 #[must_use]
 pub fn render_message(report: &MessageReport) -> String {
     let run_id = report.run_id.as_deref().unwrap_or("-");
-    format!(
-        "Delivered to daemon task {} [{}] {} (run:{run_id}) — {}",
+    let mut out = format!(
+        "Message to daemon task {} [{}] {} (run:{run_id}) — outcome: {}",
         report.id, report.kind, report.name, report.outcome
-    )
+    );
+    if let Some(note) = report.note.as_deref() {
+        out.push('\n');
+        out.push_str(note);
+    }
+    out
 }
 
 /// Render a failed kill/steer: the reason, nothing invented on top of it.
@@ -618,23 +640,55 @@ mod tests {
         assert!(rendered.contains("connection refused"), "{rendered}");
     }
 
+    /// The steer report names the target, the run id, and the daemon's tag —
+    /// and claims no delivery of its own.
+    ///
+    /// MUTATION GUARD: restore the "Delivered to daemon task" headline in
+    /// `render_message` and the first assertion fails.
     #[test]
-    fn a_delivery_names_the_target_and_the_run_id() {
+    fn a_steer_report_repeats_the_daemons_outcome_instead_of_claiming_delivery() {
         let report = MessageReport {
             requested: "w3".to_string(),
             id: "w3".to_string(),
             run_id: Some("d9671848-1111-2222-3333-444444444444".to_string()),
             kind: "sub_agent".to_string(),
             name: "sub-agent".to_string(),
-            outcome: "delivered".to_string(),
+            outcome: "queued".to_string(),
+            note: Some("a run that does not read its queue never consumes it".to_string()),
         };
         let rendered = render_message(&report);
-        assert!(rendered.contains("Delivered to daemon task w3"), "{rendered}");
+        assert!(
+            !rendered.to_lowercase().contains("deliver"),
+            "queued is not delivered, and chat must not upgrade it: {rendered}"
+        );
+        assert!(rendered.contains("Message to daemon task w3"), "{rendered}");
         assert!(
             rendered.contains("run:d9671848-1111-2222-3333-444444444444"),
             "{rendered}"
         );
-        assert!(rendered.contains("delivered"), "{rendered}");
+        assert!(rendered.contains("outcome: queued"), "{rendered}");
+        assert!(
+            rendered.contains("a run that does not read its queue never consumes it"),
+            "the daemon's own note is what tells the operator queued is not read: {rendered}"
+        );
+    }
+
+    /// A daemon that sends no note gets none invented for it.
+    #[test]
+    fn a_steer_report_without_a_note_stays_a_single_line() {
+        let report = MessageReport {
+            requested: "w3".to_string(),
+            id: "w3".to_string(),
+            run_id: None,
+            kind: "sub_agent".to_string(),
+            name: "sub-agent".to_string(),
+            outcome: "queued".to_string(),
+            note: None,
+        };
+        assert_eq!(
+            render_message(&report),
+            "Message to daemon task w3 [sub_agent] sub-agent (run:-) — outcome: queued"
+        );
     }
 
     #[test]
@@ -770,7 +824,10 @@ mod tests {
                 run_id: Some("d9671848-1111-2222-3333-444444444444".to_string()),
                 kind: "sub_agent".to_string(),
                 name: sent,
-                outcome: "delivered".to_string(),
+                // What the real endpoint answers: accepted onto the queue, and
+                // no claim about anyone reading it.
+                outcome: "queued".to_string(),
+                note: Some("the message is on the target's steering queue".to_string()),
             })
             .into_response()
         };
@@ -825,7 +882,7 @@ mod tests {
                 None,
             )
             .await;
-            assert!(rendered.contains("Delivered to daemon task w3"), "{rendered}");
+            assert!(rendered.contains("Message to daemon task w3"), "{rendered}");
             // The stub echoes the delivered message back as the target name,
             // proving the body survived the round trip rather than being lost.
             assert!(rendered.contains("also check Y"), "{rendered}");

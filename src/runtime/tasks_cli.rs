@@ -124,7 +124,17 @@ pub struct MessageReport {
     pub run_id: Option<String>,
     pub kind: String,
     pub name: String,
+    /// The server's own stable tag for what happened. Rendered verbatim: the
+    /// client is in no position to restate the guarantee the server made, and
+    /// the tag it makes today (`queued`) is deliberately weaker than the word
+    /// this field used to carry.
     pub outcome: String,
+    /// The server's plain-language gloss on `outcome`, when it sends one.
+    ///
+    /// `None` covers a gateway older than the `queued` outcome; renderers must
+    /// print it when present and invent nothing when it is absent.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// One connection pool's counters.

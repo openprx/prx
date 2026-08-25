@@ -1428,11 +1428,7 @@ async fn handle_tasks_command(command: TasksCommands, config: &Config) -> anyhow
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                let run_id = report.run_id.as_deref().unwrap_or("-");
-                println!(
-                    "Delivered to {} [{}] {} (run_id: {})",
-                    report.id, report.kind, report.name, run_id
-                );
+                println!("{}", render_task_message(&report));
             }
             Ok(())
         }
@@ -1467,6 +1463,39 @@ async fn handle_tasks_command(command: TasksCommands, config: &Config) -> anyhow
 /// the position of the batch's first member: they are siblings rather than a
 /// lineage, so nothing else in the table says they belong to one another. A
 /// listing with no batches renders exactly as it always did.
+/// Render `prx tasks send` for a human, saying only what the server said.
+///
+/// The server reports `outcome: "queued"` because accepting a message onto a
+/// run's bounded steering queue is the whole of what it can observe: an mpsc
+/// send proves the queue had room and the receiver still exists, never that
+/// anybody polls it. A task-mode sub-agent with no tools registers a steering
+/// sender and never reads the receiver, so its messages are accepted and
+/// consumed by nobody.
+///
+/// This renderer therefore prints the server's tag verbatim, labelled as the
+/// outcome, and appends the server's own note when it sent one. It states no
+/// delivery of its own: the previous "Delivered to ..." headline was a claim
+/// the CLI was in no position to make, and an operator who read it went on
+/// waiting for a target that was never going to act.
+///
+/// MUTATION GUARD: reinstate a fixed "Delivered" headline and
+/// `a_sent_message_is_reported_as_the_server_tagged_it` fails.
+fn render_task_message(report: &openprx::runtime::tasks_cli::MessageReport) -> String {
+    let run_id = report.run_id.as_deref().unwrap_or("-");
+    let mut out = format!(
+        "Message to {} [{}] {} (run_id: {}) — outcome: {}",
+        report.id, report.kind, report.name, run_id, report.outcome
+    );
+    // Absent on a gateway older than the `queued` outcome. Nothing is
+    // substituted for it: a note this CLI wrote would be a client-side guess at
+    // a server-side guarantee.
+    if let Some(note) = report.note.as_deref() {
+        out.push('\n');
+        out.push_str(note);
+    }
+    out
+}
+
 fn print_work_items(items: &[openprx::runtime::tasks_cli::WorkItem]) {
     println!(
         "{:<8} {:<10} {:>10}  {:<14} {:<}",
@@ -2846,6 +2875,68 @@ mod tests {
     #[test]
     fn cli_definition_has_no_flag_conflicts() {
         Cli::command().debug_assert();
+    }
+
+    /// `prx tasks send` must repeat the server's outcome, not upgrade it.
+    ///
+    /// The endpoint tags a success `queued` because it can only see that the
+    /// message reached the target's steering queue. This renderer used to print
+    /// "Delivered to ..." unconditionally and never printed the outcome at all,
+    /// so an operator steering a run that never drains its queue was told the
+    /// instruction had landed.
+    ///
+    /// MUTATION GUARD: restore a fixed "Delivered" headline in
+    /// `render_task_message` and the first two assertions fail.
+    #[test]
+    fn a_sent_message_is_reported_as_the_server_tagged_it() {
+        let report = openprx::runtime::tasks_cli::MessageReport {
+            requested: "w3".to_string(),
+            id: "w3".to_string(),
+            run_id: Some("d9671848-1111-2222-3333-444444444444".to_string()),
+            kind: "sub_agent".to_string(),
+            name: "sub-agent".to_string(),
+            outcome: "queued".to_string(),
+            note: Some("the message is on the target's steering queue".to_string()),
+        };
+
+        let rendered = render_task_message(&report);
+        assert!(
+            !rendered.to_lowercase().contains("deliver"),
+            "the CLI must not claim a delivery the server did not report: {rendered}"
+        );
+        assert!(
+            rendered.contains("outcome: queued"),
+            "the server's own tag must be on screen: {rendered}"
+        );
+        assert!(rendered.contains("w3"), "{rendered}");
+        assert!(
+            rendered.contains("run_id: d9671848-1111-2222-3333-444444444444"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("the message is on the target's steering queue"),
+            "the server's note explains why queued is not read: {rendered}"
+        );
+    }
+
+    /// A gateway that sends no note gets no invented one.
+    #[test]
+    fn a_missing_note_is_not_replaced_by_a_client_side_guess() {
+        let report = openprx::runtime::tasks_cli::MessageReport {
+            requested: "w3".to_string(),
+            id: "w3".to_string(),
+            run_id: None,
+            kind: "sub_agent".to_string(),
+            name: "sub-agent".to_string(),
+            outcome: "queued".to_string(),
+            note: None,
+        };
+
+        let rendered = render_task_message(&report);
+        assert_eq!(
+            rendered, "Message to w3 [sub_agent] sub-agent (run_id: -) — outcome: queued",
+            "with no note the renderer prints one line and nothing else"
+        );
     }
 
     #[test]
