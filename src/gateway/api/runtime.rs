@@ -824,7 +824,7 @@ mod tests {
     /// The receiver is returned so the channel stays open for the whole test;
     /// dropping it would turn the send into a `ChannelClosed` rejection and
     /// test the wrong path entirely.
-    async fn target_that_never_reads_its_queue() -> (registry::WorkGuard, String, tokio::sync::mpsc::Receiver<String>) {
+    fn target_that_never_reads_its_queue() -> (registry::WorkGuard, String, tokio::sync::mpsc::Receiver<String>) {
         let run_id = format!("unread-{}", uuid::Uuid::new_v4());
         let guard = registry::register_sub_agent("unread run", &run_id, None, None, None);
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(4);
@@ -846,7 +846,7 @@ mod tests {
     #[tokio::test]
     async fn a_send_to_a_target_that_never_reads_its_queue_does_not_claim_delivery() {
         let workspace = tempfile::TempDir::new().expect("test: tempdir");
-        let (guard, run_id, receiver) = target_that_never_reads_its_queue().await;
+        let (guard, run_id, receiver) = target_that_never_reads_its_queue();
 
         let (endpoint, server) = serve(test_app_state(AutonomyLevel::Full, workspace.path())).await;
         let report = tasks_cli::request_message(&endpoint, &run_id, "nobody is going to read this")
