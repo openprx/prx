@@ -302,6 +302,36 @@ intact. A malformed entry — no colon, or an empty segment — is a hard config
 error, because a `send_deny` typo that silently matched nothing would fail
 open.
 
+#### Recipient spellings
+
+The same person is reachable under more than one string. `send_deny` therefore
+matches the recipient after folding the spellings that are **derivable from the
+identifier itself**:
+
+* a JID's `:device` suffix, in either position (`1234@s.whatsapp.net`,
+  `1234:2@s.whatsapp.net` and `1234@lid:2`), and the server's letter case;
+* one leading `+` — the WhatsApp Cloud API strips it before sending, so
+  `+15550001111` and `15550001111` are one account;
+* a UUID's letter case and hyphenation, both of which Signal accepts.
+
+A colon in a recipient that is *not* a JID is left alone, because it is part of
+the identifier: a Telegram forum topic is `{chat_id}:{thread_id}` and denying it
+must not deny the parent chat.
+
+`send_allow` gets **none** of this folding and is matched exactly as written.
+Folding is a guess about which two spellings mean the same person; a wrong guess
+may refuse a send, but it must never be what grants reach to one.
+
+> **Aliases that are not derivable are not covered.** A WhatsApp LID
+> (`<id>@lid`) carries a different number from the same contact's phone JID
+> (`<number>@s.whatsapp.net`), and a Signal account's UUID is unrelated to its
+> E.164 number. Correlating either pair needs a mapping table — whatsmeow's
+> `whatsmeow_lid_map`, or the Signal server — that the policy layer does not
+> hold, and that may simply be absent, in which case "no mapping" would read as
+> "not the same person" and fail open. Write one `send_deny` entry per
+> identifier form the contact can appear under, or deny the whole channel with
+> `"{channel}:*"`, which is the only alias-proof form.
+
 ```toml
 [[autonomy.scopes.rules]]
 channel = "wacli"

@@ -1931,7 +1931,7 @@ impl SecurityPolicy {
             if rule
                 .send_deny
                 .iter()
-                .any(|entry| outbound_entry_matches(entry, dst_channel, dst_recipient))
+                .any(|entry| outbound_deny_entry_matches(entry, dst_channel, dst_recipient))
             {
                 return false;
             }
@@ -1944,6 +1944,9 @@ impl SecurityPolicy {
             // No rule constrains this turn's recipients: the channel the turn
             // already replies on stays reachable, anything else needs an opt-in.
             dst_channel == src_channel,
+            // Matched exactly, with none of `send_deny`'s alias folding: folding
+            // is a guess about who two spellings refer to, and a wrong guess must
+            // never be what grants reach to a recipient.
             |rule| {
                 rule.send_allow
                     .iter()
@@ -2013,6 +2016,78 @@ fn outbound_entry_matches(entry: &str, dst_channel: &str, dst_recipient: &str) -
     }
     let recipient = recipient.trim();
     recipient == "*" || recipient == dst_recipient
+}
+
+/// Match one `send_deny` entry against a destination, folding the recipient
+/// alias forms that are derivable from the identifier itself.
+///
+/// Denial is the one direction where widening a match is safe: treating two
+/// spellings as the same person can only refuse more, never reach further. The
+/// whitelist deliberately does *not* get this treatment — see
+/// [`SecurityPolicy::is_outbound_allowed_for_turn`].
+///
+/// The channel half of the entry is still matched exactly; only the recipient
+/// half is folded.
+fn outbound_deny_entry_matches(entry: &str, dst_channel: &str, dst_recipient: &str) -> bool {
+    if outbound_entry_matches(entry, dst_channel, dst_recipient) {
+        return true;
+    }
+    let Some((channel, recipient)) = entry.trim().split_once(':') else {
+        return false;
+    };
+    let channel = channel.trim();
+    if channel != "*" && channel != dst_channel {
+        return false;
+    }
+    let recipient = recipient.trim();
+    // `"*"` already matched above; folding it would be meaningless.
+    recipient != "*" && fold_recipient(recipient) == fold_recipient(dst_recipient)
+}
+
+/// Fold a recipient identifier into the form `send_deny` compares on.
+///
+/// Only spellings that are recoverable from the string are folded:
+///
+/// * a JID's `:device` suffix, in either position wacli emits it
+///   (`1234:2@s.whatsapp.net` and `1234@lid:2`), and the server's letter case;
+/// * one leading `+`, which the WhatsApp Cloud API strips before sending
+///   (`+15550001111` and `15550001111` reach the same account);
+/// * a UUID's letter case and hyphenation, which Signal accepts either way.
+///
+/// A colon in a recipient that is *not* a JID is left alone: Telegram addresses
+/// a forum topic as `{chat_id}:{thread_id}` and Mattermost a thread as
+/// `{channel_id}:{root_id}`, so folding there would deny the parent chat along
+/// with the thread the operator named.
+///
+/// What this cannot fold is the alias forms that are not derivable: a WhatsApp
+/// LID (`<id>@lid`) is a different number from the same contact's phone JID,
+/// and a Signal UUID is unrelated to that account's E.164 number. Both need a
+/// mapping table (whatsmeow's `whatsmeow_lid_map`, or the Signal server) that
+/// this layer does not and should not hold — a security predicate must not
+/// depend on an external program's database that may simply be absent, because
+/// "absent" would read as "not the same person" and fail open. `ScopeRule`'s
+/// `send_deny` documentation states the consequence: list every form, or deny
+/// the channel outright with `"{channel}:*"`.
+fn fold_recipient(recipient: &str) -> String {
+    let trimmed = recipient.trim();
+    match trimmed.split_once('@') {
+        Some((user, server)) => {
+            let server = strip_device_suffix(server).to_ascii_lowercase();
+            format!("{}@{server}", fold_recipient_user(strip_device_suffix(user)))
+        }
+        None => fold_recipient_user(trimmed),
+    }
+}
+
+/// Fold the user half of a recipient: one leading `+`, and UUID spelling.
+fn fold_recipient_user(user: &str) -> String {
+    let user = user.strip_prefix('+').unwrap_or(user);
+    uuid::Uuid::parse_str(user).map_or_else(|_| user.to_string(), |id| id.as_hyphenated().to_string())
+}
+
+/// Drop a `:device` suffix from one half of a JID.
+fn strip_device_suffix(part: &str) -> &str {
+    part.split_once(':').map_or(part, |(base, _)| base)
 }
 
 fn rule_matches(rule: &crate::config::ScopeRule, sender: &str, channel: &str, chat_type: &str) -> bool {
@@ -3665,9 +3740,111 @@ mod tests {
 
     #[test]
     fn outbound_entry_recipient_may_contain_colons() {
-        let p = make_scope_policy(vec![outbound_rule(None, &[], &["wacli:1234@s.whatsapp.net:1"])], true);
-        assert!(!p.is_outbound_allowed("alice", "wacli", "group", "wacli", "1234@s.whatsapp.net:1"));
-        assert!(p.is_outbound_allowed("alice", "wacli", "group", "wacli", "1234@s.whatsapp.net"));
+        // The entry is still split at its *first* colon, so the recipient half
+        // keeps every colon it was written with.
+        let p = make_scope_policy(vec![outbound_rule(None, &[], &["telegram:12345:678"])], true);
+        assert!(!p.is_outbound_allowed("alice", "telegram", "group", "telegram", "12345:678"));
+        // A colon in a non-JID recipient is part of the identifier — a Telegram
+        // forum topic is not its parent chat — so it is never folded away.
+        assert!(p.is_outbound_allowed("alice", "telegram", "group", "telegram", "12345"));
+    }
+
+    // ── R1: derivable recipient aliases ─────────────────────────────────
+
+    /// A JID's device suffix is transport detail, in either position wacli
+    /// emits it, and the server is a case-insensitive domain.
+    #[test]
+    fn outbound_send_deny_folds_jid_device_suffix_and_server_case() {
+        let p = make_scope_policy(vec![outbound_rule(None, &[], &["wacli:1234@s.whatsapp.net"])], true);
+        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "1234@s.whatsapp.net"));
+        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "1234:2@s.whatsapp.net"));
+        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "1234@s.whatsapp.net:2"));
+        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "1234@S.WhatsApp.Net"));
+        // A different account is untouched.
+        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "9999@s.whatsapp.net"));
+    }
+
+    /// The WhatsApp Cloud API strips a leading `+` before sending, so the two
+    /// spellings are one account and a deny entry must catch both.
+    #[test]
+    fn outbound_send_deny_folds_leading_plus() {
+        let p = make_scope_policy(vec![outbound_rule(None, &[], &["whatsapp:+15550001111"])], true);
+        assert!(!p.is_outbound_allowed("alice", "whatsapp", "direct", "whatsapp", "+15550001111"));
+        assert!(!p.is_outbound_allowed("alice", "whatsapp", "direct", "whatsapp", "15550001111"));
+        assert!(p.is_outbound_allowed("alice", "whatsapp", "direct", "whatsapp", "15550002222"));
+    }
+
+    /// Signal classifies a recipient as a UUID with `Uuid::parse_str`, which
+    /// accepts the hyphenless and upper-case spellings too.
+    #[test]
+    fn outbound_send_deny_folds_uuid_spelling() {
+        let p = make_scope_policy(
+            vec![outbound_rule(
+                None,
+                &[],
+                &["signal:2b1d0e7a-9c3f-4a5b-8d6e-7f0a1b2c3d4e"],
+            )],
+            true,
+        );
+        for spelling in [
+            "2b1d0e7a-9c3f-4a5b-8d6e-7f0a1b2c3d4e",
+            "2B1D0E7A-9C3F-4A5B-8D6E-7F0A1B2C3D4E",
+            "2b1d0e7a9c3f4a5b8d6e7f0a1b2c3d4e",
+        ] {
+            assert!(
+                !p.is_outbound_allowed("alice", "signal", "direct", "signal", spelling),
+                "{spelling} should be denied"
+            );
+        }
+        assert!(p.is_outbound_allowed("alice", "signal", "direct", "signal", "+15550001111"));
+    }
+
+    /// Folding widens denial only. A whitelist is matched exactly, because a
+    /// wrong guess about two spellings must never *grant* reach.
+    #[test]
+    fn outbound_send_allow_is_never_widened_by_alias_folding() {
+        let p = make_scope_policy(vec![outbound_rule(None, &["wacli:1234@s.whatsapp.net"], &[])], true);
+        assert!(p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "1234@s.whatsapp.net"));
+        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "1234:2@s.whatsapp.net"));
+    }
+
+    /// The channel half of a deny entry is never folded — only the recipient is.
+    #[test]
+    fn outbound_deny_folding_does_not_cross_channels() {
+        let p = make_scope_policy(vec![outbound_rule(None, &[], &["wacli:+1234"])], true);
+        assert!(!p.is_outbound_allowed("alice", "wacli", "direct", "wacli", "1234"));
+        assert!(p.is_outbound_allowed("alice", "telegram", "direct", "telegram", "1234"));
+    }
+
+    /// A LID and the same contact's phone JID are different numbers, so no
+    /// string fold can connect them. The documented answer is to list both, or
+    /// to deny the channel outright.
+    #[test]
+    fn outbound_send_deny_cannot_fold_a_lid_onto_a_phone_jid() {
+        let phone_only = make_scope_policy(vec![outbound_rule(None, &[], &["wacli:1234@s.whatsapp.net"])], true);
+        assert!(phone_only.is_outbound_allowed("alice", "wacli", "direct", "wacli", "5678@lid"));
+
+        let both = make_scope_policy(
+            vec![outbound_rule(
+                None,
+                &[],
+                &["wacli:1234@s.whatsapp.net", "wacli:5678@lid"],
+            )],
+            true,
+        );
+        assert!(!both.is_outbound_allowed("alice", "wacli", "direct", "wacli", "1234@s.whatsapp.net"));
+        assert!(!both.is_outbound_allowed("alice", "wacli", "direct", "wacli", "5678@lid"));
+
+        let whole_channel = make_scope_policy(vec![outbound_rule(None, &[], &["wacli:*"])], true);
+        assert!(!whole_channel.is_outbound_allowed("alice", "wacli", "direct", "wacli", "5678@lid"));
+    }
+
+    #[test]
+    fn fold_recipient_leaves_an_already_canonical_identifier_alone() {
+        assert_eq!(fold_recipient("1234@s.whatsapp.net"), "1234@s.whatsapp.net");
+        assert_eq!(fold_recipient("12345"), "12345");
+        assert_eq!(fold_recipient("12345:678"), "12345:678");
+        assert_eq!(fold_recipient(" +15550001111 "), "15550001111");
     }
 
     #[test]

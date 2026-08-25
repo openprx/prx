@@ -3279,9 +3279,11 @@ pub struct ScopeRule {
     /// Empty (the default) means this rule imposes no whitelist, so the
     /// same-channel / cross-channel default decides.
     ///
-    /// The first matching rule with a non-empty `send_allow` is the one that
-    /// applies; `validate` rejects a rule whose `send_allow` an earlier rule
-    /// would shadow, so this never fails silently.
+    /// The whitelist is matched on the recipient **exactly as written**: unlike
+    /// `send_deny`, no alias folding widens it, because widening a whitelist
+    /// would grant reach on a guess. The first matching rule with a non-empty
+    /// `send_allow` is the one that applies; `validate` rejects a rule whose
+    /// `send_allow` an earlier rule would shadow, so this never fails silently.
     #[serde(default)]
     pub send_allow: Vec<String>,
     /// Outbound recipient blacklist, in the same `{channel}:{recipient}` form.
@@ -3289,6 +3291,20 @@ pub struct ScopeRule {
     /// Evaluated before `send_allow`, mirroring how `tools_deny` outranks
     /// `tools_allow`, and evaluated across *every* matching rule so it can
     /// never be shadowed by an earlier one.
+    ///
+    /// The recipient is matched after folding the alias forms that are
+    /// derivable from the string itself: a JID's `:device` suffix and server
+    /// case (`1234@s.whatsapp.net`, `1234:2@s.whatsapp.net` and
+    /// `1234@S.WhatsApp.net` are one person), a leading `+` (`+15550001111`
+    /// and `15550001111`), and a UUID's letter case and hyphenation.
+    ///
+    /// **Aliases that are NOT derivable are not covered.** A WhatsApp LID
+    /// (`<id>@lid`) carries a different number from the same contact's phone
+    /// JID (`<number>@s.whatsapp.net`), and a Signal UUID is unrelated to that
+    /// account's E.164 number; correlating either pair needs a mapping table
+    /// this layer does not hold. Write one entry per identifier form the
+    /// contact can appear under, or deny the whole channel with
+    /// `"{channel}:*"`, which is the only form that is alias-proof.
     #[serde(default)]
     pub send_deny: Vec<String>,
 }
