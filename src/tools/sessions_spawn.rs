@@ -835,7 +835,49 @@ pub struct SessionsSpawnTool {
     /// auto-failing. When `None` (channels/gateway path, or chat without the
     /// factory) the historical auto-fail-on-gate semantics are preserved.
     approval_resolver_factory: Option<crate::agent::loop_::SpawnApprovalResolverFactory>,
+    /// Membership of each fan-out, as `spawn_batch` recorded it the moment it
+    /// launched.
+    ///
+    /// `join` used to rebuild this by scanning `active_runs` for rows carrying
+    /// the batch label. That reads the *survivors*, not the members: the chat
+    /// session reaper retires finished rows out of `active_runs`
+    /// (`crate::chat::sessions::runtime`), so a member that completed and was
+    /// retired before the join simply stopped existing — `total` shrank, its
+    /// output was never reported, and nothing in the summary said a member had
+    /// gone missing, because the only check on that identity is a
+    /// `debug_assert` that release builds do not run.
+    ///
+    /// The roster is the answer to "who was launched", which is a fact fixed at
+    /// launch and cannot be revised by a reaper. `active_runs` remains the
+    /// answer to "what happened to them"; a member the roster names and the
+    /// registry no longer holds is reported as a member with no result rather
+    /// than subtracted from the batch.
+    batch_rosters: Arc<RwLock<Vec<BatchRoster>>>,
 }
+
+/// One member of a fan-out, as it was launched.
+#[derive(Debug, Clone)]
+struct BatchMember {
+    run_id: String,
+    /// What the member was asked to do, kept here so a member whose registry
+    /// row is gone is still reported as something more useful than an id.
+    task: String,
+}
+
+/// The membership of one fan-out.
+#[derive(Debug, Clone)]
+struct BatchRoster {
+    batch_id: String,
+    members: Vec<BatchMember>,
+}
+
+/// How many fan-out rosters one tool instance remembers.
+///
+/// A roster is small and a batch is normally joined within the turn that
+/// launched it, so this is a leak guard rather than a policy. Eviction is
+/// oldest-first, and a join on an evicted batch falls back to the registry scan
+/// this field replaced — the pre-existing behaviour, not a new failure.
+const MAX_TRACKED_BATCH_ROSTERS: usize = 256;
 
 impl SessionsSpawnTool {
     fn resolved_process_config_source(&self) -> anyhow::Result<(PathBuf, String)> {
@@ -941,6 +983,7 @@ impl SessionsSpawnTool {
             event_recording: MemoryEventRecording::default(),
             event_sink: None,
             approval_resolver_factory: None,
+            batch_rosters: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -1695,7 +1738,7 @@ fn settled_verdict(status: &SubAgentStatus) -> Option<JoinedVerdict> {
 /// join. [`member_vouches_for_the_waiter`] is the rule that keeps the evidence
 /// honest; when no member satisfies it, this loop keeps polling but records
 /// nothing, and the caller's own detector is free to reach its verdict.
-async fn join_batch_members(active_runs: &Arc<RwLock<Vec<SubAgentRun>>>, members: &[String]) -> Vec<JoinedMember> {
+async fn join_batch_members(active_runs: &Arc<RwLock<Vec<SubAgentRun>>>, members: &[BatchMember]) -> Vec<JoinedMember> {
     // Read once per join rather than per poll: this is the same source a
     // task-mode member's own `run_guarded` resolves its window from, so the two
     // cannot disagree about when that member was due to be judged.
@@ -1728,10 +1771,14 @@ async fn join_batch_members(active_runs: &Arc<RwLock<Vec<SubAgentRun>>>, members
 /// A member whose row has vanished contributes nothing: it is not something the
 /// join is waiting on, it is something [`settled_batch`] already reports as
 /// having no result.
-fn batch_vouches_for_the_waiter(runs: &[SubAgentRun], members: &[String], window: Option<std::time::Duration>) -> bool {
-    members.iter().any(|run_id| {
+fn batch_vouches_for_the_waiter(
+    runs: &[SubAgentRun],
+    members: &[BatchMember],
+    window: Option<std::time::Duration>,
+) -> bool {
+    members.iter().any(|member| {
         runs.iter()
-            .find(|run| &run.id == run_id)
+            .find(|run| run.id == member.run_id)
             .is_some_and(|run| member_vouches_for_the_waiter(run, window))
     })
 }
@@ -1790,10 +1837,10 @@ fn member_vouches_for_the_waiter(run: &SubAgentRun, window: Option<std::time::Du
 /// away. Building only once the answer is final also means the verdicts come
 /// from a single consistent snapshot, so a member cannot be seen `Completed`
 /// on the deciding pass and be gone by the reporting one.
-fn settled_batch(runs: &[SubAgentRun], members: &[String]) -> Option<Vec<JoinedMember>> {
-    let all_settled = members.iter().all(|run_id| {
+fn settled_batch(runs: &[SubAgentRun], members: &[BatchMember]) -> Option<Vec<JoinedMember>> {
+    let all_settled = members.iter().all(|member| {
         runs.iter()
-            .find(|run| &run.id == run_id)
+            .find(|run| run.id == member.run_id)
             // A row that is gone is settled in the only sense that matters
             // here: nothing about it will ever change again.
             .is_none_or(|run| !matches!(run.status, SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. }))
@@ -1804,21 +1851,23 @@ fn settled_batch(runs: &[SubAgentRun], members: &[String]) -> Option<Vec<JoinedM
     Some(
         members
             .iter()
-            .map(|run_id| {
-                runs.iter().find(|run| &run.id == run_id).map_or_else(
-                    // The row was dropped from the registry (a session shutdown
-                    // retains it away) without ever publishing a conclusion.
-                    // Reporting the absence is the honest verdict; waiting for
-                    // a row that no longer exists would hang.
+            .map(|member| {
+                runs.iter().find(|run| run.id == member.run_id).map_or_else(
+                    // The roster names this member but the registry no longer
+                    // holds it — retired by the chat session reaper, or dropped
+                    // by a session shutdown. Reporting it as a member without a
+                    // result is the honest verdict, and it is the whole reason
+                    // the roster is the membership: derived from the registry,
+                    // this member would not have been in the batch at all.
                     || JoinedMember {
-                        run_id: run_id.clone(),
-                        task: String::new(),
+                        run_id: member.run_id.clone(),
+                        task: member.task.clone(),
                         verdict: JoinedVerdict::NoResult(
-                            "the run's registry row disappeared before it reported a result".to_string(),
+                            "the run's registry row was retired before the join could read its result".to_string(),
                         ),
                     },
                     |run| JoinedMember {
-                        run_id: run_id.clone(),
+                        run_id: member.run_id.clone(),
                         task: run.task.clone(),
                         // Non-terminal statuses were ruled out above; a status
                         // that slipped through is reported as the absence it is
@@ -2218,11 +2267,21 @@ impl SessionsSpawnTool {
         .await;
 
         let mut spawned = Vec::new();
+        let mut roster = Vec::new();
         for (member, outcome) in member_args.iter().zip(outcomes) {
             let task = member.get("task").cloned().unwrap_or(serde_json::Value::Null);
             match outcome {
                 Ok(outcome) => match outcome.run_id {
-                    Some(run_id) => spawned.push(json!({"run_id": run_id, "task": task})),
+                    Some(run_id) => {
+                        // The roster is written from the same value the caller
+                        // is shown, before anything can retire the row: this is
+                        // the batch's membership, fixed at launch.
+                        roster.push(BatchMember {
+                            run_id: run_id.clone(),
+                            task: task.as_str().map_or_else(|| task.to_string(), str::to_string),
+                        });
+                        spawned.push(json!({"run_id": run_id, "task": task}));
+                    }
                     None => rejected.push(json!({
                         "task": task,
                         "error": outcome.result.error.unwrap_or_else(|| "sub-agent was not started".to_string()),
@@ -2230,6 +2289,16 @@ impl SessionsSpawnTool {
                 },
                 Err(error) => rejected.push(json!({"task": task, "error": error.to_string()})),
             }
+        }
+        if !roster.is_empty() {
+            let mut rosters = self.batch_rosters.write().await;
+            while rosters.len() >= MAX_TRACKED_BATCH_ROSTERS {
+                rosters.remove(0);
+            }
+            rosters.push(BatchRoster {
+                batch_id: batch_id.clone(),
+                members: roster,
+            });
         }
 
         let started = spawned.len();
@@ -2256,13 +2325,7 @@ impl SessionsSpawnTool {
     /// once. Nothing is hidden: [`join_summary`] accounts for every member
     /// exactly once and `total` is the sum of the buckets.
     async fn execute_join(&self, batch_id: &str) -> anyhow::Result<ToolResult> {
-        let members: Vec<String> = {
-            let runs = self.active_runs.read().await;
-            runs.iter()
-                .filter(|run| run.batch_id.as_deref() == Some(batch_id))
-                .map(|run| run.id.clone())
-                .collect()
-        };
+        let members = self.batch_members(batch_id).await;
         if members.is_empty() {
             return Ok(ToolResult {
                 success: false,
@@ -2279,6 +2342,38 @@ impl SessionsSpawnTool {
             output: serde_json::to_string_pretty(&join_summary(batch_id, &settled))?,
             error: None,
         })
+    }
+
+    /// Who this batch launched.
+    ///
+    /// The roster is preferred over the registry because it is the only source
+    /// that cannot lose a member: `active_runs` is pruned by the chat session
+    /// reaper, so scanning it answers "which members are still on file", and a
+    /// join that took that for the membership silently shrank its own `total`.
+    ///
+    /// The scan remains as the fallback for the two cases the roster cannot
+    /// cover — a batch launched before this tool instance existed, and one
+    /// evicted by [`MAX_TRACKED_BATCH_ROSTERS`] — where it is exactly as good,
+    /// and exactly as lossy, as it was before.
+    async fn batch_members(&self, batch_id: &str) -> Vec<BatchMember> {
+        let recorded = {
+            let rosters = self.batch_rosters.read().await;
+            rosters
+                .iter()
+                .find(|roster| roster.batch_id == batch_id)
+                .map(|roster| roster.members.clone())
+        };
+        if let Some(members) = recorded {
+            return members;
+        }
+        let runs = self.active_runs.read().await;
+        runs.iter()
+            .filter(|run| run.batch_id.as_deref() == Some(batch_id))
+            .map(|run| BatchMember {
+                run_id: run.id.clone(),
+                task: run.task.clone(),
+            })
+            .collect()
     }
 
     /// Launch exactly one sub-agent run and return as soon as it is registered
@@ -9811,6 +9906,20 @@ mod tests {
         run
     }
 
+    /// A roster of the given run ids, as `spawn_batch` would have recorded it.
+    ///
+    /// The unit tests below drive `join_batch_members` directly, so they have to
+    /// supply the membership the tool would have handed it.
+    fn roster_of(run_ids: &[&str]) -> Vec<BatchMember> {
+        run_ids
+            .iter()
+            .map(|run_id| BatchMember {
+                run_id: (*run_id).to_string(),
+                task: format!("task for {run_id}"),
+            })
+            .collect()
+    }
+
     /// The other shape: a member that runs as a task inside this process, so
     /// its beat is a real progress signal the join can read.
     fn task_mode_batch_test_run(id: &str, batch_id: &str, status: SubAgentStatus) -> SubAgentRun {
@@ -9884,6 +9993,71 @@ mod tests {
         assert!(summary["failed"].as_array().is_some_and(Vec::is_empty));
         assert!(summary["killed"].as_array().is_some_and(Vec::is_empty));
         assert!(summary["no_result"].as_array().is_some_and(Vec::is_empty));
+    }
+
+    /// A member that finished and was then retired from `active_runs` — what
+    /// the chat session reaper does, on its own schedule, to any run that has
+    /// reached a terminal state — is still a member of the batch it was
+    /// launched in.
+    ///
+    /// Before the roster, `join` derived its membership by scanning
+    /// `active_runs` for the batch label, so a reaped member was not reported as
+    /// missing: it was never in the batch at all. `total` quietly became 1, the
+    /// caller was handed a complete-looking account of a two-member fan-out, and
+    /// the identity assertion in `join_summary` saw nothing wrong because the
+    /// buckets still summed to the (shrunken) total — and is a `debug_assert`
+    /// that a release build does not run in the first place.
+    ///
+    /// MUTATION GUARD: drop the roster lookup from
+    /// `SessionsSpawnTool::batch_members` so it falls back to the registry scan,
+    /// and `total` here is 2 -> 1 with the reaped member gone without trace.
+    #[tokio::test]
+    async fn a_member_reaped_out_of_the_registry_is_still_counted_in_its_batch() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+
+        let spawned = tool
+            .execute(with_spawn_grant(json!({
+                "action": "spawn_batch",
+                "tasks": ["the member that survives", "the member that gets reaped"],
+            })))
+            .await
+            .expect("spawn_batch tool call");
+        let payload = parse_json(&spawned.output);
+        let batch_id = payload["batch_id"].as_str().expect("a batch id").to_string();
+        let run_ids = batch_run_ids(&payload);
+        assert_eq!(run_ids.len(), 2, "{payload}");
+        for run_id in &run_ids {
+            let _ = await_terminal_reason(&tool.active_runs, run_id).await;
+        }
+
+        // Exactly what `crate::chat::sessions::runtime`'s reaper does to a
+        // finished run: `runs.retain(...)`, with no notice to anything holding
+        // the batch id.
+        let reaped = run_ids.last().expect("two members were launched").clone();
+        {
+            let mut runs = tool.active_runs.write().await;
+            runs.retain(|run| run.id != reaped);
+        }
+
+        let joined = tool
+            .execute(json!({"action": "join", "batch_id": batch_id}))
+            .await
+            .expect("join tool call");
+        let summary = parse_json(&joined.output);
+        assert_eq!(summary["total"], 2, "the batch launched two members: {summary}");
+        assert_eq!(summary["completed"].as_array().map(Vec::len), Some(1), "{summary}");
+        assert_eq!(
+            summary["no_result"].as_array().map(Vec::len),
+            Some(1),
+            "the reaped member must be reported as a member without a result: {summary}"
+        );
+        let missing = &summary["no_result"][0];
+        assert_eq!(missing["run_id"], reaped, "{summary}");
+        assert_eq!(
+            missing["task"], "the member that gets reaped",
+            "the roster keeps what the member was asked to do, so the caller can retry it: {summary}"
+        );
     }
 
     /// Core evidence 2: a member killed from outside — `registry::kill`, the
@@ -10088,7 +10262,7 @@ mod tests {
             idle: Some(std::time::Duration::from_millis(300)),
             max_total: None,
         };
-        let members = vec!["silent-worker".to_string()];
+        let members = roster_of(&["silent-worker"]);
         let joined = crate::agent::idle::run_guarded(guard, "turn joining a silent batch", None, async {
             Ok(join_batch_members(&active_runs, &members).await)
         })
@@ -10155,7 +10329,7 @@ mod tests {
             idle: Some(std::time::Duration::from_millis(500)),
             max_total: None,
         };
-        let members = vec!["silent-child".to_string()];
+        let members = roster_of(&["silent-child"]);
         let joined = crate::agent::idle::run_guarded(guard, "turn joining a real silent child", None, async {
             Ok(join_batch_members(&active_runs, &members).await)
         })
@@ -10204,7 +10378,7 @@ mod tests {
             idle: Some(std::time::Duration::from_millis(300)),
             max_total: Some(std::time::Duration::from_secs(20)),
         };
-        let members = vec!["wedged-task-member".to_string()];
+        let members = roster_of(&["wedged-task-member"]);
         // `with_guard` installs the same thresholds the member's own
         // `run_guarded` would resolve, which is what the join reads to decide
         // when that member was due to be judged.
@@ -10249,7 +10423,7 @@ mod tests {
             idle: Some(std::time::Duration::from_millis(300)),
             max_total: None,
         };
-        let members = vec!["needs-approval".to_string()];
+        let members = roster_of(&["needs-approval"]);
         let joined = crate::agent::idle::with_guard(guard, async {
             crate::agent::idle::run_guarded(guard, "turn joining a member awaiting input", None, async {
                 Ok(join_batch_members(&active_runs, &members).await)
@@ -10288,7 +10462,7 @@ mod tests {
             }
         });
 
-        let members = vec!["member".to_string()];
+        let members = roster_of(&["member"]);
         let settled = crate::agent::idle::scope_beat(
             Some(Arc::clone(&caller_beat)),
             join_batch_members(&active_runs, &members),
@@ -10394,7 +10568,7 @@ mod tests {
             }
         });
 
-        let members = vec!["long-hauler".to_string()];
+        let members = roster_of(&["long-hauler"]);
         let settled = join_batch_members(&active_runs, &members).await;
 
         assert!(
@@ -10415,7 +10589,7 @@ mod tests {
             "batch-gap",
             SubAgentStatus::Completed("fine".to_string()),
         )]));
-        let members = vec!["present".to_string(), "vanished".to_string()];
+        let members = roster_of(&["present", "vanished"]);
         let settled = join_batch_members(&active_runs, &members).await;
         let summary = join_summary("batch-gap", &settled);
         assert_eq!(summary["total"], 2, "{summary}");
