@@ -1304,6 +1304,27 @@ mod tests {
         );
     }
 
+    /// B-P5: a cron job is addressable in the work registry by its `run_id`,
+    /// which is the job id. This pins the property that makes shadowing a bare
+    /// numeric [`crate::runtime::registry::WorkId`] impossible — the id is a
+    /// server-minted UUID, never an operator-chosen string.
+    #[tokio::test]
+    async fn a_cron_job_id_can_never_shadow_a_numeric_work_address() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = announcing_job(&config, telegram_creator(), "telegram", "12345");
+
+        assert!(
+            uuid::Uuid::parse_str(&job.id).is_ok(),
+            "test: cron job ids must stay server-minted UUIDs: {}",
+            job.id
+        );
+        assert!(
+            crate::runtime::registry::WorkId::parse(&job.id).is_none(),
+            "test: a job id that parses as a WorkId would shadow that bare numeric address"
+        );
+    }
+
     fn test_job(command: &str) -> CronJob {
         CronJob {
             id: "test-job".into(),
