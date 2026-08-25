@@ -230,7 +230,7 @@ fn generate_token() -> String {
 }
 
 /// SHA-256 hash a bearer token for storage. Returns lowercase hex.
-fn hash_token(token: &str) -> String {
+pub(crate) fn hash_token(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 

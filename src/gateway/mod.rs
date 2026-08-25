@@ -56,7 +56,7 @@ use axum::{
     routing::{get, post},
 };
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1814,10 +1814,76 @@ async fn handle_pair(
     }
 }
 
+/// Add what pairing learned to the configured list, **without rewriting the
+/// entries an operator authored**.
+///
+/// Persistence used to assign `pairing.tokens()` over the whole list, which
+/// treated the in-memory set as authoritative over the file. It is not:
+/// `gateway.paired_tokens` is a restart-only field, so between startup and the
+/// next restart the file can legitimately hold entries the running guard never
+/// loaded, and it can hold them in a *spelling* the guard cannot reproduce.
+/// Both were destroyed silently.
+///
+/// The spelling matters because [`PairingGuard`] stores only hashes: a
+/// plaintext entry is hashed on load, so `tokens()` returns a hash for it and
+/// the assignment wrote that hash back in its place. The token stays valid as a
+/// bearer either way — but chat's `/sessions --daemon` takes its credential out
+/// of this list and deliberately skips hashes (a stored hash, re-hashed by the
+/// gateway on receipt, authenticates as nothing), so the entry it was reading
+/// would have become useless to it with no edit by anyone and nothing in the
+/// file to show what changed.
+///
+/// That particular sequence turns out not to be reachable through `/pair`:
+/// a pairing code is minted only when the token set is *empty*, so a config
+/// that already carries a plaintext entry can never complete a pairing. What is
+/// reachable is the same destruction one step earlier — an operator adds an
+/// entry by hand while the gateway is up and a still-live code is later
+/// redeemed, and the entry is dropped from disk outright rather than merely
+/// rehashed.
+///
+/// So nothing is rewritten or removed here. Every non-empty configured entry is
+/// kept, in order and as written, and a live hash is appended only when no
+/// configured entry already names that token. Revocation is not a thing this
+/// gateway has, so there is nothing this would wrongly resurrect.
+///
+/// This never puts a *generated* token into the file in plaintext: `/pair`
+/// hands that to the client once and persists only its hash, unchanged. The
+/// only plaintext preserved is plaintext the operator wrote themselves.
+///
+/// MUTATION GUARD: assign `pairing.tokens()` wholesale again and
+/// `a_configured_token_survives_a_later_pairing` fails.
+fn merge_paired_tokens(configured: &[String], live: &[String]) -> Vec<String> {
+    let mut merged: Vec<String> = Vec::with_capacity(configured.len().saturating_add(live.len()));
+    let mut covered: HashSet<String> = HashSet::new();
+    for entry in configured {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Compared by hash, kept by spelling: a plaintext entry and the hash
+        // pairing holds for it are the same credential, and the operator's
+        // spelling is the one that stays.
+        let hash = if crate::security::pairing::is_token_hash(trimmed) {
+            trimmed.to_string()
+        } else {
+            crate::security::pairing::hash_token(trimmed)
+        };
+        if covered.insert(hash) {
+            merged.push(trimmed.to_string());
+        }
+    }
+    for token in live {
+        if covered.insert(token.clone()) {
+            merged.push(token.clone());
+        }
+    }
+    merged
+}
+
 async fn persist_pairing_tokens(config: &crate::config::SharedConfig, pairing: &PairingGuard) -> Result<()> {
     let paired_tokens = pairing.tokens();
     let mut updated_cfg = (*config.desired().config).clone();
-    updated_cfg.gateway.paired_tokens = paired_tokens;
+    updated_cfg.gateway.paired_tokens = merge_paired_tokens(&updated_cfg.gateway.paired_tokens, &paired_tokens);
     updated_cfg
         .save()
         .await
@@ -3593,6 +3659,89 @@ mod tests {
         let desired = shared.desired();
         assert_eq!(desired.config.gateway.paired_tokens.len(), 1);
         assert_eq!(&desired.config.gateway.paired_tokens[0], persisted);
+    }
+
+    /// Pairing adds a token; it does not get to edit the operator's file.
+    ///
+    /// `gateway.paired_tokens` is a restart-only field, so the running guard's
+    /// set is not authoritative over what is on disk: an entry added by hand
+    /// while the gateway is up is invisible to the guard, and persisting the
+    /// guard's set wholesale deleted it. The same assignment also rewrote a
+    /// plaintext entry into its hash — the same credential, but not the same
+    /// text, and chat's `/sessions --daemon` fallback only accepts the
+    /// plaintext form, so an entry that was doing a job silently stopped doing
+    /// it with nothing in the file to show why.
+    ///
+    /// Both entries here are ones pairing has never seen. Neither may move.
+    #[tokio::test]
+    async fn a_configured_token_survives_a_later_pairing() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+
+        let mut config = Config::default();
+        config.config_path = config_path.clone();
+        config.workspace_dir = temp.path().join("workspace");
+        config.gateway.paired_tokens = vec!["zc_written_by_the_operator".to_string(), "a".repeat(64)];
+
+        // Empty at startup, so a code exists and a pairing can complete — the
+        // entries above landed in the file afterwards.
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap();
+        let minted = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
+
+        let shared = crate::config::new_shared(config);
+        persist_pairing_tokens(&shared, &guard).await.unwrap();
+
+        let saved = tokio::fs::read_to_string(&config_path).await.unwrap();
+        let parsed: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(
+            parsed.gateway.paired_tokens.first().map(String::as_str),
+            Some("zc_written_by_the_operator"),
+            "the operator's plaintext entry must still be there, still plaintext: {:?}",
+            parsed.gateway.paired_tokens
+        );
+        assert_eq!(
+            parsed.gateway.paired_tokens.get(1).map(String::as_str),
+            Some("a".repeat(64).as_str()),
+            "an entry pairing never loaded must not be deleted by pairing: {:?}",
+            parsed.gateway.paired_tokens
+        );
+        // And the newly minted token was still persisted — as a hash, never as
+        // the plaintext handed to the client.
+        assert_eq!(parsed.gateway.paired_tokens.len(), 3);
+        let appended = &parsed.gateway.paired_tokens[2];
+        assert!(
+            crate::security::pairing::is_token_hash(appended),
+            "the minted token must be persisted hashed, got {appended}"
+        );
+        assert_ne!(appended.as_str(), minted.as_str());
+        assert!(
+            !saved.contains(minted.as_str()),
+            "a generated token must never reach the file in plaintext"
+        );
+    }
+
+    /// A configured plaintext entry and the hash pairing holds for it are one
+    /// credential, and the file keeps the operator's spelling of it.
+    ///
+    /// Without the dedupe the file would grow a second entry for the same token
+    /// on every pairing; with the dedupe pointed the other way the plaintext
+    /// would lose to the hash, which is the rewrite this exists to prevent.
+    #[test]
+    fn a_plaintext_entry_absorbs_the_hash_pairing_holds_for_it() {
+        let plaintext = "zc_written_by_the_operator";
+        let hash = crate::security::pairing::hash_token(plaintext);
+
+        let merged = merge_paired_tokens(
+            &[format!("  {plaintext}  "), String::new()],
+            std::slice::from_ref(&hash),
+        );
+
+        assert_eq!(
+            merged,
+            vec![plaintext.to_string()],
+            "one credential, spelled the way the operator spelled it, and blanks dropped"
+        );
     }
 
     #[test]
