@@ -822,6 +822,17 @@ impl Tool for CronTool {
                         });
                     }
                 };
+                // Re-anchor the delivery principal whenever the patch rewrites
+                // `delivery`. The stored identity is what the scheduler
+                // authorizes the announcement as, so leaving the original
+                // creator's identity on a destination somebody else chose would
+                // let one caller aim another caller's outbound reach. Taken
+                // from the runtime-injected trusted scope only; a caller
+                // without one clears the identity rather than inheriting it,
+                // which can only narrow what the job may reach.
+                if patch.delivery.is_some() {
+                    patch.delivery_principal = Some(cron::delivery_principal_from_trusted_scope(&args));
+                }
                 let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
                 if let Some(command) = &patch.command {
                     patch.approval_grant_json = ApprovalGrant::persisted_runner_grant(
@@ -1370,6 +1381,142 @@ mod tests {
             .next()
             .expect("test: one job");
         assert_eq!(job.prompt.as_deref(), Some("from-payload"));
+    }
+
+    /// The creating turn's trusted scope becomes the job's delivery principal.
+    ///
+    /// MUTATION GUARD: this is the only place a cron announcement's
+    /// authorization subject can be captured — the turn is over by the time the
+    /// job fires. Dropping the capture leaves every scheduled job anonymous,
+    /// which the scheduler then treats as the least privileged caller.
+    #[tokio::test]
+    async fn add_captures_the_creating_turns_trusted_scope_as_the_delivery_principal() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let cfg_snap = cfg.load_full();
+        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
+
+        let add = tool
+            .execute(json!({
+                "action": "add",
+                "schedule": { "kind": "cron", "expr": "0 9 * * *" },
+                "job_type": "agent",
+                "prompt": "brief me",
+                "delivery": { "mode": "announce", "channel": "signal", "to": "+15551234567" },
+                "_zc_scope_trusted": true,
+                "_zc_scope": { "sender": "alice", "channel": "telegram", "chat_type": "direct" }
+            }))
+            .await
+            .unwrap();
+        assert!(add.success, "{:?}", add.error);
+
+        let job = cron::list_jobs(&cfg_snap)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("test: one job");
+        assert_eq!(job.delivery_principal.sender(), "alice");
+        assert_eq!(job.delivery_principal.channel(), "telegram");
+        assert_eq!(job.delivery_principal.chat_type(), "direct");
+    }
+
+    /// A scope the runtime did not vouch for proves nothing, so a model that
+    /// writes its own `_zc_scope` gets an anonymous principal — not the
+    /// identity it claimed.
+    #[tokio::test]
+    async fn an_untrusted_scope_cannot_claim_a_delivery_principal() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let cfg_snap = cfg.load_full();
+        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
+
+        let add = tool
+            .execute(json!({
+                "action": "add",
+                "schedule": { "kind": "cron", "expr": "0 9 * * *" },
+                "job_type": "agent",
+                "prompt": "brief me",
+                "delivery": { "mode": "announce", "channel": "signal", "to": "+15551234567" },
+                "_zc_scope": { "sender": "root", "channel": "signal", "chat_type": "direct" }
+            }))
+            .await
+            .unwrap();
+        assert!(add.success, "{:?}", add.error);
+
+        let job = cron::list_jobs(&cfg_snap)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("test: one job");
+        assert!(
+            job.delivery_principal.is_anonymous(),
+            "test: an unvouched scope must not become an authorization subject"
+        );
+    }
+
+    /// Rewriting `delivery` re-anchors the principal onto the caller doing the
+    /// rewrite; a patch that leaves `delivery` alone leaves the identity alone.
+    #[tokio::test]
+    async fn patching_delivery_re_anchors_the_principal_onto_the_updating_caller() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let cfg_snap = cfg.load_full();
+        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
+
+        let add = tool
+            .execute(json!({
+                "action": "add",
+                "schedule": { "kind": "cron", "expr": "0 9 * * *" },
+                "job_type": "agent",
+                "prompt": "brief me",
+                "_zc_scope_trusted": true,
+                "_zc_scope": { "sender": "alice", "channel": "telegram", "chat_type": "direct" }
+            }))
+            .await
+            .unwrap();
+        assert!(add.success, "{:?}", add.error);
+        let job_id = cron::list_jobs(&cfg_snap)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("test: one job")
+            .id;
+
+        let unrelated = tool
+            .execute(json!({
+                "action": "update",
+                "job_id": job_id,
+                "patch": { "enabled": false },
+                "_zc_scope_trusted": true,
+                "_zc_scope": { "sender": "bob", "channel": "signal", "chat_type": "direct" }
+            }))
+            .await
+            .unwrap();
+        assert!(unrelated.success, "{:?}", unrelated.error);
+        assert_eq!(
+            cron::get_job(&cfg_snap, &job_id).unwrap().delivery_principal.sender(),
+            "alice",
+            "test: a patch that does not touch delivery must not move the identity"
+        );
+
+        let rewritten = tool
+            .execute(json!({
+                "action": "update",
+                "job_id": job_id,
+                "patch": { "delivery": { "mode": "announce", "channel": "signal", "to": "+15550009999" } },
+                "_zc_scope_trusted": true,
+                "_zc_scope": { "sender": "bob", "channel": "signal", "chat_type": "direct" }
+            }))
+            .await
+            .unwrap();
+        assert!(rewritten.success, "{:?}", rewritten.error);
+        let job = cron::get_job(&cfg_snap, &job_id).unwrap();
+        assert_eq!(
+            job.delivery_principal.sender(),
+            "bob",
+            "test: whoever writes the destination is who the delivery is authorized as"
+        );
+        assert_eq!(job.delivery_principal.channel(), "signal");
     }
 
     /// `prompt` is used when no `payload` is given (job_type=agent), and `name`,

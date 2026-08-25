@@ -22,11 +22,11 @@ pub use store::{
     add_shell_job_with_lineage_and_approval_grant, add_shell_job_with_lineage_approval_and_delete,
     claim_job_if_current, claim_job_if_current_for_manual_run, claim_terminal_job_for_manual_rerun, due_jobs,
     finish_claimed_run, get_job, job_claim_is_current, list_job_events, list_jobs, list_runs, record_claim_lost,
-    record_terminal_manual_run, remove_job, renew_job_claim, update_job,
+    record_delivery_withheld, record_terminal_manual_run, remove_job, renew_job_claim, update_job,
 };
 pub use types::{
     CronClaim, CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronJobTerminalState, CronRun, DeliveryConfig,
-    JobType, Schedule, SessionTarget,
+    DeliveryPrincipal, JobType, Schedule, SessionTarget,
 };
 
 #[allow(clippy::needless_pass_by_value)]
@@ -249,15 +249,42 @@ pub fn resume_job(config: &Config, id: &str) -> Result<CronJob> {
     )
 }
 
-pub fn lineage_from_trusted_scope(config: &Config, args: &serde_json::Value) -> CronJobLineage {
+/// The delivery principal a set of tool arguments proves, if any.
+///
+/// Returns an anonymous principal — every axis `None` — unless the runtime
+/// marked the scope trusted. An untrusted or absent scope means the caller is
+/// not identified, and an unidentified caller is authorized as `unknown`
+/// (see [`DeliveryPrincipal`]); it is never treated as permission to skip the
+/// outbound gate.
+#[must_use]
+pub fn delivery_principal_from_trusted_scope(args: &serde_json::Value) -> DeliveryPrincipal {
+    trusted_scope(args).map_or_else(DeliveryPrincipal::default, |scope| {
+        let field = |key: &str| {
+            scope
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        DeliveryPrincipal::new(field("sender"), field("channel"), field("chat_type"))
+    })
+}
+
+/// The trusted scope object, or `None` when the runtime did not vouch for it.
+fn trusted_scope(args: &serde_json::Value) -> Option<&serde_json::Map<String, serde_json::Value>> {
     let trusted = args
         .get("_zc_scope_trusted")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     if !trusted {
-        return CronJobLineage::default();
+        return None;
     }
-    let Some(scope) = args.get("_zc_scope").and_then(serde_json::Value::as_object) else {
+    args.get("_zc_scope").and_then(serde_json::Value::as_object)
+}
+
+pub fn lineage_from_trusted_scope(config: &Config, args: &serde_json::Value) -> CronJobLineage {
+    let Some(scope) = trusted_scope(args) else {
         return CronJobLineage::default();
     };
     let channel = scope
@@ -298,6 +325,16 @@ pub fn lineage_from_trusted_scope(config: &Config, args: &serde_json::Value) -> 
 
     CronJobLineage {
         owner_id,
+        delivery_principal: DeliveryPrincipal::new(
+            sender.map(str::to_string),
+            channel.map(str::to_string),
+            scope
+                .get("chat_type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        ),
         topic_id: scope
             .get("topic_id")
             .and_then(serde_json::Value::as_str)

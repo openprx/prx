@@ -17,7 +17,7 @@ use crate::config::Config;
 use crate::cron::store::{decode_delivery, decode_schedule, format_claim_time, truncate_cron_output};
 use crate::cron::types::{
     CronClaim, CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronJobTerminalState, CronRun, DeliveryConfig,
-    JobType, Schedule, SessionTarget,
+    DeliveryPrincipal, JobType, Schedule, SessionTarget,
 };
 use crate::cron::{next_run_for_schedule, schedule_cron_expression, validate_schedule};
 use crate::memory::postgres::PostgresConnectionPool;
@@ -38,6 +38,15 @@ const TERMINAL_STATE_MIGRATION_SQL: &str = "ALTER TABLE cron_jobs ADD COLUMN IF 
          enabled = FALSE
      WHERE terminal_state IS NULL AND last_run IS NOT NULL AND last_status IN ('ok', 'error')
        AND schedule LIKE '%\"kind\":\"at\"%';";
+/// Outbound-authorization identity (T17), mirroring the SQLite `ALTER TABLE`s.
+///
+/// Nullable with no backfill on purpose: a row created before these columns
+/// existed has no recorded creator, and inventing one would be inventing an
+/// authorization subject. Such a job is authorized as `unknown` — see
+/// [`DeliveryPrincipal`].
+const DELIVERY_PRINCIPAL_MIGRATION_SQL: &str = "ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS creator_sender TEXT;
+     ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS creator_channel TEXT;
+     ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS creator_chat_type TEXT;";
 const CLAIM_LEASE_MIGRATION_SQL: &str = "ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS claim_owner TEXT;
      ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS attempt_id TEXT;
      ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS claimed_at TEXT;
@@ -191,9 +200,10 @@ impl PostgresCronStore {
                 "INSERT INTO cron_jobs (
                     id, owner_id, topic_id, parent_task_id, source_message_event_id,
                     expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json
+                    enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json,
+                    creator_sender, creator_channel, creator_chat_type
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'shell', NULL, $9, 'isolated', NULL,
-                           TRUE, $10, $11, $12, $13, $14)",
+                           TRUE, $10, $11, $12, $13, $14, $15, $16, $17)",
                 &[
                     &id,
                     &lineage.owner_id,
@@ -209,6 +219,9 @@ impl PostgresCronStore {
                     &now.to_rfc3339(),
                     &next_run.to_rfc3339(),
                     &approval_grant_json,
+                    &lineage.delivery_principal.sender,
+                    &lineage.delivery_principal.channel,
+                    &lineage.delivery_principal.chat_type,
                 ],
             )
             .context("Failed to insert cron shell job")?;
@@ -266,9 +279,10 @@ impl PostgresCronStore {
                 "INSERT INTO cron_jobs (
                     id, owner_id, topic_id, parent_task_id, source_message_event_id,
                     expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json
+                    enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json,
+                    creator_sender, creator_channel, creator_chat_type
                  ) VALUES ($1, $2, $3, $4, $5, $6, '', $7, 'agent', $8, $9, $10, $11,
-                           TRUE, $12, $13, $14, $15, NULL)",
+                           TRUE, $12, $13, $14, $15, NULL, $16, $17, $18)",
                 &[
                     &id,
                     &lineage.owner_id,
@@ -285,6 +299,9 @@ impl PostgresCronStore {
                     &delete_after_run,
                     &now.to_rfc3339(),
                     &next_run.to_rfc3339(),
+                    &lineage.delivery_principal.sender,
+                    &lineage.delivery_principal.channel,
+                    &lineage.delivery_principal.chat_type,
                 ],
             )
             .context("Failed to insert cron agent job")?;
@@ -670,6 +687,41 @@ impl PostgresCronStore {
         })
     }
 
+    /// Postgres mirror of [`crate::cron::store::record_delivery_withheld`].
+    pub fn record_delivery_withheld(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+        dst_channel: &str,
+        destination_ref: &str,
+        principal_channel: &str,
+    ) -> Result<()> {
+        self.with_client(|client| {
+            let mut tx = client
+                .transaction()
+                .context("failed to open cron delivery-withheld transaction")?;
+            if let Some(lineage) = load_job_lineage(&mut tx, job_id)? {
+                let payload = serde_json::json!({
+                    "dst_channel": dst_channel,
+                    "destination_ref": destination_ref,
+                    "src_channel": principal_channel,
+                    "reason": "outbound scope rules",
+                })
+                .to_string();
+                self.insert_job_event(
+                    &mut tx,
+                    workspace_id,
+                    job_id,
+                    &lineage,
+                    "cron.job.delivery_withheld",
+                    Some("delivery_withheld"),
+                    Some(&payload),
+                )?;
+            }
+            tx.commit().context("failed to commit cron delivery-withheld event")
+        })
+    }
+
     pub fn due_jobs(&self, now: DateTime<Utc>, max_tasks: usize) -> Result<Vec<CronJob>> {
         let lim = i64::try_from(max_tasks.max(1)).context("Scheduler max_tasks overflows i64")?;
         self.with_client(|client| {
@@ -746,6 +798,11 @@ impl PostgresCronStore {
         if let Some(delivery) = patch.delivery {
             job.delivery = delivery;
         }
+        // Mirrors the SQLite path: whoever rewrites `delivery` becomes the
+        // principal that delivery is authorized as.
+        if let Some(delivery_principal) = patch.delivery_principal {
+            job.delivery_principal = delivery_principal;
+        }
         if let Some(model) = patch.model {
             job.model = Some(model);
         }
@@ -780,7 +837,8 @@ impl PostgresCronStore {
                          session_target = $7, model = $8, enabled = $9, delivery = $10, delete_after_run = $11,
                          next_run = $12, last_run = $13, last_status = $14, last_output = $15,
                          terminal_state = $16, approval_grant_json = $17, claim_owner = $18,
-                         attempt_id = $19, claimed_at = $20, claim_expires_at = $21
+                         attempt_id = $19, claimed_at = $20, claim_expires_at = $21,
+                         creator_sender = $31, creator_channel = $32, creator_chat_type = $33
                      WHERE id = $22 AND next_run = $23
                        AND (schedule = $24 OR (schedule IS NULL AND expression = $25))
                        AND last_status IS NOT DISTINCT FROM $26
@@ -817,6 +875,9 @@ impl PostgresCronStore {
                         &expected_claim.as_ref().map(|claim| claim.attempt_id.as_str()),
                         &expected_claim.as_ref().map(|claim| format_claim_time(claim.claimed_at)),
                         &expected_claim.as_ref().map(|claim| format_claim_time(claim.expires_at)),
+                        &job.delivery_principal.sender,
+                        &job.delivery_principal.channel,
+                        &job.delivery_principal.chat_type,
                     ],
                 )
                 .context("Failed to update cron job")?;
@@ -1341,7 +1402,8 @@ impl PostgresCronStore {
 const SELECT_JOB_COLUMNS: &str = "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
             expression, command, schedule, job_type, prompt, name, session_target, model,
             enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-            terminal_state, approval_grant_json, claim_owner, attempt_id, claimed_at, claim_expires_at
+            terminal_state, approval_grant_json, claim_owner, attempt_id, claimed_at, claim_expires_at,
+            creator_sender, creator_channel, creator_chat_type
      FROM cron_jobs";
 
 /// Lineage + last-known status of a job, used to enrich emitted events.
@@ -1412,6 +1474,7 @@ fn map_cron_job_row(row: &Row) -> Result<CronJob> {
             .transpose()?,
         approval_grant_json: row.try_get(22)?,
         claim: decode_postgres_claim(row, 23)?,
+        delivery_principal: DeliveryPrincipal::new(row.try_get(27)?, row.try_get(28)?, row.try_get(29)?),
     })
 }
 
@@ -1596,7 +1659,10 @@ fn init_schema(client: &mut Client) -> Result<()> {
                 claim_owner      TEXT,
                 attempt_id       TEXT,
                 claimed_at       TEXT,
-                claim_expires_at TEXT
+                claim_expires_at TEXT,
+                creator_sender   TEXT,
+                creator_channel  TEXT,
+                creator_chat_type TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_run ON cron_jobs(next_run);
             CREATE INDEX IF NOT EXISTS idx_cron_jobs_owner ON cron_jobs(owner_id, enabled, next_run);
@@ -1643,6 +1709,9 @@ fn init_schema(client: &mut Client) -> Result<()> {
     client
         .batch_execute(CLAIM_LEASE_MIGRATION_SQL)
         .context("Failed to migrate cron postgres claim lease")?;
+    client
+        .batch_execute(DELIVERY_PRINCIPAL_MIGRATION_SQL)
+        .context("Failed to migrate cron postgres delivery principal")?;
     Ok(())
 }
 
@@ -2090,6 +2159,7 @@ mod tests {
             topic_id: Some("topic-pg".to_string()),
             parent_task_id: Some("parent-pg".to_string()),
             source_message_event_id: Some("msg-pg".to_string()),
+            ..CronJobLineage::default()
         };
 
         // Insert a shell job and verify round-trip + created event.

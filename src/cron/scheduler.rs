@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::cron::{
     CronClaim, CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, claim_job_if_current, due_jobs,
     finish_claimed_run, finish_claimed_run_preserving_schedule, job_claim_is_current, next_run_for_schedule,
-    record_claim_lost, record_terminal_manual_run, renew_job_claim,
+    record_claim_lost, record_delivery_withheld, record_terminal_manual_run, renew_job_claim,
 };
 use crate::runtime::shell_process::{ShellProcessAdapter, ShellProcessError, ShellProcessRequest};
 use crate::security::SecurityPolicy;
@@ -430,12 +430,18 @@ async fn run_claimed_job(
             if !committed {
                 return (false, output);
             }
-            if let Err(e) = deliver_if_configured(config, job, &output).await {
-                if job.delivery.best_effort {
-                    tracing::warn!("Cron delivery failed (best_effort): {e}");
-                } else {
-                    success = false;
-                    tracing::warn!("Cron delivery failed: {e}");
+            match deliver_if_configured(config, security, job, &output).await {
+                // A withheld delivery is reported on the job's event stream by
+                // `record_withheld_delivery`, not treated as a run failure: the
+                // job did its work, the operator's rules stopped the message.
+                Ok(DeliveryOutcome::Sent | DeliveryOutcome::Withheld) => {}
+                Err(e) => {
+                    if job.delivery.best_effort {
+                        tracing::warn!("Cron delivery failed (best_effort): {e}");
+                    } else {
+                        success = false;
+                        tracing::warn!("Cron delivery failed: {e}");
+                    }
                 }
             }
             (success, output)
@@ -769,7 +775,84 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
     }
 }
 
-async fn deliver_if_configured(config: &Config, job: &CronJob, raw_output: &str) -> Result<()> {
+/// What became of one job's `announce` delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryOutcome {
+    /// Nothing to deliver (`mode != "announce"`), or the message was handed to
+    /// the channel.
+    Sent,
+    /// The outbound scope rules refused the destination. The job itself ran
+    /// fine; only the announcement was stopped.
+    Withheld,
+}
+
+/// Outbound authorization for a cron `announce`.
+///
+/// MUTATION GUARD: every `Channel::send` in this module sits behind this
+/// decision. `delivery.channel` and `delivery.to` are both written by the model
+/// when it schedules the job, so without this the scheduler is an unauthorized
+/// send-anywhere primitive that fires on a timer.
+///
+/// The four inputs are:
+///
+/// * `sender` / `chat_type` — the creating turn's trusted scope, persisted with
+///   the job because the turn is long over by the time this runs.
+/// * `src_channel` — the channel that turn was anchored to. **Not** the
+///   destination: unlike a sub-agent announcement, which has no channel
+///   argument and can only ever reply where the run was started,
+///   `delivery.channel` is a model-chosen destination. Naming a channel other
+///   than one's own is exactly the cross-channel send `message_send` gates
+///   through its own `channel` argument, and anchoring `src` on the destination
+///   would make `src == dst` hold by construction and quietly retire the
+///   cross-channel default for every cron job.
+/// * `dst_channel` / `dst_recipient` — the model-chosen destination.
+///
+/// There is no channel-registry fallback anywhere on this path — the
+/// destination is resolved straight out of `[channels]` by the name the job
+/// stores — so `src != dst` here always means a real cross-channel delivery,
+/// never a routing artefact.
+///
+/// A job with no recorded creator resolves to `unknown` on all three identity
+/// axes (see [`crate::cron::DeliveryPrincipal`]). That is the least privileged
+/// caller there is, never a bypass.
+fn delivery_is_authorized(security: &SecurityPolicy, job: &CronJob, dst_channel: &str, dst_recipient: &str) -> bool {
+    let principal = &job.delivery_principal;
+    security.is_outbound_allowed(
+        principal.sender(),
+        principal.channel(),
+        principal.chat_type(),
+        dst_channel,
+        dst_recipient,
+    )
+}
+
+/// Report a refused delivery on the job's event stream and in the log.
+///
+/// Silence is not an option here: a withheld announcement looks exactly like a
+/// channel that never fired. Only the destination's audit fingerprint is
+/// recorded, never the plaintext recipient.
+fn record_withheld_delivery(config: &Config, job: &CronJob, dst_channel: &str, dst_recipient: &str) {
+    let destination_ref = crate::security::op_id::ref_for_channel_recipient(dst_channel, dst_recipient);
+    let principal_channel = job.delivery_principal.channel();
+    tracing::warn!(
+        job_id = %job.id,
+        dst_channel,
+        destination = %destination_ref,
+        src_channel = principal_channel,
+        anonymous_principal = job.delivery_principal.is_anonymous(),
+        "cron delivery withheld: the outbound scope rules do not permit this destination"
+    );
+    if let Err(error) = record_delivery_withheld(config, &job.id, dst_channel, &destination_ref, principal_channel) {
+        tracing::warn!(job_id = %job.id, "failed to record the withheld cron delivery: {error}");
+    }
+}
+
+async fn deliver_if_configured(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+    raw_output: &str,
+) -> Result<DeliveryOutcome> {
     // Cap delivery output to prevent OOM on large command stdout.
     const MAX_DELIVERY_BYTES: usize = 4096;
     let output: &str = if raw_output.len() > MAX_DELIVERY_BYTES {
@@ -783,7 +866,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, raw_output: &str)
     };
     let delivery: &DeliveryConfig = &job.delivery;
     if !delivery.mode.eq_ignore_ascii_case("announce") {
-        return Ok(());
+        return Ok(DeliveryOutcome::Sent);
     }
 
     let channel = delivery
@@ -795,7 +878,15 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, raw_output: &str)
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
 
-    match channel.to_ascii_lowercase().as_str() {
+    // MUTATION GUARD: authorization happens before any channel object is built,
+    // so a refused destination never reaches a network client at all.
+    let dst_channel = channel.to_ascii_lowercase();
+    if !delivery_is_authorized(security, job, &dst_channel, target) {
+        record_withheld_delivery(config, job, &dst_channel, target);
+        return Ok(DeliveryOutcome::Withheld);
+    }
+
+    match dst_channel.as_str() {
         "telegram" => {
             let tg = config
                 .channels_config
@@ -869,7 +960,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, raw_output: &str)
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
 
-    Ok(())
+    Ok(DeliveryOutcome::Sent)
 }
 
 async fn run_job_command(config: &Config, job: &CronJob) -> (bool, String) {
@@ -977,6 +1068,242 @@ mod tests {
         config
     }
 
+    // ── T17: outbound authorization for cron announce deliveries ──────────
+    //
+    // `deliver_if_configured` builds its channel object *after* the gate, so a
+    // destination that is authorized but unconfigured fails with "<channel>
+    // channel not configured" while a withheld one returns `Withheld` without
+    // touching a network client at all. Every test below leaves `[channels]`
+    // empty and reads that difference: it is the only observation that
+    // distinguishes "the gate let this through" from "the gate stopped it"
+    // without a live channel.
+
+    fn outbound_rule(channel: Option<&str>, send_allow: &[&str], send_deny: &[&str]) -> crate::config::ScopeRule {
+        crate::config::ScopeRule {
+            user: None,
+            channel: channel.map(str::to_string),
+            chat_type: None,
+            tools_allow: vec![],
+            tools_deny: vec![],
+            send_allow: send_allow.iter().map(|entry| (*entry).to_string()).collect(),
+            send_deny: send_deny.iter().map(|entry| (*entry).to_string()).collect(),
+        }
+    }
+
+    fn outbound_policy(rules: Vec<crate::config::ScopeRule>) -> SecurityPolicy {
+        SecurityPolicy {
+            scope_rules: rules,
+            ..SecurityPolicy::default()
+        }
+    }
+
+    fn announce_to(channel: &str, to: &str) -> DeliveryConfig {
+        DeliveryConfig {
+            mode: "announce".to_string(),
+            channel: Some(channel.to_string()),
+            to: Some(to.to_string()),
+            best_effort: true,
+        }
+    }
+
+    /// Persist an agent job whose announcement targets `channel:to`, created by
+    /// `principal` (an anonymous principal models a job with no recorded
+    /// creator).
+    fn announcing_job(
+        config: &Config,
+        principal: crate::cron::DeliveryPrincipal,
+        channel: &str,
+        to: &str,
+    ) -> CronJob {
+        cron::add_agent_job_with_lineage(
+            config,
+            Some("announce-test".to_string()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "report",
+            SessionTarget::Isolated,
+            None,
+            Some(announce_to(channel, to)),
+            false,
+            crate::cron::CronJobLineage {
+                delivery_principal: principal,
+                ..crate::cron::CronJobLineage::default()
+            },
+        )
+        .expect("test: persist announcing job")
+    }
+
+    fn telegram_creator() -> crate::cron::DeliveryPrincipal {
+        crate::cron::DeliveryPrincipal::new(
+            Some("alice".to_string()),
+            Some("telegram".to_string()),
+            Some("direct".to_string()),
+        )
+    }
+
+    /// MUTATION GUARD: dropping the `delivery_is_authorized` call from
+    /// `deliver_if_configured` turns the `Withheld` below into the "telegram
+    /// channel not configured" error of an attempted send.
+    #[tokio::test]
+    async fn a_denied_announce_destination_is_withheld_and_recorded_on_the_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = announcing_job(&config, telegram_creator(), "telegram", "12345");
+        let security = outbound_policy(vec![outbound_rule(None, &[], &["telegram:12345"])]);
+
+        let outcome = deliver_if_configured(&config, &security, &job, "daily report")
+            .await
+            .expect("test: a withheld delivery is not an error");
+
+        assert_eq!(
+            outcome,
+            DeliveryOutcome::Withheld,
+            "test: a send_deny hit must stop the announcement from reaching the channel"
+        );
+        let events = cron::list_job_events(&config, &job.id).expect("test: read job events");
+        let withheld = events
+            .iter()
+            .find(|event| event.event_type == "cron.job.delivery_withheld")
+            .expect("test: a withheld delivery must be visible on the job, not silently dropped");
+        let payload = withheld.payload_json.as_deref().unwrap_or_default();
+        assert!(payload.contains("\"dst_channel\":\"telegram\""), "test: {payload}");
+        assert!(
+            !payload.contains("12345"),
+            "test: the recipient must be fingerprinted, never logged in plaintext: {payload}"
+        );
+    }
+
+    /// Zero regression: the common shape — a job announcing back on the channel
+    /// it was created from, on a deployment with no scope rules at all — must
+    /// still be delivered.
+    #[tokio::test]
+    async fn a_same_channel_announce_is_unchanged_when_no_outbound_rules_are_configured() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = announcing_job(&config, telegram_creator(), "telegram", "12345");
+        let security = outbound_policy(vec![]);
+
+        let error = deliver_if_configured(&config, &security, &job, "daily report")
+            .await
+            .expect_err("test: delivery must be attempted, and fail only on the missing channel config");
+
+        assert!(
+            error.to_string().contains("telegram channel not configured"),
+            "test: an unconfigured rule set must not withhold a same-channel announce: {error}"
+        );
+    }
+
+    /// A `mode: "none"` job never reaches the gate, so a job that announces
+    /// nothing is unaffected by any rule.
+    #[tokio::test]
+    async fn a_job_without_announce_mode_is_untouched_by_the_gate() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = announcing_job(&config, telegram_creator(), "telegram", "12345");
+        job.delivery = DeliveryConfig::default();
+        let security = outbound_policy(vec![outbound_rule(None, &[], &["*:*"])]);
+
+        let outcome = deliver_if_configured(&config, &security, &job, "daily report")
+            .await
+            .expect("test: a non-announcing job delivers nothing and fails nothing");
+
+        assert_eq!(outcome, DeliveryOutcome::Sent);
+    }
+
+    /// A job with no recorded creator is authorized as `unknown`, which is the
+    /// least privileged caller there is — never a bypass.
+    #[tokio::test]
+    async fn an_identity_less_job_is_authorized_as_the_least_privileged_caller() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = announcing_job(&config, crate::cron::DeliveryPrincipal::default(), "telegram", "12345");
+        assert!(job.delivery_principal.is_anonymous(), "test: no creator was recorded");
+        let security = outbound_policy(vec![]);
+
+        let outcome = deliver_if_configured(&config, &security, &job, "daily report")
+            .await
+            .expect("test: a withheld delivery is not an error");
+
+        assert_eq!(
+            outcome,
+            DeliveryOutcome::Withheld,
+            "test: a job with no identity must not be waved through the gate"
+        );
+    }
+
+    /// A rule scoped to the creator's own channel still applies to a job it
+    /// created — the identity is the *creator's*, not the destination's.
+    #[tokio::test]
+    async fn a_rule_scoped_to_the_creator_channel_matches_the_job_it_created() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = announcing_job(&config, telegram_creator(), "telegram", "12345");
+        let security = outbound_policy(vec![outbound_rule(Some("telegram"), &[], &["telegram:12345"])]);
+
+        let outcome = deliver_if_configured(&config, &security, &job, "daily report")
+            .await
+            .expect("test: a withheld delivery is not an error");
+
+        assert_eq!(outcome, DeliveryOutcome::Withheld);
+    }
+
+    /// MUTATION GUARD: the destination is model-written at creation time, so a
+    /// model that picks a denied recipient must not reach it — while an
+    /// undenied recipient on the same rule set still goes out.
+    #[tokio::test]
+    async fn a_model_chosen_recipient_cannot_escape_the_operators_send_deny() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = outbound_policy(vec![outbound_rule(None, &[], &["*:+15550001111"])]);
+
+        let denied = announcing_job(&config, telegram_creator(), "telegram", "+15550001111");
+        assert_eq!(
+            deliver_if_configured(&config, &security, &denied, "exfiltrate")
+                .await
+                .expect("test: a withheld delivery is not an error"),
+            DeliveryOutcome::Withheld,
+            "test: a model-chosen recipient must not escape the operator's send_deny"
+        );
+
+        let allowed = announcing_job(&config, telegram_creator(), "telegram", "+15550002222");
+        let error = deliver_if_configured(&config, &security, &allowed, "daily report")
+            .await
+            .expect_err("test: an undenied recipient must still be attempted");
+        assert!(
+            error.to_string().contains("telegram channel not configured"),
+            "test: {error}"
+        );
+    }
+
+    /// `send_allow` is what lets an operator keep cross-channel cron announces:
+    /// without a rule the cross-channel default refuses them, with one they go
+    /// out — the same contract `message_send`'s `channel` argument has.
+    #[tokio::test]
+    async fn a_cross_channel_announce_needs_send_allow() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = announcing_job(&config, telegram_creator(), "signal", "+15550003333");
+
+        assert_eq!(
+            deliver_if_configured(&config, &outbound_policy(vec![]), &job, "daily report")
+                .await
+                .expect("test: a withheld delivery is not an error"),
+            DeliveryOutcome::Withheld,
+            "test: naming another channel is a cross-channel send and is refused by default"
+        );
+
+        let permitted = outbound_policy(vec![outbound_rule(Some("telegram"), &["signal:*"], &[])]);
+        let error = deliver_if_configured(&config, &permitted, &job, "daily report")
+            .await
+            .expect_err("test: an operator-permitted cross-channel announce must be attempted");
+        assert!(
+            error.to_string().contains("signal channel not configured"),
+            "test: {error}"
+        );
+    }
+
     fn test_job(command: &str) -> CronJob {
         CronJob {
             id: "test-job".into(),
@@ -1006,6 +1333,7 @@ mod tests {
             claim: None,
             terminal_state: None,
             approval_grant_json: None,
+            delivery_principal: crate::cron::DeliveryPrincipal::default(),
         }
     }
 
@@ -1928,6 +2256,14 @@ mod tests {
         (format!("http://{addr}"), hits)
     }
 
+    fn mattermost_creator() -> crate::cron::DeliveryPrincipal {
+        crate::cron::DeliveryPrincipal::new(
+            Some("operator".to_string()),
+            Some("mattermost".to_string()),
+            Some("channel".to_string()),
+        )
+    }
+
     fn announce_to_mattermost(config: &mut Config, base_url: String) {
         config.channels_config.mattermost = Some(crate::config::schema::MattermostConfig {
             url: base_url,
@@ -1960,6 +2296,11 @@ mod tests {
             to: Some("town-square".into()),
             best_effort: true,
         };
+        // Fencing, not authorization, is what this test is about: the job is
+        // given the creator identity a job scheduled from Mattermost would
+        // carry, so the announcement is authorized and the run counts stay the
+        // subject of the assertions below.
+        job.delivery_principal = mattermost_creator();
 
         // The stale owner: it claimed the job, its lease then ran out.
         let now = Utc::now();
@@ -2020,6 +2361,11 @@ mod tests {
             to: Some("town-square".into()),
             best_effort: true,
         };
+        // Fencing, not authorization, is what this test is about: the job is
+        // given the creator identity a job scheduled from Mattermost would
+        // carry, so the announcement is authorized and the run counts stay the
+        // subject of the assertions below.
+        job.delivery_principal = mattermost_creator();
         let claim = test_claim(&config, &job, Utc::now());
 
         let (success, output) =
@@ -2032,13 +2378,21 @@ mod tests {
         assert_eq!(runs[0].status, "ok");
     }
 
+    /// The destination name is validated after authorization, so this passes an
+    /// operator rule set that permits every destination: what it pins is the
+    /// unknown-channel error, not the gate (which the T17 tests above cover).
     #[tokio::test]
     async fn deliver_if_configured_handles_none_and_invalid_channel() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
+        let permit_everything = outbound_policy(vec![outbound_rule(None, &["*"], &[])]);
         let mut job = test_job("echo ok");
 
-        assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
+        assert!(
+            deliver_if_configured(&config, &permit_everything, &job, "x")
+                .await
+                .is_ok()
+        );
 
         job.delivery = DeliveryConfig {
             mode: "announce".into(),
@@ -2046,7 +2400,9 @@ mod tests {
             to: Some("target".into()),
             best_effort: true,
         };
-        let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
+        let err = deliver_if_configured(&config, &permit_everything, &job, "x")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("unsupported delivery channel"));
     }
 }

@@ -20,7 +20,8 @@
 use crate::config::Config;
 use crate::cron::{
     CronClaim, CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronJobTerminalState, CronRun, DeliveryConfig,
-    JobType, Schedule, SessionTarget, next_run_for_schedule, schedule_cron_expression, validate_schedule,
+    DeliveryPrincipal, JobType, Schedule, SessionTarget, next_run_for_schedule, schedule_cron_expression,
+    validate_schedule,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
@@ -112,14 +113,17 @@ pub fn add_shell_job_with_lineage_approval_and_delete(
     let topic_id = lineage.topic_id.clone();
     let parent_task_id = lineage.parent_task_id.clone();
     let source_message_event_id = lineage.source_message_event_id;
+    let delivery_principal = lineage.delivery_principal;
 
     with_connection(config, |conn| {
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, owner_id, topic_id, parent_task_id, source_message_event_id,
                 expression, command, schedule, job_type, prompt, name, session_target, model,
-                enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'shell', NULL, ?9, 'isolated', NULL, 1, ?10, ?11, ?12, ?13, ?14)",
+                enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json,
+                creator_sender, creator_channel, creator_chat_type
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'shell', NULL, ?9, 'isolated', NULL, 1, ?10, ?11, ?12, ?13, ?14,
+                       ?15, ?16, ?17)",
             params![
                 id,
                 owner_id.as_deref(),
@@ -135,6 +139,9 @@ pub fn add_shell_job_with_lineage_approval_and_delete(
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
                 approval_grant_json,
+                delivery_principal.sender.as_deref(),
+                delivery_principal.channel.as_deref(),
+                delivery_principal.chat_type.as_deref(),
             ],
         )
         .context("Failed to insert cron shell job")?;
@@ -228,14 +235,17 @@ pub fn add_agent_job_with_lineage(
     let topic_id = lineage.topic_id.clone();
     let parent_task_id = lineage.parent_task_id.clone();
     let source_message_event_id = lineage.source_message_event_id;
+    let delivery_principal = lineage.delivery_principal;
 
     with_connection(config, |conn| {
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, owner_id, topic_id, parent_task_id, source_message_event_id,
                 expression, command, schedule, job_type, prompt, name, session_target, model,
-                enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?7, 'agent', ?8, ?9, ?10, ?11, 1, ?12, ?13, ?14, ?15, NULL)",
+                enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json,
+                creator_sender, creator_channel, creator_chat_type
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?7, 'agent', ?8, ?9, ?10, ?11, 1, ?12, ?13, ?14, ?15, NULL,
+                       ?16, ?17, ?18)",
             params![
                 id,
                 owner_id.as_deref(),
@@ -252,6 +262,9 @@ pub fn add_agent_job_with_lineage(
                 if delete_after_run { 1 } else { 0 },
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
+                delivery_principal.sender.as_deref(),
+                delivery_principal.channel.as_deref(),
+                delivery_principal.chat_type.as_deref(),
             ],
         )
         .context("Failed to insert cron agent job")?;
@@ -295,7 +308,8 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
             "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
                     expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    terminal_state, approval_grant_json, claim_owner, attempt_id, claimed_at, claim_expires_at
+                    terminal_state, approval_grant_json, claim_owner, attempt_id, claimed_at, claim_expires_at,
+                    creator_sender, creator_channel, creator_chat_type
              FROM cron_jobs ORDER BY next_run ASC",
         )?;
 
@@ -318,7 +332,8 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
             "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
                     expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    terminal_state, approval_grant_json, claim_owner, attempt_id, claimed_at, claim_expires_at
+                    terminal_state, approval_grant_json, claim_owner, attempt_id, claimed_at, claim_expires_at,
+                    creator_sender, creator_channel, creator_chat_type
              FROM cron_jobs WHERE id = ?1",
         )?;
 
@@ -758,6 +773,56 @@ pub fn record_claim_lost(
     })
 }
 
+/// Record that a job's `announce` delivery was refused by the outbound ACL.
+///
+/// A withheld delivery is a policy decision, not an execution failure, so it
+/// must not be inferred from a missing message: without a row of its own the
+/// only difference between "the operator's rules stopped this" and "the channel
+/// never fired" is a log line. This puts it on the job's own event stream, where
+/// `cron events <job_id>` shows it next to the run that produced the output.
+///
+/// `destination_ref` is the audit fingerprint of `channel:recipient`
+/// ([`crate::security::op_id::ref_for_channel_recipient`]), never the plaintext
+/// recipient — the same rule the `message_send` rejection path follows.
+pub fn record_delivery_withheld(
+    config: &Config,
+    job_id: &str,
+    dst_channel: &str,
+    destination_ref: &str,
+    principal_channel: &str,
+) -> Result<()> {
+    if let Some(store) = pg_store(config)? {
+        return store.record_delivery_withheld(
+            &workspace_id(config),
+            job_id,
+            dst_channel,
+            destination_ref,
+            principal_channel,
+        );
+    }
+    with_connection(config, |conn| {
+        if let Some(lineage) = load_job_lineage(conn, job_id)? {
+            let payload = serde_json::json!({
+                "dst_channel": dst_channel,
+                "destination_ref": destination_ref,
+                "src_channel": principal_channel,
+                "reason": "outbound scope rules",
+            })
+            .to_string();
+            insert_job_event(
+                conn,
+                &workspace_id(config),
+                job_id,
+                lineage,
+                "cron.job.delivery_withheld",
+                Some("delivery_withheld"),
+                Some(&payload),
+            )?;
+        }
+        Ok(())
+    })
+}
+
 pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     if let Some(store) = pg_store(config)? {
         return store.due_jobs(now, config.scheduler.max_tasks);
@@ -768,7 +833,8 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
             "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
                     expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    terminal_state, approval_grant_json, claim_owner, attempt_id, claimed_at, claim_expires_at
+                    terminal_state, approval_grant_json, claim_owner, attempt_id, claimed_at, claim_expires_at,
+                    creator_sender, creator_channel, creator_chat_type
              FROM cron_jobs
              WHERE enabled = 1 AND terminal_state IS NULL AND next_run <= ?1
                AND (
@@ -843,6 +909,13 @@ pub fn update_job_at(config: &Config, job_id: &str, patch: CronJobPatch, now: Da
     if let Some(delivery) = patch.delivery {
         job.delivery = delivery;
     }
+    // Re-anchoring is unconditional when the runtime asks for it: whoever
+    // rewrites `delivery` becomes the principal that delivery is authorized as.
+    // Keeping the original creator's identity would let one caller aim another
+    // caller's privileges at a destination of its choosing.
+    if let Some(delivery_principal) = patch.delivery_principal {
+        job.delivery_principal = delivery_principal;
+    }
     if let Some(model) = patch.model {
         job.model = Some(model);
     }
@@ -872,7 +945,8 @@ pub fn update_job_at(config: &Config, job_id: &str, patch: CronJobPatch, now: Da
                  session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
                  next_run = ?12, last_run = ?13, last_status = ?14, last_output = ?15,
                  terminal_state = ?16, approval_grant_json = ?17,
-                 claim_owner = ?18, attempt_id = ?19, claimed_at = ?20, claim_expires_at = ?21
+                 claim_owner = ?18, attempt_id = ?19, claimed_at = ?20, claim_expires_at = ?21,
+                 creator_sender = ?31, creator_channel = ?32, creator_chat_type = ?33
              WHERE id = ?22 AND next_run = ?23
                AND (schedule = ?24 OR (schedule IS NULL AND expression = ?25))
                AND last_status IS ?26
@@ -908,6 +982,9 @@ pub fn update_job_at(config: &Config, job_id: &str, patch: CronJobPatch, now: Da
                     expected_claim.as_ref().map(|claim| claim.attempt_id.as_str()),
                     expected_claim.as_ref().map(|claim| format_claim_time(claim.claimed_at)),
                     expected_claim.as_ref().map(|claim| format_claim_time(claim.expires_at)),
+                    job.delivery_principal.sender.as_deref(),
+                    job.delivery_principal.channel.as_deref(),
+                    job.delivery_principal.chat_type.as_deref(),
                 ],
             )
             .context("Failed to update cron job")?;
@@ -1646,6 +1723,7 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
             .transpose()?,
         approval_grant_json: row.get(22)?,
         claim: decode_sqlite_claim(row, 23)?,
+        delivery_principal: DeliveryPrincipal::new(row.get(27)?, row.get(28)?, row.get(29)?),
     })
 }
 
@@ -1997,7 +2075,10 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&mut Connection) -> Result
             claim_owner      TEXT,
             attempt_id       TEXT,
             claimed_at       TEXT,
-            claim_expires_at TEXT
+            claim_expires_at TEXT,
+            creator_sender   TEXT,
+            creator_channel  TEXT,
+            creator_chat_type TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_run ON cron_jobs(next_run);
 
@@ -2074,6 +2155,14 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&mut Connection) -> Result
     add_column_if_missing(&conn, "cron_jobs", "attempt_id", "TEXT")?;
     add_column_if_missing(&conn, "cron_jobs", "claimed_at", "TEXT")?;
     add_column_if_missing(&conn, "cron_jobs", "claim_expires_at", "TEXT")?;
+    // Outbound-authorization identity (T17). Nullable on purpose: a row written
+    // before these columns existed, or by anything outside the tool path, keeps
+    // NULL and is authorized as the least privileged caller — see
+    // `DeliveryPrincipal`. Nothing is backfilled, because there is no honest
+    // value to invent for a job whose creator was never recorded.
+    add_column_if_missing(&conn, "cron_jobs", "creator_sender", "TEXT")?;
+    add_column_if_missing(&conn, "cron_jobs", "creator_channel", "TEXT")?;
+    add_column_if_missing(&conn, "cron_jobs", "creator_chat_type", "TEXT")?;
     add_column_if_missing(&conn, "cron_runs", "attempt_id", "TEXT")?;
     add_column_if_missing(&conn, "cron_runs", "worker_id", "TEXT")?;
     add_column_if_missing(&conn, "cron_job_events", "source_message_event_id", "TEXT")?;
@@ -2165,6 +2254,7 @@ mod tests {
             topic_id: Some("topic-1".to_string()),
             parent_task_id: Some("task-parent".to_string()),
             source_message_event_id: Some("msg-1".to_string()),
+            ..CronJobLineage::default()
         };
 
         let job = add_shell_job_with_lineage_and_approval_grant(
@@ -2283,6 +2373,7 @@ mod tests {
             topic_id: Some("topic-a".to_string()),
             parent_task_id: Some("task-a".to_string()),
             source_message_event_id: Some("msg-a".to_string()),
+            ..CronJobLineage::default()
         };
         let job = add_shell_job_with_lineage_and_approval_grant(
             &config,
@@ -2336,6 +2427,82 @@ mod tests {
         );
     }
 
+    /// The creator identity survives insert → read → update, in both job
+    /// shapes, and an update that re-anchors it replaces every axis at once.
+    #[test]
+    fn delivery_principal_round_trips_and_is_re_anchored_by_a_patch() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let lineage = CronJobLineage {
+            delivery_principal: DeliveryPrincipal::new(
+                Some("alice".to_string()),
+                Some("telegram".to_string()),
+                Some("direct".to_string()),
+            ),
+            ..CronJobLineage::default()
+        };
+
+        let shell = add_shell_job_with_lineage_and_approval_grant(
+            &config,
+            Some("shell-principal".to_string()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "echo hi",
+            None,
+            lineage.clone(),
+        )
+        .unwrap();
+        assert_eq!(shell.delivery_principal.channel(), "telegram");
+        assert_eq!(shell.delivery_principal.sender(), "alice");
+        assert_eq!(shell.delivery_principal.chat_type(), "direct");
+
+        let agent = add_agent_job_with_lineage(
+            &config,
+            Some("agent-principal".to_string()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "report",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            lineage,
+        )
+        .unwrap();
+        assert_eq!(get_job(&config, &agent.id).unwrap().delivery_principal.sender(), "alice");
+
+        // An unrelated patch leaves the identity alone.
+        let renamed = update_job(
+            &config,
+            &agent.id,
+            CronJobPatch {
+                name: Some("renamed".to_string()),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(renamed.delivery_principal.channel(), "telegram");
+
+        // Re-anchoring replaces all three axes, so an unidentified caller
+        // clears the previous owner's identity instead of inheriting it.
+        let reanchored = update_job(
+            &config,
+            &agent.id,
+            CronJobPatch {
+                delivery: Some(DeliveryConfig::default()),
+                delivery_principal: Some(DeliveryPrincipal::default()),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert!(reanchored.delivery_principal.is_anonymous());
+        assert!(get_job(&config, &agent.id).unwrap().delivery_principal.is_anonymous());
+    }
+
     #[test]
     fn legacy_cron_schema_migrates_lineage_columns_and_events_table() {
         let tmp = TempDir::new().unwrap();
@@ -2374,6 +2541,13 @@ mod tests {
 
         let jobs = list_jobs(&config).unwrap();
         assert_eq!(jobs.len(), 1);
+        // A row that predates the identity columns keeps NULLs and reads back
+        // as an anonymous principal — the scheduler then authorizes it as the
+        // least privileged caller instead of failing to load it.
+        assert!(
+            jobs[0].delivery_principal.is_anonymous(),
+            "test: a legacy row must migrate to an anonymous principal, not a fabricated one"
+        );
 
         with_connection(&config, |conn| {
             let mut stmt = conn.prepare("PRAGMA table_info(cron_jobs)")?;
@@ -2387,6 +2561,9 @@ mod tests {
                 "source_message_event_id",
                 "terminal_state",
                 "approval_grant_json",
+                "creator_sender",
+                "creator_channel",
+                "creator_chat_type",
             ] {
                 assert!(names.iter().any(|existing| existing == name), "missing {name}");
             }

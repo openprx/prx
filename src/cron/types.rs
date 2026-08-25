@@ -118,6 +118,93 @@ const fn default_true() -> bool {
     true
 }
 
+/// The principal an `announce` delivery is authorized as.
+///
+/// A cron delivery is the one outbound message in this runtime with no live
+/// caller behind it: `delivery.channel` and `delivery.to` are written by the
+/// model when the job is created and fire hours or days later, long after that
+/// turn ended. The authorization subject therefore has to be captured at
+/// creation time and persisted with the job — that is what this is.
+///
+/// It is filled from the runtime-injected trusted scope (`_zc_scope`, guarded
+/// by `_zc_scope_trusted`), which [`crate::tools::execution`] scrubs of any
+/// model-supplied value before rewriting it, so a model cannot name a different
+/// sender to widen the reach of a job it schedules.
+///
+/// Every field is optional because a job can reach the store without one: a row
+/// added by `prx cron add` on the CLI, hand-inserted into `jobs.db`, written by
+/// an external tool, or created by a PRX build that predates these columns.
+/// Such a job is **not** waved through — it is authorized as the least
+/// privileged caller there is (`unknown` on all three axes), the same
+/// degradation `message_send` applies when it finds no trusted scope. Only
+/// wildcard scope rules can then match it, and the cross-channel default still
+/// applies, so the absence of an identity can never widen what a job may reach.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryPrincipal {
+    #[serde(default)]
+    pub sender: Option<String>,
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub chat_type: Option<String>,
+}
+
+impl DeliveryPrincipal {
+    /// What every unset axis of an identity-less job resolves to.
+    ///
+    /// MUTATION GUARD: this must stay a value no real channel, sender or chat
+    /// type can equal. Replacing it with the destination channel, or with any
+    /// value that makes `src == dst` hold by construction, turns the missing
+    /// identity into a free pass through the same-channel default.
+    pub const UNKNOWN: &'static str = "unknown";
+
+    /// Build the principal a creating turn's trusted scope describes.
+    #[must_use]
+    pub const fn new(sender: Option<String>, channel: Option<String>, chat_type: Option<String>) -> Self {
+        Self {
+            sender,
+            channel,
+            chat_type,
+        }
+    }
+
+    /// The authorizing sender, or [`Self::UNKNOWN`] when the job carries none.
+    #[must_use]
+    pub fn sender(&self) -> &str {
+        Self::field(self.sender.as_deref())
+    }
+
+    /// The channel the creating turn was anchored to, or [`Self::UNKNOWN`].
+    ///
+    /// This is the `src_channel` of the outbound decision. A delivery whose
+    /// `delivery.channel` differs from it is a genuine cross-channel send — the
+    /// model named another channel — and is gated exactly like the `channel`
+    /// argument of `message_send`.
+    #[must_use]
+    pub fn channel(&self) -> &str {
+        Self::field(self.channel.as_deref())
+    }
+
+    /// The creating turn's chat type, or [`Self::UNKNOWN`].
+    #[must_use]
+    pub fn chat_type(&self) -> &str {
+        Self::field(self.chat_type.as_deref())
+    }
+
+    /// Whether no axis of this principal is known.
+    #[must_use]
+    pub const fn is_anonymous(&self) -> bool {
+        self.sender.is_none() && self.channel.is_none() && self.chat_type.is_none()
+    }
+
+    fn field(value: Option<&str>) -> &str {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(Self::UNKNOWN)
+    }
+}
+
 /// Fencing handle for one scheduler execution attempt.
 ///
 /// A handle is authoritative only while the matching database lease is still
@@ -159,6 +246,11 @@ pub struct CronJob {
     #[serde(default)]
     pub terminal_state: Option<CronJobTerminalState>,
     pub approval_grant_json: Option<String>,
+    /// Who this job's `announce` delivery is authorized as. See
+    /// [`DeliveryPrincipal`]; absent on rows that predate the columns or were
+    /// written outside the tool path, which authorizes them as `unknown`.
+    #[serde(default)]
+    pub delivery_principal: DeliveryPrincipal,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -167,6 +259,9 @@ pub struct CronJobLineage {
     pub topic_id: Option<String>,
     pub parent_task_id: Option<String>,
     pub source_message_event_id: Option<String>,
+    /// Creator identity carried alongside the lineage so every `add_*` entry
+    /// point persists it without growing another argument.
+    pub delivery_principal: DeliveryPrincipal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,4 +306,13 @@ pub struct CronJobPatch {
     pub delete_after_run: Option<bool>,
     #[serde(skip)]
     pub approval_grant_json: Option<String>,
+    /// Re-anchor the delivery principal, set only by the runtime.
+    ///
+    /// `#[serde(skip)]` for the same reason `approval_grant_json` is: the patch
+    /// body is model-written, and a model that could set this would be choosing
+    /// the identity its own delivery is authorized as. `Some` replaces all
+    /// three axes at once, so re-anchoring to a caller with no trusted scope
+    /// clears the previous owner's identity instead of inheriting it.
+    #[serde(skip)]
+    pub delivery_principal: Option<DeliveryPrincipal>,
 }

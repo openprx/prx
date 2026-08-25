@@ -517,6 +517,7 @@ mod tests {
             claim: None,
             terminal_state: None,
             approval_grant_json: None,
+            delivery_principal: cron::DeliveryPrincipal::default(),
         };
 
         assert!(is_heartbeat_job(&mk(Some("daily-heartbeat"), "echo ok", None)));
