@@ -501,6 +501,104 @@ fn parse_spawn_scope(args: &serde_json::Value) -> Option<SpawnScope> {
     })
 }
 
+/// Trusted provenance of the turn that launched a run, kept for the moment that
+/// run finally announces.
+///
+/// A sub-agent announcement is a real outbound message whose `recipient` comes
+/// straight from the model's tool call, but it leaves the process long after the
+/// launching turn ended — there is no turn context left to authorize it against.
+/// The only trustworthy identity is the one captured atomically from the
+/// launching message's `_zc_scope`, in the very same snapshot `recipient` and
+/// `channel_name` come from. Nothing may stand in for it: a synthesised
+/// "system" sender would make the outbound ACL *look* enforced while letting
+/// every announcement through, which is worse than not gating the path at all.
+#[derive(Debug, Clone)]
+struct AnnounceOrigin {
+    sender: String,
+    chat_type: String,
+}
+
+impl AnnounceOrigin {
+    /// Capture the launching turn's identity, when this spawn carried a trusted
+    /// scope.
+    ///
+    /// `None` — an absent or untrusted `_zc_scope`, i.e. the CLI and
+    /// single-channel paths — degrades to the same `"unknown"` identity
+    /// `message_send` falls back to in exactly that situation (see
+    /// `trusted_outbound_identity` there), never to a privileged one.
+    fn from_scope(scope: Option<&SpawnScope>) -> Option<Self> {
+        scope.map(|scope| Self {
+            sender: scope.sender.clone(),
+            chat_type: scope.chat_type.clone(),
+        })
+    }
+}
+
+/// Outbound recipient authorization for one sub-agent announcement.
+///
+/// The counterpart of `MessageSendTool::authorize_outbound`: both funnel into
+/// [`SecurityPolicy::is_outbound_allowed`], so a `send_allow` / `send_deny` rule
+/// an operator writes governs the announcement path as well as the tool path.
+/// Without this the model-supplied `recipient` on a `sessions_spawn` call was a
+/// complete bypass of that ACL — spawn a throwaway task, name any recipient, and
+/// its completion notice is delivered with zero authorization.
+///
+/// Source and destination channel are deliberately the same value, and that is
+/// load-bearing rather than lazy. An announcement has no channel argument: it
+/// always leaves on the channel the run resolved for itself, so that channel
+/// *is* both the anchor and the destination — there is no cross-channel
+/// capability on this path to defend. Passing the captured scope channel instead
+/// would diverge exactly when [`SessionsSpawnTool::resolve_announce_channel`]
+/// falls back to the shared active channel (a name absent from the registry —
+/// every single-channel deployment), source and destination would then differ,
+/// the channel default would flip to deny, and every announcement in a
+/// deployment with no rules configured at all would vanish.
+///
+/// MUTATION GUARD: pass the origin's own channel as `src_channel` here and
+/// `announce_is_not_denied_by_a_channel_registry_fallback` goes red. That test is
+/// the zero-regression tripwire for this decision, not a style preference.
+fn announce_is_authorized(
+    security: &SecurityPolicy,
+    origin: Option<&AnnounceOrigin>,
+    dst_channel: &str,
+    recipient: &str,
+) -> bool {
+    let (sender, chat_type) = origin.map_or(("unknown", "unknown"), |origin| {
+        (origin.sender.as_str(), origin.chat_type.as_str())
+    });
+    security.is_outbound_allowed(sender, dst_channel, chat_type, dst_channel, recipient)
+}
+
+/// Record an announcement the outbound ACL refused.
+///
+/// A refusal must never be a silent drop. It lands in the log *and* on the run's
+/// own history, where `sessions_spawn action='history'` and `session_status`
+/// surface it to the operator wondering why no result ever arrived. Both carry
+/// only the destination's stable audit fingerprint, never the plaintext
+/// recipient — the same rule `message_send`'s rejection text follows.
+async fn record_withheld_announcement(
+    history: &Arc<RwLock<Vec<HistoryEntry>>>,
+    run_id: &str,
+    dst_channel: &str,
+    recipient: &str,
+) {
+    let recipient_ref = crate::security::op_id::ref_for_channel_recipient(dst_channel, recipient);
+    tracing::warn!(
+        run_id = %run_id,
+        channel = %dst_channel,
+        recipient = %recipient_ref,
+        "Sub-agent announcement withheld: the configured scope rules do not permit this recipient"
+    );
+    history.write().await.push(HistoryEntry {
+        role: "system".to_string(),
+        content: crate::security::audit::redact_secrets(&format!(
+            "Announcement withheld: outbound messaging to recipient {recipient_ref} on channel \
+             '{dst_channel}' is not permitted by the configured scope rules"
+        )),
+        timestamp: Utc::now(),
+    });
+}
+
 fn current_spawn_execution_context() -> Option<SpawnExecutionContext> {
     SPAWN_EXECUTION_CONTEXT.try_with(|ctx| ctx.clone()).ok()
 }
@@ -2373,6 +2471,11 @@ impl SessionsSpawnTool {
             let task_owned = task.to_string();
             let rid = run_id.clone();
             let process_scope = spawn_scope.clone();
+            // Announcement gate inputs for the process-mode monitor — identical
+            // contract to the task-mode branch below; see `announce_is_authorized`.
+            let process_announce_security = self.security.clone();
+            let process_announce_origin = AnnounceOrigin::from_scope(spawn_scope.as_ref());
+            let process_announce_history = history_arc.clone();
             let process_parent_run_id = parent_run_id.clone();
             let process_session_scope_key = session_scope_key.clone();
             let process_spawn_depth = spawn_depth;
@@ -2563,12 +2666,30 @@ impl SessionsSpawnTool {
                                      it is delivered to whoever joins this run's batch"
                                 );
                             } else if let Some(target) = recipient {
-                                let msg = SendMessage::new(&announce, &target);
-                                if let Err(error) = channel.send(&msg).await {
-                                    tracing::error!(
-                                        run_id = %rid,
-                                        "Failed to announce sub-agent process result: {error}"
-                                    );
+                                // MUTATION GUARD: as in task mode — without this
+                                // gate a process-mode run announces to any
+                                // recipient the model named, unauthorized.
+                                if announce_is_authorized(
+                                    &process_announce_security,
+                                    process_announce_origin.as_ref(),
+                                    channel.name(),
+                                    &target,
+                                ) {
+                                    let msg = SendMessage::new(&announce, &target);
+                                    if let Err(error) = channel.send(&msg).await {
+                                        tracing::error!(
+                                            run_id = %rid,
+                                            "Failed to announce sub-agent process result: {error}"
+                                        );
+                                    }
+                                } else {
+                                    record_withheld_announcement(
+                                        &process_announce_history,
+                                        &rid,
+                                        channel.name(),
+                                        &target,
+                                    )
+                                    .await;
                                 }
                             }
 
@@ -2680,6 +2801,16 @@ impl SessionsSpawnTool {
         let workspace_dir = self.workspace_dir.clone();
         let multimodal_config = self.multimodal_config.clone();
         let security = self.security.clone();
+        // Second handle, for the announcement gate: `security` above is moved
+        // into the sub-agent's own loop, and the announcement is authorized only
+        // once that loop has returned.
+        let announce_security = self.security.clone();
+        // The launching turn's trusted identity, captured atomically with
+        // `recipient` / `run_channel_name` from the same scope snapshot.
+        let announce_origin = AnnounceOrigin::from_scope(spawn_scope.as_ref());
+        // Same handle the run writes its transcript through, so a refused
+        // announcement is visible on the run itself and not only in the log.
+        let announce_history = history_arc.clone();
         let task_scope = spawn_scope.clone();
         let task_memory = self.memory.clone();
         let compaction_config = resolved_compaction.config.clone();
@@ -2964,9 +3095,17 @@ impl SessionsSpawnTool {
                      it is delivered to whoever joins this run's batch"
                 );
             } else if let Some(target) = recipient {
-                let msg = SendMessage::new(&announce, &target);
-                if let Err(e) = channel.send(&msg).await {
-                    tracing::error!(run_id = %rid, "Failed to announce sub-agent result: {e}");
+                // MUTATION GUARD: drop this gate and the model-supplied
+                // `recipient` on the spawn call reaches the channel with no
+                // authorization at all — the hole `message_send`'s own outbound
+                // gate closes on its side.
+                if announce_is_authorized(&announce_security, announce_origin.as_ref(), channel.name(), &target) {
+                    let msg = SendMessage::new(&announce, &target);
+                    if let Err(e) = channel.send(&msg).await {
+                        tracing::error!(run_id = %rid, "Failed to announce sub-agent result: {e}");
+                    }
+                } else {
+                    record_withheld_announcement(&announce_history, &rid, channel.name(), &target).await;
                 }
             } else {
                 tracing::warn!(
@@ -6246,6 +6385,238 @@ mod tests {
         let a_run = runs.first().expect("one run registered");
         assert_eq!(a_run.recipient.as_deref(), Some("A-wacli-recipient"));
         assert_eq!(a_run.channel_name.as_deref(), Some("wacli"));
+    }
+
+    // ── Outbound ACL coverage for the announcement path ──────────────────
+    //
+    // `message_send` has cleared `SecurityPolicy::is_outbound_allowed` since the
+    // ACL landed; the announcement did not. Since `recipient` is a plain
+    // `sessions_spawn` parameter the model fills in, that made "spawn a
+    // throwaway task naming any recipient" a complete bypass of every
+    // `send_deny` an operator wrote. These four tests pin the fix from both
+    // sides: the gate bites, and it stays inert where no rules exist.
+
+    /// A scope rule carrying only outbound entries — the shape an operator
+    /// writes to restrict who the agent may reach, with no tool restrictions.
+    fn announce_scope_rule(send_allow: &[&str], send_deny: &[&str]) -> crate::config::ScopeRule {
+        crate::config::ScopeRule {
+            user: None,
+            channel: None,
+            chat_type: None,
+            tools_allow: vec![],
+            tools_deny: vec![],
+            send_allow: send_allow.iter().map(|entry| (*entry).to_string()).collect(),
+            send_deny: send_deny.iter().map(|entry| (*entry).to_string()).collect(),
+        }
+    }
+
+    fn announce_policy(rules: Vec<crate::config::ScopeRule>) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            scope_rules: rules,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn make_tool_with_channels_and_security(
+        default_channel: Arc<dyn Channel>,
+        provider: Arc<dyn crate::providers::Provider>,
+        registry: Vec<Arc<dyn Channel>>,
+        security: Arc<SecurityPolicy>,
+    ) -> SessionsSpawnTool {
+        let channels: HashMap<String, Arc<dyn Channel>> =
+            registry.into_iter().map(|ch| (ch.name().to_string(), ch)).collect();
+        make_tool_with_security_and_spawn_config(
+            default_channel,
+            provider,
+            security,
+            crate::config::SessionsSpawnConfig::default(),
+        )
+        .with_channels(Arc::new(channels))
+    }
+
+    /// A `send_deny` hit stops the announcement from leaving — and says so.
+    ///
+    /// The second half matters as much as the first: a security refusal that
+    /// drops the message and logs nothing an operator can find is
+    /// indistinguishable from the run having crashed. The refusal is recorded on
+    /// the run's own history, which `action='history'` and `session_status`
+    /// surface.
+    ///
+    /// MUTATION GUARD: delete the `announce_is_authorized` call in the task-mode
+    /// announce block and this test goes red on the first assertion.
+    #[tokio::test]
+    async fn announce_to_a_denied_recipient_is_withheld_and_recorded_on_the_run() {
+        let (wacli_ch, wacli_sent) = NamedRecordingChannel::new("wacli");
+        let tool = make_tool_with_channels_and_security(
+            wacli_ch.clone(),
+            Arc::new(EchoProvider {
+                response: "sub-agent done".into(),
+            }),
+            vec![wacli_ch],
+            announce_policy(vec![announce_scope_rule(&[], &["wacli:+15550001111"])]),
+        );
+
+        let result = tool
+            .execute(with_spawn_grant(with_scope(
+                json!({"task": "do the thing"}),
+                "wacli",
+                "+15550001111",
+            )))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "the ACL gates delivery, not the spawn itself: {:?}",
+            result.error
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert!(
+            wacli_sent.lock().await.is_empty(),
+            "a send_deny hit must stop the announcement from reaching the channel"
+        );
+
+        let runs = tool.active_runs_snapshot().await;
+        let run = runs.first().expect("one run registered");
+        let history = run.history.read().await;
+        assert!(
+            history.iter().any(|entry| {
+                entry.content.contains("Announcement withheld")
+                    && entry.content.contains("not permitted by the configured scope rules")
+            }),
+            "the refusal must be recorded on the run, not silently swallowed; history was: {:?}",
+            history.iter().map(|entry| entry.content.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Zero regression: with no outbound rules configured — every deployment
+    /// today — the announcement goes out exactly as it always did.
+    #[tokio::test]
+    async fn announce_is_unchanged_when_no_outbound_rules_are_configured() {
+        let (wacli_ch, wacli_sent) = NamedRecordingChannel::new("wacli");
+        let tool = make_tool_with_channels(
+            wacli_ch.clone(),
+            Arc::new(EchoProvider {
+                response: "sub-agent done".into(),
+            }),
+            vec![wacli_ch],
+        );
+
+        let result = tool
+            .execute(with_spawn_grant(with_scope(
+                json!({"task": "do the thing"}),
+                "wacli",
+                "+15550001111",
+            )))
+            .await
+            .unwrap();
+        assert!(result.success, "spawn should succeed: {:?}", result.error);
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let sent = wacli_sent.lock().await;
+        assert_eq!(
+            sent.len(),
+            1,
+            "an unconfigured deployment must keep announcing exactly as before"
+        );
+        assert!(sent[0].contains("sub-agent done"));
+    }
+
+    /// The zero-regression tripwire for *how* the gate is called.
+    ///
+    /// This run's captured scope names channel `wacli`, but the tool has no
+    /// channel registry (the single-channel and CLI paths, plus every caller
+    /// that never calls `with_channels`), so `resolve_announce_channel` falls
+    /// back to the shared active channel — here named `signal`. That fallback is
+    /// the pre-existing route, not a cross-channel jump anybody requested. Judge
+    /// the announcement with the captured scope channel as its source and the
+    /// destination would differ from it, the ACL's channel default would flip to
+    /// deny, and *every* announcement in a deployment with no rules at all would
+    /// disappear without a trace. Hence `announce_is_authorized` anchors source
+    /// and destination on the channel actually carrying the message.
+    #[tokio::test]
+    async fn announce_is_not_denied_by_a_channel_registry_fallback() {
+        let (signal_ch, signal_sent) = NamedRecordingChannel::new("signal");
+        let tool = make_tool(
+            signal_ch as Arc<dyn Channel>,
+            Arc::new(EchoProvider {
+                response: "fallback result".into(),
+            }),
+        );
+
+        let result = tool
+            .execute(with_spawn_grant(with_scope(
+                json!({"task": "do the thing"}),
+                "wacli",
+                "+15550001111",
+            )))
+            .await
+            .unwrap();
+        assert!(result.success, "spawn should succeed: {:?}", result.error);
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let sent = signal_sent.lock().await;
+        assert_eq!(
+            sent.len(),
+            1,
+            "an announcement that fell back to the shared active channel must still be delivered"
+        );
+        assert!(sent[0].contains("fallback result"));
+    }
+
+    /// The bypass this task closes, stated directly: `recipient` is a parameter
+    /// the model writes, so it must not be able to address someone the operator
+    /// denied. The control spawn in the same test proves the rule is a targeted
+    /// refusal and not a blanket kill of the announce path.
+    #[tokio::test]
+    async fn a_model_supplied_recipient_cannot_bypass_send_deny() {
+        let (wacli_ch, wacli_sent) = NamedRecordingChannel::new("wacli");
+        let tool = make_tool_with_channels_and_security(
+            wacli_ch.clone(),
+            Arc::new(EchoProvider {
+                response: "sub-agent done".into(),
+            }),
+            vec![wacli_ch],
+            announce_policy(vec![announce_scope_rule(&[], &["wacli:+15559999999"])]),
+        );
+
+        // The turn is anchored to an allowed chat, and the model overrides the
+        // announcement's destination with the denied one.
+        let denied = tool
+            .execute(with_spawn_grant(with_scope(
+                json!({"task": "reach the denied recipient", "recipient": "+15559999999"}),
+                "wacli",
+                "+15550002222",
+            )))
+            .await
+            .unwrap();
+        assert!(denied.success, "spawn should succeed: {:?}", denied.error);
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            wacli_sent.lock().await.is_empty(),
+            "a model-chosen recipient must not escape the operator's send_deny"
+        );
+
+        // Control: the very same override to a recipient outside the deny list
+        // is delivered, so the gate is not simply refusing everything.
+        let allowed = tool
+            .execute(with_spawn_grant(with_scope(
+                json!({"task": "reach an allowed recipient", "recipient": "+15550003333"}),
+                "wacli",
+                "+15550002222",
+            )))
+            .await
+            .unwrap();
+        assert!(allowed.success, "spawn should succeed: {:?}", allowed.error);
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let sent = wacli_sent.lock().await;
+        assert_eq!(sent.len(), 1, "the undenied recipient must still receive the result");
+        assert!(sent[0].contains("sub-agent done"));
     }
 
     /// P0 concurrency race (kill variant): killing a run must notify on the run's
