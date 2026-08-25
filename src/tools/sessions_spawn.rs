@@ -1508,6 +1508,10 @@ pub(crate) const TERMINATED_BEFORE_RESULT_SUFFIX: &str = "was terminated before 
 
 /// Whether a `Failed` reason describes a kill rather than a task-level failure.
 ///
+/// A *sub-rule* of [`termination_cause`], which only reaches it for a reason
+/// the runtime itself wrote — the suffix match below is deliberately never
+/// applied to text a sub-agent could have chosen.
+///
 /// MUTATION GUARD: collapse this into `false` and a killed member of a joined
 /// batch is reported as an ordinary failure, which is the one distinction the
 /// caller of `join` needs in order to decide whether to retry it.
@@ -1533,6 +1537,126 @@ pub(crate) const PROCESS_OWNER_PANICKED_PREFIX: &str = "process owner panicked";
 
 /// Reason recorded when a run was cut off by its manifest `timeout_seconds`.
 pub(crate) const SUB_AGENT_TIMED_OUT_REASON: &str = "timeout";
+
+/// Marker the runtime writes in front of a failure reason that came out of the
+/// sub-agent itself.
+///
+/// Every other constant in this group is wording the *runtime* records about a
+/// run. This one quarantines wording the run recorded about itself — a
+/// process-mode worker's `WorkerResult.error`, an agent loop error carrying a
+/// tool's or a provider's message — none of which the runtime authored and all
+/// of which a sub-agent (or the untrusted input it is chewing on) can choose.
+///
+/// It is the load-bearing half of [`termination_cause`]: because the tag can
+/// only ever sit at the *front* of a reason and only the runtime puts it there,
+/// a sub-agent that names its own failure `killed by user`, `timeout`, or
+/// anything ending in [`TERMINATED_BEFORE_RESULT_SUFFIX`] cannot relabel how
+/// its own termination is reported to whoever joins the batch.
+pub(crate) const SUB_AGENT_REPORTED_PREFIX: &str = "sub-agent reported:";
+
+/// Wrap a sub-agent's own account of why it failed in the quarantine tag.
+///
+/// A function rather than a `format!` at each site so the tag and the space
+/// after it cannot drift, and so a test can build the exact reason production
+/// would from an adversarial worker payload.
+fn sub_agent_reported_failure(detail: &str) -> String {
+    let detail = detail.trim();
+    if detail.is_empty() {
+        SUB_AGENT_REPORTED_PREFIX.to_string()
+    } else {
+        format!("{SUB_AGENT_REPORTED_PREFIX} {detail}")
+    }
+}
+
+/// Which of the three ways a run can stop this reason describes.
+///
+/// `join`'s buckets are a claim about *who* ended a run, and until this
+/// summer that claim was read out of the reason's prose — so a sub-agent that
+/// wrote the right words into its own error could pick its own bucket, and a
+/// generic one like `timeout` could collide with a runtime wording by
+/// accident. The classification now follows the reason's *provenance*, which
+/// the writer stamps and the reader only reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminationCause {
+    /// Somebody ended the run: an operator kill, or a cascade that reached it.
+    Killed,
+    /// The run stopped without ever reaching a conclusion of its own.
+    NoConclusion,
+    /// The account came from the sub-agent, so it is a task-level verdict —
+    /// whatever words it happens to contain.
+    SelfReported,
+}
+
+/// Read a `Failed` reason's provenance.
+///
+/// The order of the checks is the whole design and is not interchangeable:
+///
+/// 1. The quarantine tag first. A reason the runtime marked as the sub-agent's
+///    own account is a task verdict no matter what it says, which is what makes
+///    the wordings below unforgeable rather than merely unlikely to collide.
+/// 2. The runtime tags that are *anchored at the front* and carry an untrusted
+///    tail — [`EXITED_WITHOUT_RESULT_PREFIX`] embeds a preview of the worker's
+///    stderr, and [`PROCESS_OWNER_PANICKED_PREFIX`] embeds a cleanup error.
+///    They are read before the suffix rule below because a worker whose last
+///    stderr bytes are [`TERMINATED_BEFORE_RESULT_SUFFIX`] would otherwise
+///    relabel its own silent death as an operator kill.
+/// 3. Only then the remaining wordings, none of which an untrusted string can
+///    reach any more.
+///
+/// An untagged reason from somewhere that never went through the writers here
+/// falls to `SelfReported`: it is the one bucket that claims nothing about the
+/// runtime having acted.
+///
+/// MUTATION GUARD: delete the first arm and
+/// `a_sub_agent_cannot_forge_its_own_termination_verdict` fails — a worker
+/// whose reported error ends in [`TERMINATED_BEFORE_RESULT_SUFFIX`] is filed
+/// as an operator kill.
+fn termination_cause(reason: &str) -> TerminationCause {
+    if reason.starts_with(SUB_AGENT_REPORTED_PREFIX) {
+        return TerminationCause::SelfReported;
+    }
+    if reason.starts_with(EXITED_WITHOUT_RESULT_PREFIX) || reason.starts_with(PROCESS_OWNER_PANICKED_PREFIX) {
+        return TerminationCause::NoConclusion;
+    }
+    if failure_is_kill(reason) {
+        return TerminationCause::Killed;
+    }
+    if failure_gave_no_conclusion(reason) {
+        return TerminationCause::NoConclusion;
+    }
+    TerminationCause::SelfReported
+}
+
+/// Turn an agent-loop error into the reason its run's row will carry.
+///
+/// The decision is made from the error's *type*, on the task that owns the run,
+/// at the moment it ends — the only place where the runtime still knows what
+/// actually happened. Rendering to text is the last step, and once rendered the
+/// text is only ever an explanation for a human; [`termination_cause`] reads the
+/// tag this function chose, not the prose.
+///
+/// MUTATION GUARD: replace the body with `error.to_string()` and
+/// `a_task_mode_failure_is_classified_by_the_error_type_not_its_words` fails —
+/// a cancelled loop is filed as the task's own verdict, and a tool error that
+/// merely quotes the hang detector is filed as `no_result`.
+fn task_failure_reason(error: &anyhow::Error) -> String {
+    if error
+        .chain()
+        .any(|source| source.is::<crate::agent::idle::IdleHangTerminated>())
+    {
+        // The runtime's own hang detector ended this turn: its rendering already
+        // carries the markers `failure_gave_no_conclusion` recognises, and no
+        // sub-agent can produce this type.
+        error.to_string()
+    } else if crate::agent::loop_::is_tool_loop_cancelled(error) {
+        // Somebody cancelled the loop — `prx tasks kill`, a parent cascade, a
+        // shutdown. That is a kill, and it is the same shape
+        // `vanished_monitor_reason` records for the cascade it can observe.
+        format!("sub-agent run {TERMINATED_BEFORE_RESULT_SUFFIX}")
+    } else {
+        sub_agent_reported_failure(&error.to_string())
+    }
+}
 
 /// The reason a run's row carries after its worker died without writing a
 /// result.
@@ -1568,8 +1692,11 @@ const fn spawn_completion_note(announce_result: bool) -> &'static str {
 /// caller to trust a verdict that was never rendered.
 ///
 /// Every arm matches a constant that the *writing* site also uses, so the two
-/// halves cannot drift; string matching is the only channel available because a
-/// run's outcome reaches the registry as `SubAgentStatus::Failed(String)`.
+/// halves cannot drift. A string is the only channel available because a run's
+/// outcome reaches the registry as `SubAgentStatus::Failed(String)`, but the
+/// string is no longer trusted on its own: this predicate is a *sub-rule* of
+/// [`termination_cause`], which refuses to consult it at all for a reason the
+/// sub-agent authored.
 ///
 /// MUTATION GUARD: collapse this into `false` and every silent death is
 /// reported as a considered failure.
@@ -1623,7 +1750,9 @@ impl SpawnOutcome {
 enum JoinedVerdict {
     Completed(String),
     /// The task looked at the problem and concluded it could not be done. The
-    /// string is the sub-agent's own account of why.
+    /// string is the sub-agent's own account of why, which is exactly why it
+    /// is tagged with [`SUB_AGENT_REPORTED_PREFIX`] on the way in: this is the
+    /// one bucket whose contents the run itself gets to write.
     Failed(String),
     Killed(String),
     /// The run produced no conclusion at all: its worker died on a signal, its
@@ -1706,14 +1835,15 @@ fn settled_verdict(status: &SubAgentStatus) -> Option<JoinedVerdict> {
         // keeps waiting through it.
         SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => None,
         SubAgentStatus::Completed(output) => Some(JoinedVerdict::Completed(output.clone())),
-        SubAgentStatus::Failed(reason) if failure_is_kill(reason) => Some(JoinedVerdict::Killed(reason.clone())),
-        // Ordered before the general `Failed` arm on purpose: a reason that
-        // names a silent death must never fall through to the bucket that means
-        // "the task decided this could not be done".
-        SubAgentStatus::Failed(reason) if failure_gave_no_conclusion(reason) => {
-            Some(JoinedVerdict::NoResult(reason.clone()))
-        }
-        SubAgentStatus::Failed(reason) => Some(JoinedVerdict::Failed(reason.clone())),
+        // One dispatch on the reason's provenance rather than a chain of
+        // guards, so the precedence between the three causes lives in exactly
+        // one place — [`termination_cause`] — and cannot be reordered here by
+        // accident.
+        SubAgentStatus::Failed(reason) => Some(match termination_cause(reason) {
+            TerminationCause::Killed => JoinedVerdict::Killed(reason.clone()),
+            TerminationCause::NoConclusion => JoinedVerdict::NoResult(reason.clone()),
+            TerminationCause::SelfReported => JoinedVerdict::Failed(reason.clone()),
+        }),
     }
 }
 
@@ -2013,10 +2143,10 @@ impl Tool for SessionsSpawnTool {
                 "announce": {
                     "type": "boolean",
                     "description": "Whether this sub-agent posts its own result to the channel when it finishes. \
-                                    Defaults to true for 'spawn' and to false for every member of a 'spawn_batch' — \
-                                    a batch's results are collected by 'join' and summarised by you in one message, \
-                                    instead of each member reporting separately. Set true on a batch member to opt \
-                                    it back in."
+                                    Applies to 'spawn' only and defaults to true. A 'spawn_batch' member never \
+                                    announces, whatever this is set to: a batch's results are collected by 'join' \
+                                    and summarised by you in one message, instead of each member reporting \
+                                    separately. Use a plain 'spawn' for a run that should report for itself."
                 },
                 "last_n": {
                     "type": "integer",
@@ -2140,6 +2270,13 @@ impl SessionsSpawnTool {
     /// [`Self::batch_member_args`] enforces, via the key set derived from it
     /// in [`Self::batch_member_overridable_keys`]. One declaration, so the
     /// advertised contract and the enforced one cannot drift apart.
+    ///
+    /// `announce` is deliberately **absent**. A fan-out's account of itself is
+    /// the single summary its caller sends after `join`; a member that could
+    /// switch its own announcement on would turn that into N+1 messages, and
+    /// because the whitelist is derived from this object, listing the key here
+    /// is the same thing as letting the model set it. A run that should report
+    /// for itself is a plain `spawn`.
     fn batch_member_entry_schema() -> serde_json::Value {
         json!({
             "type": "object",
@@ -2151,7 +2288,6 @@ impl SessionsSpawnTool {
                 "provider": {"type": "string"},
                 "mode": {"type": "string", "enum": ["task", "process"]},
                 "recipient": {"type": "string"},
-                "announce": {"type": "boolean"},
                 "timeout_seconds": {"type": "integer", "minimum": 0},
                 "max_iterations": {"type": "integer", "minimum": 1}
             },
@@ -2586,18 +2722,29 @@ impl SessionsSpawnTool {
         // on the channel *and* the parent's summary after it — N+1 messages for
         // one request. Which of those two a run is, is exactly `batch_id`.
         //
+        // For a batch member this is not a default but a **property**: the
+        // argument is not consulted at all. "One request, one message" is the
+        // whole point of `spawn_batch` + `join`, and a default the model can
+        // flip is not that promise — it is a suggestion. `announce` is
+        // therefore no longer a per-member parameter of the entry schema
+        // either, so an entry that names it is refused where the caller can
+        // see it (see `batch_member_overridable_keys`), rather than silently
+        // ignored here. A run that really should report for itself is a plain
+        // `spawn`, which is unchanged.
+        //
         // This deliberately changes nothing else about the announce wiring: the
         // run still captures `channel_name` + `recipient` atomically from the
         // launching message's scope (below), so a later kill notification still
-        // routes to the right channel, and a member may opt back in with an
-        // explicit `announce: true`.
+        // routes to the right channel.
         //
-        // MUTATION GUARD: make this `unwrap_or(true)` and a joined batch of
-        // three delivers four messages instead of one.
-        let announce_result = args
-            .get("announce")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or_else(|| batch_id.is_none());
+        // MUTATION GUARD: drop the `batch_id.is_none() &&` and a batch launched
+        // with `announce: true` at the top level delivers one message per member
+        // on top of the parent's summary.
+        let announce_result = batch_id.is_none()
+            && args
+                .get("announce")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
 
         let resolved_provider_name = provider_override.unwrap_or_else(|| {
             selected_agent
@@ -2878,8 +3025,14 @@ impl SessionsSpawnTool {
                                 Ok(ProcessWorkerOutcome::Finished(result)) => {
                                     let error = result.error.unwrap_or_else(|| "worker failed".to_string());
                                     let msg = format!("Sub-agent error: {error}");
+                                    // `result.error` is a field of the JSON the
+                                    // worker itself printed, so it is the run's
+                                    // account of the run — quarantined here so
+                                    // it cannot pass for a runtime wording in
+                                    // `termination_cause`. The announcement
+                                    // above still shows the raw account.
                                     (
-                                        SubAgentStatus::Failed(error),
+                                        SubAgentStatus::Failed(sub_agent_reported_failure(&error)),
                                         msg,
                                         Vec::new(),
                                         ProcessFinalization::Natural,
@@ -3284,7 +3437,7 @@ impl SessionsSpawnTool {
                 Ok(Err(e)) => {
                     let msg = format!("Sub-agent error: {e}");
                     (
-                        SubAgentStatus::Failed(e.to_string()),
+                        SubAgentStatus::Failed(task_failure_reason(&e)),
                         msg,
                         crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
                             &route_decision,
@@ -11296,6 +11449,147 @@ mod tests {
         assert!(matches!(settled_verdict(&silent), Some(JoinedVerdict::NoResult(_))));
     }
 
+    /// A joined member's bucket is a claim about *who* ended it, so the member
+    /// must not be able to choose its own.
+    ///
+    /// Every string below is a wording the runtime writes for a termination the
+    /// runtime performed. Here they arrive as the sub-agent's own account of
+    /// itself — `WorkerResult.error` is a field of the JSON the worker prints,
+    /// and a sub-agent handling untrusted input can be talked into printing
+    /// anything — so every one of them must land in `failed`, the only bucket
+    /// that claims nothing about the runtime having acted.
+    ///
+    /// MUTATION GUARD: delete the [`SUB_AGENT_REPORTED_PREFIX`] arm at the top
+    /// of `termination_cause` and a self-declared
+    /// [`TERMINATED_BEFORE_RESULT_SUFFIX`] is filed as an operator kill.
+    #[test]
+    fn a_sub_agent_cannot_forge_its_own_termination_verdict() {
+        let forgeries = [
+            KILLED_BY_USER_REASON.to_string(),
+            format!("sub-agent run {TERMINATED_BEFORE_RESULT_SUFFIX}"),
+            format!("the patch {TERMINATED_BEFORE_RESULT_SUFFIX}"),
+            format!("sub-agent run {PANICKED_BEFORE_RESULT_SUFFIX}"),
+            exited_without_result_reason("killed by signal 9"),
+            PROCESS_OWNER_PANICKED_PREFIX.to_string(),
+            SUB_AGENT_TIMED_OUT_REASON.to_string(),
+            format!("the build {} after 900s", crate::agent::idle::HANG_TERMINATION_MARKER),
+            format!(
+                "the build {}",
+                crate::agent::idle::RUNTIME_CEILING_TERMINATION_MARKER
+            ),
+        ];
+        for forged in forgeries {
+            // Exactly what the process branch commits for a worker that reported
+            // this as its own error.
+            let status = SubAgentStatus::Failed(sub_agent_reported_failure(&forged));
+            assert!(
+                matches!(settled_verdict(&status), Some(JoinedVerdict::Failed(_))),
+                "a sub-agent writing {forged:?} into its own error must not relabel its termination"
+            );
+            // And the runtime's own use of the same wording is untouched: this
+            // is a provenance rule, not a ban on the words.
+            assert!(
+                !matches!(
+                    settled_verdict(&SubAgentStatus::Failed(forged.clone())),
+                    Some(JoinedVerdict::Failed(_))
+                ),
+                "the runtime's own {forged:?} must keep meaning what it meant"
+            );
+        }
+    }
+
+    /// The other half of the same hole: a worker that never wrote a result at
+    /// all still gets its **stderr** quoted into the reason, and the two rules
+    /// that used to be consulted for that reason both match on its *tail*.
+    ///
+    /// Falsified while writing this: the live path cannot be exploited today,
+    /// because `exited_without_result_reason` closes the quoted detail with
+    /// `)`, so no worker log can make the reason literally end in a kill
+    /// wording. That is a property of a format string in a different function,
+    /// though, and the bucket a member lands in should not depend on it — so
+    /// the classifier reads the front-anchored runtime tag first and the case
+    /// below pins that, together with the shape production really builds.
+    ///
+    /// MUTATION GUARD: move the `EXITED_WITHOUT_RESULT_PREFIX` check in
+    /// `termination_cause` below the `failure_is_kill` call and the crafted
+    /// case is filed as an operator kill, which would drop a dead worker off
+    /// the caller's retry list.
+    #[cfg(unix)]
+    #[test]
+    fn a_silent_death_stays_a_silent_death_however_its_tail_reads() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let stderr = format!("worker log: the sub-agent run {TERMINATED_BEFORE_RESULT_SUFFIX}");
+        // Built by the same function the process branch uses on a real dead
+        // child, so the shape under test is production's and not a copy.
+        let live = exited_without_result_reason(&describe_worker_exit(
+            std::process::ExitStatus::from_raw(9),
+            &stderr,
+        ));
+        // The same reason, minus the closing bracket that happens to defuse it.
+        let crafted = format!("{EXITED_WITHOUT_RESULT_PREFIX}: {stderr}");
+        assert!(
+            crafted.ends_with(TERMINATED_BEFORE_RESULT_SUFFIX),
+            "the crafted case must really end in the kill wording: {crafted}"
+        );
+        for reason in [live, crafted] {
+            assert!(
+                matches!(
+                    settled_verdict(&SubAgentStatus::Failed(reason.clone())),
+                    Some(JoinedVerdict::NoResult(_))
+                ),
+                "a worker killed by a signal produced no verdict, whatever it logged: {reason}"
+            );
+        }
+    }
+
+    /// Task mode has the typed error in hand at the moment the run ends, so the
+    /// classification is made there, from the type, and the text is only the
+    /// explanation that comes with it.
+    ///
+    /// MUTATION GUARD: make `task_failure_reason` return `error.to_string()`
+    /// and the third case files a tool error that merely quotes the hang
+    /// detector as `no_result`.
+    #[test]
+    fn a_task_mode_failure_is_classified_by_the_error_type_not_its_words() {
+        let hang = crate::agent::idle::IdleHangTerminated {
+            reason: crate::agent::idle::HangReason::NoProgress,
+            label: Arc::from("sub-agent turn"),
+            idle: std::time::Duration::from_mins(10),
+            threshold: std::time::Duration::from_mins(10),
+            elapsed: std::time::Duration::from_mins(15),
+            progress_events: 0,
+            last_progress: crate::agent::idle::ProgressKind::TurnStart,
+            killed: 1,
+        };
+        let hung = SubAgentStatus::Failed(task_failure_reason(&anyhow::Error::new(hang)));
+        assert!(
+            matches!(settled_verdict(&hung), Some(JoinedVerdict::NoResult(_))),
+            "the runtime's own hang detector reached no verdict"
+        );
+
+        let cancelled = SubAgentStatus::Failed(task_failure_reason(&anyhow::Error::new(
+            crate::agent::loop_::ToolLoopCancelled,
+        )));
+        assert!(
+            matches!(settled_verdict(&cancelled), Some(JoinedVerdict::Killed(_))),
+            "a cancelled loop is somebody ending the run, not the task's own verdict"
+        );
+
+        // The same words, but reached through an ordinary task failure: the type
+        // says "the task failed", so the bucket does too.
+        let impostor = anyhow::anyhow!(
+            "tool `read_file` failed: the log says the previous turn {} and {}",
+            crate::agent::idle::HANG_TERMINATION_MARKER,
+            KILLED_BY_USER_REASON
+        );
+        let quoted = SubAgentStatus::Failed(task_failure_reason(&impostor));
+        assert!(
+            matches!(settled_verdict(&quoted), Some(JoinedVerdict::Failed(_))),
+            "a tool error that merely quotes a termination is still a task failure: {quoted:?}"
+        );
+    }
+
     /// The identity holds for any mixture, not just the one the fan-out test
     /// happens to produce.
     #[test]
@@ -11456,11 +11750,10 @@ mod tests {
         assert!(messages[0].contains("solo result"), "{messages:?}");
     }
 
-    /// The switch is a switch, not a batch side effect: a standalone spawn may
-    /// turn its own announcement off, and a batch member may turn its own back
-    /// on.
+    /// The switch is a switch for a standalone `spawn`: it may turn its own
+    /// announcement off and still say where the result went.
     #[tokio::test]
-    async fn announce_is_an_explicit_argument_in_both_directions() {
+    async fn announce_is_an_explicit_argument_for_a_standalone_spawn() {
         let (recorder, sent) = NamedRecordingChannel::new("wacli");
         let channel: Arc<dyn Channel> = recorder;
         let tool = make_tool(
@@ -11481,45 +11774,94 @@ mod tests {
             "a run that will not announce must say where its result goes: {}",
             silenced.output
         );
-        let silenced_id = {
-            let runs = tool.active_runs_snapshot().await;
-            runs.first().expect("the silenced run is registered").id.clone()
-        };
 
-        let batch = tool
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            sent.lock().await.is_empty(),
+            "the standalone spawn that switched announcing off must stay quiet: {:?}",
+            sent.lock().await
+        );
+    }
+
+    /// "One message, not four" was a *default* before this: `announce` was a
+    /// per-member parameter, and the whitelist that decides what a member entry
+    /// may set is derived from that schema — so the model could switch a
+    /// member's own announcement back on and get the fan-out's raw output on
+    /// the channel plus the summary after it.
+    ///
+    /// Both routes are closed here, and they are closed differently on purpose:
+    /// a member entry naming `announce` is **refused**, visibly, in `rejected`,
+    /// while a batch-level `announce` simply does not reach members — it is a
+    /// legal argument of the `spawn` this call is not making.
+    ///
+    /// MUTATION GUARD: drop the `batch_id.is_none() &&` from `announce_result`
+    /// and the second half sees two member announcements.
+    #[tokio::test]
+    async fn a_batch_member_cannot_turn_its_own_announcement_back_on() {
+        let (recorder, sent) = NamedRecordingChannel::new("wacli");
+        let channel: Arc<dyn Channel> = recorder;
+        let tool = make_tool(
+            Arc::clone(&channel),
+            Arc::new(EchoProvider {
+                response: "raw member output".into(),
+            }),
+        );
+        tool.set_active_recipient("120363000000000000@g.us").await;
+
+        // Route 1: the per-member entry.
+        let refused = tool
             .execute(with_spawn_grant(json!({
                 "action": "spawn_batch",
                 "tasks": [{"task": "report for myself", "announce": true}],
             })))
             .await
             .expect("spawn_batch tool call");
-        assert!(batch.success, "{batch:?}");
-        let opted_in_id = batch_run_ids(&parse_json(&batch.output))
-            .first()
-            .expect("the opted-in member is registered")
-            .clone();
+        let payload = parse_json(&refused.output);
+        assert_eq!(payload["started"], 0, "nothing may start from a refused entry: {payload}");
+        let error = payload["rejected"][0]["error"]
+            .as_str()
+            .expect("a refused entry says why");
+        assert!(
+            error.contains("announce"),
+            "the refusal must name the offending key so the caller can see it: {error}"
+        );
 
+        // Route 2: the batch-level argument, inherited by every member.
+        let batch = tool
+            .execute(with_spawn_grant(json!({
+                "action": "spawn_batch",
+                "announce": true,
+                "tasks": ["check the weather", "check the calendar"],
+            })))
+            .await
+            .expect("spawn_batch tool call");
+        assert!(batch.success, "{batch:?}");
+        let payload = parse_json(&batch.output);
+        assert_eq!(payload["started"], 2, "{payload}");
+        assert!(
+            !batch.output.contains("Will announce result when complete."),
+            "a member must not promise an announcement it will not make: {payload}"
+        );
+        let batch_id = payload["batch_id"].as_str().expect("a batch id").to_string();
+
+        let joined = tool
+            .execute(json!({"action": "join", "batch_id": batch_id}))
+            .await
+            .expect("join tool call");
+        assert_eq!(parse_json(&joined.output)["completed"].as_array().map(Vec::len), Some(2));
+
+        // Members announce after publishing their terminal status, so the join
+        // returns first; this window is what makes the mutation visible.
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        let messages = sent.lock().await;
-        assert_eq!(
-            messages.len(),
-            1,
-            "exactly the member that opted in may speak: {messages:?}"
-        );
-        // The announcement names its run, so the one message can be attributed
-        // rather than merely counted.
         assert!(
-            messages[0].contains(&opted_in_id),
-            "the message must be the opted-in batch member's: {messages:?}"
-        );
-        assert!(
-            !messages[0].contains(&silenced_id),
-            "the standalone spawn that switched announcing off must stay quiet: {messages:?}"
+            sent.lock().await.is_empty(),
+            "no member of a batch may report on the channel by itself: {:?}",
+            sent.lock().await
         );
     }
 
-    /// The switch has to be discoverable or the model can never use it, and the
-    /// batch default has to be stated where the model reads it.
+    /// The switch has to be discoverable or the model can never use it, and
+    /// what it does *not* reach has to be stated where the model reads it.
     #[test]
     fn schema_advertises_the_announce_switch_and_its_batch_default() {
         let (ch, _) = RecordingChannel::new();
@@ -11531,8 +11873,17 @@ mod tests {
             .expect("the announce switch is documented");
         assert!(description.contains("spawn_batch"), "{description}");
         assert!(description.contains("join"), "{description}");
-        // And per-member, so a single member can opt back in.
+        // But not per-member: the whitelist a member entry is checked against
+        // is derived from this object, so advertising the key here would be the
+        // same thing as letting a member set it.
+        //
+        // MUTATION GUARD: put `"announce"` back into
+        // `batch_member_entry_schema` and this fails.
         let member = &schema["properties"]["tasks"]["items"]["anyOf"][1]["properties"];
-        assert_eq!(member["announce"]["type"].as_str(), Some("boolean"));
+        assert!(
+            member.get("announce").is_none(),
+            "a batch member has no announcement of its own to switch: {member}"
+        );
+        assert!(member["task"]["type"].as_str() == Some("string"), "{member}");
     }
 }
