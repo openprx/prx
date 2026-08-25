@@ -1732,6 +1732,15 @@ fn settled_verdict(status: &SubAgentStatus) -> Option<JoinedVerdict> {
 /// the last member ends, this returns; there is no third outcome to time out
 /// on.
 ///
+/// That bound is real but conditional, and the condition is worth stating: a
+/// member's watchdog only fires while the runtime it lives in still schedules.
+/// A worker stopped by a signal, wedged in a blocking call, or hung before it
+/// reached [`crate::agent::idle::install`] has no watchdog left to end it. What
+/// covers *that* is not a deadline here — it is that the join stops vouching for
+/// members it can no longer account for, so the caller's own detector reaches a
+/// verdict. See [`member_vouches_for_the_waiter`] for which members those are,
+/// and for the one class it cannot yet tell apart.
+///
 /// # Why it stamps the caller's beat, and why not on every poll
 ///
 /// The caller is parked here, so it emits nothing of its own, and its own hang
