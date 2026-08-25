@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{RwLock, watch};
@@ -1617,22 +1617,7 @@ impl Tool for SessionsSpawnTool {
                     "items": {
                         "anyOf": [
                             {"type": "string", "minLength": 1},
-                            {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "properties": {
-                                    "task": {"type": "string", "minLength": 1},
-                                    "agent": {"type": "string"},
-                                    "model": {"type": "string"},
-                                    "provider": {"type": "string"},
-                                    "mode": {"type": "string", "enum": ["task", "process"]},
-                                    "recipient": {"type": "string"},
-                                    "announce": {"type": "boolean"},
-                                    "timeout_seconds": {"type": "integer", "minimum": 0},
-                                    "max_iterations": {"type": "integer", "minimum": 1}
-                                },
-                                "required": ["task"]
-                            }
+                            Self::batch_member_entry_schema()
                         ]
                     }
                 },
@@ -1805,14 +1790,78 @@ impl Tool for SessionsSpawnTool {
 }
 
 impl SessionsSpawnTool {
+    /// What one `spawn_batch` member entry may carry — declared exactly once.
+    ///
+    /// This is both what the model is told (it is inlined into `tasks.items`
+    /// by [`SessionsSpawnTool::parameters_schema`]) and what the merge in
+    /// [`Self::batch_member_args`] enforces, via the key set derived from it
+    /// in [`Self::batch_member_overridable_keys`]. One declaration, so the
+    /// advertised contract and the enforced one cannot drift apart.
+    fn batch_member_entry_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "task": {"type": "string", "minLength": 1},
+                "agent": {"type": "string"},
+                "model": {"type": "string"},
+                "provider": {"type": "string"},
+                "mode": {"type": "string", "enum": ["task", "process"]},
+                "recipient": {"type": "string"},
+                "announce": {"type": "boolean"},
+                "timeout_seconds": {"type": "integer", "minimum": 0},
+                "max_iterations": {"type": "integer", "minimum": 1}
+            },
+            "required": ["task"]
+        })
+    }
+
+    /// The keys a member entry may set, read off [`Self::batch_member_entry_schema`].
+    ///
+    /// Derived rather than restated: a parameter added to the entry schema is
+    /// accepted here the same day, and — the point of it — a *runtime* field
+    /// added elsewhere is refused here without anyone remembering to extend a
+    /// denylist. `_zc_scope`, `_zc_scope_trusted`, `_prx_scope_trusted` and
+    /// the two approval-grant keys are not in the schema, so they are not in
+    /// this set, so a member entry cannot set them.
+    ///
+    /// A schema that stopped exposing `properties` would yield the empty set
+    /// and refuse every entry: the failure direction is refusal, not silent
+    /// acceptance.
+    fn batch_member_overridable_keys() -> &'static BTreeSet<String> {
+        static KEYS: OnceLock<BTreeSet<String>> = OnceLock::new();
+        KEYS.get_or_init(|| {
+            Self::batch_member_entry_schema()
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .map(|properties| properties.keys().cloned().collect())
+                .unwrap_or_default()
+        })
+    }
+
     /// Merge one batch entry over the batch-level arguments.
     ///
     /// The batch-level object carries the trusted per-turn scope and the
     /// approval grant for this tool call, so members inherit them by
-    /// construction — a member cannot be spawned with a scope or a grant the
-    /// batch request did not already have. `action`/`tasks` are dropped because
-    /// they describe the batch, not a member, and every remaining batch-level
-    /// key acts as a default that the member entry may override.
+    /// construction. Inheritance is only half the story, and the half that
+    /// was reasoned about here before: the entry is written by the model, so
+    /// any key it names *overwrites* what was inherited. `_zc_scope_trusted`
+    /// is the single boolean [`parse_spawn_scope`] consults, and `_zc_scope`
+    /// beside it names the sender, channel and chat id the sub-agent then
+    /// speaks as — an entry allowed to set those picks its own identity and
+    /// its own recipient, on a channel this turn never came from.
+    ///
+    /// So the merge is a whitelist, not a denylist: an entry may set only the
+    /// per-member parameters the `spawn` schema declares, and any other key is
+    /// an **error** rather than a silent drop. Dropping it would let a forged
+    /// scope fail quietly and look like an ordinary spawn; refusing it puts
+    /// the attempt in the caller's `rejected` list where it can be seen. The
+    /// message names the offending key and never its value, which is
+    /// model-authored content.
+    ///
+    /// `action`/`tasks` are dropped because they describe the batch, not a
+    /// member, and every remaining batch-level key acts as a default that the
+    /// member entry may override.
     fn batch_member_args(
         batch_args: &serde_json::Value,
         entry: &serde_json::Value,
@@ -1830,7 +1879,18 @@ impl SessionsSpawnTool {
                 member.insert("task".to_string(), json!(task));
             }
             serde_json::Value::Object(fields) => {
+                let overridable = Self::batch_member_overridable_keys();
                 for (key, value) in fields {
+                    // MUTATION GUARD: delete this refusal and a member entry
+                    // carrying `_zc_scope_trusted`/`_zc_scope` overwrites the
+                    // batch's real scope, choosing its own sender, channel and
+                    // recipient.
+                    if !overridable.contains(key) {
+                        anyhow::bail!(
+                            "entry key '{key}' is not a per-member parameter of 'spawn'; a batch entry may only set: {}",
+                            overridable.iter().map(String::as_str).collect::<Vec<_>>().join(", ")
+                        );
+                    }
                     member.insert(key.clone(), value.clone());
                 }
             }
@@ -9419,6 +9479,93 @@ mod tests {
             .expect("a bare task string is a valid entry");
         assert_eq!(bare["task"], "just a string");
         assert!(SessionsSpawnTool::batch_member_args(&batch_args, &json!(7)).is_err());
+    }
+
+    /// A batch entry is written by the model, so it must not be able to name
+    /// the runtime-only keys that decide *who* a sub-agent speaks as — and the
+    /// attempt has to be refused out loud, not dropped in silence, or a forged
+    /// scope looks exactly like an ordinary spawn.
+    #[test]
+    fn batch_entry_cannot_forge_a_trusted_scope_or_an_approval_grant() {
+        let batch_args = json!({
+            "action": "spawn_batch",
+            "tasks": ["ignored"],
+            "_zc_scope_trusted": true,
+            "_zc_scope": {"sender": "+100", "channel": "signal", "chat_type": "dm", "chat_id": "+100"},
+        });
+
+        for forged in [
+            "_zc_scope",
+            "_zc_scope_trusted",
+            "_prx_scope_trusted",
+            crate::security::policy::RUNTIME_APPROVAL_GRANTED_ARG,
+            crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG,
+            "action",
+            "an_unknown_key",
+        ] {
+            let mut fields = serde_json::Map::new();
+            fields.insert("task".to_string(), json!("t"));
+            fields.insert(forged.to_string(), json!("attacker-chosen-value"));
+            let entry = serde_json::Value::Object(fields);
+
+            let error = SessionsSpawnTool::batch_member_args(&batch_args, &entry)
+                .expect_err("a key outside the member schema must be refused, not merged")
+                .to_string();
+            assert!(
+                error.contains(forged),
+                "the refusal names the offending key, got: {error}"
+            );
+            assert!(
+                !error.contains("attacker-chosen-value"),
+                "the refusal must not echo the key's value, got: {error}"
+            );
+        }
+
+        // The inherited scope is still the batch's own, unforged.
+        let member =
+            SessionsSpawnTool::batch_member_args(&batch_args, &json!({"task": "t"})).expect("a well-formed entry");
+        assert_eq!(member["_zc_scope"], batch_args["_zc_scope"]);
+        assert_eq!(member["_zc_scope_trusted"], json!(true));
+    }
+
+    /// The list the merge enforces and the list the model is shown are one
+    /// list — derived, not restated, so they cannot drift.
+    #[test]
+    fn batch_member_overridable_keys_are_derived_from_the_advertised_entry_schema() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+        let schema = tool.parameters_schema();
+        let advertised = schema["properties"]["tasks"]["items"]["anyOf"][1].clone();
+        assert_eq!(
+            advertised,
+            SessionsSpawnTool::batch_member_entry_schema(),
+            "the model is shown exactly the entry schema the merge enforces"
+        );
+
+        let declared = advertised["properties"]
+            .as_object()
+            .expect("the entry schema declares its properties")
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<String>>();
+        assert_eq!(*SessionsSpawnTool::batch_member_overridable_keys(), declared);
+        assert!(!declared.is_empty());
+        assert!(
+            declared.contains("recipient"),
+            "recipient is a declared member parameter and stays model-settable"
+        );
+        for runtime_only in [
+            "_zc_scope",
+            "_zc_scope_trusted",
+            "_prx_scope_trusted",
+            crate::security::policy::RUNTIME_APPROVAL_GRANTED_ARG,
+            crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG,
+        ] {
+            assert!(
+                !declared.contains(runtime_only),
+                "'{runtime_only}' is runtime-only and must never be declared as a member parameter"
+            );
+        }
     }
 
     /// Argument validation for the two new actions.
