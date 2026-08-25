@@ -519,8 +519,12 @@ struct AnnounceOrigin {
 }
 
 impl AnnounceOrigin {
-    /// Capture the launching turn's identity, when this spawn carried a trusted
-    /// scope.
+    /// Capture a turn's identity from its trusted scope.
+    ///
+    /// Two callers with the same shape and different timing: a spawn snapshots
+    /// the *launching* turn here because its announcement fires after that turn
+    /// is gone, while `action='kill'` reads the *killing* turn's scope off its
+    /// own arguments, since that turn is still running when its receipt goes out.
     ///
     /// `None` — an absent or untrusted `_zc_scope`, i.e. the CLI and
     /// single-channel paths — degrades to the same `"unknown"` identity
@@ -534,20 +538,22 @@ impl AnnounceOrigin {
     }
 }
 
-/// Outbound recipient authorization for one sub-agent announcement.
+/// Outbound recipient authorization for one message this tool emits by itself —
+/// a run's result announcement or the receipt for a kill.
 ///
 /// The counterpart of `MessageSendTool::authorize_outbound`: both funnel into
 /// [`SecurityPolicy::is_outbound_allowed`], so a `send_allow` / `send_deny` rule
 /// an operator writes governs the announcement path as well as the tool path.
 /// Without this the model-supplied `recipient` on a `sessions_spawn` call was a
 /// complete bypass of that ACL — spawn a throwaway task, name any recipient, and
-/// its completion notice is delivered with zero authorization.
+/// both its completion notice *and* the receipt for killing it are delivered
+/// with zero authorization.
 ///
 /// Source and destination channel are deliberately the same value, and that is
-/// load-bearing rather than lazy. An announcement has no channel argument: it
-/// always leaves on the channel the run resolved for itself, so that channel
-/// *is* both the anchor and the destination — there is no cross-channel
-/// capability on this path to defend. Passing the captured scope channel instead
+/// load-bearing rather than lazy. Neither notice has a channel argument: both
+/// always leave on the channel the run resolved for itself, so that channel *is*
+/// both the anchor and the destination — there is no cross-channel capability on
+/// this path to defend. Passing the captured scope channel instead
 /// would diverge exactly when [`SessionsSpawnTool::resolve_announce_channel`]
 /// falls back to the shared active channel (a name absent from the registry —
 /// every single-channel deployment), source and destination would then differ,
@@ -569,34 +575,112 @@ fn announce_is_authorized(
     security.is_outbound_allowed(sender, dst_channel, chat_type, dst_channel, recipient)
 }
 
-/// Record an announcement the outbound ACL refused.
+/// Which of this tool's self-initiated messages is being delivered.
+///
+/// Three call sites — the task-mode result, the process-mode result and the
+/// receipt for `action='kill'` — share one delivery path, so the only thing that
+/// legitimately differs between them (operator-facing wording) lives here. The
+/// authorization itself deliberately has no per-site variant: that is what makes
+/// it impossible to fix the gate on one notice and leave another ungated, which
+/// is precisely how the kill receipt stayed a bypass after the announcement was
+/// closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundNotice {
+    /// A finished task-mode run reporting its own result.
+    RunResult,
+    /// A finished process-mode run reporting its own result.
+    ProcessRunResult,
+    /// The receipt for an operator's kill of a run.
+    KillNotice,
+}
+
+impl OutboundNotice {
+    /// How the withholding record names this notice to the operator.
+    const fn withheld_label(self) -> &'static str {
+        match self {
+            Self::RunResult | Self::ProcessRunResult => "Announcement",
+            Self::KillNotice => "Kill notice",
+        }
+    }
+
+    /// Log context when the channel itself rejects the send (transport failure,
+    /// not authorization).
+    const fn send_failure_context(self) -> &'static str {
+        match self {
+            Self::RunResult => "Failed to announce sub-agent result",
+            Self::ProcessRunResult => "Failed to announce sub-agent process result",
+            Self::KillNotice => "Failed to announce sub-agent kill",
+        }
+    }
+}
+
+/// Record a notice the outbound ACL refused.
 ///
 /// A refusal must never be a silent drop. It lands in the log *and* on the run's
 /// own history, where `sessions_spawn action='history'` and `session_status`
 /// surface it to the operator wondering why no result ever arrived. Both carry
 /// only the destination's stable audit fingerprint, never the plaintext
 /// recipient — the same rule `message_send`'s rejection text follows.
-async fn record_withheld_announcement(
+async fn record_withheld_notice(
     history: &Arc<RwLock<Vec<HistoryEntry>>>,
     run_id: &str,
     dst_channel: &str,
     recipient: &str,
+    notice: OutboundNotice,
 ) {
     let recipient_ref = crate::security::op_id::ref_for_channel_recipient(dst_channel, recipient);
+    let label = notice.withheld_label();
     tracing::warn!(
         run_id = %run_id,
         channel = %dst_channel,
         recipient = %recipient_ref,
-        "Sub-agent announcement withheld: the configured scope rules do not permit this recipient"
+        notice = %label,
+        "Sub-agent outbound notice withheld: the configured scope rules do not permit this recipient"
     );
     history.write().await.push(HistoryEntry {
         role: "system".to_string(),
         content: crate::security::audit::redact_secrets(&format!(
-            "Announcement withheld: outbound messaging to recipient {recipient_ref} on channel \
+            "{label} withheld: outbound messaging to recipient {recipient_ref} on channel \
              '{dst_channel}' is not permitted by the configured scope rules"
         )),
         timestamp: Utc::now(),
     });
+}
+
+/// The one path by which this tool puts a message on a channel by its own
+/// initiative — result announcement or kill receipt alike.
+///
+/// Folding the three call sites into a single function is the substance of this
+/// gate, not tidiness. While each site inlined its own copy, "the process-mode
+/// block is a verbatim mirror of the task-mode one" was an argument, not
+/// evidence, and the kill receipt — carrying the *same* model-chosen
+/// `recipient` — simply never grew a copy at all. With one implementation there
+/// is one thing to test and nothing left to forget.
+///
+/// MUTATION GUARD: delete the [`announce_is_authorized`] branch here and four
+/// tests go red at once —
+/// `announce_to_a_denied_recipient_is_withheld_and_recorded_on_the_run`,
+/// `a_model_supplied_recipient_cannot_bypass_send_deny`,
+/// `a_kill_notice_to_a_denied_recipient_is_withheld_and_recorded_on_the_run` and
+/// `a_model_supplied_recipient_cannot_bypass_send_deny_through_the_kill_notice`.
+async fn deliver_or_withhold_notice(
+    security: &SecurityPolicy,
+    origin: Option<&AnnounceOrigin>,
+    channel: &dyn Channel,
+    history: &Arc<RwLock<Vec<HistoryEntry>>>,
+    run_id: &str,
+    recipient: &str,
+    text: &str,
+    notice: OutboundNotice,
+) {
+    if !announce_is_authorized(security, origin, channel.name(), recipient) {
+        record_withheld_notice(history, run_id, channel.name(), recipient, notice).await;
+        return;
+    }
+    let message = SendMessage::new(text, recipient);
+    if let Err(error) = channel.send(&message).await {
+        tracing::error!(run_id = %run_id, "{}: {error}", notice.send_failure_context());
+    }
 }
 
 fn current_spawn_execution_context() -> Option<SpawnExecutionContext> {
@@ -1827,7 +1911,18 @@ impl Tool for SessionsSpawnTool {
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("Missing 'run_id' parameter for kill action"))?;
                 let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
-                return self.execute_kill(run_id, approval_grant.as_ref()).await;
+                // Identity for the kill receipt's outbound gate, taken from the
+                // killing turn's own trusted scope. Unlike a completion
+                // announcement — which fires long after its launching turn ended
+                // and therefore has to rely on an identity captured at spawn
+                // time — a kill happens *inside* a live turn, so the authority
+                // for the message it emits is present rather than remembered.
+                // An absent or untrusted scope degrades to the same "unknown"
+                // identity `AnnounceOrigin` documents, never a privileged one.
+                let notice_origin = AnnounceOrigin::from_scope(parse_spawn_scope(&args).as_ref());
+                return self
+                    .execute_kill(run_id, approval_grant.as_ref(), notice_origin.as_ref())
+                    .await;
             }
             "history" => {
                 let run_id = args
@@ -2471,8 +2566,9 @@ impl SessionsSpawnTool {
             let task_owned = task.to_string();
             let rid = run_id.clone();
             let process_scope = spawn_scope.clone();
-            // Announcement gate inputs for the process-mode monitor — identical
-            // contract to the task-mode branch below; see `announce_is_authorized`.
+            // Announcement gate inputs for the process-mode monitor. Same three
+            // values the task-mode branch below captures, handed to the same
+            // `deliver_or_withhold_notice`.
             let process_announce_security = self.security.clone();
             let process_announce_origin = AnnounceOrigin::from_scope(spawn_scope.as_ref());
             let process_announce_history = history_arc.clone();
@@ -2666,31 +2762,25 @@ impl SessionsSpawnTool {
                                      it is delivered to whoever joins this run's batch"
                                 );
                             } else if let Some(target) = recipient {
-                                // MUTATION GUARD: as in task mode — without this
-                                // gate a process-mode run announces to any
-                                // recipient the model named, unauthorized.
-                                if announce_is_authorized(
+                                // Not a mirror of the task-mode block any more:
+                                // the same function, so the gate this path gets
+                                // is literally the gate the task-mode tests
+                                // exercise. Driving a real process-mode
+                                // announcement from a unit test is impossible
+                                // (the worker re-execs `current_exe`, which under
+                                // `cargo test` is the test binary), so sharing the
+                                // implementation is what covers it.
+                                deliver_or_withhold_notice(
                                     &process_announce_security,
                                     process_announce_origin.as_ref(),
-                                    channel.name(),
+                                    channel.as_ref(),
+                                    &process_announce_history,
+                                    &rid,
                                     &target,
-                                ) {
-                                    let msg = SendMessage::new(&announce, &target);
-                                    if let Err(error) = channel.send(&msg).await {
-                                        tracing::error!(
-                                            run_id = %rid,
-                                            "Failed to announce sub-agent process result: {error}"
-                                        );
-                                    }
-                                } else {
-                                    record_withheld_announcement(
-                                        &process_announce_history,
-                                        &rid,
-                                        channel.name(),
-                                        &target,
-                                    )
-                                    .await;
-                                }
+                                    &announce,
+                                    OutboundNotice::ProcessRunResult,
+                                )
+                                .await;
                             }
 
                             tracing::info!(run_id = %rid, "Sub-agent process finished");
@@ -3095,18 +3185,21 @@ impl SessionsSpawnTool {
                      it is delivered to whoever joins this run's batch"
                 );
             } else if let Some(target) = recipient {
-                // MUTATION GUARD: drop this gate and the model-supplied
-                // `recipient` on the spawn call reaches the channel with no
-                // authorization at all — the hole `message_send`'s own outbound
-                // gate closes on its side.
-                if announce_is_authorized(&announce_security, announce_origin.as_ref(), channel.name(), &target) {
-                    let msg = SendMessage::new(&announce, &target);
-                    if let Err(e) = channel.send(&msg).await {
-                        tracing::error!(run_id = %rid, "Failed to announce sub-agent result: {e}");
-                    }
-                } else {
-                    record_withheld_announcement(&announce_history, &rid, channel.name(), &target).await;
-                }
+                // MUTATION GUARD: route this straight to `channel.send` and the
+                // model-supplied `recipient` on the spawn call reaches the
+                // channel with no authorization at all — the hole
+                // `message_send`'s own outbound gate closes on its side.
+                deliver_or_withhold_notice(
+                    &announce_security,
+                    announce_origin.as_ref(),
+                    channel.as_ref(),
+                    &announce_history,
+                    &rid,
+                    &target,
+                    &announce,
+                    OutboundNotice::RunResult,
+                )
+                .await;
             } else {
                 tracing::warn!(
                     run_id = %rid,
@@ -3221,7 +3314,12 @@ impl SessionsSpawnTool {
     }
 
     /// Kill a running sub-agent by its run ID.
-    async fn execute_kill(&self, run_id: &str, approval_grant: Option<&ApprovalGrant>) -> anyhow::Result<ToolResult> {
+    async fn execute_kill(
+        &self,
+        run_id: &str,
+        approval_grant: Option<&ApprovalGrant>,
+        notice_origin: Option<&AnnounceOrigin>,
+    ) -> anyhow::Result<ToolResult> {
         let (process_control, task_kill_target) =
             {
                 let mut runs = self.active_runs.write().await;
@@ -3329,12 +3427,36 @@ impl SessionsSpawnTool {
             .await;
 
         if let Some(target) = recipient_opt {
-            let msg_text = format!("🤖 Sub-agent `{rid}` was killed by user.");
-            let msg = SendMessage::new(&msg_text, &target);
             let channel = self.resolve_announce_channel(channel_name_opt.as_deref()).await;
-            if let Err(error) = channel.send(&msg).await {
-                tracing::error!(run_id = %rid, "Failed to announce sub-agent kill: {error}");
-            }
+            // The receipt is addressed to the run's `recipient`, which the model
+            // wrote on the *spawn* call — the identical bypass surface the
+            // completion announcement had, and the one it kept after that was
+            // closed: name any address, kill the run, and the notice went out
+            // with no authorization at all.
+            //
+            // This does not re-open the deliberate call that a kill receipt
+            // ignores `announce`. That switch answers "does a run report itself?"
+            // and a kill is the operator's own action, not the run's; the ACL
+            // answers "may this process address that recipient?". Two questions,
+            // two mechanisms — folding them into one switch would mean either
+            // silencing operator receipts or leaving them unauthorized.
+            //
+            // MUTATION GUARD: send directly on `channel` here instead and
+            // `a_kill_notice_to_a_denied_recipient_is_withheld_and_recorded_on_the_run`
+            // plus
+            // `a_model_supplied_recipient_cannot_bypass_send_deny_through_the_kill_notice`
+            // go red.
+            deliver_or_withhold_notice(
+                self.security.as_ref(),
+                notice_origin,
+                channel.as_ref(),
+                &killed_run.history,
+                &rid,
+                &target,
+                &format!("🤖 Sub-agent `{rid}` was killed by user."),
+                OutboundNotice::KillNotice,
+            )
+            .await;
         } else {
             tracing::warn!(
                 run_id = %rid,
@@ -6442,8 +6564,9 @@ mod tests {
     /// the run's own history, which `action='history'` and `session_status`
     /// surface.
     ///
-    /// MUTATION GUARD: delete the `announce_is_authorized` call in the task-mode
-    /// announce block and this test goes red on the first assertion.
+    /// MUTATION GUARD: send straight to the channel from the task-mode announce
+    /// block, or drop the gate inside `deliver_or_withhold_notice`, and this test
+    /// goes red on the first assertion.
     #[tokio::test]
     async fn announce_to_a_denied_recipient_is_withheld_and_recorded_on_the_run() {
         let (wacli_ch, wacli_sent) = NamedRecordingChannel::new("wacli");
@@ -6617,6 +6740,239 @@ mod tests {
         let sent = wacli_sent.lock().await;
         assert_eq!(sent.len(), 1, "the undenied recipient must still receive the result");
         assert!(sent[0].contains("sub-agent done"));
+    }
+
+    // ── Outbound ACL coverage for the kill receipt ───────────────────────
+    //
+    // The kill notice is addressed to the run's `recipient` — the same value the
+    // model wrote on the *spawn* call — so closing the announcement alone left
+    // the identical bypass one action away: spawn naming any recipient, kill the
+    // run, receipt delivered unauthorized. These four tests are the announcement
+    // set restated for the kill path: the gate bites on a denied recipient, it
+    // records rather than swallows, a model-chosen recipient cannot escape a
+    // `send_deny`, and it stays inert both where no rules exist and where the
+    // channel registry falls back.
+
+    /// A long-running provider, so a spawned run is still `Running` when the
+    /// test kills it and a receipt is actually emitted.
+    fn unfinishing_provider() -> Arc<dyn crate::providers::Provider> {
+        Arc::new(SleepyProvider {
+            delay_ms: 5_000,
+            response: "never reached".into(),
+        })
+    }
+
+    /// The argument shape the runtime hands this tool for `action='kill'`: the
+    /// resource-operation grant plus the trusted `_zc_scope` that
+    /// `normalize_arguments` injects into *every* tool call.
+    fn kill_args(run_id: &str, channel: &str, chat_id: &str) -> serde_json::Value {
+        let grant = serde_json::to_value(ApprovalGrant::for_resource_operation(
+            "sessions_spawn",
+            &format!("sessions_spawn:kill:{run_id}"),
+            "test",
+            None,
+        ))
+        .expect("kill grant serializes");
+        with_scope(
+            json!({
+                "action": "kill",
+                "run_id": run_id,
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG: grant,
+            }),
+            channel,
+            chat_id,
+        )
+    }
+
+    /// Spawn one task-mode run under `tool` and return its run id.
+    async fn spawn_long_run(tool: &SessionsSpawnTool, args: serde_json::Value, channel: &str, chat_id: &str) -> String {
+        let spawned = tool
+            .execute(with_spawn_grant(with_scope(args, channel, chat_id)))
+            .await
+            .expect("spawn executes");
+        assert!(spawned.success, "spawn should succeed: {:?}", spawned.error);
+        tool.active_runs_snapshot()
+            .await
+            .last()
+            .expect("a run was registered")
+            .id
+            .clone()
+    }
+
+    /// A `send_deny` hit stops the kill receipt from leaving — and says so on the
+    /// run, exactly as a withheld announcement does.
+    ///
+    /// MUTATION GUARD: send straight to the channel in `execute_kill` and this
+    /// test goes red on the first assertion.
+    #[tokio::test]
+    async fn a_kill_notice_to_a_denied_recipient_is_withheld_and_recorded_on_the_run() {
+        let (wacli_ch, wacli_sent) = NamedRecordingChannel::new("wacli");
+        let tool = make_tool_with_channels_and_security(
+            wacli_ch.clone(),
+            unfinishing_provider(),
+            vec![wacli_ch],
+            announce_policy(vec![announce_scope_rule(&[], &["wacli:+15550001111"])]),
+        );
+
+        let run_id = spawn_long_run(
+            &tool,
+            json!({"task": "long work", "mode": "task"}),
+            "wacli",
+            "+15550001111",
+        )
+        .await;
+
+        let kill = tool
+            .execute(kill_args(&run_id, "wacli", "+15550001111"))
+            .await
+            .expect("kill executes");
+        assert!(
+            kill.success,
+            "the ACL gates the receipt, not the kill itself: {:?}",
+            kill.error
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            wacli_sent.lock().await.is_empty(),
+            "a send_deny hit must stop the kill notice from reaching the channel"
+        );
+
+        let runs = tool.active_runs_snapshot().await;
+        let run = runs.iter().find(|r| r.id == run_id).expect("killed run still listed");
+        let history = run.history.read().await;
+        assert!(
+            history.iter().any(|entry| {
+                entry.content.contains("Kill notice withheld")
+                    && entry.content.contains("not permitted by the configured scope rules")
+            }),
+            "the refusal must be recorded on the run, not silently swallowed; history was: {:?}",
+            history.iter().map(|entry| entry.content.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Zero regression: with no outbound rules configured — every deployment
+    /// today — the kill receipt goes out exactly as it always did.
+    #[tokio::test]
+    async fn a_kill_notice_is_unchanged_when_no_outbound_rules_are_configured() {
+        let (wacli_ch, wacli_sent) = NamedRecordingChannel::new("wacli");
+        let tool = make_tool_with_channels(wacli_ch.clone(), unfinishing_provider(), vec![wacli_ch]);
+
+        let run_id = spawn_long_run(
+            &tool,
+            json!({"task": "long work", "mode": "task"}),
+            "wacli",
+            "+15550001111",
+        )
+        .await;
+        let kill = tool
+            .execute(kill_args(&run_id, "wacli", "+15550001111"))
+            .await
+            .expect("kill executes");
+        assert!(kill.success, "kill should succeed: {:?}", kill.error);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let sent = wacli_sent.lock().await;
+        assert_eq!(
+            sent.len(),
+            1,
+            "an unconfigured deployment must keep sending kill receipts exactly as before"
+        );
+        assert!(sent[0].contains("killed"));
+    }
+
+    /// The zero-regression tripwire, kill variant.
+    ///
+    /// The run's captured scope names `wacli`, but this tool has no channel
+    /// registry, so `resolve_announce_channel` falls back to the shared active
+    /// channel — here `signal`. Judge the receipt with the captured scope channel
+    /// as its source and source would differ from destination, the ACL's channel
+    /// default would flip to deny, and every kill receipt in a deployment with no
+    /// rules at all would vanish. Source and destination therefore both anchor on
+    /// the channel actually carrying the message.
+    #[tokio::test]
+    async fn a_kill_notice_is_not_denied_by_a_channel_registry_fallback() {
+        let (signal_ch, signal_sent) = NamedRecordingChannel::new("signal");
+        let tool = make_tool(signal_ch as Arc<dyn Channel>, unfinishing_provider());
+
+        let run_id = spawn_long_run(
+            &tool,
+            json!({"task": "long work", "mode": "task"}),
+            "wacli",
+            "+15550001111",
+        )
+        .await;
+        let kill = tool
+            .execute(kill_args(&run_id, "wacli", "+15550001111"))
+            .await
+            .expect("kill executes");
+        assert!(kill.success, "kill should succeed: {:?}", kill.error);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let sent = signal_sent.lock().await;
+        assert_eq!(
+            sent.len(),
+            1,
+            "a kill receipt that fell back to the shared active channel must still be delivered"
+        );
+        assert!(sent[0].contains("killed"));
+    }
+
+    /// The bypass this task closes, stated directly: `recipient` is written by
+    /// the model on the spawn call and the kill receipt is addressed to it, so it
+    /// must not reach someone the operator denied. The control run in the same
+    /// test proves the rule is a targeted refusal, not a blanket kill of the
+    /// receipt path.
+    #[tokio::test]
+    async fn a_model_supplied_recipient_cannot_bypass_send_deny_through_the_kill_notice() {
+        let (wacli_ch, wacli_sent) = NamedRecordingChannel::new("wacli");
+        let tool = make_tool_with_channels_and_security(
+            wacli_ch.clone(),
+            unfinishing_provider(),
+            vec![wacli_ch],
+            announce_policy(vec![announce_scope_rule(&[], &["wacli:+15559999999"])]),
+        );
+
+        // The turn is anchored to an allowed chat; the model overrides the run's
+        // recipient with the denied one, then kills the run to trigger a receipt.
+        let denied_run = spawn_long_run(
+            &tool,
+            json!({"task": "long work", "mode": "task", "recipient": "+15559999999"}),
+            "wacli",
+            "+15550002222",
+        )
+        .await;
+        let denied_kill = tool
+            .execute(kill_args(&denied_run, "wacli", "+15550002222"))
+            .await
+            .expect("kill executes");
+        assert!(denied_kill.success, "kill should succeed: {:?}", denied_kill.error);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            wacli_sent.lock().await.is_empty(),
+            "a model-chosen recipient must not escape the operator's send_deny via the kill receipt"
+        );
+
+        // Control: the same override to a recipient outside the deny list is
+        // delivered.
+        let allowed_run = spawn_long_run(
+            &tool,
+            json!({"task": "long work", "mode": "task", "recipient": "+15550003333"}),
+            "wacli",
+            "+15550002222",
+        )
+        .await;
+        let allowed_kill = tool
+            .execute(kill_args(&allowed_run, "wacli", "+15550002222"))
+            .await
+            .expect("kill executes");
+        assert!(allowed_kill.success, "kill should succeed: {:?}", allowed_kill.error);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let sent = wacli_sent.lock().await;
+        assert_eq!(sent.len(), 1, "the undenied recipient must still receive the receipt");
+        assert!(sent[0].contains("killed"));
     }
 
     /// P0 concurrency race (kill variant): killing a run must notify on the run's
