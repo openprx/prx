@@ -152,13 +152,22 @@ impl Tool for SessionsListTool {
 
         let mut lines = group_lines_by_batch(&filtered, &rendered);
         let mut recovered_lines = recovered.iter().map(format_recovered_run).collect::<Vec<_>>();
+        // Runs, not lines. `group_lines_by_batch` inserts one header line per
+        // batch, so counting the rendered lines reported more sessions than
+        // exist — and the model reading this number acts on it, deciding a
+        // fan-out is still short of its expected width or that runs it never
+        // started are alive. The runs are exactly what was filtered plus what
+        // was recovered; presentation cannot change how many there are.
+        //
+        // MUTATION GUARD: count `lines.len()` again and
+        // `the_shown_count_is_runs_not_rendered_lines` fails.
+        let shown = filtered.len().saturating_add(recovered.len());
         lines.append(&mut recovered_lines);
 
         Ok(ToolResult {
             success: true,
             output: format!(
-                "Sessions ({} shown, filter: {}):\n\n{}",
-                lines.len(),
+                "Sessions ({shown} shown, filter: {}):\n\n{}",
                 status_filter,
                 lines.join("\n\n")
             ),
@@ -475,6 +484,44 @@ mod tests {
         assert!(
             !solo_line.contains("batch="),
             "a run outside any batch must not be labelled with one: {solo_line}"
+        );
+    }
+
+    /// The headline count is the number of runs, not the number of lines the
+    /// renderer happened to emit.
+    ///
+    /// Batch grouping adds a header line per fan-out. Counting those inflated
+    /// the number a model reads as "how many sessions are there", and it is a
+    /// number models act on: three runs reported as four invites a search for a
+    /// run that does not exist, or a conclusion that a fan-out is wider than it
+    /// is. Two batches here, so the inflation is two — large enough that an
+    /// off-by-one elsewhere could not produce it by accident.
+    #[tokio::test]
+    async fn the_shown_count_is_runs_not_rendered_lines() {
+        let mut first = make_run("m1", SubAgentStatus::Running, "member one");
+        first.batch_id = Some("batch-a".to_string());
+        let mut second = make_run("m2", SubAgentStatus::Running, "member two");
+        second.batch_id = Some("batch-a".to_string());
+        let mut other = make_run("m3", SubAgentStatus::Running, "member three");
+        other.batch_id = Some("batch-b".to_string());
+        let loner = make_run("solo", SubAgentStatus::Running, "unrelated");
+
+        let runs = Arc::new(RwLock::new(vec![first, loner, second, other]));
+        let tool = SessionsListTool::new(runs);
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(result.success);
+
+        let output = result.output;
+        assert!(
+            output.starts_with("Sessions (4 shown"),
+            "four runs are listed, so the count must say four however they are laid out: {output}"
+        );
+        // And the layout really did add lines, so the assertion above is not
+        // passing by there being nothing to inflate it.
+        assert_eq!(
+            output.matches("▣ batch").count(),
+            2,
+            "the two batch headers must be present: {output}"
         );
     }
 
