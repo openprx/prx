@@ -1753,6 +1753,41 @@ fn tool_execution_event_input(
     }
 }
 
+/// Tool-argument name prefixes reserved for the runtime.
+///
+/// Every argument under one of these prefixes is *runtime-only*: it is written
+/// by the runtime immediately before a tool executes and it carries trust —
+/// the caller scope (`_zc_scope`, `_zc_scope_trusted`, `_prx_scope_trusted`),
+/// the approval grant (`_zc_approval_granted`, `_zc_approval_grant`) and the
+/// principal binding (`_zc_principal`). None of it may ever survive from an
+/// externally supplied payload (model output, an MCP gateway HTTP body, a
+/// third-party tool result) into tool execution, and none of it may leak back
+/// out to a third-party MCP server.
+///
+/// Stripping is by prefix on purpose. A per-key blocklist fails *open*: adding
+/// a new `_zc_*` key and forgetting one of the injection sites silently accepts
+/// a forged one. With a prefix the same mistake fails *closed* — the runtime
+/// key simply goes missing, which surfaces immediately as a denied or
+/// untrusted call instead of an authorization bypass.
+pub const RUNTIME_ONLY_ARG_PREFIXES: [&str; 2] = ["_zc_", "_prx_"];
+
+/// Whether `key` names a runtime-only tool argument (see
+/// [`RUNTIME_ONLY_ARG_PREFIXES`]).
+#[must_use]
+pub fn is_runtime_only_arg(key: &str) -> bool {
+    RUNTIME_ONLY_ARG_PREFIXES.iter().any(|prefix| key.starts_with(prefix))
+}
+
+/// Single source of truth for scrubbing runtime-only arguments off a tool
+/// argument object.
+///
+/// Every site that injects trusted runtime state into tool arguments must call
+/// this first, and every site that forwards arguments to an untrusted process
+/// must call it last.
+pub fn strip_runtime_only_args(root: &mut serde_json::Map<String, serde_json::Value>) {
+    root.retain(|key, _| !is_runtime_only_arg(key));
+}
+
 fn normalize_arguments(
     arguments: &serde_json::Value,
     descriptor: &ToolDescriptor,
@@ -1780,11 +1815,9 @@ fn normalize_arguments(
         }
     }
 
-    root.remove("_zc_scope");
-    root.remove("_zc_scope_trusted");
-    root.remove("_prx_scope_trusted");
-    root.remove(RUNTIME_APPROVAL_GRANTED_ARG);
-    root.remove(RUNTIME_APPROVAL_GRANT_ARG);
+    // Single source of truth: drop every runtime-only key an external caller
+    // may have supplied before re-injecting the authoritative ones below.
+    strip_runtime_only_args(root);
 
     let mut scope = serde_json::json!({
         "sender": context.sender(),

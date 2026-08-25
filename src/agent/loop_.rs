@@ -4046,10 +4046,11 @@ async fn execute_one_tool(
     let root = call_arguments
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("tool arguments must be a JSON object"))?;
-    // Never trust model/user supplied approval markers. ApprovalManager is the
-    // only path that can re-inject this runtime-only grant for the current call.
-    root.remove(RUNTIME_APPROVAL_GRANTED_ARG);
-    root.remove(RUNTIME_APPROVAL_GRANT_ARG);
+    // Never trust model/user supplied runtime markers — approval grant, scope
+    // or principal. The runtime is the only thing allowed to write them, and it
+    // re-injects the authoritative values below. `strip_runtime_only_args` is
+    // the single source of truth for which keys those are.
+    crate::tools::execution::strip_runtime_only_args(root);
     root.insert(
         RUNTIME_APPROVAL_GRANTED_ARG.to_string(),
         serde_json::Value::Bool(runtime_approval_granted),
@@ -4117,8 +4118,8 @@ async fn execute_one_tool(
         root.insert("_zc_scope".to_string(), trusted_scope);
         root.insert("_zc_scope_trusted".to_string(), serde_json::Value::Bool(true));
     } else {
-        // Never trust user-provided scope payloads when runtime has no trusted scope.
-        root.remove("_zc_scope");
+        // No trusted scope: the strip above already dropped any user-provided
+        // scope payload, so only the explicit "untrusted" marker is needed.
         root.insert("_zc_scope_trusted".to_string(), serde_json::Value::Bool(false));
     }
 

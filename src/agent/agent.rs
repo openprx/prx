@@ -375,17 +375,18 @@ impl Agent {
             )
             .await;
 
-        // Strip scope markers before passing to tools (FIX-P1-17). The trusted
-        // scope context is injected by `run_tool_call_loop` in loop_.rs using the
-        // canonical `_zc_scope` / `_zc_scope_trusted` markers — every scope-aware
-        // tool reads those keys. This direct execution path injects no trusted
-        // scope, so any attacker/model-supplied scope markers must be scrubbed and
-        // the trust flag forced to `false` so they can never leak through to tool
-        // execution. The legacy `_prx_scope` key was removed here historically but
-        // no runtime path ever injects it; the live marker name is `_zc_scope`.
+        // Strip runtime-only markers before passing to tools (FIX-P1-17). The
+        // trusted scope context is injected by `run_tool_call_loop` in loop_.rs
+        // using the canonical `_zc_scope` / `_zc_scope_trusted` markers — every
+        // scope-aware tool reads those keys. This direct execution path injects
+        // no trusted scope, so every attacker/model-supplied runtime key (scope
+        // markers, approval grants, principal binding) must be scrubbed and the
+        // trust flags forced to `false` so they can never leak through to tool
+        // execution. `strip_runtime_only_args` is the single source of truth for
+        // what counts as runtime-only.
         let mut sanitized_args = call.arguments.clone();
         if let Some(obj) = sanitized_args.as_object_mut() {
-            obj.remove("_zc_scope");
+            crate::tools::execution::strip_runtime_only_args(obj);
             obj.insert("_zc_scope_trusted".to_string(), serde_json::Value::Bool(false));
             // Gateway destructive-action guard reads `_prx_scope_trusted`; force it
             // off here too so user-supplied values cannot authorize destructive ops.
