@@ -1514,12 +1514,29 @@ fn print_work_items(items: &[openprx::runtime::tasks_cli::WorkItem]) {
 /// Render one row. `indented` marks a row as belonging to the batch header
 /// above it.
 fn print_work_item(item: &openprx::runtime::tasks_cli::WorkItem, indented: bool) {
+    println!("{}", work_item_line(item, indented));
+}
+
+/// The text of one listing row, split out from the printing so what an operator
+/// reads can be asserted rather than eyeballed.
+fn work_item_line(item: &openprx::runtime::tasks_cli::WorkItem, indented: bool) -> String {
     let mut name = item.name.clone();
     if let Some(parent) = &item.parent {
         name.push_str(&format!("  (parent {parent})"));
     }
     if let Some(run_id) = &item.run_id {
         name.push_str(&format!("  (run {run_id})"));
+    }
+    // Marked, not columned: only a minority of rows can take a message, and a
+    // column would spend width on the ones that cannot. The mark exists because
+    // the KIND column reads like an answer and is not one — a detached gateway
+    // job is listed `sub_agent` and has no steering channel — so without it the
+    // only way to learn an item is unsteerable is to send it a message and read
+    // the refusal.
+    //
+    // MUTATION GUARD: drop this and `a_steerable_row_is_marked_and_a_look_alike_is_not` fails.
+    if item.steerable {
+        name.push_str("  (steerable)");
     }
     if let Some(pid) = item.pid {
         name.push_str(&format!("  (pid {pid}"));
@@ -1533,13 +1550,13 @@ fn print_work_item(item: &openprx::runtime::tasks_cli::WorkItem, indented: bool)
     } else {
         item.id.clone()
     };
-    println!(
+    format!(
         "{:<8} {:<10} {:>10}  {:<14} {name}",
         id,
         item.kind,
         openprx::runtime::tasks_cli::format_elapsed(item.elapsed_secs),
         item.state
-    );
+    )
 }
 
 async fn handle_memory_command(command: MemoryCommands, config: &Config) -> anyhow::Result<()> {
@@ -2937,6 +2954,49 @@ mod tests {
             rendered, "Message to w3 [sub_agent] sub-agent (run_id: -) — outcome: queued",
             "with no note the renderer prints one line and nothing else"
         );
+    }
+
+    fn listed(kind: &str, name: &str, steerable: bool) -> openprx::runtime::tasks_cli::WorkItem {
+        openprx::runtime::tasks_cli::WorkItem {
+            id: "w2".to_string(),
+            kind: kind.to_string(),
+            name: name.to_string(),
+            state: "running".to_string(),
+            parent: None,
+            run_id: None,
+            batch_id: None,
+            elapsed_secs: 3,
+            pid: None,
+            pgid: None,
+            steerable,
+        }
+    }
+
+    /// The listing has to separate the rows that accept a message from the ones
+    /// that only look like they do.
+    ///
+    /// The KIND column cannot do it: a detached gateway job is registered as
+    /// `sub_agent` and has no steering channel at all, so an operator reading
+    /// the kind as permission sends a message, gets a 409, and has no way to
+    /// tell a wrong address from an unsteerable target. Both rows below are
+    /// `sub_agent`; only one of them can be steered.
+    ///
+    /// MUTATION GUARD: drop the `(steerable)` mark from `work_item_line` and
+    /// the first assertion fails.
+    #[test]
+    fn a_steerable_row_is_marked_and_a_look_alike_is_not() {
+        let run = work_item_line(&listed("sub_agent", "researcher", true), false);
+        assert!(
+            run.contains("(steerable)"),
+            "a run that takes messages must say so: {run}"
+        );
+
+        let job = work_item_line(&listed("sub_agent", "gateway:webhook:anonymous", false), false);
+        assert!(
+            !job.contains("steerable"),
+            "a gateway job is listed sub_agent but takes no messages, so it must not be marked: {job}"
+        );
+        assert!(job.contains("sub_agent"), "the kind is still reported as it is: {job}");
     }
 
     #[test]

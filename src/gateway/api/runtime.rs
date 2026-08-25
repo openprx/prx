@@ -32,6 +32,10 @@ pub(super) struct WorkItemResponse {
     elapsed_ms: u128,
     pid: Option<u32>,
     pgid: Option<i32>,
+    /// Whether `POST /runtime/tasks/{id}/message` can hand this item anything.
+    /// See [`registry::WorkSnapshot::steerable`] for why the kind cannot be
+    /// read as the answer.
+    steerable: bool,
 }
 
 impl From<registry::WorkSnapshot> for WorkItemResponse {
@@ -49,6 +53,7 @@ impl From<registry::WorkSnapshot> for WorkItemResponse {
             elapsed_ms: snapshot.elapsed.as_millis(),
             pid: snapshot.pid,
             pgid: snapshot.pgid,
+            steerable: snapshot.steerable,
         }
     }
 }
@@ -335,9 +340,24 @@ pub async fn post_task_message(
 
     if let Err(rejection) = outcome {
         let detail = match rejection {
+            // Says what is actually true of *this* row rather than denying its
+            // kind. The old wording ("only sub-agent runs can be steered") was
+            // self-contradicting on the commonest case that reaches it: a
+            // detached gateway job is registered as `sub_agent` and has no
+            // steering channel, so an operator was told the item was not the
+            // very thing the listing had just called it, and reasonably
+            // concluded he had mistyped the address.
+            //
+            // MUTATION GUARD: reinstate "only sub-agent runs can be steered"
+            // and `a_sub_agent_kind_without_a_channel_is_refused_without_denying_its_kind`
+            // fails.
             registry::SteerRejection::NotSteerable => format!(
-                "work item '{work_id}' ({}) exposes no message channel; only sub-agent runs can be steered",
-                target.kind.as_str()
+                "work item '{work_id}' ({} '{}') has no steering channel. A steering channel is \
+                 opened only by a sub-agent run started through `sessions_spawn`; agent turns, \
+                 tool calls and detached gateway jobs never open one, whatever kind they are \
+                 listed under. `prx tasks list` marks the items that can be steered.",
+                target.kind.as_str(),
+                target.name,
             ),
             registry::SteerRejection::ChannelClosed => {
                 format!("work item '{work_id}' finished before the message could be delivered")
@@ -803,7 +823,7 @@ mod tests {
         server.abort();
     }
 
-    /// A live item with no message channel — an agent turn, a tool call — is a
+    /// A live item with no steering channel — an agent turn, a tool call — is a
     /// distinct, explicit refusal rather than a 404 or a quiet success.
     #[tokio::test]
     async fn items_without_a_message_channel_are_refused_explicitly() {
@@ -818,7 +838,73 @@ mod tests {
             .expect_err("test: a turn exposes no message channel");
         let rendered = format!("{error:#}");
         assert!(rendered.contains("409"), "expected a conflict, got: {rendered}");
-        assert!(rendered.contains("no message channel"), "got: {rendered}");
+        assert!(rendered.contains("has no steering channel"), "got: {rendered}");
+        assert!(
+            rendered.contains("turn 'inbound turn'"),
+            "the refusal names the row it is about: {rendered}"
+        );
+
+        drop(guard);
+        server.abort();
+    }
+
+    /// The refusal must describe the row, not contradict it.
+    ///
+    /// Every detached gateway job — a webhook turn, a console session message,
+    /// an MCP tool call — is registered through `jobs::submit`, which uses
+    /// `register_sub_agent`, so the listing calls it `sub_agent`. None of them
+    /// ever reach `attach_steer_sender`, which only `sessions_spawn` calls, so
+    /// steering one is correctly refused. The old wording refused it by saying
+    /// "only sub-agent runs can be steered" *to a row the same API had just
+    /// labelled `sub_agent`*, which reads as "you have the wrong address" and
+    /// sends the operator hunting for an id that does not exist.
+    ///
+    /// MUTATION GUARD: restore "only sub-agent runs can be steered" in
+    /// `post_task_message` and the second assertion fails.
+    #[tokio::test]
+    async fn a_sub_agent_kind_without_a_channel_is_refused_without_denying_its_kind() {
+        let workspace = tempfile::TempDir::new().expect("test: tempdir");
+        let run_id = format!("job-{}", uuid::Uuid::new_v4());
+        // Exactly how `gateway::jobs::submit` registers a webhook job.
+        let guard = registry::register_sub_agent("gateway:webhook:anonymous", &run_id, None, None, None);
+        let work_id = guard.id();
+
+        assert!(
+            registry::snapshot(work_id).is_some_and(|row| !row.steerable),
+            "test: the row this test is about must be listed as unsteerable"
+        );
+        // The same field says yes for a row that really does listen, so the
+        // negative above is a distinction and not a constant.
+        let (steerable, _steerable_run_id, _receiver) = target_that_never_reads_its_queue();
+        assert!(
+            registry::snapshot(steerable.id()).is_some_and(|row| row.steerable),
+            "test: a run with a steering channel must be reported steerable"
+        );
+
+        let (endpoint, server) = serve(test_app_state(AutonomyLevel::Full, workspace.path())).await;
+        let error = tasks_cli::request_message(&endpoint, &work_id.to_string(), "steer a gateway job")
+            .await
+            .expect_err("test: a gateway job exposes no steering channel");
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains("409"), "expected a conflict, got: {rendered}");
+        assert!(
+            !rendered.contains("only sub-agent runs can be steered"),
+            "the refusal must not deny the kind the listing reports for this very row: {rendered}"
+        );
+        assert!(
+            rendered.contains("has no steering channel"),
+            "the refusal must name the real cause: {rendered}"
+        );
+        assert!(
+            rendered.contains("sessions_spawn"),
+            "the refusal must say what does open one, so the operator can tell a wrong address apart \
+             from an unsteerable target: {rendered}"
+        );
+        assert!(
+            rendered.contains("gateway:webhook:anonymous"),
+            "the refusal must name the row it is about: {rendered}"
+        );
 
         drop(guard);
         server.abort();

@@ -509,6 +509,7 @@ mod tests {
             elapsed_secs: 75,
             pid: None,
             pgid: None,
+            steerable: false,
         }
     }
 

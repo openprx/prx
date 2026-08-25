@@ -198,6 +198,16 @@ pub struct WorkSnapshot {
     pub state: WorkState,
     pub pid: Option<u32>,
     pub pgid: Option<i32>,
+    /// Whether this item currently has a steering channel, i.e. whether
+    /// `POST /api/runtime/tasks/{id}/message` can hand it anything.
+    ///
+    /// Reported because the *kind* does not answer the question and reading it
+    /// as if it did is an easy, expensive mistake: a detached gateway job is
+    /// registered as [`WorkKind::SubAgent`] and still has no channel, because
+    /// only a run started through `sessions_spawn` ever calls
+    /// [`attach_steer_sender`]. Without this field the only way to find out was
+    /// to send a message and read the refusal.
+    pub steerable: bool,
 }
 
 /// One registry row. Immutable metadata plus a small mutable state word.
@@ -271,6 +281,7 @@ impl Slot {
             state,
             pid: self.pid,
             pgid: self.pgid,
+            steerable: self.steer.read().is_some(),
         }
     }
 }
@@ -638,8 +649,15 @@ pub fn resolve_address(address: &str) -> Option<WorkId> {
 /// Why a steering message could not be handed to a work item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SteerRejection {
-    /// The item is live but exposes no steering channel — an agent turn, a tool
-    /// call, or a run started before steering existed.
+    /// The item is live but has no steering channel.
+    ///
+    /// A channel is opened by [`attach_steer_sender`], which only a sub-agent
+    /// run started through `sessions_spawn` ever reaches. Everything else is
+    /// in this bucket — agent turns, tool calls, detached gateway jobs, cron
+    /// runs, and runs started before steering existed — *including* rows whose
+    /// [`WorkKind`] is [`WorkKind::SubAgent`]: a gateway job is registered with
+    /// that kind and still has nothing to receive a message. The kind is not
+    /// the criterion; see [`WorkSnapshot::steerable`], which is.
     NotSteerable,
     /// The item's receiver is gone, or its row was retired while the message
     /// was being routed: the run ended.

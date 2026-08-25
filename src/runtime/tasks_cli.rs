@@ -85,6 +85,12 @@ pub struct WorkItem {
     pub pid: Option<u32>,
     #[serde(default)]
     pub pgid: Option<i32>,
+    /// Whether `prx tasks message` can hand this item anything. `default`
+    /// because a daemon older than this field omits it, and the safe reading of
+    /// silence is "unknown, so do not advertise it" rather than a promise the
+    /// listing cannot keep.
+    #[serde(default)]
+    pub steerable: bool,
 }
 
 /// Full listing: live work, plus children spawned but never reaped.
@@ -490,6 +496,7 @@ mod tests {
             elapsed_secs: 3,
             pid: None,
             pgid: None,
+            steerable: false,
         }
     }
 
