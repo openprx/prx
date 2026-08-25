@@ -2620,33 +2620,6 @@ impl SessionsSpawnTool {
         // event it produces refreshes this row and the caller's window alike.
         let task_progress = crate::agent::idle::child_beat();
 
-        // Register the run (abort_handle set after spawn)
-        {
-            let mut runs = self.active_runs.write().await;
-            runs.push(SubAgentRun {
-                id: run_id.clone(),
-                task: task.to_string(),
-                owner_id: run_lineage.owner_id.clone(),
-                topic_id: run_lineage.topic_id.clone(),
-                source_message_event_id: run_lineage.source_message_event_id.clone(),
-                started_at: Utc::now(),
-                finished_at: None,
-                status: SubAgentStatus::Running,
-                recipient: recipient.clone(),
-                channel_name: run_channel_name.clone(),
-                abort_handle: None,
-                process_control: None,
-                history: history_arc.clone(),
-                steer_tx: Some(steer_tx.clone()),
-                parent_run_id: parent_run_id.clone(),
-                session_scope_key: session_scope_key.clone(),
-                spawn_depth,
-                token_usage_records: Vec::new(),
-                progress: Arc::clone(&task_progress),
-                batch_id: batch_id.map(str::to_string),
-            });
-        }
-
         // Clone everything the spawned task needs.
         // Resolve the announce channel from the *per-turn* channel name bound to
         // this run (the launching message's scope), not the shared active channel
@@ -2756,6 +2729,45 @@ impl SessionsSpawnTool {
         } else {
             (DEFAULT_SUB_AGENT_SYSTEM_PROMPT.to_string(), tools)
         };
+
+        // Register the run.
+        //
+        // Deliberately the *last* fallible-free step before the driver task is
+        // spawned, and never earlier: everything between this block and
+        // `tokio::spawn` below is infallible, so the presence of a row in
+        // `active_runs` implies a driver task that will publish a terminal status
+        // for it. Registering before the fallible preparation above (agent prompt
+        // and tool resolution) left a `Running` row behind on every early return —
+        // no abort handle, no driver task, no observer — and `join` polls such a
+        // row forever, with no wall-clock fallback in this runtime to break the
+        // tie. Keep any new fallible step above this block.
+        //
+        // `abort_handle` is filled in right after `tokio::spawn` returns.
+        {
+            let mut runs = self.active_runs.write().await;
+            runs.push(SubAgentRun {
+                id: run_id.clone(),
+                task: task.to_string(),
+                owner_id: run_lineage.owner_id.clone(),
+                topic_id: run_lineage.topic_id.clone(),
+                source_message_event_id: run_lineage.source_message_event_id.clone(),
+                started_at: Utc::now(),
+                finished_at: None,
+                status: SubAgentStatus::Running,
+                recipient: recipient.clone(),
+                channel_name: run_channel_name.clone(),
+                abort_handle: None,
+                process_control: None,
+                history: history_arc.clone(),
+                steer_tx: Some(steer_tx.clone()),
+                parent_run_id: parent_run_id.clone(),
+                session_scope_key: session_scope_key.clone(),
+                spawn_depth,
+                token_usage_records: Vec::new(),
+                progress: Arc::clone(&task_progress),
+                batch_id: batch_id.map(str::to_string),
+            });
+        }
 
         // Registry row for this run. Parent captured on the spawning task, which
         // is the tool call that requested the spawn; a spawned task inherits no
@@ -3382,12 +3394,18 @@ impl SessionsSpawnTool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MemoryScope {
+pub(crate) enum MemoryScope {
     Shared,
     Isolated,
 }
 
-fn parse_memory_scope(scope: Option<&str>) -> anyhow::Result<MemoryScope> {
+/// The single definition of what `agents.<name>.memory_scope` accepts.
+///
+/// `Config::validate` calls this too, so a typo is refused when the config is
+/// loaded rather than surviving until the first spawn of that agent. Both
+/// callers must keep using this one function: a second copy of the rule that
+/// drifts would put the startup check and the spawn-time check out of step.
+pub(crate) fn parse_memory_scope(scope: Option<&str>) -> anyhow::Result<MemoryScope> {
     match scope
         .map(str::trim)
         .map(str::to_ascii_lowercase)
@@ -9113,6 +9131,110 @@ mod tests {
             "killing one member must not disturb the others: {summary}"
         );
         assert!(summary["failed"].as_array().is_some_and(Vec::is_empty), "{summary}");
+    }
+
+    /// A tool whose only configured agent carries a `memory_scope` typo — the
+    /// cheapest way to make `execute_spawn` fail *after* the point at which the
+    /// run's row used to be pushed.
+    fn tool_with_broken_agent(agent: &str) -> SessionsSpawnTool {
+        let (ch, _) = RecordingChannel::new();
+        let mut agents = HashMap::new();
+        let mut cfg = make_agent_config(None);
+        // A plausible typo for "isolated": `parse_memory_scope` refuses it.
+        cfg.memory_scope = Some("isolate".to_string());
+        agents.insert(agent.to_string(), cfg);
+        SessionsSpawnTool::new(
+            Arc::new(ch),
+            Arc::new(EchoProvider { response: "ok".into() }),
+            "test-provider",
+            "test-model",
+            0.7,
+            test_security(),
+            std::path::PathBuf::from("/tmp"),
+            crate::config::MultimodalConfig::default(),
+            crate::config::AgentCompactionConfig::default(),
+            agents,
+            None,
+            crate::providers::ProviderRuntimeOptions::default(),
+            crate::config::SessionsSpawnConfig::default(),
+        )
+    }
+
+    /// b2: a spawn that fails while preparing the sub-agent must leave nothing
+    /// behind.
+    ///
+    /// The failure happens after the announce channel is resolved and after
+    /// every clone the driver task needs has been made — exactly where the run
+    /// used to be registered already. A row published there has no abort
+    /// handle, no driver task and no observer, so nothing will ever move it off
+    /// `Running`.
+    ///
+    /// MUTATION GUARD: move the `active_runs` push in `execute_spawn` back above
+    /// the agent prompt/tool resolution and this assertion finds one `Running`
+    /// row that no code will ever finish.
+    #[tokio::test]
+    async fn a_spawn_that_fails_while_preparing_the_agent_registers_no_run() {
+        let tool = tool_with_broken_agent("alpha");
+
+        let error = tool
+            .execute(with_spawn_grant(json!({"task": "hello", "agent": "alpha"})))
+            .await
+            .expect_err("an unparseable memory_scope must fail the spawn");
+        assert!(error.to_string().contains("memory_scope"), "{error}");
+
+        let runs = tool.active_runs_snapshot().await;
+        assert!(
+            runs.is_empty(),
+            "a spawn that never started a driver task must not leave a row behind: {:?}",
+            runs.iter()
+                .map(|run| (run.id.clone(), format!("{:?}", run.status)))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// b2, from the joining caller's side: the risk that actually bites.
+    ///
+    /// A fan-out where one member cannot be prepared reports that member in
+    /// `rejected`, and the caller then joins the batch. If the failed member
+    /// left a `Running` row carrying the batch id, `join_batch_members` selects
+    /// it, never sees it settle, and polls for it forever — this runtime has no
+    /// wall clock that would ever break the tie.
+    ///
+    /// The timeout below is the test's assertion, not a production mechanism:
+    /// it exists so a regression fails in seconds instead of hanging the suite.
+    #[tokio::test]
+    async fn a_batch_member_that_fails_preparation_does_not_park_the_join_forever() {
+        let tool = tool_with_broken_agent("broken");
+
+        let spawned = tool
+            .execute(with_spawn_grant(json!({
+                "action": "spawn_batch",
+                "tasks": ["a member that starts", {"task": "a member that cannot", "agent": "broken"}],
+            })))
+            .await
+            .expect("spawn_batch tool call");
+        let payload = parse_json(&spawned.output);
+        let batch_id = payload["batch_id"].as_str().expect("a batch id").to_string();
+        assert_eq!(payload["started"], 1, "{payload}");
+        assert_eq!(
+            payload["rejected"].as_array().map(Vec::len),
+            Some(1),
+            "the unpreparable member belongs in rejected: {payload}"
+        );
+
+        let joined = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tool.execute(json!({"action": "join", "batch_id": batch_id})),
+        )
+        .await
+        .expect("join must converge: a member that never started a driver task must not be joinable")
+        .expect("join tool call");
+        let summary = parse_json(&joined.output);
+        assert_eq!(
+            summary["total"], 1,
+            "only the member that actually started is part of the batch: {summary}"
+        );
+        assert_eq!(summary["completed"].as_array().map(Vec::len), Some(1), "{summary}");
     }
 
     /// Core evidence 3, through the real hang detector: a turn parked on a

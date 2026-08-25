@@ -6211,6 +6211,12 @@ impl Config {
         }
 
         for (name, agent) in &self.agents {
+            // Checked for every agent, agentic or not: an unrecognised value is
+            // a typo, and without this the typo only surfaces the first time
+            // that agent is spawned — deep inside `sessions_spawn`, after the
+            // run has already been announced to the caller.
+            crate::tools::sessions_spawn::parse_memory_scope(agent.memory_scope.as_deref())
+                .with_context(|| format!("agents.{name}.memory_scope"))?;
             if !agent.agentic {
                 continue;
             }
@@ -6541,6 +6547,33 @@ mod tests {
             .agents
             .insert("worker".into(), agentic_delegate_config(vec!["*".into()]));
         config.validate().unwrap();
+    }
+
+    /// A `memory_scope` typo used to survive config load and only fail at the
+    /// first spawn of that agent, deep inside `sessions_spawn`.
+    ///
+    /// MUTATION GUARD: delete the `parse_memory_scope` call in `validate` and
+    /// `config.validate()` accepts "isolate" here.
+    #[test]
+    async fn config_rejects_an_unknown_agent_memory_scope() {
+        let mut config = Config::default();
+        let mut agent = agentic_delegate_config(vec!["*".into()]);
+        agent.memory_scope = Some("isolate".into());
+        config.agents.insert("worker".into(), agent);
+
+        let error = format!("{:#}", config.validate().unwrap_err());
+        assert!(error.contains("agents.worker.memory_scope"), "{error}");
+        assert!(error.contains("isolate"), "{error}");
+
+        // Both accepted spellings, and the unset default, still load.
+        for scope in [None, Some("shared".to_string()), Some(" Isolated ".to_string())] {
+            let mut agent = agentic_delegate_config(vec!["*".into()]);
+            agent.memory_scope = scope.clone();
+            config.agents.insert("worker".into(), agent);
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{scope:?} must load: {error:#}"));
+        }
     }
 
     #[test]
