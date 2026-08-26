@@ -354,6 +354,27 @@ pub enum ChatSessionError {
     Invalid(String),
 }
 
+impl ChatSessionError {
+    /// Stable machine tag for this refusal.
+    ///
+    /// The prose above is written for a person and will be reworded; a client
+    /// that has to *act* on one particular refusal — the chat poller
+    /// re-registering when its session is gone — branches on this instead, so
+    /// improving a sentence can never quietly break a recovery path. Sent as
+    /// `code` alongside `error` in every HTTP refusal, and mirrored by
+    /// `crate::runtime::tasks_cli::ControlApiRefusal` on the client side.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::UnknownSession => "unknown_session",
+            Self::BadToken => "bad_token",
+            Self::NotAuthorized { .. } => "not_authorized",
+            Self::UnknownAssignment => "unknown_assignment",
+            Self::Invalid(_) => "invalid_request",
+        }
+    }
+}
+
 impl std::fmt::Display for ChatSessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

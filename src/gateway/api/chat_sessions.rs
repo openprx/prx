@@ -48,7 +48,14 @@ fn into_refusal(error: &ChatSessionError) -> Refusal {
         ChatSessionError::NotAuthorized { .. } => StatusCode::FORBIDDEN,
         ChatSessionError::Invalid(_) => StatusCode::BAD_REQUEST,
     };
-    refusal(status, error.to_string())
+    // `code` rides along with the sentence. Two of these refusals share a
+    // status — an unregistered session and an unknown assignment are both
+    // `404` — and a client that must tell them apart had nothing but the prose
+    // to do it with. See `ChatSessionError::code`.
+    (
+        status,
+        Json(serde_json::json!({ "error": error.to_string(), "code": error.code() })),
+    )
 }
 
 fn session_token(headers: &HeaderMap) -> String {
@@ -840,6 +847,45 @@ mod tests {
         // The pulled work carries the redacted origin, never the plaintext one.
         assert!(!body.contains(SENDER), "test: {body}");
         assert_eq!(string_at(&body, "/assignments/0/origin_channel"), CHANNEL);
+        server.abort();
+    }
+
+    /// The tag a client acts on. Two of these refusals are `404`, and a chat
+    /// that re-registers on the wrong one would abandon a live enrolment — so
+    /// the pair has to be told apart by something more stable than the
+    /// sentence next to it.
+    #[tokio::test]
+    async fn a_refusal_carries_the_machine_tag_a_client_can_act_on() {
+        let workspace = TempDir::new().expect("test: workspace");
+        let config = config_with(workspace.path(), vec![], &[]);
+        let (base_url, server) = serve(test_app_state(config)).await;
+        let (session_id, session_token) = register_session(&base_url).await;
+
+        let (status, body) = post(
+            &base_url,
+            "/chat-sessions/no-such-session/inbox/pull",
+            Some(TOKEN),
+            Some(&session_token),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, 404, "test: body was {body}");
+        assert_eq!(string_at(&body, "/code"), "unknown_session");
+
+        let (status, body) = post(
+            &base_url,
+            &format!("/chat-sessions/{session_id}/result"),
+            Some(TOKEN),
+            Some(&session_token),
+            serde_json::json!({"assignment_id": "no-such-assignment", "status": "completed", "summary": "x"}),
+        )
+        .await;
+        assert_eq!(status, 404, "test: body was {body}");
+        assert_eq!(
+            string_at(&body, "/code"),
+            "unknown_assignment",
+            "same status, different fact: this one must never read as an unregistered session"
+        );
         server.abort();
     }
 

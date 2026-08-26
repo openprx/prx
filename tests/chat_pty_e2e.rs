@@ -1700,8 +1700,16 @@ struct FakeDaemon {
 #[derive(Default)]
 struct FakeDaemonState {
     registered_label: Option<String>,
+    /// How many times a chat registered. A daemon restart is not a new process
+    /// here — it is this counter going up a second time.
+    registrations: usize,
+    /// The session id handed out by the most recent registration.
+    session_id: String,
     /// One assignment, handed out on the first pull and never again.
     pending: Option<(String, String, String)>,
+    /// Set to model a restart: the registry is process memory, so a restarted
+    /// daemon refuses every pull from a session registered before it.
+    forgot_registrations: bool,
     /// The `ack` array of every pull, in order.
     pull_acks: Vec<Vec<String>>,
     /// Every reported result: (assignment id, status, summary).
@@ -1712,10 +1720,23 @@ struct FakeDaemonState {
 impl FakeDaemon {
     /// Start a daemon that will hand out one assignment with `disposition`.
     fn start(assignment_id: &str, task: &str, disposition: &str) -> Self {
+        Self::with_pending(Some((
+            assignment_id.to_string(),
+            task.to_string(),
+            disposition.to_string(),
+        )))
+    }
+
+    /// Start a daemon holding no work, for tests that queue it later.
+    fn start_idle() -> Self {
+        Self::with_pending(None)
+    }
+
+    fn with_pending(pending: Option<(String, String, String)>) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
         let addr = listener.local_addr().expect("fake daemon addr");
         let state = std::sync::Arc::new(std::sync::Mutex::new(FakeDaemonState {
-            pending: Some((assignment_id.to_string(), task.to_string(), disposition.to_string())),
+            pending,
             ..FakeDaemonState::default()
         }));
         let served = std::sync::Arc::clone(&state);
@@ -1729,6 +1750,16 @@ impl FakeDaemon {
             base_url: format!("http://127.0.0.1:{}", addr.port()),
             state,
         }
+    }
+
+    /// Restart the daemon, as far as a chat session can tell: every
+    /// registration is forgotten, and a task is waiting for whoever registers
+    /// next. Nothing about this is a reconnect the *daemon* performs — it
+    /// cannot, which is the whole point.
+    fn restart_holding(&self, assignment_id: &str, task: &str) {
+        let mut state = self.state.lock().expect("fake daemon state");
+        state.forgot_registrations = true;
+        state.pending = Some((assignment_id.to_string(), task.to_string(), "queue".to_string()));
     }
 
     fn snapshot<T>(&self, read: impl FnOnce(&FakeDaemonState) -> T) -> T {
@@ -1791,9 +1822,10 @@ fn serve_one(mut stream: std::net::TcpStream, state: &std::sync::Mutex<FakeDaemo
     }
     let body = String::from_utf8_lossy(&raw[head_end..]).to_string();
     let request_line = head.lines().next().unwrap_or_default().to_string();
-    let body = answer(&request_line, &body, state);
+    let (status, body) = answer(&request_line, &body, state);
+    let reason = if status == 200 { "OK" } else { "Not Found" };
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
@@ -1801,22 +1833,48 @@ fn serve_one(mut stream: std::net::TcpStream, state: &std::sync::Mutex<FakeDaemo
     let _ = stream.flush();
 }
 
-fn answer(request_line: &str, body: &str, state: &std::sync::Mutex<FakeDaemonState>) -> String {
+fn answer(request_line: &str, body: &str, state: &std::sync::Mutex<FakeDaemonState>) -> (u16, String) {
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default();
     let path = parts.next().unwrap_or_default();
     let mut state = state.lock().expect("fake daemon state");
     if method == "POST" && path == "/api/chat-sessions/register" {
         state.registered_label = Some(json_string(body, "label"));
-        return r#"{"session_id":"sess-1","session_ref":"9b2e0f7c","token":"tok-1","label":"workspace","registered_at_unix_ms":1}"#.to_string();
+        state.registrations += 1;
+        state.forgot_registrations = false;
+        let id = format!("sess-{}", state.registrations);
+        state.session_id.clone_from(&id);
+        return (
+            200,
+            format!(
+                r#"{{"session_id":"{id}","session_ref":"9b2e0f7c","token":"tok-1","label":"workspace","registered_at_unix_ms":1}}"#
+            ),
+        );
+    }
+    // A restarted daemon knows nothing about a session registered before it,
+    // and says so in the shape the real one does: `404`, with the registry's
+    // own machine tag next to the sentence.
+    if state.forgot_registrations && path.starts_with("/api/chat-sessions/") {
+        return (
+            404,
+            r#"{"error":"no chat session with that id is registered; `GET /api/chat-sessions` lists the live ones","code":"unknown_session"}"#
+                .to_string(),
+        );
     }
     if method == "POST" && path.ends_with("/inbox/pull") {
         state.pull_acks.push(json_string_array(body, "ack"));
+        let session_id = state.session_id.clone();
         return match state.pending.take() {
-            Some((id, task, disposition)) => format!(
-                r#"{{"assignments":[{{"assignment_id":"{id}","session_id":"sess-1","task":"{task}","disposition":"{disposition}","deliveries":1,"created_at_unix_ms":1,"work_id":"w1","origin_channel":"wacli","origin_ref":"3d1a4f5b"}}],"acked":0,"requeued":0,"queued_remaining":0}}"#
+            Some((id, task, disposition)) => (
+                200,
+                format!(
+                    r#"{{"assignments":[{{"assignment_id":"{id}","session_id":"{session_id}","task":"{task}","disposition":"{disposition}","deliveries":1,"created_at_unix_ms":1,"work_id":"w1","origin_channel":"wacli","origin_ref":"3d1a4f5b"}}],"acked":0,"requeued":0,"queued_remaining":0}}"#
+                ),
             ),
-            None => r#"{"assignments":[],"acked":0,"requeued":0,"queued_remaining":0}"#.to_string(),
+            None => (
+                200,
+                r#"{"assignments":[],"acked":0,"requeued":0,"queued_remaining":0}"#.to_string(),
+            ),
         };
     }
     if method == "POST" && path.ends_with("/result") {
@@ -1824,13 +1882,17 @@ fn answer(request_line: &str, body: &str, state: &std::sync::Mutex<FakeDaemonSta
         let status = json_string(body, "status");
         let summary = json_string(body, "summary");
         state.results.push((id.clone(), status.clone(), summary));
-        return format!(r#"{{"assignment_id":"{id}","status":"{status}","seq":1}}"#);
+        return (
+            200,
+            format!(r#"{{"assignment_id":"{id}","status":"{status}","seq":1}}"#),
+        );
     }
     if method == "DELETE" && path.starts_with("/api/chat-sessions/") {
         state.deregistered = true;
-        return r#"{"session_id":"sess-1","discarded":0}"#.to_string();
+        let id = state.session_id.clone();
+        return (200, format!(r#"{{"session_id":"{id}","discarded":0}}"#));
     }
-    r#"{"error":"unexpected request"}"#.to_string()
+    (200, r#"{"error":"unexpected request"}"#.to_string())
 }
 
 /// Pull one JSON string field out of a flat body. Enough for the four keys this
@@ -1988,4 +2050,65 @@ fn test_chat_starts_normally_when_it_cannot_enrol_with_a_daemon() {
         wait_for_exit(session, EXIT_TIMEOUT),
         "a chat that could not enrol must still exit cleanly"
     );
+}
+
+/// A daemon restart must not cost the operator a chat restart.
+///
+/// The daemon keeps its chat-session registry in memory, so every upgrade,
+/// config change or crash recovery leaves a live `prx chat` holding a session
+/// id nothing answers to. Before this, the chat said so once and then stayed
+/// unassignable until somebody restarted it by hand — which, since daemon
+/// restarts are routine, meant assignment quietly stopped working most of the
+/// time. Here the restart happens under a chat that nobody touches, and the
+/// chat has to come back on its own and run work handed to the *new*
+/// registration.
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_re_enrols_by_itself_after_the_daemon_forgets_its_session() {
+    let sentinel = "RECONNECTED_REPLY_SENTINEL";
+    let daemon = FakeDaemon::start_idle();
+    let guard = new_harness_guard().expect("harness");
+    write_daemon_config(&guard, &daemon.base_url);
+    let mut sg = spawn_chat_in(&guard, &[], &[("OPENPRX_MOCK_RESPONSE", sentinel)]);
+    let session = sg.session();
+    let mut transcript = read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+
+    daemon.wait_for("the first registration", STARTUP_TIMEOUT, |state| {
+        state.registrations == 1
+    });
+    // Wait until this chat is actually polling, so the restart lands on a
+    // session the daemon really had rather than on one still being set up.
+    daemon.wait_for("the first pull", Duration::from_secs(15), |state| {
+        !state.pull_acks.is_empty()
+    });
+
+    // The daemon restarts, and has work waiting for whoever registers next.
+    // Nobody touches the chat from here on.
+    daemon.restart_holding("assign-after-restart", "count the crates");
+
+    daemon.wait_for("the chat to register again", Duration::from_secs(20), |state| {
+        state.registrations == 2
+    });
+
+    // Being registered again is not the claim; being able to take work is.
+    transcript.push_str(&read_until_with_dsr(session, sentinel, Duration::from_secs(20)));
+    assert!(
+        transcript.contains("registered again"),
+        "a chat that re-enrolled must say so; captured:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("count the crates"),
+        "the assignment handed to the new registration must arrive; captured:\n{transcript}"
+    );
+    daemon.wait_for("the result", Duration::from_secs(20), |state| !state.results.is_empty());
+    let (id, status, summary) = daemon.snapshot(|state| state.results[0].clone());
+    assert_eq!(id, "assign-after-restart");
+    assert_eq!(status, "completed");
+    assert!(
+        summary.contains(sentinel),
+        "the reply must come from the turn this chat ran, got: {summary}"
+    );
+
+    session.send("/exit\r").expect("send /exit");
+    assert!(wait_for_exit(session, EXIT_TIMEOUT), "chat should exit cleanly");
 }

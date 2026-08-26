@@ -186,6 +186,114 @@ fn client() -> Result<reqwest::Client> {
         .context("failed to build HTTP client for the runtime control API")
 }
 
+/// A refusal the control API stated, kept in the form it was stated in.
+///
+/// # Why this is a type and not a sentence
+///
+/// A caller that has to *act* on a particular refusal — the chat assignment
+/// poller re-registering when the daemon says it has no such session — used to
+/// have nothing but the rendered message to go on, and matching on prose is a
+/// bug waiting for the day somebody improves the wording. The status code and
+/// the API's own machine tag ride along here so a decision can be made on them,
+/// while [`std::fmt::Display`] still renders exactly the sentence this client
+/// has always produced.
+#[derive(Debug, Clone)]
+pub struct ControlApiRefusal {
+    /// HTTP status the daemon answered with.
+    status: u16,
+    /// The API's stable machine tag for the refusal (`code` in the body), when
+    /// it sent one. A daemon older than the tag sends none, so `None` means
+    /// "not stated" and never "some other reason".
+    code: Option<String>,
+    /// The full operator-facing message, including any hint appended to it.
+    message: String,
+}
+
+impl ControlApiRefusal {
+    /// The tag the daemon uses for "no session with that id is registered".
+    ///
+    /// Must stay in step with `ChatSessionError::code` on the daemon side; the
+    /// pair is what keeps this decision off the prose.
+    pub const UNKNOWN_SESSION: &'static str = "unknown_session";
+
+    /// HTTP status the daemon answered with.
+    #[must_use]
+    pub const fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// The API's machine tag for this refusal, when it sent one.
+    #[must_use]
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+
+    /// Whether this refusal is the daemon saying it holds no such chat session.
+    ///
+    /// A `404` with the tag is unambiguous. A `404` with **no** tag is accepted
+    /// as the same thing because that is what an older daemon — or a router
+    /// that no longer has the route — answers, and on the mailbox endpoints
+    /// there is nothing else a `404` can mean: the pull path returns it only
+    /// for an unregistered session, and an unknown acknowledgement id is
+    /// ignored rather than refused. A tag that says something *else* is
+    /// therefore the only case this rejects, which is exactly the case a newer
+    /// daemon would use to mean something new.
+    #[must_use]
+    pub fn says_the_session_is_unregistered(&self) -> bool {
+        self.status == reqwest::StatusCode::NOT_FOUND.as_u16()
+            && matches!(self.code.as_deref(), None | Some(Self::UNKNOWN_SESSION))
+    }
+}
+
+impl std::fmt::Display for ControlApiRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ControlApiRefusal {}
+
+/// Whether an error from this client is the daemon saying it has no such chat
+/// session.
+///
+/// The one supported way to ask. Callers must not match on the message: see
+/// [`ControlApiRefusal`].
+#[must_use]
+pub fn session_is_unregistered(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ControlApiRefusal>()
+        .is_some_and(ControlApiRefusal::says_the_session_is_unregistered)
+}
+
+/// The `code` and `error` fields the API sends with a refusal, when it sends
+/// them. One reader, so a test double and the live client cannot disagree about
+/// what a refusal body means.
+fn refusal_fields(body: &str) -> (Option<String>, Option<String>) {
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let field = |name: &str| {
+        parsed
+            .as_ref()
+            .and_then(|value| value.get(name))
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string)
+    };
+    (field("code"), field("error"))
+}
+
+/// Rebuild the error a refusal body would have produced, for tests that need a
+/// client-side failure in the exact shape the daemon sends one.
+#[cfg(test)]
+#[must_use]
+pub fn refusal_for_tests(status: u16, body: &str, what: &str) -> anyhow::Error {
+    let (code, detail) = refusal_fields(body);
+    let detail = detail.unwrap_or_else(|| body.to_string());
+    anyhow::Error::new(ControlApiRefusal {
+        status,
+        code,
+        message: format!("{what} failed with HTTP {status}: {detail}"),
+    })
+}
+
 async fn decode<T: serde::de::DeserializeOwned>(
     endpoint: &TasksEndpoint,
     response: reqwest::Response,
@@ -197,22 +305,21 @@ async fn decode<T: serde::de::DeserializeOwned>(
         .await
         .with_context(|| format!("failed to read {what} response body"))?;
     if !status.is_success() {
-        let detail = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("error")
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToString::to_string)
-            })
-            .unwrap_or(body);
-        if matches!(
+        let (code, detail) = refusal_fields(&body);
+        let detail = detail.unwrap_or(body);
+        let message = if matches!(
             status,
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
         ) {
-            anyhow::bail!("{}", auth_hint(endpoint, status, what, &detail));
-        }
-        anyhow::bail!("{what} failed with HTTP {status}: {detail}");
+            auth_hint(endpoint, status, what, &detail)
+        } else {
+            format!("{what} failed with HTTP {status}: {detail}")
+        };
+        return Err(anyhow::Error::new(ControlApiRefusal {
+            status: status.as_u16(),
+            code,
+            message,
+        }));
     }
     serde_json::from_str::<T>(&body).with_context(|| format!("failed to parse {what} response"))
 }

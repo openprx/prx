@@ -24,6 +24,13 @@
 //!   refusing credentials must cost this chat exactly one capability — being
 //!   assignable — and nothing else. The failure is stated once, in the
 //!   transcript, and chat carries on.
+//! - **A forgotten registration heals itself.** The daemon keeps its session
+//!   registry in memory, so every daemon restart — an upgrade, a config change,
+//!   a crash recovery — leaves every chat holding a session id nothing answers
+//!   to. Chat notices that in the refusal it already makes a request for, and
+//!   registers again; it does not wait for somebody to restart it. The retry is
+//!   the next pull, because this loop is already periodic and nothing in this
+//!   runtime is allowed a timer.
 //! - **Assigned work is never silent.** Somebody else is driving this terminal.
 //!   Every arrival is announced with where it came from and how it was
 //!   dispatched, and every result reported back is announced too, so the person
@@ -225,6 +232,36 @@ pub trait AssignmentMailbox: Send + Sync {
     /// nothing: `false` means "work I already hold", which must still be
     /// acknowledged and must not be run a second time.
     fn accept(&self, assignment_id: &str) -> bool;
+
+    /// Which enrolment the caller is looking at. `0` means "not enrolled".
+    ///
+    /// Read before a call that may fail, and handed back to [`Self::re_enrol`]
+    /// afterwards: that is what makes re-enrolment idempotent without a lock
+    /// held across the network. Two callers that saw the same dead enrolment
+    /// pass the same number, and only the first of them registers.
+    fn enrolment_generation(&self) -> u64;
+
+    /// Register again, because the enrolment `stale` names is gone.
+    ///
+    /// Registering is the entire recovery: the daemon keeps its session
+    /// registry in memory and rebuilds nothing on start, so a restart leaves
+    /// this chat holding a session id nothing answers to. A new registration
+    /// yields a new id and a new token, and the old row does not need
+    /// withdrawing because a refusal that says "no such session" is the daemon
+    /// saying the row is already gone.
+    fn re_enrol(&self, stale: u64) -> MailboxFuture<'_, ReEnrolment>;
+}
+
+/// What one re-enrolment attempt did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReEnrolment {
+    /// This call registered again. The session id and token are new, and every
+    /// id from the old enrolment is meaningless to the daemon now.
+    Registered { session_ref: String },
+    /// The enrolment the caller saw had already been replaced — or withdrawn on
+    /// the way out — so this call registered nothing. Idempotency, stated
+    /// rather than assumed.
+    Superseded { session_ref: String },
 }
 
 /// Chat's enrolment with one daemon, and the state that keeps it honest.
@@ -233,6 +270,12 @@ pub struct AssignmentClient {
     label: String,
     pid: Option<u32>,
     enrolment: Mutex<Option<Enrolment>>,
+    /// Serialises re-enrolment, so two callers that raced the same dead
+    /// enrolment produce one registration rather than two sessions the daemon
+    /// then has to be told apart. `tokio::sync::Mutex` because the section it
+    /// guards contains an HTTP round trip; the `parking_lot` mutexes here are
+    /// never held across an await.
+    re_enrolling: tokio::sync::Mutex<()>,
     /// Assignment ids this chat has already taken into its own queue.
     ///
     /// The mailbox is at-least-once, so the same id can arrive again whenever a
@@ -250,6 +293,10 @@ struct Enrolment {
     /// Returned once by the daemon, which keeps only its hash. Held in memory
     /// for the life of the process and never written anywhere.
     token: String,
+    /// Which registration this is: 1 for the first, one more for each
+    /// replacement. The version stamp re-enrolment checks so a caller acting on
+    /// an enrolment that has already been replaced replaces nothing.
+    generation: u64,
 }
 
 impl AssignmentClient {
@@ -261,6 +308,7 @@ impl AssignmentClient {
             label: label_for(config),
             pid: Some(std::process::id()),
             enrolment: Mutex::new(None),
+            re_enrolling: tokio::sync::Mutex::new(()),
             taken: Mutex::new(HashSet::new()),
         })
     }
@@ -275,17 +323,37 @@ impl AssignmentClient {
     ///
     /// Returns the redacted session handle on success. The caller decides what
     /// to do with a failure; nothing here retries, because a chat that cannot
-    /// enrol has a perfectly usable degraded mode and hammering a daemon that
-    /// refused it would only bury the reason.
+    /// enrol at all has a perfectly usable degraded mode and hammering a daemon
+    /// that refused it would only bury the reason. Losing an enrolment that
+    /// once worked is the different case, and [`AssignmentClient::re_enrol_now`]
+    /// is what answers it.
     pub async fn enrol(&self) -> Result<String> {
         let registration = tasks_cli::register_chat_session(&self.endpoint, &self.label, self.pid).await?;
         let session_ref = registration.session_ref.clone();
+        self.install(registration, 1);
+        Ok(session_ref)
+    }
+
+    /// Replace the held enrolment with a fresh registration.
+    ///
+    /// Everything the old one meant goes with it: the id, the token, and the
+    /// set of assignment ids already taken, which belonged to a mailbox that no
+    /// longer exists. Keeping the last of those would let an id the *new*
+    /// daemon hands out collide with a dead one and be silently discarded as a
+    /// redelivery.
+    fn install(&self, registration: tasks_cli::ChatSessionRegistration, generation: u64) {
         *self.enrolment.lock() = Some(Enrolment {
             session_id: registration.session_id,
             session_ref: registration.session_ref,
             token: registration.token,
+            generation,
         });
-        Ok(session_ref)
+        self.taken.lock().clear();
+    }
+
+    /// The enrolment version this client currently holds; `0` when unenrolled.
+    fn generation(&self) -> u64 {
+        self.enrolment.lock().as_ref().map_or(0, |held| held.generation)
     }
 
     /// Whether this chat is currently enrolled.
@@ -317,6 +385,30 @@ impl AssignmentClient {
         let report = tasks_cli::deregister_chat_session(&self.endpoint, &session_id).await?;
         *self.enrolment.lock() = None;
         Ok(report.discarded)
+    }
+
+    /// Register again after the daemon stopped recognising this session.
+    ///
+    /// Idempotent by version stamp rather than by trust: the generation the
+    /// caller saw is compared with the one held now, under a lock that is also
+    /// held across the registration call, so concurrent callers that saw the
+    /// same dead enrolment yield exactly one new session. A caller holding an
+    /// older stamp is told it was superseded and registers nothing — which is
+    /// also what stops a poll that raced the exit path from re-registering a
+    /// chat that has just withdrawn.
+    async fn re_enrol_now(&self, stale: u64) -> Result<ReEnrolment> {
+        let _serialised = self.re_enrolling.lock().await;
+        let held = self.enrolment.lock().clone();
+        let current = held.as_ref().map_or(0, |enrolment| enrolment.generation);
+        if current != stale {
+            return Ok(ReEnrolment::Superseded {
+                session_ref: held.map_or_else(|| "unenrolled".to_string(), |enrolment| enrolment.session_ref),
+            });
+        }
+        let registration = tasks_cli::register_chat_session(&self.endpoint, &self.label, self.pid).await?;
+        let session_ref = registration.session_ref.clone();
+        self.install(registration, stale.saturating_add(1));
+        Ok(ReEnrolment::Registered { session_ref })
     }
 }
 
@@ -361,6 +453,14 @@ impl AssignmentMailbox for AssignmentClient {
 
     fn accept(&self, assignment_id: &str) -> bool {
         self.taken.lock().insert(assignment_id.to_string())
+    }
+
+    fn enrolment_generation(&self) -> u64 {
+        self.generation()
+    }
+
+    fn re_enrol(&self, stale: u64) -> MailboxFuture<'_, ReEnrolment> {
+        Box::pin(self.re_enrol_now(stale))
     }
 }
 
@@ -559,6 +659,22 @@ pub fn enrolment_failure_notice(base_url: &str, error: &anyhow::Error) -> String
         "This chat could not enrol with the daemon at {base_url}, so it cannot be assigned work: {error:#}\n\
          Everything else in this chat is unaffected. Restart chat once the daemon accepts it to become \
          assignable again."
+    )
+}
+
+/// The line shown when this chat had to register with the daemon again.
+///
+/// Not silent, and not a warning either: the session id and the mailbox behind
+/// it are new, so anything an operator wrote down about the old one — a
+/// `--session` argument, an `assign_allow` rule keyed on the id — is stale, and
+/// the only place they can learn that is here. Printed once per re-enrolment,
+/// which is once per daemon restart rather than once per poll.
+#[must_use]
+pub fn re_enrolled_notice(base_url: &str, session_ref: &str) -> String {
+    format!(
+        "The daemon at {base_url} no longer had this chat's registration — it keeps them in memory, so a \
+         restart forgets every one — and this chat registered again as {session_ref}. It is assignable \
+         again; anything queued for the old registration is gone with it."
     )
 }
 
@@ -830,6 +946,16 @@ impl FailureNotices {
         Some(pull_recovery_notice(&episode.reason, episode.pulls))
     }
 
+    /// End the failing episode without a recovery line, for a caller that has
+    /// already said something more specific about the same recovery.
+    ///
+    /// The re-enrolment notice is exactly that: it names what was wrong and
+    /// says this chat is assignable again, so adding the generic line after it
+    /// would say the same thing twice.
+    pub fn settled(&mut self) {
+        self.episode = None;
+    }
+
     /// Whether a failing episode is currently open.
     #[must_use]
     pub const fn is_failing(&self) -> bool {
@@ -961,6 +1087,12 @@ pub async fn enrol_and_poll(
 /// shows it and `/kill --daemon d<N>` ends it — the same answer to a stuck
 /// daemon that every other request in this process gets, and the reason none of
 /// this needs a clock.
+///
+/// MUTATION GUARD: drop the re-enrolment arm — treat a refusal that says this
+/// session is unregistered like any other failure — and
+/// `a_daemon_that_forgot_this_session_is_answered_by_registering_again` fails:
+/// the poller keeps asking with credentials nothing recognises until a human
+/// restarts the chat.
 pub async fn run_poller(
     mailbox: Arc<dyn AssignmentMailbox>,
     in_flight: InFlightRegistry,
@@ -996,6 +1128,39 @@ pub async fn run_poller(
                 pending_acks = outcome.acks;
                 if outcome.input_closed {
                     break;
+                }
+            }
+            Err(error) if tasks_cli::session_is_unregistered(&error) => {
+                // The daemon holds no row for this session: it restarted — the
+                // registry is process memory and rebuilds nothing — or an
+                // operator removed the row. Either way this chat is
+                // unassignable until it registers again, and requiring a human
+                // to restart every chat after every daemon restart is not a
+                // recovery. Registering again is, and the next pull is the
+                // natural retry for a registration that also fails: this loop
+                // is already periodic, so nothing here needs a timer.
+                let stale = mailbox.enrolment_generation();
+                let re_enrolled = tokio::select! {
+                    () = cancel.cancelled() => break,
+                    outcome = mailbox.re_enrol(stale) => outcome,
+                };
+                // Whatever the outcome, the acknowledgements were for a mailbox
+                // that no longer exists. Sending them to a new session would
+                // acknowledge ids it never handed out.
+                pending_acks.clear();
+                match re_enrolled {
+                    Ok(ReEnrolment::Registered { session_ref }) => {
+                        notices.settled();
+                        notify(&re_enrolled_notice(&mailbox.base_url(), &session_ref));
+                    }
+                    // Someone else had already replaced this enrolment. Saying
+                    // so again would be one line per poller for one event.
+                    Ok(ReEnrolment::Superseded { .. }) => notices.settled(),
+                    Err(error) => {
+                        if let Some(line) = notices.failed(&format!("{error:#}")) {
+                            notify(&line);
+                        }
+                    }
                 }
             }
             Err(error) => {
@@ -1054,6 +1219,20 @@ mod tests {
         Batch(Vec<PulledAssignment>),
         /// Refuse with this reason.
         Refuse(&'static str),
+        /// Refuse the way a daemon that has forgotten this session does: a
+        /// `404` carrying the registry's own machine tag.
+        ForgotTheSession,
+        /// Refuse the way a daemon answers when the *assignment* is unknown —
+        /// the same status, a different tag, and never a reason to register
+        /// again.
+        ForgotTheAssignment,
+    }
+
+    /// A refusal in the shape the daemon really sends one, so the poller's
+    /// decision is made on the wire form rather than on a sentence.
+    fn refusal(status: u16, code: &str, detail: &str) -> anyhow::Error {
+        let body = serde_json::json!({ "error": detail, "code": code }).to_string();
+        tasks_cli::refusal_for_tests(status, &body, "chat assignment pull")
     }
 
     /// Records every pull's `ack` array and every report, and answers from a
@@ -1065,6 +1244,13 @@ mod tests {
         script: Mutex<Vec<Answer>>,
         taken: Mutex<HashSet<String>>,
         seq: AtomicUsize,
+        /// Which enrolment this double is on; bumped by every registration.
+        generation: Mutex<u64>,
+        /// How many times the poller registered again.
+        registrations: AtomicUsize,
+        /// Makes registration fail, for the case where the daemon is not just
+        /// forgetful but down.
+        refuse_registration: std::sync::atomic::AtomicBool,
     }
 
     impl RecordingMailbox {
@@ -1080,6 +1266,9 @@ mod tests {
                 script: Mutex::new(script),
                 taken: Mutex::new(HashSet::new()),
                 seq: AtomicUsize::new(0),
+                generation: Mutex::new(1),
+                registrations: AtomicUsize::new(0),
+                refuse_registration: std::sync::atomic::AtomicBool::new(false),
             })
         }
     }
@@ -1112,6 +1301,16 @@ mod tests {
                         queued_remaining: 0,
                     }),
                     Answer::Refuse(reason) => Err(anyhow::anyhow!("{reason}")),
+                    Answer::ForgotTheSession => Err(refusal(
+                        404,
+                        "unknown_session",
+                        "no chat session with that id is registered; `GET /api/chat-sessions` lists the live ones",
+                    )),
+                    Answer::ForgotTheAssignment => Err(refusal(
+                        404,
+                        "unknown_assignment",
+                        "that assignment is not outstanding for this session",
+                    )),
                 }
             })
         }
@@ -1135,6 +1334,29 @@ mod tests {
 
         fn accept(&self, assignment_id: &str) -> bool {
             self.taken.lock().insert(assignment_id.to_string())
+        }
+
+        fn enrolment_generation(&self) -> u64 {
+            *self.generation.lock()
+        }
+
+        fn re_enrol(&self, stale: u64) -> MailboxFuture<'_, ReEnrolment> {
+            Box::pin(async move {
+                if self.refuse_registration.load(Ordering::SeqCst) {
+                    anyhow::bail!("cannot reach a running PRX process at {}", self.base_url);
+                }
+                let mut generation = self.generation.lock();
+                if *generation != stale {
+                    return Ok(ReEnrolment::Superseded {
+                        session_ref: "9b2e0f7c".to_string(),
+                    });
+                }
+                *generation = stale + 1;
+                self.registrations.fetch_add(1, Ordering::SeqCst);
+                Ok(ReEnrolment::Registered {
+                    session_ref: format!("re-enrolled-{}", *generation),
+                })
+            })
         }
     }
 
@@ -1327,8 +1549,13 @@ mod tests {
     /// interval is a sampling rate, and simulating it is what keeps a test about
     /// twenty pulls from taking thirty seconds.
     async fn lines_from_script(script: Vec<Answer>) -> Vec<String> {
-        let pulls_scripted = script.len();
-        let mailbox = RecordingMailbox::scripted(script);
+        drive_script(RecordingMailbox::scripted(script)).await.1
+    }
+
+    /// Drive a prepared mailbox to the end of its script, handing back the
+    /// mailbox and everything the poller said.
+    async fn drive_script(mailbox: Arc<RecordingMailbox>) -> (Arc<RecordingMailbox>, Vec<String>) {
+        let pulls_scripted = mailbox.script.lock().len();
         let (notify, lines) = recording_notifier();
         let registry = super::super::daemon::new_in_flight_registry();
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
@@ -1353,12 +1580,142 @@ mod tests {
             "the script must have been driven to the end"
         );
         let said = lines.lock().clone();
-        said
+        (mailbox, said)
     }
 
     const RATE_LIMITED: &str = "chat assignment pull failed with HTTP 429 Too Many Requests: \
                                 Too many API requests. Please retry later.";
     const UNREACHABLE: &str = "cannot reach a running PRX process at http://127.0.0.1:9";
+
+    /// A daemon restart forgets every registration, and this chat holds a
+    /// session id nothing answers to. Registering again is the recovery, and it
+    /// happens here rather than in whoever notices the chat stopped working.
+    #[tokio::test(start_paused = true)]
+    async fn a_daemon_that_forgot_this_session_is_answered_by_registering_again() {
+        let (mailbox, said) = drive_script(RecordingMailbox::scripted(vec![
+            Answer::Batch(vec![]),
+            Answer::ForgotTheSession,
+            Answer::Batch(vec![assignment("after-restart", "count the crates", "queue")]),
+        ]))
+        .await;
+        assert_eq!(
+            mailbox.registrations.load(Ordering::SeqCst),
+            1,
+            "the poller must register again by itself; said:\n{said:#?}"
+        );
+        assert_eq!(*mailbox.generation.lock(), 2, "the new enrolment replaces the old one");
+        assert!(
+            mailbox.taken.lock().contains("after-restart"),
+            "the point of re-enrolling is taking work again, and this chat took none"
+        );
+        assert!(
+            said.iter().any(|line| line.contains("registered again")),
+            "a new session id is a fact the operator has to be told; said:\n{said:#?}"
+        );
+        assert!(
+            !said.iter().any(|line| line.contains("are not being received")),
+            "a restart that healed itself must not be reported as a failure; said:\n{said:#?}"
+        );
+    }
+
+    /// The acknowledgements from before the restart belong to a mailbox that no
+    /// longer exists; sending them on would acknowledge ids the new session
+    /// never handed out.
+    #[tokio::test(start_paused = true)]
+    async fn work_acknowledged_to_the_old_session_is_not_acknowledged_to_the_new_one() {
+        let (mailbox, _said) = drive_script(RecordingMailbox::scripted(vec![
+            Answer::Batch(vec![assignment("before-restart", "work", "queue")]),
+            Answer::ForgotTheSession,
+            Answer::Batch(vec![]),
+        ]))
+        .await;
+        let acks = mailbox.pulls.lock().clone();
+        assert_eq!(
+            acks.first().map(Vec::len),
+            Some(0),
+            "the first pull acknowledges nothing: {acks:?}"
+        );
+        assert_eq!(
+            acks.get(1).map(Vec::as_slice),
+            Some(["before-restart".to_string()].as_slice()),
+            "the pull that met the restart still carried the acknowledgement it owed: {acks:?}"
+        );
+        assert!(
+            acks.iter().skip(2).all(Vec::is_empty),
+            "a new session must not be handed the dead session's acknowledgements: {acks:?}"
+        );
+    }
+
+    /// The same status, a different fact. An unknown *assignment* says nothing
+    /// about whether this session is registered, and re-registering on it would
+    /// abandon a perfectly good enrolment.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_about_an_assignment_never_makes_this_chat_register_again() {
+        let (mailbox, said) = drive_script(RecordingMailbox::scripted(vec![
+            Answer::ForgotTheAssignment,
+            Answer::ForgotTheAssignment,
+            Answer::Batch(vec![]),
+        ]))
+        .await;
+        assert_eq!(
+            mailbox.registrations.load(Ordering::SeqCst),
+            0,
+            "only `unknown_session` means this session is gone; said:\n{said:#?}"
+        );
+        assert!(
+            said.iter().any(|line| line.contains("are not being received")),
+            "a refusal this chat cannot heal must still be stated; said:\n{said:#?}"
+        );
+    }
+
+    /// A daemon that is gone rather than merely forgetful: registering again
+    /// fails too, and the next pull is the retry. No timer, no backoff, and one
+    /// line about it.
+    #[tokio::test(start_paused = true)]
+    async fn a_registration_that_also_fails_is_retried_by_the_next_pull_and_said_once() {
+        let mailbox = RecordingMailbox::scripted(vec![
+            Answer::ForgotTheSession,
+            Answer::ForgotTheSession,
+            Answer::ForgotTheSession,
+        ]);
+        mailbox.refuse_registration.store(true, Ordering::SeqCst);
+        let (mailbox, said) = drive_script(mailbox).await;
+        assert_eq!(mailbox.registrations.load(Ordering::SeqCst), 0);
+        assert!(
+            mailbox.pulls.lock().len() >= 3,
+            "the poll loop is the retry; it must keep asking: {:?}",
+            mailbox.pulls.lock().len()
+        );
+        assert_eq!(
+            complaints_about(&said, "cannot reach"),
+            1,
+            "one blocked recovery, one line; said:\n{said:#?}"
+        );
+    }
+
+    /// Idempotency, at the level it actually matters: two callers that saw the
+    /// same dead enrolment must produce one registration, not two sessions the
+    /// daemon then has to be told apart.
+    #[tokio::test]
+    async fn concurrent_recoveries_from_the_same_dead_enrolment_register_once() {
+        let mailbox = RecordingMailbox::scripted(vec![]);
+        let stale = mailbox.enrolment_generation();
+        let first = mailbox.re_enrol(stale);
+        let second = mailbox.re_enrol(stale);
+        let third = mailbox.re_enrol(stale);
+        let (first, second, third) = tokio::join!(first, second, third);
+        let outcomes = [
+            first.expect("re-enrolment"),
+            second.expect("re-enrolment"),
+            third.expect("re-enrolment"),
+        ];
+        let registered = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, ReEnrolment::Registered { .. }))
+            .count();
+        assert_eq!(registered, 1, "three triggers, one registration: {outcomes:?}");
+        assert_eq!(mailbox.registrations.load(Ordering::SeqCst), 1);
+    }
 
     /// The flood this was written against: a mailbox that refuses every other
     /// pull. The reason is identical every time, so it is worth exactly one
