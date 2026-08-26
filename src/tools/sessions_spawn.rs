@@ -8,6 +8,7 @@
 //! - `history` action: view the conversation log of any sub-agent run
 //! - `steer` action: inject a message into a running sub-agent's context
 
+use super::chat_assignment::{self, ReturnTrip};
 use super::sessions_list::format_run_usage;
 use super::sessions_read_model;
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
@@ -20,6 +21,7 @@ use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MessageEventScop
 use crate::observability::NoopObserver;
 use crate::providers::{self, ChatMessage, Provider};
 use crate::router::CompactionResolver;
+use crate::runtime::chat_sessions::{AssignPrincipal, Disposition};
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
 use crate::security::{SecurityPolicy, SideEffectGate};
@@ -542,12 +544,28 @@ fn parse_spawn_scope(args: &serde_json::Value) -> Option<SpawnScope> {
 /// "system" sender would make the outbound ACL *look* enforced while letting
 /// every announcement through, which is worse than not gating the path at all.
 #[derive(Debug, Clone)]
-struct AnnounceOrigin {
+pub(crate) struct AnnounceOrigin {
     sender: String,
     chat_type: String,
 }
 
 impl AnnounceOrigin {
+    /// Build an origin from an identity another module already established as
+    /// trusted.
+    ///
+    /// The one caller is [`crate::tools::chat_assignment`], which relays a chat
+    /// session's result to the correspondent who asked for it and takes that
+    /// correspondent from the origin the mailbox *recorded*, not from anything
+    /// the model or the result payload said. Same rule as `from_scope`: an
+    /// identity that cannot be established is `None` and degrades to `"unknown"`,
+    /// never to a privileged one.
+    pub(crate) fn from_parts(sender: &str, chat_type: &str) -> Self {
+        Self {
+            sender: sender.to_string(),
+            chat_type: chat_type.to_string(),
+        }
+    }
+
     /// Capture a turn's identity from its trusted scope.
     ///
     /// Two callers with the same shape and different timing: a spawn snapshots
@@ -592,7 +610,7 @@ impl AnnounceOrigin {
 /// MUTATION GUARD: pass the origin's own channel as `src_channel` here and
 /// `announce_is_not_denied_by_a_channel_registry_fallback` goes red. That test is
 /// the zero-regression tripwire for this decision, not a style preference.
-fn announce_is_authorized(
+pub(crate) fn announce_is_authorized(
     security: &SecurityPolicy,
     origin: Option<&AnnounceOrigin>,
     dst_channel: &str,
@@ -2130,7 +2148,10 @@ impl Tool for SessionsSpawnTool {
          'list' — show all active/completed sub-agent runs; \
          'kill' — abort a running sub-agent by run_id; \
          'history' — view the conversation log of a sub-agent run; \
-         'steer' — inject a message into a running sub-agent to redirect it."
+         'steer' — inject a message into a running sub-agent to redirect it; \
+         'chat_sessions' — list the live `prx chat` sessions you may hand work to; \
+         'chat_assign' — hand a task to one of those chat sessions and have its result \
+         relayed back to this conversation when it finishes."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -2146,9 +2167,19 @@ impl Tool for SessionsSpawnTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["spawn", "spawn_batch", "join", "list", "kill", "history", "steer"],
+                    "enum": ["spawn", "spawn_batch", "join", "list", "kill", "history", "steer", "chat_sessions", "chat_assign"],
                     "default": "spawn",
-                    "description": "Action to perform: spawn a new sub-agent, spawn_batch a whole fan-out, join a batch and wait for all of its results, list all runs, kill a run, view history, or steer a running sub-agent."
+                    "description": "Action to perform: spawn a new sub-agent, spawn_batch a whole fan-out, join a batch and wait for all of its results, list all runs, kill a run, view history, steer a running sub-agent, chat_sessions to list the live `prx chat` sessions you may assign work to, or chat_assign to hand one of them a task."
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "For action='chat_assign': which live `prx chat` session gets the task, as reported by action='chat_sessions'."
+                },
+                "disposition": {
+                    "type": "string",
+                    "enum": ["queue", "steer", "interrupt"],
+                    "default": "queue",
+                    "description": "For action='chat_assign': what to do about a turn that chat session may already be running. 'queue' (default) waits for it to finish, 'steer' hands the task to the running turn as extra input, 'interrupt' stops the running turn first. Choose 'queue' unless the user asked for the work to happen right now."
                 },
                 "tasks": {
                     "type": "array",
@@ -2316,6 +2347,8 @@ impl Tool for SessionsSpawnTool {
                 let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
                 return self.execute_steer(run_id, message, approval_grant.as_ref()).await;
             }
+            "chat_sessions" => return self.execute_chat_sessions(&args),
+            "chat_assign" => return self.execute_chat_assign(&args).await,
             "spawn_batch" => return self.execute_spawn_batch(&args).await,
             "join" => {
                 let batch_id = args
@@ -2580,6 +2613,174 @@ impl SessionsSpawnTool {
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&join_summary(batch_id, &settled))?,
+            error: None,
+        })
+    }
+
+    /// The identity behind a chat-assignment call, or the refusal that replaces
+    /// it.
+    ///
+    /// The only source is the `_zc_*` block the runtime writes immediately
+    /// before a tool executes, and an absent or untrusted one is a hard refusal
+    /// rather than a fallback: an anonymous principal is something a later rule
+    /// could match, and the operator plane is the *most* privileged principal
+    /// there is. Degrading to either would turn "no identity" into a
+    /// permission. The refusal names nobody, because there is nobody to name.
+    fn assignment_principal(args: &serde_json::Value) -> Result<AssignPrincipal, ToolResult> {
+        AssignPrincipal::from_trusted_scope(args).ok_or_else(|| ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(
+                "This call carries no trusted caller scope, so there is no identity to authorize a \
+                 chat-session assignment against. Assignment is refused."
+                    .to_string(),
+            ),
+        })
+    }
+
+    /// `action='chat_sessions'` — the live `prx chat` sessions *this caller*
+    /// may hand work to.
+    ///
+    /// Filtered rather than complete on purpose. `chat_sessions::assign`
+    /// authorizes before it reports a session unknown, precisely so a
+    /// correspondent who may not assign anywhere cannot use it to learn which
+    /// sessions exist; an unfiltered listing on the same principal's tool
+    /// surface would hand back exactly that. A caller with no grants sees an
+    /// empty list, which is the same thing it would learn by trying.
+    fn execute_chat_sessions(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let principal = match Self::assignment_principal(args) {
+            Ok(principal) => principal,
+            Err(refusal) => return Ok(refusal),
+        };
+        let sessions = crate::runtime::chat_sessions::list()
+            .into_iter()
+            .filter(|session| {
+                chat_assignment::may_assign(&self.security, &principal, &session.label, &session.session_id)
+            })
+            .map(|session| {
+                json!({
+                    "session_id": session.session_id,
+                    "label": session.label,
+                    "liveness": session.liveness.as_str(),
+                    "last_poll_age_secs": session.last_poll_age_secs,
+                    "queued": session.queued,
+                    "delivered": session.delivered,
+                    "accepted": session.accepted,
+                    "registered_at_unix_ms": session.registered_at_unix_ms,
+                })
+            })
+            .collect::<Vec<_>>();
+        let note = if sessions.is_empty() {
+            "No chat session is both registered and assignable by you. Assignment is default-deny: \
+             an operator has to name the origin in `autonomy.scopes.assign_owners` or give it an \
+             `assign_allow` entry."
+        } else {
+            "`liveness` is evidence, not a clock: 'silent' means the session has not pulled its \
+             mailbox recently and may be busy or gone. Nothing is evicted for it."
+        };
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&json!({"sessions": sessions, "note": note}))?,
+            error: None,
+        })
+    }
+
+    /// `action='chat_assign'` — hand a task to a live `prx chat` session and
+    /// arrange for its answer to come back here.
+    ///
+    /// In-process rather than over the daemon's own HTTP API, and that is the
+    /// substance of the action rather than an optimisation: an HTTP request
+    /// carries no trustworthy caller identity, so the same call made over the
+    /// loopback API would be authorized as the operator plane — the most
+    /// privileged principal there is — no matter who typed the message. The
+    /// only identity worth anything here is the one the runtime injected, and it
+    /// exists only inside this process.
+    ///
+    /// The call returns as soon as the mailbox accepts the task. It does not
+    /// wait: a chat session has no deadline, so waiting here would park the
+    /// correspondent's turn for as long as the other end takes. The relay
+    /// started below is what closes the loop, and it is a work-registry row of
+    /// its own so an operator can end it.
+    async fn execute_chat_assign(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let principal = match Self::assignment_principal(args) {
+            Ok(principal) => principal,
+            Err(refusal) => return Ok(refusal),
+        };
+        let session_id = args
+            .get("session_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'session_id' parameter for chat_assign action"))?;
+        let task = args
+            .get("task")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'task' parameter for chat_assign action"))?;
+        let disposition = match args.get("disposition").and_then(|value| value.as_str()) {
+            // Unknown values are rejected rather than folded into the default:
+            // a caller that asked to interrupt and silently got a queue would
+            // have its intent evaporate with nothing said.
+            Some(raw) => Disposition::parse(raw)
+                .ok_or_else(|| anyhow::anyhow!("Unknown disposition '{raw}': use 'queue', 'steer' or 'interrupt'"))?,
+            None => Disposition::Queue,
+        };
+
+        let receipt =
+            match crate::runtime::chat_sessions::assign(&self.security, &principal, session_id, task, disposition) {
+                Ok(receipt) => receipt,
+                // Already redacted at the source: the mailbox's refusals name the
+                // parties by `op_id` fingerprint, so this is safe to hand to a model
+                // that will read it back out loud.
+                Err(error) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(error.to_string()),
+                    });
+                }
+            };
+
+        // Where the answer goes is settled here, from the assigning turn's own
+        // trusted scope, and never from the tool arguments — unlike `spawn`,
+        // which accepts an explicit `recipient` and gates it. There is no reason
+        // for one correspondent to assign work whose result lands in someone
+        // else's conversation, so the capability simply is not offered.
+        let scope = parse_spawn_scope(args);
+        let recipient = scope.as_ref().map_or_else(
+            || match &principal {
+                // No conversation on the scope: answer the correspondent
+                // directly, which is the only address left that is still theirs.
+                AssignPrincipal::Correspondent { sender, .. } => sender.clone(),
+                AssignPrincipal::OperatorPlane => crate::runtime::chat_sessions::OPERATOR_PLANE_CHANNEL.to_string(),
+            },
+            |scope| scope.chat_id.clone(),
+        );
+        let channel = self.resolve_announce_channel(Some(principal.channel())).await;
+        let relay_work_id = chat_assignment::spawn_return_trip(ReturnTrip {
+            assignment_id: receipt.assignment_id.clone(),
+            session_ref: receipt.session_ref.clone(),
+            origin: principal,
+            recipient,
+            channel,
+            security: Arc::clone(&self.security),
+        });
+
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&json!({
+                "assignment_id": receipt.assignment_id,
+                "session_id": receipt.session_id,
+                "session_ref": receipt.session_ref,
+                "disposition": receipt.disposition.as_str(),
+                "queued_ahead": receipt.queued_ahead,
+                "work_id": receipt.work_id.to_string(),
+                "relay_work_id": relay_work_id.to_string(),
+                "delivery": "Accepted into the session's mailbox. Its result will be relayed to this \
+                             conversation on its own when the session reports it — say that it was \
+                             handed over and stop; do not wait for it here.",
+            }))?,
             error: None,
         })
     }
@@ -12014,5 +12215,295 @@ mod tests {
             "a batch member has no announcement of its own to switch: {member}"
         );
         assert!(member["task"]["type"].as_str() == Some("string"), "{member}");
+    }
+
+    // ── chat-session assignment (`chat_sessions` / `chat_assign`) ────────────
+
+    /// A tool instance whose outbound registry knows `wacli`, under a policy the
+    /// caller supplies.
+    fn assignment_tool(security: Arc<SecurityPolicy>) -> (SessionsSpawnTool, Arc<Mutex<Vec<String>>>) {
+        let (wacli, sent) = NamedRecordingChannel::new("wacli");
+        let tool = make_tool_with_channels_and_security(
+            wacli.clone(),
+            Arc::new(EchoProvider { response: "ok".into() }),
+            vec![wacli],
+            security,
+        );
+        (tool, sent)
+    }
+
+    /// A policy that makes `wacli:alice` — the identity [`with_scope`] injects —
+    /// an owner of this daemon.
+    fn owner_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            assign_owners: vec!["wacli:alice".to_string()],
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn chat_assign_args(session_id: &str, disposition: Option<&str>) -> serde_json::Value {
+        let mut args = json!({
+            "action": "chat_assign",
+            "session_id": session_id,
+            "task": "summarise the TODOs",
+        });
+        if let (Some(object), Some(disposition)) = (args.as_object_mut(), disposition) {
+            object.insert("disposition".to_string(), json!(disposition));
+        }
+        with_scope(args, "wacli", "group-42")
+    }
+
+    /// No trusted scope, no assignment. The refusal is the whole point: an
+    /// untrusted call must not degrade into an anonymous principal (which a
+    /// later rule could match) or into the operator plane (which is authorized
+    /// by construction).
+    ///
+    /// MUTATION GUARD: make `assignment_principal` fall back to
+    /// `AssignPrincipal::operator_plane()` and this test goes red.
+    #[tokio::test]
+    async fn chat_assign_is_refused_when_the_call_carries_no_trusted_scope() {
+        let registration = crate::runtime::chat_sessions::register("workstation", None).expect("registered");
+        let (tool, _sent) = assignment_tool(owner_security());
+
+        // Same arguments, minus the runtime-injected scope block — exactly what
+        // a model that tried to assign on its own behalf would produce.
+        let result = tool
+            .execute(json!({
+                "action": "chat_assign",
+                "session_id": registration.session_id,
+                "task": "summarise the TODOs",
+            }))
+            .await
+            .expect("the tool answers rather than erroring out");
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("no trusted caller scope"), "{error}");
+        assert!(
+            !error.contains(&registration.session_id),
+            "the refusal must not confirm which sessions exist: {error}"
+        );
+        // And nothing reached the mailbox.
+        let listed = crate::runtime::chat_sessions::list();
+        let session = listed
+            .iter()
+            .find(|session| session.session_id == registration.session_id)
+            .expect("session is registered");
+        assert_eq!(session.queued, 0, "an unauthenticated call must queue nothing");
+        crate::runtime::chat_sessions::deregister(&registration.session_id);
+    }
+
+    /// Assignment is default-deny, so a correspondent with no grant is refused —
+    /// and the refusal names neither the sender nor the session in the clear.
+    #[tokio::test]
+    async fn an_ungranted_correspondent_is_refused_and_the_refusal_names_nobody() {
+        let registration = crate::runtime::chat_sessions::register("workstation", None).expect("registered");
+        let (tool, _sent) = assignment_tool(test_security());
+
+        let result = tool
+            .execute(chat_assign_args(&registration.session_id, None))
+            .await
+            .expect("tool call");
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(
+            !error.contains("alice") && !error.contains(&registration.session_id),
+            "the refusal must fingerprint both parties, not echo them: {error}"
+        );
+        assert!(
+            error.contains(&crate::security::op_id::ref_for_channel_recipient(
+                "chat",
+                &registration.session_id
+            )),
+            "the refusal must use the same session fingerprint the registry row does: {error}"
+        );
+        crate::runtime::chat_sessions::deregister(&registration.session_id);
+    }
+
+    /// The owner path, and the three dispositions arriving intact.
+    ///
+    /// The disposition is asserted from the *mailbox*, not from the tool's own
+    /// answer: what the tool printed proves nothing about what the chat session
+    /// will be told.
+    #[tokio::test]
+    async fn an_owner_may_assign_and_every_disposition_reaches_the_mailbox() {
+        for disposition in ["queue", "steer", "interrupt"] {
+            let registration = crate::runtime::chat_sessions::register("workstation", None).expect("registered");
+            let (tool, _sent) = assignment_tool(owner_security());
+
+            let result = tool
+                .execute(chat_assign_args(&registration.session_id, Some(disposition)))
+                .await
+                .expect("tool call");
+            assert!(result.success, "owner assignment refused: {:?}", result.error);
+            let answer: serde_json::Value = serde_json::from_str(&result.output).expect("json answer");
+            assert_eq!(answer["disposition"].as_str(), Some(disposition));
+
+            let pulled = crate::runtime::chat_sessions::pull(&registration.session_id, &registration.token, &[], None)
+                .expect("pull");
+            assert_eq!(pulled.assignments.len(), 1, "one assignment per call");
+            assert_eq!(pulled.assignments[0].task, "summarise the TODOs");
+            assert_eq!(
+                pulled.assignments[0].disposition.as_str(),
+                disposition,
+                "the disposition the caller chose must reach the session unchanged"
+            );
+            crate::runtime::chat_sessions::deregister(&registration.session_id);
+        }
+    }
+
+    /// An unknown disposition is an error, never a silent downgrade to `queue`:
+    /// a caller who asked to interrupt and got a queue would have its intent
+    /// evaporate with nothing said.
+    #[tokio::test]
+    async fn an_unknown_disposition_is_rejected_rather_than_folded_into_the_default() {
+        let registration = crate::runtime::chat_sessions::register("workstation", None).expect("registered");
+        let (tool, _sent) = assignment_tool(owner_security());
+
+        let error = tool
+            .execute(chat_assign_args(&registration.session_id, Some("right-now")))
+            .await
+            .expect_err("an unknown disposition is a tool error");
+        assert!(error.to_string().contains("right-now"), "{error}");
+
+        let listed = crate::runtime::chat_sessions::list();
+        let session = listed
+            .iter()
+            .find(|session| session.session_id == registration.session_id)
+            .expect("registered");
+        assert_eq!(session.queued, 0, "a rejected disposition must queue nothing");
+        crate::runtime::chat_sessions::deregister(&registration.session_id);
+    }
+
+    /// The listing is the caller's, not the daemon's.
+    ///
+    /// `chat_sessions::assign` authorizes before it reports a session unknown so
+    /// that an unauthorized correspondent cannot enumerate sessions through it;
+    /// an unfiltered listing on the same principal's tool surface would hand
+    /// back exactly what that refusal withholds.
+    ///
+    /// MUTATION GUARD: drop the `may_assign` filter in `execute_chat_sessions`
+    /// and this test goes red.
+    #[tokio::test]
+    async fn chat_sessions_lists_only_what_this_caller_may_assign_to() {
+        let registration = crate::runtime::chat_sessions::register("workstation", None).expect("registered");
+
+        let (ungranted, _) = assignment_tool(test_security());
+        let result = ungranted
+            .execute(with_scope(json!({"action": "chat_sessions"}), "wacli", "group-42"))
+            .await
+            .expect("tool call");
+        assert!(result.success);
+        let answer: serde_json::Value = serde_json::from_str(&result.output).expect("json");
+        assert!(
+            !result.output.contains(&registration.session_id),
+            "an ungranted caller must not learn that a session exists: {}",
+            result.output
+        );
+        assert_eq!(answer["sessions"].as_array().map(Vec::len), Some(0));
+
+        let (owner, _) = assignment_tool(owner_security());
+        let result = owner
+            .execute(with_scope(json!({"action": "chat_sessions"}), "wacli", "group-42"))
+            .await
+            .expect("tool call");
+        let answer: serde_json::Value = serde_json::from_str(&result.output).expect("json");
+        let listed = answer["sessions"].as_array().cloned().unwrap_or_default();
+        assert!(
+            listed
+                .iter()
+                .any(|session| session["session_id"].as_str() == Some(registration.session_id.as_str())),
+            "an owner sees the session it may assign to: {}",
+            result.output
+        );
+        crate::runtime::chat_sessions::deregister(&registration.session_id);
+    }
+
+    /// Where the answer goes is the assigning turn's business, never the
+    /// model's.
+    ///
+    /// `spawn` accepts an explicit `recipient` (and gates it); `chat_assign`
+    /// does not accept one at all, because there is no reason for one
+    /// correspondent to start work whose result lands in someone else's
+    /// conversation. The relay's registry row is where that decision is
+    /// observable: it fingerprints the destination it will actually use.
+    ///
+    /// MUTATION GUARD: read the recipient from `args` in `execute_chat_assign`
+    /// and this test goes red.
+    #[tokio::test]
+    async fn the_model_cannot_redirect_a_chat_assignment_result_to_a_recipient_of_its_own() {
+        let registration = crate::runtime::chat_sessions::register("workstation", None).expect("registered");
+        let (tool, _sent) = assignment_tool(owner_security());
+
+        let mut args = chat_assign_args(&registration.session_id, None);
+        if let Some(object) = args.as_object_mut() {
+            object.insert("recipient".to_string(), json!("+15550009999"));
+        }
+        let result = tool.execute(args).await.expect("tool call");
+        assert!(result.success, "{:?}", result.error);
+        let answer: serde_json::Value = serde_json::from_str(&result.output).expect("json");
+        let relay = crate::runtime::registry::WorkId::parse(
+            answer["relay_work_id"].as_str().expect("the relay is addressable"),
+        )
+        .expect("a parseable work id");
+        let row = crate::runtime::registry::snapshot(relay).expect("the relay is listed");
+
+        assert!(
+            row.name
+                .contains(&crate::security::op_id::ref_for_channel_recipient("wacli", "group-42")),
+            "the relay must answer in the conversation the assignment came from: {}",
+            row.name
+        );
+        assert!(
+            !row.name.contains(&crate::security::op_id::ref_for_channel_recipient(
+                "wacli",
+                "+15550009999"
+            )),
+            "a model-supplied recipient must not become the relay's destination: {}",
+            row.name
+        );
+        crate::runtime::registry::kill(relay, true).await;
+        crate::runtime::chat_sessions::deregister(&registration.session_id);
+    }
+
+    /// Listing is an identity-bearing action too, so it fails closed on the same
+    /// condition `chat_assign` does.
+    #[tokio::test]
+    async fn chat_sessions_is_refused_without_a_trusted_scope() {
+        let (tool, _sent) = assignment_tool(owner_security());
+        let result = tool
+            .execute(json!({"action": "chat_sessions"}))
+            .await
+            .expect("tool call");
+        assert!(!result.success);
+        assert!(
+            result.error.unwrap_or_default().contains("no trusted caller scope"),
+            "listing must fail closed on the same condition assignment does"
+        );
+    }
+
+    /// Both actions have to be reachable and documented, or the model can never
+    /// use them — and both live on this tool rather than on new ones.
+    #[test]
+    fn the_schema_advertises_the_chat_assignment_actions_on_this_tool() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+        let schema = tool.parameters_schema();
+        let actions: Vec<&str> = schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("enumerated actions")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert!(actions.contains(&"chat_sessions"), "{actions:?}");
+        assert!(actions.contains(&"chat_assign"), "{actions:?}");
+        let dispositions: Vec<&str> = schema["properties"]["disposition"]["enum"]
+            .as_array()
+            .expect("enumerated dispositions")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert_eq!(dispositions, vec!["queue", "steer", "interrupt"]);
+        assert_eq!(schema["properties"]["session_id"]["type"].as_str(), Some("string"));
+        assert!(tool.description().contains("chat_assign"), "{}", tool.description());
     }
 }

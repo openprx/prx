@@ -16,6 +16,7 @@
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
 pub mod agents_list;
+pub(crate) mod chat_assignment;
 pub mod chat_profile_update;
 pub mod composio;
 pub mod config_reload;
