@@ -488,6 +488,13 @@ chat that tried anyway would announce a refusal on every start.
   handed back is announced too.
 - **The poller is ordinary in-flight work.** `/sessions` lists it and
   `/kill --daemon d<N>` ends it, the same as any other daemon request.
+- **The mailbox is not rate limited.** `gateway.api_rate_limit_per_minute`
+  bounds what a caller may spend on the API; the two mailbox endpoints
+  (`POST /api/chat-sessions/{id}/inbox/pull` and `.../result`) are exempt from
+  it, because they are one local process polling for work already addressed to
+  it rather than a caller reaching in. What guards a mailbox is the per-session
+  token, not a quota. Every other route keeps its quota, `assign` included, so
+  raising the number of open chats no longer costs the operator theirs.
 - **Exiting withdraws the session.** Nothing on the daemon side expires a chat
   session, so a chat killed with `SIGKILL` leaves a row listed as `silent` until
   an operator reaps it with `DELETE /api/chat-sessions/{id}`.
