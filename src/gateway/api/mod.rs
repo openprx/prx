@@ -79,8 +79,6 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/chat-sessions/results", get(chat_sessions::get_results))
         .route("/chat-sessions/{id}", delete(chat_sessions::delete_session))
         .route("/chat-sessions/{id}/assign", post(chat_sessions::post_assign))
-        .route("/chat-sessions/{id}/inbox/pull", post(chat_sessions::post_pull))
-        .route("/chat-sessions/{id}/result", post(chat_sessions::post_result))
         .route("/config", get(config::get_config))
         .route("/config/files", get(config::get_config_files))
         .route("/config/files/{filename}", put(config::put_config_file))
@@ -120,6 +118,31 @@ pub fn router(state: AppState) -> Router<AppState> {
             auth_middleware,
         ));
 
+    // The two mailbox endpoints, and only those two. They are authenticated
+    // exactly like everything above — the same bearer check, plus the
+    // per-session token — but they are deliberately **not** rate limited, so
+    // they are merged in after that layer is applied rather than before.
+    //
+    // Why they are the exception. This is a `prx chat` on this machine asking
+    // its own mailbox whether the daemon has given it work, and answering when
+    // it has: an internal poll between two local processes, not a public API
+    // surface. The per-minute quota exists to bound what a *remote* caller can
+    // spend; applying it here was an accident of mounting the mailbox under the
+    // same `/api` router, and it bites immediately — one chat polling costs two
+    // thirds of the default 60/min budget, so a second chat, or the operator's
+    // own `curl`, gets 429 and assignment stops working. What protects a
+    // mailbox is the per-session token every one of these requests must carry —
+    // a secret that guessing does not get cheaper at; a quota only decides how
+    // fast a chat may ask about work already addressed to it.
+    //
+    // The exemption stops here. `assign` — the endpoint that *puts* work in a
+    // mailbox, and the one an agent on a channel reaches — stays above, rate
+    // limited with the rest, as does every destructive route on this router.
+    let mailbox_routes = Router::new()
+        .route("/chat-sessions/{id}/inbox/pull", post(chat_sessions::post_pull))
+        .route("/chat-sessions/{id}/result", post(chat_sessions::post_result))
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+
     Router::new()
         .route("/logs", get(logs::ws_handler))
         // Phase 1: alias for frontend compatibility
@@ -130,6 +153,7 @@ pub fn router(state: AppState) -> Router<AppState> {
             state,
             api_rate_limit_middleware,
         ))
+        .merge(mailbox_routes)
 }
 
 pub(super) fn extract_bearer_auth_token(headers: &HeaderMap) -> Option<String> {
