@@ -1,5 +1,6 @@
 pub mod blocking;
 pub mod bootstrap;
+pub mod chat_sessions;
 pub mod control_ladder;
 pub mod docker;
 pub mod envelope;
