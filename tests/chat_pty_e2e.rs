@@ -1669,3 +1669,316 @@ fn s5_release_p0_1_gemini_cancel_midstream_via_real_path() {
         "gemini flavor cancel-mid-stream 应在 {EXIT_TIMEOUT:?} 内退出"
     );
 }
+
+// ── Daemon-assigned work (c2) ────────────────────────────────────────────────
+//
+// The loop this covers is the one a person actually asks for: another process
+// hands `prx chat` a task, chat runs it in its ordinary turn machinery, and the
+// answer goes back. Only a real binary against a real socket can show that,
+// because every interesting part of it — enrolling before a prompt appears,
+// pulling off the input loop, acknowledging on the *next* pull, reporting when
+// the turn ends, and withdrawing on exit — is about ordering between a process
+// and a peer, not about a function's return value.
+
+/// Minimal HTTP/1.1 stand-in for the daemon's chat-session mailbox.
+///
+/// It speaks exactly the five calls chat makes and records what arrived, which
+/// is what lets the test assert on ordering (`ack` on the second pull, never the
+/// first) rather than merely on the happy path.
+struct FakeDaemon {
+    base_url: String,
+    state: std::sync::Arc<std::sync::Mutex<FakeDaemonState>>,
+}
+
+#[derive(Default)]
+struct FakeDaemonState {
+    registered_label: Option<String>,
+    /// One assignment, handed out on the first pull and never again.
+    pending: Option<(String, String, String)>,
+    /// The `ack` array of every pull, in order.
+    pull_acks: Vec<Vec<String>>,
+    /// Every reported result: (assignment id, status, summary).
+    results: Vec<(String, String, String)>,
+    deregistered: bool,
+}
+
+impl FakeDaemon {
+    /// Start a daemon that will hand out one assignment with `disposition`.
+    fn start(assignment_id: &str, task: &str, disposition: &str) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
+        let addr = listener.local_addr().expect("fake daemon addr");
+        let state = std::sync::Arc::new(std::sync::Mutex::new(FakeDaemonState {
+            pending: Some((assignment_id.to_string(), task.to_string(), disposition.to_string())),
+            ..FakeDaemonState::default()
+        }));
+        let served = std::sync::Arc::clone(&state);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                serve_one(stream, &served);
+            }
+        });
+        Self {
+            base_url: format!("http://127.0.0.1:{}", addr.port()),
+            state,
+        }
+    }
+
+    fn snapshot<T>(&self, read: impl FnOnce(&FakeDaemonState) -> T) -> T {
+        let guard = self.state.lock().expect("fake daemon state");
+        read(&guard)
+    }
+
+    /// Wait until `ready` is satisfied, or fail with what the daemon did see.
+    fn wait_for(&self, what: &str, total: Duration, ready: impl Fn(&FakeDaemonState) -> bool) {
+        let deadline = Instant::now() + total;
+        while Instant::now() < deadline {
+            if self.snapshot(&ready) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let dump = self.snapshot(|state| {
+            format!(
+                "registered={:?} pulls={:?} results={:?} deregistered={}",
+                state.registered_label, state.pull_acks, state.results, state.deregistered
+            )
+        });
+        panic!("timed out waiting for {what}; fake daemon saw: {dump}");
+    }
+}
+
+/// Read one request, answer it, close. Keep-alive is deliberately not offered:
+/// one exchange per connection keeps this parser trivial and correct.
+fn serve_one(mut stream: std::net::TcpStream, state: &std::sync::Mutex<FakeDaemonState>) {
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 4096];
+    let head_end = loop {
+        match stream.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => {
+                raw.extend_from_slice(&buf[..n]);
+                if let Some(at) = window(&raw, b"\r\n\r\n") {
+                    break at + 4;
+                }
+            }
+            Err(_) => return,
+        }
+    };
+    let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+    let content_length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    while raw.len() < head_end + content_length {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    let body = String::from_utf8_lossy(&raw[head_end..]).to_string();
+    let request_line = head.lines().next().unwrap_or_default().to_string();
+    let body = answer(&request_line, &body, state);
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+fn answer(request_line: &str, body: &str, state: &std::sync::Mutex<FakeDaemonState>) -> String {
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let path = parts.next().unwrap_or_default();
+    let mut state = state.lock().expect("fake daemon state");
+    if method == "POST" && path == "/api/chat-sessions/register" {
+        state.registered_label = Some(json_string(body, "label"));
+        return r#"{"session_id":"sess-1","session_ref":"9b2e0f7c","token":"tok-1","label":"workspace","registered_at_unix_ms":1}"#.to_string();
+    }
+    if method == "POST" && path.ends_with("/inbox/pull") {
+        state.pull_acks.push(json_string_array(body, "ack"));
+        return match state.pending.take() {
+            Some((id, task, disposition)) => format!(
+                r#"{{"assignments":[{{"assignment_id":"{id}","session_id":"sess-1","task":"{task}","disposition":"{disposition}","deliveries":1,"created_at_unix_ms":1,"work_id":"w1","origin_channel":"wacli","origin_ref":"3d1a4f5b"}}],"acked":0,"requeued":0,"queued_remaining":0}}"#
+            ),
+            None => r#"{"assignments":[],"acked":0,"requeued":0,"queued_remaining":0}"#.to_string(),
+        };
+    }
+    if method == "POST" && path.ends_with("/result") {
+        let id = json_string(body, "assignment_id");
+        let status = json_string(body, "status");
+        let summary = json_string(body, "summary");
+        state.results.push((id.clone(), status.clone(), summary));
+        return format!(r#"{{"assignment_id":"{id}","status":"{status}","seq":1}}"#);
+    }
+    if method == "DELETE" && path.starts_with("/api/chat-sessions/") {
+        state.deregistered = true;
+        return r#"{"session_id":"sess-1","discarded":0}"#.to_string();
+    }
+    r#"{"error":"unexpected request"}"#.to_string()
+}
+
+/// Pull one JSON string field out of a flat body. Enough for the four keys this
+/// test reads, and it unescapes the two sequences chat can actually emit.
+fn json_string(body: &str, key: &str) -> String {
+    let needle = format!("\"{key}\":\"");
+    let Some(start) = body.find(&needle) else {
+        return String::new();
+    };
+    let rest = &body[start + needle.len()..];
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => break,
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(other) => out.push(other),
+                None => break,
+            },
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn json_string_array(body: &str, key: &str) -> Vec<String> {
+    let needle = format!("\"{key}\":[");
+    let Some(start) = body.find(&needle) else {
+        return Vec::new();
+    };
+    let rest = &body[start + needle.len()..];
+    let Some(end) = rest.find(']') else {
+        return Vec::new();
+    };
+    rest[..end]
+        .split(',')
+        .map(|item| item.trim().trim_matches('"').to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+/// Point a harness at a daemon by writing the config chat reads at startup.
+fn write_daemon_config(guard: &HarnessGuard, base_url: &str) {
+    // The five top-level keys have no serde default, so a config file that omits
+    // them fails to deserialize before anything in it is read.
+    let config = format!(
+        "api_key = \"test-key\"\n\
+         api_url = \"https://example.invalid/v1\"\n\
+         default_provider = \"mock\"\n\
+         default_model = \"mock\"\n\
+         default_temperature = 0.0\n\
+         \n[chat.daemon]\nurl = \"{base_url}\"\ntoken = \"operator-token\"\n\
+         \n[gateway]\nrequire_pairing = false\n"
+    );
+    std::fs::write(guard.config_dir.join("config.toml"), config).expect("write chat config");
+}
+
+/// The whole loop: assigned in, executed here, answered back, withdrawn on exit.
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_runs_daemon_assigned_work_and_reports_the_answer_back() {
+    let sentinel = "ASSIGNED_REPLY_SENTINEL";
+    let daemon = FakeDaemon::start("assign-1", "count the crates", "queue");
+    let guard = new_harness_guard().expect("harness");
+    write_daemon_config(&guard, &daemon.base_url);
+    let mut sg = spawn_chat_in(&guard, &[], &[("OPENPRX_MOCK_RESPONSE", sentinel)]);
+    let session = sg.session();
+    // Both captures are kept: enrolment and delivery race the banner, so a
+    // notice can land in either one and asserting on only the later capture
+    // would make this test flaky about the very thing it is checking.
+    let mut transcript = read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+
+    // Enrolment happens off the startup path, but it does happen.
+    daemon.wait_for("registration", STARTUP_TIMEOUT, |state| {
+        state.registered_label.is_some()
+    });
+    assert_eq!(
+        daemon.snapshot(|state| state.registered_label.clone()),
+        Some("workspace".to_string()),
+        "chat registers under its workspace name, which is what an assign_allow rule matches"
+    );
+
+    // The assignment arrives without anybody typing, is announced, and runs.
+    transcript.push_str(&read_until_with_dsr(session, sentinel, Duration::from_secs(15)));
+    assert!(
+        transcript.contains("Assigned by wacli"),
+        "assigned work must never be silent; captured:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("count the crates"),
+        "the announcement must say what was assigned; captured:\n{transcript}"
+    );
+
+    // The answer goes back, and it is the reply the turn produced.
+    daemon.wait_for("the result", Duration::from_secs(15), |state| !state.results.is_empty());
+    let (id, status, summary) = daemon.snapshot(|state| state.results[0].clone());
+    assert_eq!(id, "assign-1");
+    assert_eq!(status, "completed");
+    assert!(
+        summary.contains(sentinel),
+        "the reported summary must be the reply this chat produced, got: {summary}"
+    );
+
+    // Acknowledgement rides the *next* pull, never the one that delivered it:
+    // a client that acknowledged on receipt and then died would destroy the work.
+    daemon.wait_for("the acknowledging pull", Duration::from_secs(15), |state| {
+        state.pull_acks.iter().any(|ack| ack.contains(&"assign-1".to_string()))
+    });
+    let acks = daemon.snapshot(|state| state.pull_acks.clone());
+    assert!(acks.len() >= 2, "expected at least two pulls, saw: {acks:?}");
+    assert!(
+        acks[0].is_empty(),
+        "the first pull cannot acknowledge work it has not received yet: {acks:?}"
+    );
+    assert!(
+        acks.iter().any(|ack| ack.contains(&"assign-1".to_string())),
+        "the assignment must be acknowledged by a later pull: {acks:?}"
+    );
+
+    // Exiting withdraws the session: nothing on the daemon reaps it on a clock.
+    session.send("/exit\r").expect("send /exit");
+    assert!(wait_for_exit(session, EXIT_TIMEOUT), "chat should exit cleanly");
+    daemon.wait_for("deregistration", Duration::from_secs(10), |state| state.deregistered);
+}
+
+/// A chat that no daemon will accept still starts, and says why it cannot be
+/// assigned work rather than failing or going quiet about it.
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_starts_normally_when_it_cannot_enrol_with_a_daemon() {
+    let sentinel = "STILL_WORKS_SENTINEL";
+    // A port nothing is listening on: enrolment cannot succeed.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = closed.local_addr().expect("addr").port();
+    drop(closed);
+
+    let guard = new_harness_guard().expect("harness");
+    write_daemon_config(&guard, &format!("http://127.0.0.1:{port}"));
+    let mut sg = spawn_chat_in(&guard, &[], &[("OPENPRX_MOCK_RESPONSE", sentinel)]);
+    let session = sg.session();
+    let mut transcript = read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+
+    // The chat is fully usable: a failed enrolment costs one capability.
+    session.send("hello\r").expect("send prompt");
+    transcript.push_str(&read_until_with_dsr(session, sentinel, Duration::from_secs(15)));
+    assert!(
+        transcript.contains("cannot be assigned work"),
+        "a failed enrolment must be stated, not swallowed; captured:\n{transcript}"
+    );
+
+    session.send("/exit\r").expect("send /exit");
+    assert!(
+        wait_for_exit(session, EXIT_TIMEOUT),
+        "a chat that could not enrol must still exit cleanly"
+    );
+}
