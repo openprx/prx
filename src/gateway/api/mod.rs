@@ -11,6 +11,7 @@ use axum::{
 };
 
 mod channels;
+mod chat_sessions;
 mod config;
 mod hooks;
 mod jobs;
@@ -69,6 +70,17 @@ pub fn router(state: AppState) -> Router<AppState> {
         // (`prx chat`). Authenticated operator plane, and still subject to the
         // same outbound scope rules as an in-process send.
         .route("/channels/{name}/send", post(channels::post_channel_send))
+        // daemon → `prx chat` assignment. Chat has no listener of its own, so
+        // the daemon holds a mailbox per session and chat pulls from it; the
+        // authorization for filling that mailbox is default-deny and lives in
+        // `runtime::chat_sessions::assign`.
+        .route("/chat-sessions", get(chat_sessions::get_sessions))
+        .route("/chat-sessions/register", post(chat_sessions::post_register))
+        .route("/chat-sessions/results", get(chat_sessions::get_results))
+        .route("/chat-sessions/{id}", delete(chat_sessions::delete_session))
+        .route("/chat-sessions/{id}/assign", post(chat_sessions::post_assign))
+        .route("/chat-sessions/{id}/inbox/pull", post(chat_sessions::post_pull))
+        .route("/chat-sessions/{id}/result", post(chat_sessions::post_result))
         .route("/config", get(config::get_config))
         .route("/config/files", get(config::get_config_files))
         .route("/config/files/{filename}", put(config::put_config_file))
