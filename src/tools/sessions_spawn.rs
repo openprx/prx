@@ -2141,7 +2141,7 @@ impl Tool for SessionsSpawnTool {
     }
 
     fn description(&self) -> &str {
-        "Manage async sub-agents. Actions: \
+        "Hand work to an async sub-agent, or to a live `prx chat` session, and manage what is running. Actions: \
          'spawn' (default) — launch a sub-agent for a task and return a run_id; \
          'spawn_batch' — launch several sub-agents at once and return a batch_id; \
          'join' — block until every sub-agent in a batch_id has finished, then return all their results; \
@@ -2151,7 +2151,12 @@ impl Tool for SessionsSpawnTool {
          'steer' — inject a message into a running sub-agent to redirect it; \
          'chat_sessions' — list the live `prx chat` sessions you may hand work to; \
          'chat_assign' — hand a task to one of those chat sessions and have its result \
-         relayed back to this conversation when it finishes."
+         relayed back to this conversation when it finishes. \
+         Each action reads a different parameter, so pass the right one the first time: \
+         'spawn' needs `task`; 'spawn_batch' needs `tasks`; 'join' needs `batch_id`; \
+         'kill'/'history' need `run_id`; 'steer' needs `run_id` + `message`; \
+         'chat_assign' needs `session_id` + `task` (the work goes in `task`, not `message`); \
+         'list' and 'chat_sessions' take no parameters."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -2169,22 +2174,31 @@ impl Tool for SessionsSpawnTool {
                     "type": "string",
                     "enum": ["spawn", "spawn_batch", "join", "list", "kill", "history", "steer", "chat_sessions", "chat_assign"],
                     "default": "spawn",
-                    "description": "Action to perform: spawn a new sub-agent, spawn_batch a whole fan-out, join a batch and wait for all of its results, list all runs, kill a run, view history, steer a running sub-agent, chat_sessions to list the live `prx chat` sessions you may assign work to, or chat_assign to hand one of them a task."
+                    "description": "Action to perform, and what each one requires: \
+                     'spawn' (task) launches a new sub-agent; \
+                     'spawn_batch' (tasks) launches a whole fan-out; \
+                     'join' (batch_id) waits for all of a batch's results; \
+                     'list' (no parameters) shows all runs; \
+                     'kill' (run_id) aborts a run; \
+                     'history' (run_id) views a run's log; \
+                     'steer' (run_id, message) redirects a running sub-agent; \
+                     'chat_sessions' (no parameters) lists the live `prx chat` sessions you may assign work to; \
+                     'chat_assign' (session_id, task) hands one of them a task."
                 },
                 "session_id": {
                     "type": "string",
-                    "description": "For action='chat_assign': which live `prx chat` session gets the task, as reported by action='chat_sessions'."
+                    "description": "Required for action='chat_assign': which live `prx chat` session gets the task, as reported by action='chat_sessions'. This is a chat session id, not a sub-agent run id — 'kill'/'history'/'steer' address sub-agents through `run_id` instead. Unused by every other action."
                 },
                 "disposition": {
                     "type": "string",
                     "enum": ["queue", "steer", "interrupt"],
                     "default": "queue",
-                    "description": "For action='chat_assign': what to do about a turn that chat session may already be running. 'queue' (default) waits for it to finish, 'steer' hands the task to the running turn as extra input, 'interrupt' stops the running turn first. Choose 'queue' unless the user asked for the work to happen right now."
+                    "description": "Optional, for action='chat_assign' only: what to do about a turn that chat session may already be running. 'queue' (default) waits for it to finish, 'steer' hands the task to the running turn as extra input, 'interrupt' stops the running turn first. Choose 'queue' unless the user asked for the work to happen right now."
                 },
                 "tasks": {
                     "type": "array",
                     "minItems": 1,
-                    "description": "For action='spawn_batch': the tasks to launch, all at once. Each entry is either a task string or an object {task, agent?, model?, provider?, mode?}; any top-level parameter of this call acts as the default for every entry. There is no limit on how many may be launched. Members do not announce their own results — call 'join' with the returned batch_id and report the outcome yourself in a single message.",
+                    "description": "Required for action='spawn_batch' (and used by no other action): the tasks to launch, all at once. Each entry is either a task string or an object {task, agent?, model?, provider?, mode?, recipient?, timeout_seconds?, max_iterations?} — those eight keys and no others; any other key is rejected rather than ignored. Any top-level parameter of this call acts as the default for every entry, and an entry key overrides that default for that member alone. There is no limit on how many may be launched. Members do not announce their own results — call 'join' with the returned batch_id and report the outcome yourself in a single message.",
                     "items": {
                         "anyOf": [
                             {"type": "string", "minLength": 1},
@@ -2194,33 +2208,38 @@ impl Tool for SessionsSpawnTool {
                 },
                 "batch_id": {
                     "type": "string",
-                    "description": "Batch identifier returned by 'spawn_batch'. Required for the 'join' action, which blocks until every member of that batch has finished — however long that takes — and then reports all of them."
+                    "description": "Batch identifier returned by 'spawn_batch'. Required for the 'join' action, which blocks until every member of that batch has finished — however long that takes — and then reports all of them. Unused by every other action."
                 },
                 "task": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Task description for the sub-agent to complete. Required for 'spawn' action."
+                    "description": "The work to be done, written as instructions for whoever carries it out. Required by TWO actions: \
+                                    for action='spawn' it is the task the new sub-agent is launched with, and \
+                                    for action='chat_assign' it is the task handed to the live `prx chat` session named by `session_id`. \
+                                    chat_assign carries its text here — there is no `message`, `prompt` or `text` parameter for it. \
+                                    For action='spawn_batch' pass `tasks` instead; for action='steer' pass `message`."
                 },
                 "run_id": {
                     "type": "string",
-                    "description": "Run ID for kill/history/steer actions."
+                    "description": "Identifier of one sub-agent run, as returned by 'spawn' and listed by 'list'. Required for actions 'kill', 'history' and 'steer'. Not a chat session id — action='chat_assign' addresses those through `session_id`."
                 },
                 "message": {
                     "type": "string",
-                    "description": "Message to inject into the running sub-agent. Required for 'steer' action."
+                    "description": "Required for action='steer' (and used by no other action): the text injected into an already-running sub-agent to redirect it. \
+                                    This is not how work is handed out — action='spawn' and action='chat_assign' both take their instructions in `task`."
                 },
                 "model": {
                     "type": "string",
-                    "description": "Optional model override for the sub-agent. Defaults to the gateway model."
+                    "description": "Optional model override for the sub-agent, for actions 'spawn' and 'spawn_batch' (ignored by every other action). Defaults to the gateway model."
                 },
                 "provider": {
                     "type": "string",
-                    "description": "Optional provider override for the sub-agent (e.g. 'openrouter', 'ollama'). Defaults to the agent config provider, then the gateway provider."
+                    "description": "Optional provider override for the sub-agent (e.g. 'openrouter', 'ollama'), for actions 'spawn' and 'spawn_batch' (ignored by every other action). Defaults to the agent config provider, then the gateway provider."
                 },
                 "agent": {
                     "type": "string",
                     "description": format!(
-                        "Optional identity agent name. Available: {}",
+                        "Optional identity agent name, for actions 'spawn' and 'spawn_batch' (ignored by every other action). Available: {}",
                         if available_agents.is_empty() {
                             "(none configured)".to_string()
                         } else {
@@ -2231,23 +2250,26 @@ impl Tool for SessionsSpawnTool {
                 "timeout_seconds": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "Maximum runtime in seconds. 0 or omitted = no timeout (sub-agent runs until completion). Set a value to enforce a deadline."
+                    "description": "Maximum runtime in seconds, for actions 'spawn' and 'spawn_batch' (ignored by every other action). Omitted = the 600s default deadline; pass 0 explicitly for no timeout (sub-agent runs until completion); any other value enforces that deadline."
                 },
                 "max_iterations": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Maximum tool call iterations for the sub-agent. Overrides agent config default. Omit to use agent/global config value."
+                    "description": "Maximum tool call iterations for the sub-agent, for actions 'spawn' and 'spawn_batch' (ignored by every other action). Can only lower the agent/global config ceiling — a larger value is clamped down to it. Omit to use the configured value."
                 },
                 "mode": {
                     "type": "string",
                     "enum": ["task", "process"],
                     "default": "task",
-                    "description": "Execution mode. 'task' keeps current in-process behavior (default), 'process' launches an isolated OS process."
+                    "description": "Execution mode, for actions 'spawn' and 'spawn_batch' (ignored by every other action). 'task' keeps current in-process behavior (default), 'process' launches an isolated OS process."
                 },
                 "recipient": {
                     "type": "string",
-                    "description": "Optional recipient for result announcement (phone number, group ID, etc.). \
-                                    Defaults to the current conversation sender."
+                    "description": "Optional recipient (phone number, group ID, etc.) for what action='spawn' sends about a run: \
+                                    its result announcement, and any later kill notice. Defaults to the current conversation \
+                                    sender. Under action='spawn_batch' it only routes the kill notice, since a batch member \
+                                    never announces its own result. Unused by every other action — action='chat_assign' \
+                                    always relays its answer back into the assigning conversation, and offers no override."
                 },
                 "announce": {
                     "type": "boolean",
@@ -2261,13 +2283,13 @@ impl Tool for SessionsSpawnTool {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 200,
-                    "description": "For action='history', return only the last N entries. Defaults to the last 20 entries so final proof markers stay visible."
+                    "description": "Optional, for action='history' only: return only the last N entries. Defaults to the last 20 entries so final proof markers stay visible."
                 },
                 "max_chars_per_entry": {
                     "type": "integer",
                     "minimum": 80,
                     "maximum": 4000,
-                    "description": "For action='history', maximum characters per returned history entry. Defaults to 800."
+                    "description": "Optional, for action='history' only: maximum characters per returned history entry. Defaults to 800."
                 }
             },
             "required": []
@@ -12598,5 +12620,171 @@ mod tests {
         assert_eq!(dispositions, vec!["queue", "steer", "interrupt"]);
         assert_eq!(schema["properties"]["session_id"]["type"].as_str(), Some("string"));
         assert!(tool.description().contains("chat_assign"), "{}", tool.description());
+    }
+
+    // ── c7: getting the call right on the FIRST try ─────────────────────
+    //
+    // A real WhatsApp run called
+    //   {"action":"chat_assign","disposition":"queue","message":"…"}
+    // and was refused with "Missing 'task' parameter for chat_assign action".
+    // The model had not been careless: `task` advertised itself as "Required
+    // for 'spawn' action", while `session_id` and `disposition` each opened
+    // "For action='chat_assign'". The schema therefore *taught* it that
+    // chat_assign takes neither `task` nor anything else named there, so it
+    // invented a parameter. A partial "parameter × action" statement misleads
+    // harder than saying nothing at all, and one whole LLM round trip was
+    // spent discovering that.
+    //
+    // The tests below assert the property — that every action's parameters are
+    // discoverable from the text the model actually reads — and never the
+    // wording, so a rewrite that keeps the contract stays green.
+
+    /// Which parameters each action really consumes, read off the executors
+    /// (`execute`, `execute_spawn`, `execute_spawn_batch`, `execute_history`,
+    /// `execute_chat_assign`) rather than off the schema. This is the table the
+    /// schema is checked *against*, so it must be updated from the code — never
+    /// from the prose it is validating.
+    ///
+    /// `list` and `chat_sessions` are absent because they read no parameter at
+    /// all; both are still required to be documented, by
+    /// [`every_action_is_named_where_the_model_reads_it`].
+    const PARAMETER_ACTION_MATRIX: &[(&str, &[&str])] = &[
+        ("task", &["spawn", "chat_assign"]),
+        ("tasks", &["spawn_batch"]),
+        ("batch_id", &["join"]),
+        ("run_id", &["kill", "history", "steer"]),
+        ("message", &["steer"]),
+        ("session_id", &["chat_assign"]),
+        ("disposition", &["chat_assign"]),
+        ("last_n", &["history"]),
+        ("max_chars_per_entry", &["history"]),
+        ("model", &["spawn", "spawn_batch"]),
+        ("provider", &["spawn", "spawn_batch"]),
+        ("agent", &["spawn", "spawn_batch"]),
+        ("timeout_seconds", &["spawn", "spawn_batch"]),
+        ("max_iterations", &["spawn", "spawn_batch"]),
+        ("mode", &["spawn", "spawn_batch"]),
+        ("recipient", &["spawn", "spawn_batch"]),
+        ("announce", &["spawn"]),
+    ];
+
+    /// The schema refers to an action by its name in single quotes throughout
+    /// (`'spawn'`, `action='chat_assign'`). Keeping the closing quote in the
+    /// needle is what stops `'spawn'` from matching inside `'spawn_batch'`.
+    fn mentions_action(text: &str, action: &str) -> bool {
+        text.contains(&format!("'{action}'"))
+    }
+
+    /// Every parameter must name *every* action that reads it.
+    ///
+    /// This is the regression that cost the round trip: `task` serves both
+    /// `spawn` and `chat_assign`, and naming only `spawn` sent the model
+    /// looking for a different parameter name.
+    #[test]
+    fn every_parameter_names_every_action_that_reads_it() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+        let schema = tool.parameters_schema();
+        for (parameter, actions) in PARAMETER_ACTION_MATRIX {
+            let description = schema["properties"][parameter]["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("parameter '{parameter}' must exist and carry a description"));
+            for action in *actions {
+                assert!(
+                    mentions_action(description, action),
+                    "parameter '{parameter}' is read by action '{action}' but its description never says so, \
+                     so a model calling '{action}' cannot tell that '{parameter}' is the parameter to pass: \
+                     {description}"
+                );
+            }
+        }
+    }
+
+    /// No parameter may sit outside the matrix.
+    ///
+    /// Adding a parameter without classifying it is how the next `task` gets
+    /// written: this fails until the new key is placed against the actions that
+    /// consume it, and [`every_parameter_names_every_action_that_reads_it`]
+    /// then forces its description to say so.
+    #[test]
+    fn the_matrix_covers_every_declared_parameter() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+        let schema = tool.parameters_schema();
+        let mut declared: Vec<&str> = schema["properties"]
+            .as_object()
+            .expect("schema properties")
+            .keys()
+            .map(String::as_str)
+            .filter(|key| *key != "action")
+            .collect();
+        declared.sort_unstable();
+        let mut classified: Vec<&str> = PARAMETER_ACTION_MATRIX.iter().map(|(name, _)| *name).collect();
+        classified.sort_unstable();
+        assert_eq!(
+            declared, classified,
+            "every schema parameter must be classified against the actions that read it"
+        );
+    }
+
+    /// Both places the model reads before it can choose an action — the tool
+    /// description in the tool list and the `action` enum's own description —
+    /// must name every action, including the two that take no parameters.
+    #[test]
+    fn every_action_is_named_where_the_model_reads_it() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+        let schema = tool.parameters_schema();
+        let action_description = schema["properties"]["action"]["description"]
+            .as_str()
+            .expect("the action parameter's description");
+        let actions: Vec<&str> = schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("enumerated actions")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        for action in &actions {
+            assert!(
+                mentions_action(tool.description(), action),
+                "action '{action}' is callable but the tool description never mentions it: {}",
+                tool.description()
+            );
+            assert!(
+                mentions_action(action_description, action),
+                "action '{action}' is callable but the action enum's description never mentions it: \
+                 {action_description}"
+            );
+        }
+        // Every action the matrix classifies has to be a real, callable one.
+        for (parameter, matrix_actions) in PARAMETER_ACTION_MATRIX {
+            for action in *matrix_actions {
+                assert!(
+                    actions.contains(action),
+                    "the matrix claims '{parameter}' serves action '{action}', which is not in the enum"
+                );
+            }
+        }
+    }
+
+    /// The one-line summary the channel tool list carries has to mention chat
+    /// assignment too. It is the only thing the model reads while *choosing* a
+    /// tool: the schema above is never consulted for a capability the summary
+    /// gave no reason to look for.
+    #[test]
+    fn the_channel_tool_summary_advertises_chat_assignment() {
+        let summary = crate::channels::SESSIONS_SPAWN_TOOL_SUMMARY;
+        for action in ["spawn", "chat_sessions", "chat_assign"] {
+            assert!(
+                mentions_action(summary, action),
+                "tool-list summary omits '{action}': {summary}"
+            );
+        }
+        for parameter in ["task", "session_id"] {
+            assert!(
+                summary.contains(parameter),
+                "tool-list summary never names the '{parameter}' parameter: {summary}"
+            );
+        }
     }
 }

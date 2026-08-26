@@ -5354,6 +5354,28 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 }
 
 /// Start all configured channels and route messages to the agent
+/// How `sessions_spawn` is introduced in the tool list — the one sentence the
+/// model reads while *choosing* a tool, before it ever sees the parameter
+/// schema.
+///
+/// It names the required parameter of each action for the same reason the
+/// schema does: a real WhatsApp run picked this tool correctly and then called
+/// `chat_assign` with `message` instead of `task`, because nothing it had read
+/// so far said chat assignment existed at all, let alone what it takes. A tool
+/// summary that stops at "spawn a sub-agent" hides half the tool.
+///
+/// Named rather than inlined so the properties below can be asserted; the
+/// value is used verbatim by `start_channels_with_config`.
+pub(crate) const SESSIONS_SPAWN_TOOL_SUMMARY: &str = "Hand work to a sub-agent or to a live `prx chat` session. \
+         action='spawn' (task) launches an async sub-agent in isolation, returns a run ID immediately, \
+         and the sub-agent announces its own result when complete — use it for long-running or \
+         parallel work that should not block this conversation; action='spawn_batch' (tasks) fans out, \
+         action='join' (batch_id) collects the fan-out. \
+         action='chat_sessions' (no parameters) lists the live `prx chat` sessions you are allowed to \
+         assign work to, and action='chat_assign' (session_id, task) hands one of them a task and \
+         relays its answer back here — use these when the work belongs to a running chat session \
+         rather than to a fresh sub-agent. Also 'list', 'kill', 'history', 'steer'.";
+
 pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Result<()> {
     let shared_config = crate::config::new_shared(config.clone());
     let generation = shared_config.pin();
@@ -5502,12 +5524,7 @@ pub async fn start_channels_with_config(
             "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt and returns its response.",
         ));
     }
-    tool_descs.push((
-        "sessions_spawn",
-        "Spawn an async sub-agent to handle a task in isolation. Returns immediately with a run ID. \
-         The sub-agent announces its result when complete. Use for long-running or parallel tasks \
-         that should not block the main conversation.",
-    ));
+    tool_descs.push(("sessions_spawn", SESSIONS_SPAWN_TOOL_SUMMARY));
     tool_descs.push((
         "subagents",
         "Manage sub-agent runs spawned by sessions_spawn. Actions: list active/recent runs, kill a running run, or steer a running run with a new instruction.",
