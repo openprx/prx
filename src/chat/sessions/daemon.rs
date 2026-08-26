@@ -123,12 +123,32 @@ pub fn register_in_flight(
     base_url: &str,
     cancel: CancellationToken,
 ) -> InFlightGuard {
+    register_in_flight_labeled(registry, &request_label(request), base_url, cancel)
+}
+
+/// Publish one piece of daemon-facing work under a caller-supplied label.
+///
+/// Same rows, same `d<N>` address space, same guard: work that talks to the
+/// daemon but is not one of the three `--daemon` session commands — the
+/// assignment poller and the results it reports — belongs in the very same
+/// list, because the property that matters is "this chat is waiting on the
+/// daemon", not which command started it.
+///
+/// The label reaches an operator's screen, so callers pass a redacted one:
+/// nothing here strips anything.
+#[must_use]
+pub fn register_in_flight_labeled(
+    registry: &InFlightRegistry,
+    label: &str,
+    base_url: &str,
+    cancel: CancellationToken,
+) -> InFlightGuard {
     let mut state = registry.lock();
     state.next_id += 1;
     let id = state.next_id;
     state.rows.push(InFlightDaemonRequest {
         id,
-        label: request_label(request),
+        label: label.to_string(),
         base_url: base_url.to_string(),
         started: Instant::now(),
         cancel,
@@ -235,7 +255,12 @@ fn configured_url(config: &Config) -> Option<String> {
     (!url.is_empty()).then(|| url.to_string())
 }
 
-fn operator_token(config: &Config) -> Option<String> {
+/// The operator credential chat would send to the daemon, if any.
+///
+/// `pub(crate)` because enrolling for daemon assignments has to know whether a
+/// credential exists at all: with none, and no explicitly configured daemon
+/// URL, there is nothing to enrol with and silence is the honest outcome.
+pub(crate) fn operator_token(config: &Config) -> Option<String> {
     let configured = config.chat.daemon.token.trim();
     if !configured.is_empty() {
         return Some(configured.to_string());

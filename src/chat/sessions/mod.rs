@@ -14,6 +14,9 @@
 //! - [`id::SessionId`] — stable handle over the run UUID.
 //! - [`model::ManagedSessionView`] / [`model::project_run`] — UI projection.
 //! - [`command::SessionCommand`] / [`command::parse_session_command`] — parsing.
+//! - [`assignment`] — the other direction of the same link: work a *daemon*
+//!   hands to this chat session, pulled over the same control API, run through
+//!   the ordinary input queue, and answered for when the turn ends.
 //! - [`daemon`] — the `--daemon` scope of `/sessions`, `/steer`, and `/kill`:
 //!   the same commands pointed at the work a *daemon* process holds, over the
 //!   runtime control API rather than this process's registries.
@@ -31,6 +34,7 @@
 //! scope.
 
 pub mod approval;
+pub mod assignment;
 pub mod command;
 pub mod daemon;
 pub mod event;

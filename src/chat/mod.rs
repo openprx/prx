@@ -200,6 +200,15 @@ struct PerTurnContext {
     model_name: String,
     history_len_before_user_turn: usize,
     history_user_message: ChatMessage,
+    /// Set when this turn was started by daemon-assigned work, and carried all
+    /// the way to the commit because that is where the reply exists.
+    ///
+    /// A visible turn is *launched* by the main loop and finalized somewhere
+    /// else entirely, so a guard left behind in the loop body would report the
+    /// moment the turn started — an answer of "no reply" to work that was about
+    /// to produce one. Moving it into the context ties the report to the turn
+    /// rather than to the iteration that started it.
+    assignment: Option<crate::chat::sessions::assignment::AssignmentTurnGuard>,
 }
 
 #[cfg(feature = "terminal-tui")]
@@ -1956,6 +1965,137 @@ fn start_daemon_session_command(
         control.redraw_tx,
     );
     Some(notice)
+}
+
+/// One chat process's enrolment for daemon-assigned work.
+///
+/// Held for the life of the chat loop so the exit path can withdraw it: nothing
+/// on the daemon side removes a chat session on a clock — a session that
+/// stopped pulling is *reported* as silent, never evicted — so an exit that
+/// forgets this leaves a row that work can still be addressed to with nobody
+/// left to run it.
+struct AssignmentEnrolment {
+    client: std::sync::Arc<crate::chat::sessions::assignment::AssignmentClient>,
+    /// Ends the poll loop. Also the token behind its `/kill --daemon d<N>` row.
+    cancel: CancellationToken,
+}
+
+/// The sink assignment machinery reports through.
+///
+/// The same system-message path background sessions use, so assigned work is
+/// announced wherever the operator is already reading — TUI transcript on one
+/// path, plain stdout on the other — instead of inventing a second surface.
+fn assignment_notifier(
+    dispatcher: &dispatcher::ChatDispatcher,
+    redraw_tx: Option<&mpsc::Sender<()>>,
+) -> std::sync::Arc<dyn Fn(&str) + Send + Sync> {
+    let dispatcher = dispatcher.clone();
+    let redraw_tx = redraw_tx.cloned();
+    std::sync::Arc::new(move |text: &str| surface_session_message(&dispatcher, redraw_tx.as_ref(), text))
+}
+
+/// Start enrolling this chat for daemon-assigned work, without waiting for it.
+///
+/// Returns `None` when nothing in the configuration points this chat at a
+/// daemon — the common case, and one that must stay silent: the fallback daemon
+/// address is `[gateway]`'s own bind, which every chat has whether or not a
+/// daemon listens there, so a chat that tried regardless would announce a
+/// refusal on every single start.
+///
+/// Enrolment itself happens in the spawned task, so a daemon that is slow,
+/// down, or refusing credentials never delays the prompt.
+fn start_assignment_enrolment(
+    config: &Config,
+    chat_sessions: &crate::chat::sessions::ChatSessionsHandle,
+    input_tx: &mpsc::Sender<crate::channels::traits::ChannelMessage>,
+    dispatcher: &dispatcher::ChatDispatcher,
+    redraw_tx: Option<&mpsc::Sender<()>>,
+) -> Option<AssignmentEnrolment> {
+    use crate::chat::sessions::assignment::{self, Enrolable};
+
+    match assignment::enrolable(config) {
+        Enrolable::No(reason) => {
+            tracing::debug!(reason, "chat is not enrolling for daemon assignments");
+            return None;
+        }
+        Enrolable::Yes => {}
+    }
+    let client = assignment::AssignmentClient::new(config);
+    let cancel = CancellationToken::new();
+    tokio::spawn(assignment::enrol_and_poll(
+        std::sync::Arc::clone(&client),
+        chat_sessions.daemon_requests(),
+        input_tx.clone(),
+        assignment_notifier(dispatcher, redraw_tx),
+        cancel.clone(),
+    ));
+    Some(AssignmentEnrolment { client, cancel })
+}
+
+/// Arm the report for an input message that turns out to be assigned work.
+///
+/// `None` for ordinary input and for a chat that never enrolled, so the turn
+/// loop pays nothing for the feature it is not using.
+fn assignment_turn_guard(
+    enrolment: Option<&AssignmentEnrolment>,
+    chat_sessions: &crate::chat::sessions::ChatSessionsHandle,
+    dispatcher: &dispatcher::ChatDispatcher,
+    redraw_tx: Option<&mpsc::Sender<()>>,
+    msg: &crate::channels::traits::ChannelMessage,
+) -> Option<crate::chat::sessions::assignment::AssignmentTurnGuard> {
+    let delivery = crate::chat::sessions::assignment::delivered(msg)?;
+    let enrolment = enrolment?;
+    Some(crate::chat::sessions::assignment::AssignmentTurnGuard::new(
+        std::sync::Arc::clone(&enrolment.client)
+            as std::sync::Arc<dyn crate::chat::sessions::assignment::AssignmentMailbox>,
+        chat_sessions.daemon_requests(),
+        assignment_notifier(dispatcher, redraw_tx),
+        delivery.assignment_id,
+    ))
+}
+
+/// Withdraw this chat from the daemon's registry on the way out.
+///
+/// Ends the poll loop first so nothing takes new work between here and the
+/// deregistration, then hands back whatever was still outstanding. The daemon
+/// records a `cancelled` result for each of those, which is how the assigner
+/// learns the work is not coming rather than waiting on a session that no
+/// longer exists.
+///
+/// The final turn's result is reported from its own task, so it races this
+/// call. That race is not closed by waiting on it: the control API carries no
+/// request timeout by design, so a daemon that accepted the connection and then
+/// said nothing would hold this chat's exit open with nothing left on screen to
+/// end it with. The losing side of the race is a `cancelled` verdict instead of
+/// a `completed` one — still true, and still delivered.
+async fn withdraw_assignment_enrolment(
+    enrolment: Option<&AssignmentEnrolment>,
+    dispatcher: &dispatcher::ChatDispatcher,
+    redraw_tx: Option<&mpsc::Sender<()>>,
+) {
+    let Some(enrolment) = enrolment else {
+        return;
+    };
+    enrolment.cancel.cancel();
+    if !enrolment.client.is_enrolled() {
+        return;
+    }
+    match enrolment.client.deregister().await {
+        Ok(0) => tracing::info!("withdrew this chat session from the daemon assignment registry"),
+        Ok(discarded) => surface_session_message(
+            dispatcher,
+            redraw_tx,
+            &format!(
+                "Withdrew this chat from the daemon; {discarded} assignment(s) it had not finished were \
+                 handed back as cancelled."
+            ),
+        ),
+        Err(error) => tracing::warn!(
+            error = %error,
+            "could not withdraw this chat session from the daemon assignment registry; it will be listed \
+             as silent until an operator reaps it"
+        ),
+    }
 }
 
 /// Whether an action is one of the three `--daemon`-scoped variants.
@@ -4138,6 +4278,11 @@ pub async fn run(
     // ── Input channel ────────────────────────────────────────────
     let (input_tx, mut input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
     scheduled_input_handle.set_input_sender(input_tx.clone());
+    // Taken before the terminal listener consumes `input_tx`: daemon-assigned
+    // work is submitted through the very same FIFO as typed input, which is
+    // what makes it go through the ordinary turn machinery rather than a
+    // parallel path with its own bugs.
+    let assignment_input_tx = input_tx.clone();
     let (control_tx, mut control_rx) = mpsc::channel(CHAT_CONTROL_CHANNEL_CAPACITY);
     #[cfg(not(feature = "terminal-tui"))]
     let _ = &control_tx;
@@ -4654,6 +4799,22 @@ pub async fn run(
         let recap = format_reloaded_background_sessions(&chat_session.background_sessions);
         surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &recap);
     }
+
+    // ── Daemon-assigned work (c2) ────────────────────────────────
+    //
+    // The other direction of the control link: a message on another channel can
+    // name this chat session and a task, and the task has to run *here*. Chat
+    // pulls its mailbox over the same control API it already uses, so nothing
+    // listens and no new transport exists. Enrolment happens off this path — a
+    // daemon that is down, slow or refusing credentials costs this chat the
+    // ability to be assigned work and nothing else.
+    let assignment_enrolment = start_assignment_enrolment(
+        &config,
+        &chat_sessions,
+        &assignment_input_tx,
+        &chat_dispatcher,
+        sessions_redraw_handle.as_ref(),
+    );
 
     // ── Main message loop ────────────────────────────────────────
     //
@@ -5344,6 +5505,18 @@ pub async fn run(
         let msg = input.msg;
         let user_input = msg.content.clone();
         let synthetic_ui_command = is_synthetic_ui_command(&msg);
+        // Armed here, at the top, because the turn body has many exits — a
+        // slash command short-circuits it, a cancellation unwinds it, `/quit`
+        // breaks the loop — and an assigner left waiting forever is the worst
+        // of them. The guard reports on whichever exit happens; the one that
+        // requeues the input disarms it, because that work still has to run.
+        let mut assignment_guard = assignment_turn_guard(
+            assignment_enrolment.as_ref(),
+            &chat_sessions,
+            &chat_dispatcher,
+            sessions_redraw_handle.as_ref(),
+            &msg,
+        );
 
         // Bug #3: 本轮生效的 provider 名（借自可变 owned 值）。`/provider <name>`
         // 拦截会改写 `current_provider_owned` + `provider` Arc，下一轮迭代此 shadow
@@ -7274,6 +7447,13 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 target_kind = ?provider_worker_kind,
                 "visible provider turn admission rejected after route decision; requeueing input"
             );
+            // The input goes back on the backlog and will run later, so this
+            // attempt owes the daemon nothing: reporting here would answer for
+            // a turn that has not happened, and the real report would then be
+            // refused as unknown.
+            if let Some(guard) = assignment_guard.as_mut() {
+                guard.disarm();
+            }
             requeue_post_route_admission_rejected_input(
                 &mut input_backlog,
                 &mut defer_visible_input_pop_once,
@@ -7473,6 +7653,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             model_name: model_name.to_string(),
                             history_len_before_user_turn,
                             history_user_message: history_user_message.clone(),
+                            assignment: assignment_guard.take(),
                         },
                     )
                     .is_some()
@@ -8647,6 +8828,12 @@ Retry with a compatible model: /provider {new_provider} <model>"
         );
         publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
         publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
+        // The reply this turn produced *is* the answer to the assignment, so it
+        // is what goes back. Reaching here at all is what distinguishes a turn
+        // that answered from every other way the body can end.
+        if let Some(guard) = assignment_guard.as_mut() {
+            guard.completed(&response);
+        }
     }
 
     // ── Child-session shutdown on exit (Phase C) ─────────────────
@@ -8657,6 +8844,12 @@ Retry with a compatible model: /provider {new_provider} <model>"
     let _shutdown_report =
         shutdown_child_sessions_for_exit(&mut chat_sessions, &mut chat_session, &chat_dispatcher).await;
     session_rings.clear();
+    withdraw_assignment_enrolment(
+        assignment_enrolment.as_ref(),
+        &chat_dispatcher,
+        sessions_redraw_handle.as_ref(),
+    )
+    .await;
 
     // Step 5b: dispatcher task graceful shutdown.
     //
@@ -10022,7 +10215,7 @@ async fn commit_completed_provider_turn(
     redraw_tx_for_main: Option<&mpsc::Sender<()>>,
     turn_signal: &dispatcher::TurnCompletionSignal,
 ) -> bool {
-    let pending = pending_commit.context;
+    let mut pending = pending_commit.context;
     let ProviderTurnTerminalPlan::Completed {
         final_text,
         reasoning,
@@ -10039,6 +10232,17 @@ async fn commit_completed_provider_turn(
         );
         return false;
     };
+
+    // The reply is the answer to whatever assigned this turn. Recorded here,
+    // sent when `pending` drops at the end of this call — an empty response is
+    // reported as such rather than as a completion with nothing in it.
+    if let Some(guard) = pending.assignment.as_mut() {
+        if empty_response {
+            guard.failed("The turn this chat ran for the assignment finished without any reply text.");
+        } else {
+            guard.completed(&recorded_response);
+        }
+    }
 
     let provider_turn_task_id = Some(pending.task_id);
     let provider_outcome = ProviderExecutionOutcome::success_for_decision_with_usage(
@@ -10341,6 +10545,9 @@ async fn finalize_per_turn_context(
             }
         }
         ProviderTurnTerminalPlan::Failed { err, .. } => {
+            if let Some(guard) = pending.assignment.as_mut() {
+                guard.failed(&format!("The turn this chat ran for the assignment failed: {err}"));
+            }
             let failed_outcome = ProviderExecutionOutcome::failed_for_decision(
                 &pending.route_decision,
                 pending.provider_started_at,
@@ -10380,6 +10587,9 @@ async fn finalize_per_turn_context(
             publish_provider_worker_status(chat_dispatcher, provider_turn_workers);
         }
         ProviderTurnTerminalPlan::Cancelled { .. } => {
+            // Deliberately not marked: the guard's own default already says the
+            // turn ended before it answered, which is exactly what happened —
+            // and `cancelled` is the daemon's verdict, not a client's to claim.
             if let Err(error) = finalize_chat_non_success_turn(
                 memory_fabric,
                 &pending.turn_run_id,
@@ -11042,6 +11252,27 @@ async fn process_active_turn_input_message(
         emit_chat_output(&output);
         return;
     }
+    // An assignment dispatched as `interrupt` ends the turn in flight first,
+    // through the very same local path Ctrl+C uses. Two things this is not:
+    // it is not a timeout — nothing measured a clock, somebody asked for it —
+    // and it is not the daemon acting, which only recorded the disposition and
+    // put the item at the head of its queue. `steer` deliberately does *not*
+    // land here: it jumps the queue and leaves the running turn alone.
+    if let Some(delivery) = crate::chat::sessions::assignment::delivered(&msg)
+        && delivery.disposition.ends_the_turn_in_flight()
+    {
+        request_provider_turn_cancel(
+            scheduler,
+            provider_turn_workers,
+            provider_turn_task_id,
+            "daemon assignment interrupt",
+        );
+        dispatch_provider_worker_cancel_signal(chat_dispatcher, Some(ProviderWorkerCancelSignal::CancelRequested));
+        publish_provider_worker_status(chat_dispatcher, provider_turn_workers);
+    }
+    // Everything else about an assignment is ordinary input: `queue` lands at
+    // the back of the backlog, `steer` and `interrupt` at the front, because
+    // their message carries the same `/now ` prefix a person types to do that.
     let _priority =
         enqueue_input_message_and_return_priority_with_scheduler(backlog, scheduler, msg, chat_session.turns.len());
 }
@@ -17654,6 +17885,158 @@ mod p3_directional_switch_tests {
         assert_eq!(scheduler.status().main_queue_status().queued, 1);
     }
 
+    /// Build the input message a daemon assignment arrives as.
+    fn assigned_msg(id: &str, task: &str, disposition: &str) -> crate::channels::traits::ChannelMessage {
+        let pulled = crate::runtime::tasks_cli::PulledAssignment {
+            assignment_id: id.to_string(),
+            session_id: "sess".to_string(),
+            task: task.to_string(),
+            disposition: disposition.to_string(),
+            deliveries: 1,
+            created_at_unix_ms: 0,
+            work_id: "w1".to_string(),
+            origin_channel: "wacli".to_string(),
+            origin_ref: Some("3d1a4f5b".to_string()),
+        };
+        crate::chat::sessions::assignment::assignment_message(
+            &pulled,
+            crate::chat::sessions::assignment::Disposition::from_wire(disposition),
+        )
+    }
+
+    /// Feed one assignment into a chat with a turn in flight, and report what
+    /// the backlog and the running task look like afterwards.
+    async fn dispatch_assignment_during_a_turn(
+        disposition: &str,
+    ) -> (
+        Vec<(InputQueuePriority, String)>,
+        crate::chat::turn_scheduler::TurnTaskState,
+    ) {
+        let msg = assigned_msg("assign-1", "count the crates", disposition);
+        let (tx, mut input_rx) = mpsc::channel(4);
+        drop(tx);
+        let mut outputs = Vec::<String>::new();
+        let mut emit = |text: &str| outputs.push(text.to_string());
+        let mut backlog = std::collections::VecDeque::new();
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue(
+            "active provider turn",
+            crate::chat::turn_scheduler::TurnPriority::Normal,
+            3,
+        );
+        scheduler.start_task(task_id).expect("task starts");
+        let mut provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        provider_turn_workers
+            .start_from_task(
+                scheduler.task(task_id).expect("task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited,
+            )
+            .expect("worker starts");
+        let (chat_dispatcher, _action_rx) = dispatcher::ChatDispatcher::new();
+        let chat_session = session::ChatSession::new("p", "m");
+        let mut chat_sessions =
+            crate::chat::sessions::ChatSessionsHandle::new(std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())));
+        let session_rings = std::collections::HashMap::new();
+        let mut reaped_log_archive = ReapedSessionLogArchive::default();
+        let reap_policy = crate::chat::sessions::runtime::ReapPolicy::default();
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let daemon_config = Config::default();
+        let (daemon_dispatcher, _daemon_action_rx) = dispatcher::ChatDispatcher::new();
+        let daemon_control = DaemonControl {
+            config: &daemon_config,
+            dispatcher: &daemon_dispatcher,
+            redraw_tx: None,
+        };
+
+        process_active_turn_input_batch(
+            msg,
+            &mut emit,
+            &mut input_rx,
+            &mut backlog,
+            &mut scheduler,
+            &mut provider_turn_workers,
+            Some(task_id),
+            &chat_dispatcher,
+            &chat_session,
+            &mut chat_sessions,
+            &session_rings,
+            &mut reaped_log_archive,
+            &reap_policy,
+            &tools_registry,
+            daemon_control,
+        )
+        .await;
+
+        let queued = backlog
+            .iter()
+            .map(|entry| (entry.priority, entry.msg.content.clone()))
+            .collect::<Vec<_>>();
+        let state = scheduler.task(task_id).expect("task snapshot").state;
+        (queued, state)
+    }
+
+    /// The three dispositions differ in exactly two observable ways: where the
+    /// work lands in the queue, and whether the turn in flight survives.
+    #[tokio::test]
+    async fn each_assignment_disposition_reaches_the_path_it_names() {
+        let (queued, state) = dispatch_assignment_during_a_turn("queue").await;
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, InputQueuePriority::Normal, "queue must not jump the queue");
+        assert_eq!(
+            queued[0].1, "count the crates",
+            "the model must see the task, not a prefix"
+        );
+        assert_eq!(
+            state,
+            crate::chat::turn_scheduler::TurnTaskState::Running,
+            "queue must leave the turn in flight alone"
+        );
+
+        let (queued, state) = dispatch_assignment_during_a_turn("steer").await;
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            queued[0].0,
+            InputQueuePriority::Priority,
+            "steer must go in front of the backlog"
+        );
+        assert_eq!(queued[0].1, "count the crates");
+        assert_eq!(
+            state,
+            crate::chat::turn_scheduler::TurnTaskState::Running,
+            "steer inserts into the turn in flight; it must not destroy it"
+        );
+
+        let (queued, state) = dispatch_assignment_during_a_turn("interrupt").await;
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, InputQueuePriority::Priority);
+        assert_eq!(queued[0].1, "count the crates");
+        assert_eq!(
+            state,
+            crate::chat::turn_scheduler::TurnTaskState::Cancelling,
+            "interrupt must end the turn in flight before the assignment runs"
+        );
+    }
+
+    /// A word this chat cannot read is never permission to destroy a turn.
+    #[tokio::test]
+    async fn an_unknown_disposition_never_ends_the_turn_in_flight() {
+        let (queued, state) = dispatch_assignment_during_a_turn("obliterate").await;
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, InputQueuePriority::Normal);
+        assert_eq!(
+            state,
+            crate::chat::turn_scheduler::TurnTaskState::Running,
+            "an unrecognised disposition degrades to queue, never to interrupt"
+        );
+    }
+
+    /// Ordinary typed input must not acquire assignment behaviour.
+    #[tokio::test]
+    async fn ordinary_input_during_a_turn_still_only_queues() {
+        let msg = input_msg("just a message");
+        assert!(crate::chat::sessions::assignment::delivered(&msg).is_none());
+    }
+
     #[tokio::test]
     async fn p4a_active_turn_quit_is_queued_for_delayed_exit() {
         let mut outputs = Vec::<String>::new();
@@ -19628,6 +20011,7 @@ mod p3_directional_switch_tests {
                     model_name: "mock".to_string(),
                     history_len_before_user_turn: 0,
                     history_user_message: ChatMessage::user(user_input.to_string()),
+                    assignment: None,
                 },
                 terminal_plan: plan,
             }
