@@ -45,6 +45,39 @@ no inbound conversation behind it, it is authorized as a send *from* the
 operator plane channel `api`, which makes it cross-channel by construction and
 therefore denied until an operator opts in with `send_allow`.
 
+`sessions_spawn` also carries the two actions that let a correspondent on a
+messaging channel hand work to a live `prx chat` session, rather than to a
+sub-agent. `action="chat_sessions"` lists the sessions currently registered with
+the daemon, and `action="chat_assign"` hands one of them a `task` with a
+`disposition` of `queue` (default — wait for the session to be free), `steer`
+(hand it to the turn running right now as extra input) or `interrupt` (stop that
+turn first). Both are actions on this tool rather than tools of their own, so the
+model's tool surface does not grow.
+
+Assignment is **default-deny** and the identity it is judged on is the one the
+runtime injected for the message being processed, never anything the model wrote:
+an operator opts a correspondent in with `autonomy.scopes.assign_owners` or an
+`assign_allow` scope rule (see
+[Scope rules](configuration.md#scope-rules)). A caller with no grant is refused,
+and the refusal names both parties by audit fingerprint only; the listing is
+filtered to what that caller could actually assign to, so it cannot be used to
+discover which sessions exist. The call is deliberately made in-process rather
+than over `POST /api/chat-sessions/{id}/assign`: an HTTP request carries no
+trustworthy caller identity, so the same call over the loopback API would be
+authorized as the operator plane whoever typed the message.
+
+`chat_assign` returns as soon as the mailbox accepts the task — a chat session has
+no deadline, so waiting would park the correspondent's turn for as long as the
+other end takes. Instead a **relay** is started: it waits for that assignment's
+result and sends it back to the conversation the assignment came from, on the
+channel that conversation arrived on. The destination is fixed from the assigning
+turn and is never model-supplied, and the send passes the same `send_allow` /
+`send_deny` gate every other outbound message does — a denied recipient is
+withheld and logged with the destination's fingerprint. The relay has a
+work-registry row of its own (its address is `relay_work_id` in the answer), so
+`prx tasks list` shows it while it waits and `prx tasks kill` ends it; nothing
+about it expires on a clock.
+
 Agentic `delegate` configurations require an explicit non-empty
 `allowed_tools`. A named list is intersected with the eligible parent registry;
 unknown or ineligible names fail before the provider turn starts. The exclusive
