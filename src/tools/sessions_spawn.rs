@@ -2685,6 +2685,35 @@ impl SessionsSpawnTool {
         })
     }
 
+    /// A mailbox refusal, plus the one thing that keeps an unknown id from
+    /// costing a round trip.
+    ///
+    /// Only [`ChatSessionError::UnknownSession`] is enriched. A model that gets
+    /// "no session with that id" answers by guessing another id — the real-machine
+    /// run produced `prx-agent-chat-6914` out of thin air — so the refusal that
+    /// says the id is wrong is exactly where the right ones belong.
+    ///
+    /// **Every other refusal is passed through untouched, and that is a security
+    /// decision, not an omission.** `NotAuthorized` is raised for a principal that
+    /// may not assign here; attaching a listing to it would turn the one refusal
+    /// that is supposed to reveal nothing into an enumeration oracle. The hint
+    /// itself is filtered per session by the same [`chat_assignment::may_assign`]
+    /// the `chat_sessions` listing uses, and is omitted entirely when the caller
+    /// may assign nowhere.
+    fn assignment_refusal(
+        security: &SecurityPolicy,
+        principal: &AssignPrincipal,
+        error: &crate::runtime::chat_sessions::ChatSessionError,
+    ) -> String {
+        let hint = matches!(error, crate::runtime::chat_sessions::ChatSessionError::UnknownSession)
+            .then(|| chat_assignment::assignable_sessions_hint(security, principal))
+            .flatten();
+        hint.map_or_else(
+            || error.to_string(),
+            |hint| format!("{error}. Sessions you may assign to right now: {hint}"),
+        )
+    }
+
     /// `action='chat_assign'` — hand a task to a live `prx chat` session and
     /// arrange for its answer to come back here.
     ///
@@ -2737,7 +2766,7 @@ impl SessionsSpawnTool {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(error.to_string()),
+                        error: Some(Self::assignment_refusal(&self.security, &principal, &error)),
                     });
                 }
             };
@@ -12416,6 +12445,70 @@ mod tests {
             result.output
         );
         crate::runtime::chat_sessions::deregister(&registration.session_id);
+    }
+
+    /// A policy that lets `wacli:alice` assign anywhere *except* to sessions
+    /// carrying `denied_label`.
+    ///
+    /// The wildcard allow is what makes an invented `session_id` reach
+    /// `UnknownSession` at all: a narrower whitelist would refuse it as
+    /// `NotAuthorized` first, and that is the path that must stay silent.
+    fn partial_assign_security(denied_label: &str) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            scope_rules: vec![crate::config::ScopeRule {
+                channel: Some("wacli".to_string()),
+                assign_allow: vec!["*".to_string()],
+                assign_deny: vec![format!("{denied_label}:*")],
+                ..crate::config::ScopeRule::default()
+            }],
+            ..SecurityPolicy::default()
+        })
+    }
+
+    /// An invented `session_id` costs a round trip unless the refusal says what
+    /// the real ones are — and the real-machine run showed a model will invent
+    /// one (`prx-agent-chat-6914`) rather than ask.
+    ///
+    /// The listing attached to the refusal is the caller's, not the daemon's: a
+    /// session this caller may not assign to must not appear, or the refusal
+    /// becomes a cheaper enumeration oracle than the `chat_sessions` action it
+    /// borrows its filter from.
+    ///
+    /// Labels are test-unique because the session registry is process-wide and
+    /// this binary runs its tests concurrently.
+    ///
+    /// MUTATION GUARD: drop the `may_assign` filter in
+    /// `chat_assignment::assignable_sessions_hint` and this test goes red on the
+    /// off-limits session; drop the hint entirely and it goes red on the granted
+    /// one.
+    #[tokio::test]
+    async fn an_unknown_session_id_is_answered_with_the_sessions_this_caller_may_assign_to() {
+        const GRANTED: &str = "c6-granted-workstation";
+        const OFF_LIMITS: &str = "c6-off-limits-vault";
+        let granted = crate::runtime::chat_sessions::register(GRANTED, None).expect("registered");
+        let off_limits = crate::runtime::chat_sessions::register(OFF_LIMITS, None).expect("registered");
+        let (tool, _sent) = assignment_tool(partial_assign_security(OFF_LIMITS));
+
+        let result = tool
+            .execute(chat_assign_args("prx-agent-chat-6914", None))
+            .await
+            .expect("tool call");
+        assert!(!result.success, "an invented session id is still refused");
+        let error = result.error.unwrap_or_default();
+        assert!(
+            error.contains("no chat session with that id is registered"),
+            "the refusal itself is unchanged: {error}"
+        );
+        assert!(
+            error.contains(&granted.session_id) && error.contains(GRANTED),
+            "a session this caller may assign to belongs in the refusal: {error}"
+        );
+        assert!(
+            !error.contains(&off_limits.session_id) && !error.contains(OFF_LIMITS),
+            "a session this caller may not assign to must not leak through the refusal: {error}"
+        );
+        crate::runtime::chat_sessions::deregister(&granted.session_id);
+        crate::runtime::chat_sessions::deregister(&off_limits.session_id);
     }
 
     /// Where the answer goes is the assigning turn's business, never the

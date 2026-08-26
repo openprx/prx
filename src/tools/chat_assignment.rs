@@ -294,6 +294,37 @@ pub(crate) fn may_assign(policy: &SecurityPolicy, principal: &AssignPrincipal, l
     }
 }
 
+/// The live sessions `principal` may hand work to, rendered for a refusal that
+/// would otherwise leave the caller guessing.
+///
+/// Exists because an unknown `session_id` is a refusal a model answers by
+/// *inventing another one*: on the first real-machine run an agent made up
+/// `prx-agent-chat-6914`, was refused, and only then asked for the real listing —
+/// a whole extra round trip through the correspondent's conversation.
+///
+/// The filter is [`may_assign`], per session, and it is the same one
+/// `execute_chat_sessions` applies. That is not a convenience: naming a session
+/// this caller may not assign to would hand back exactly what
+/// [`chat_sessions::assign`]'s authorize-before-report-unknown ordering exists to
+/// withhold, and would do it on a *cheaper* path than the listing action. A hint
+/// is a listing, and it is filtered like one.
+///
+/// [`None`] when nothing is assignable, so a caller with no grants is told
+/// nothing beyond the bare refusal — not even that sessions exist.
+pub(crate) fn assignable_sessions_hint(policy: &SecurityPolicy, principal: &AssignPrincipal) -> Option<String> {
+    let assignable = chat_sessions::list()
+        .into_iter()
+        .filter(|session| may_assign(policy, principal, &session.label, &session.session_id))
+        .map(|session| {
+            format!(
+                "'{}' (label '{}', ref {})",
+                session.session_id, session.label, session.session_ref
+            )
+        })
+        .collect::<Vec<_>>();
+    (!assignable.is_empty()).then(|| assignable.join(", "))
+}
+
 /// Put one relayed result on the channel, and record what happened either way.
 ///
 /// # What the log may and may not say
@@ -863,6 +894,58 @@ mod tests {
             "test: the relayed body must never reach the log: {text}"
         );
         chat_sessions::deregister(&session_id);
+    }
+
+    /// The hint is omitted, not emptied, when the caller may assign nowhere.
+    ///
+    /// "No session with that id" and "you may assign to none of them" have to
+    /// read identically, or the enriched refusal still confirms that sessions
+    /// exist — precisely what [`chat_sessions::assign`] authorizes before
+    /// reporting unknown in order to avoid. Asserted against a default-deny
+    /// policy rather than a crafted denylist so that sessions registered by other
+    /// tests in this process cannot make it pass or fail by accident.
+    ///
+    /// MUTATION GUARD: return `Some` for an empty listing — `Some(String::new())`
+    /// or an unconditional `Some(assignable.join(", "))` — and this test goes red.
+    #[tokio::test]
+    async fn an_unassignable_principal_gets_no_session_hint_at_all() {
+        let denied = Arc::new(SecurityPolicy::default());
+        let registration = chat_sessions::register("workstation", None).expect("registration");
+
+        let hint = assignable_sessions_hint(&denied, &correspondent());
+
+        assert_eq!(
+            hint, None,
+            "a principal that may assign nowhere must not learn that any session exists"
+        );
+        chat_sessions::deregister(&registration.session_id);
+    }
+
+    /// The other half of the same rule: a principal that may assign somewhere is
+    /// told where, by an id it can actually use, so an unknown-session refusal
+    /// does not cost a round trip.
+    ///
+    /// MUTATION GUARD: drop either half of the rendered entry — the `session_id`
+    /// a caller has to pass back, or the `session_ref` that ties it to
+    /// `prx tasks list` — and this test goes red. That the hint is *reached* at
+    /// all is guarded separately, by
+    /// `sessions_spawn::tests::an_unknown_session_id_is_answered_with_the_sessions_this_caller_may_assign_to`.
+    #[tokio::test]
+    async fn an_assignable_principal_is_given_the_ids_it_may_use() {
+        let security = policy(&[], &[]);
+        let registration = chat_sessions::register("workstation", None).expect("registration");
+
+        let hint = assignable_sessions_hint(&security, &correspondent()).unwrap_or_default();
+
+        assert!(
+            hint.contains(&registration.session_id),
+            "the hint must carry the id the caller would pass back: {hint}"
+        );
+        assert!(
+            hint.contains(&registration.session_ref),
+            "and the reference that ties it to the work-registry rows: {hint}"
+        );
+        chat_sessions::deregister(&registration.session_id);
     }
 
     /// The eviction inference, asserted on its own rather than by overflowing
