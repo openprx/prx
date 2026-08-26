@@ -1460,6 +1460,8 @@ mod tests {
                 tools_deny: vec![],
                 send_allow: send_allow.iter().map(|s| (*s).to_string()).collect(),
                 send_deny: send_deny.iter().map(|s| (*s).to_string()).collect(),
+                assign_allow: vec![],
+                assign_deny: vec![],
             }],
             ..SecurityPolicy::default()
         })
@@ -1517,6 +1519,8 @@ mod tests {
                 tools_deny: vec![],
                 send_allow: vec![],
                 send_deny: send_deny.iter().map(|s| (*s).to_string()).collect(),
+                assign_allow: vec![],
+                assign_deny: vec![],
             }],
             ..SecurityPolicy::default()
         })
@@ -2140,6 +2144,8 @@ mod tests {
                 tools_deny: vec![],
                 send_allow: vec![],
                 send_deny: vec!["*".into()],
+                assign_allow: vec![],
+                assign_deny: vec![],
             }],
             ..SecurityPolicy::default()
         });

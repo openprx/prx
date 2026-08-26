@@ -1120,6 +1120,10 @@ pub struct SecurityPolicy {
     pub scope_rules: Vec<crate::config::ScopeRule>,
     /// Default action when no scope rule matches: true = allow, false = deny.
     pub scope_default_allow: bool,
+    /// `{channel}:{sender}` origins that own this daemon and may hand work to
+    /// any registered `prx chat` session. See
+    /// [`is_assignment_allowed`](Self::is_assignment_allowed).
+    pub assign_owners: Vec<String>,
     /// FIX-P1-31: audit configuration governing the side-effect gate's audit
     /// trail. When `enabled=false` the gate's best-effort audit hook writes
     /// nothing and performs no `fsync`, so a user who disables `security.audit`
@@ -1824,6 +1828,7 @@ impl SecurityPolicy {
             max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
             scope_rules: autonomy_config.scopes.rules.clone(),
             scope_default_allow: autonomy_config.scopes.default.to_lowercase() != "deny",
+            assign_owners: autonomy_config.scopes.assign_owners.clone(),
             // Default audit config; callers that have the real `security.audit`
             // block attach it via [`Self::with_audit_config`] so the gate audit
             // path honours `enabled`/`log_path`/`max_size_mb`.
@@ -1979,6 +1984,87 @@ impl SecurityPolicy {
         )
     }
 
+    /// Whether `sender` may hand work to a registered `prx chat` session.
+    ///
+    /// This is the assignment counterpart of
+    /// [`is_outbound_allowed`](Self::is_outbound_allowed), and it differs from
+    /// it in the one way that matters: **it is default-deny.** An outbound send
+    /// with no rules configured still reaches the channel the turn already
+    /// owns, because refusing it would break every existing deployment. An
+    /// assignment has no such prior: it starts work on a *different* entry
+    /// point, on this machine, on behalf of whoever spoke into a chat app. With
+    /// nothing configured, the answer is no.
+    ///
+    /// `target_label` / `target_session_id` describe the chat session being
+    /// addressed; entries are matched as `{label}:{session_id}` pairs.
+    ///
+    /// Evaluation order:
+    /// 1. `assign_deny` sweeps **every** matching rule that carries assignment
+    ///    entries, so a later deny is always reachable and can never be
+    ///    shadowed by an earlier rule. A deny outranks everything below,
+    ///    including ownership.
+    /// 2. An `autonomy.scopes.assign_owners` entry matching this origin allows.
+    /// 3. Otherwise the **first** matching rule with a non-empty `assign_allow`
+    ///    decides, exactly as `send_allow` does (`ScopeConfig::validate`
+    ///    rejects a whitelist an earlier one would shadow, so this cannot
+    ///    silently discard an operator's intent).
+    /// 4. Nothing matched — deny.
+    ///
+    /// Rules with neither assignment list are skipped before their criteria are
+    /// even considered, so a rule written for some unrelated reason cannot
+    /// consume the decision. That is the same shape as the outbound evaluator
+    /// and deliberately *not* the first-match-wins shape `tools_allow` /
+    /// `tools_deny` keep.
+    ///
+    /// The operator plane does not come through here at all: a request that
+    /// authenticated against the gateway is already an operator, and the caller
+    /// is what decides whether to consult this predicate. See
+    /// `crate::runtime::chat_sessions::AssignPrincipal`.
+    #[must_use]
+    pub fn is_assignment_allowed(
+        &self,
+        sender: &str,
+        channel: &str,
+        chat_type: &str,
+        target_label: &str,
+        target_session_id: &str,
+    ) -> bool {
+        let mut whitelist: Option<&crate::config::ScopeRule> = None;
+
+        for rule in &self.scope_rules {
+            if rule.assign_allow.is_empty() && rule.assign_deny.is_empty() {
+                continue;
+            }
+            if !rule_matches(rule, sender, channel, chat_type) {
+                continue;
+            }
+            if rule
+                .assign_deny
+                .iter()
+                .any(|entry| acl_pair_matches(entry, target_label, target_session_id))
+            {
+                return false;
+            }
+            if whitelist.is_none() && !rule.assign_allow.is_empty() {
+                whitelist = Some(rule);
+            }
+        }
+
+        if self
+            .assign_owners
+            .iter()
+            .any(|entry| acl_pair_matches(entry, channel, sender))
+        {
+            return true;
+        }
+
+        whitelist.is_some_and(|rule| {
+            rule.assign_allow
+                .iter()
+                .any(|entry| acl_pair_matches(entry, target_label, target_session_id))
+        })
+    }
+
     /// Unified tool-authorization decision point (permission-model Phase 1).
     ///
     /// This is the single entry point that replaces the former scattered
@@ -2021,25 +2107,37 @@ impl SecurityPolicy {
 /// A criterion is skipped (matches anything) when not specified (`None`).
 /// Match one `{channel}:{recipient}` outbound ACL entry against a destination.
 ///
-/// `"*"` matches everything. Otherwise the entry is split at its first colon so
-/// recipients that themselves contain colons (group ids, JIDs) stay intact.
-/// Either segment may be `"*"`. An entry without a colon matches nothing;
-/// `ScopeConfig::validate` rejects that shape at load time so a `send_deny`
-/// typo cannot silently fail open.
+/// Named separately from [`acl_pair_matches`] so the outbound call sites read
+/// in the vocabulary of their own decision; the matching itself is shared, so
+/// every ACL list in this file agrees on what an entry means.
 fn outbound_entry_matches(entry: &str, dst_channel: &str, dst_recipient: &str) -> bool {
+    acl_pair_matches(entry, dst_channel, dst_recipient)
+}
+
+/// Match one `{left}:{right}` ACL entry against a pair of literals.
+///
+/// Shared by every two-segment list in this file — outbound recipients,
+/// assignable chat sessions, assignment owners — so all of them agree on what
+/// `"*"` means and where the entry splits. `"*"` alone matches everything;
+/// otherwise the entry splits at its **first** colon, which keeps a right-hand
+/// side that itself contains colons (a JID, a forum topic) intact. Either
+/// segment may be `"*"`. An entry with no colon matches nothing;
+/// `ScopeConfig::validate` rejects that shape at load time so a deny-list typo
+/// cannot silently fail open.
+fn acl_pair_matches(entry: &str, left: &str, right: &str) -> bool {
     let entry = entry.trim();
     if entry == "*" {
         return true;
     }
-    let Some((channel, recipient)) = entry.split_once(':') else {
+    let Some((entry_left, entry_right)) = entry.split_once(':') else {
         return false;
     };
-    let channel = channel.trim();
-    if channel != "*" && channel != dst_channel {
+    let entry_left = entry_left.trim();
+    if entry_left != "*" && entry_left != left {
         return false;
     }
-    let recipient = recipient.trim();
-    recipient == "*" || recipient == dst_recipient
+    let entry_right = entry_right.trim();
+    entry_right == "*" || entry_right == right
 }
 
 /// Match one `send_deny` entry against a destination, folding the recipient
@@ -3648,6 +3746,8 @@ mod tests {
             tools_deny: vec![],
             send_allow: send_allow.iter().map(|s| (*s).to_string()).collect(),
             send_deny: send_deny.iter().map(|s| (*s).to_string()).collect(),
+            assign_allow: vec![],
+            assign_deny: vec![],
         }
     }
 
@@ -3869,6 +3969,141 @@ mod tests {
         assert_eq!(fold_recipient("12345"), "12345");
         assert_eq!(fold_recipient("12345:678"), "12345:678");
         assert_eq!(fold_recipient(" +15550001111 "), "15550001111");
+    }
+
+    // ── Chat-assignment authorization (plan c1) ─────────────────────────
+
+    fn assign_rule(channel: Option<&str>, assign_allow: &[&str], assign_deny: &[&str]) -> crate::config::ScopeRule {
+        crate::config::ScopeRule {
+            channel: channel.map(str::to_string),
+            assign_allow: assign_allow.iter().map(|entry| (*entry).to_string()).collect(),
+            assign_deny: assign_deny.iter().map(|entry| (*entry).to_string()).collect(),
+            ..crate::config::ScopeRule::default()
+        }
+    }
+
+    fn assign_policy(rules: Vec<crate::config::ScopeRule>, owners: &[&str]) -> SecurityPolicy {
+        SecurityPolicy {
+            scope_rules: rules,
+            assign_owners: owners.iter().map(|entry| (*entry).to_string()).collect(),
+            ..SecurityPolicy::default()
+        }
+    }
+
+    /// The whole shape of this predicate, in one assertion: nothing configured
+    /// means nobody may assign. That is the opposite of the outbound default,
+    /// and it is the point — an assignment starts work on another entry point,
+    /// so silence has to mean no.
+    ///
+    /// MUTATION GUARD: make the final fallthrough allow instead of deny and
+    /// this test fails.
+    #[test]
+    fn assignment_is_denied_when_nothing_is_configured() {
+        let p = assign_policy(vec![], &[]);
+        assert!(!p.is_assignment_allowed("+15550001111", "wacli", "direct", "workstation", "session-1"));
+        // Not even a scope default of "allow" opens it: that governs tools.
+        let permissive = SecurityPolicy {
+            scope_default_allow: true,
+            ..assign_policy(vec![], &[])
+        };
+        assert!(!permissive.is_assignment_allowed("+15550001111", "wacli", "direct", "workstation", "session-1"));
+    }
+
+    /// The owner path: a `{channel}:{sender}` entry naming this correspondent.
+    ///
+    /// MUTATION GUARD: drop the `assign_owners` check and this test fails.
+    #[test]
+    fn an_owner_may_assign_to_any_session() {
+        let p = assign_policy(vec![], &["wacli:+15550001111"]);
+        assert!(p.is_assignment_allowed("+15550001111", "wacli", "direct", "workstation", "session-1"));
+        assert!(p.is_assignment_allowed("+15550001111", "wacli", "group", "laptop", "session-2"));
+        // A different sender, and the same sender on a different channel, are
+        // not that owner.
+        assert!(!p.is_assignment_allowed("+15550009999", "wacli", "direct", "workstation", "session-1"));
+        assert!(!p.is_assignment_allowed("+15550001111", "telegram", "direct", "workstation", "session-1"));
+    }
+
+    /// The scope-rule path: an explicit grant to one labelled session.
+    #[test]
+    fn an_assign_allow_rule_grants_reach_to_the_sessions_it_names() {
+        let p = assign_policy(vec![assign_rule(Some("wacli"), &["workstation:*"], &[])], &[]);
+        assert!(p.is_assignment_allowed("+15550001111", "wacli", "direct", "workstation", "session-1"));
+        // A session the whitelist does not name stays denied.
+        assert!(!p.is_assignment_allowed("+15550001111", "wacli", "direct", "laptop", "session-2"));
+        // And the rule's own criteria still have to match.
+        assert!(!p.is_assignment_allowed("+15550001111", "telegram", "direct", "workstation", "session-1"));
+    }
+
+    /// A deny is reachable from anywhere in the list, mirroring `send_deny`.
+    ///
+    /// MUTATION GUARD: return on the first matching rule instead of sweeping,
+    /// and this test fails.
+    #[test]
+    fn assign_deny_is_reachable_behind_an_earlier_assign_allow() {
+        let p = assign_policy(
+            vec![
+                assign_rule(None, &["*"], &[]),
+                assign_rule(None, &[], &["*:quarantined-session"]),
+            ],
+            &[],
+        );
+        assert!(p.is_assignment_allowed("+1", "wacli", "direct", "workstation", "session-1"));
+        assert!(!p.is_assignment_allowed("+1", "wacli", "direct", "workstation", "quarantined-session"));
+    }
+
+    /// Deny outranks ownership, exactly as `tools_deny` outranks `tools_allow`.
+    ///
+    /// MUTATION GUARD: check `assign_owners` before the deny sweep and this
+    /// test fails.
+    #[test]
+    fn assign_deny_outranks_an_owner() {
+        let p = assign_policy(
+            vec![assign_rule(None, &[], &["*:quarantined-session"])],
+            &["wacli:+15550001111"],
+        );
+        assert!(p.is_assignment_allowed("+15550001111", "wacli", "direct", "workstation", "session-1"));
+        assert!(!p.is_assignment_allowed("+15550001111", "wacli", "direct", "workstation", "quarantined-session"));
+    }
+
+    /// A rule carrying neither assignment list says nothing about assignment
+    /// and must not consume the decision — the same separation the outbound
+    /// evaluator makes, and deliberately not the first-match-wins shape the
+    /// tool lists keep.
+    #[test]
+    fn a_rule_without_assignment_entries_does_not_shadow_a_later_one() {
+        let tools_only = crate::config::ScopeRule {
+            tools_deny: vec!["shell".into()],
+            ..crate::config::ScopeRule::default()
+        };
+        let p = assign_policy(vec![tools_only, assign_rule(None, &["*"], &[])], &[]);
+        assert!(p.is_assignment_allowed("+1", "wacli", "direct", "workstation", "session-1"));
+        // The tool ACL keeps its own, unchanged, first-match-wins semantics.
+        assert!(!p.is_tool_allowed("shell", "+1", "wacli", "direct"));
+    }
+
+    /// Only the first matching whitelist is consulted, which is why
+    /// `ScopeConfig::validate` rejects a shadowed one at load time.
+    #[test]
+    fn the_first_matching_assign_allow_decides() {
+        let p = assign_policy(
+            vec![
+                assign_rule(None, &["workstation:*"], &[]),
+                assign_rule(None, &["laptop:*"], &[]),
+            ],
+            &[],
+        );
+        assert!(p.is_assignment_allowed("+1", "wacli", "direct", "workstation", "session-1"));
+        assert!(!p.is_assignment_allowed("+1", "wacli", "direct", "laptop", "session-2"));
+    }
+
+    /// A session id is generated by this daemon and has one spelling, so the
+    /// assignment lists compare literally — no `send_deny`-style alias folding,
+    /// and therefore no guess about who two spellings mean.
+    #[test]
+    fn assignment_entries_are_matched_literally() {
+        let p = assign_policy(vec![assign_rule(None, &["*"], &["*:Session-1"])], &[]);
+        assert!(p.is_assignment_allowed("+1", "wacli", "direct", "workstation", "session-1"));
+        assert!(!p.is_assignment_allowed("+1", "wacli", "direct", "workstation", "Session-1"));
     }
 
     #[test]
@@ -4222,6 +4457,8 @@ mod tests {
                 tools_deny: vec!["shell".into()],
                 send_allow: vec![],
                 send_deny: vec![],
+                assign_allow: vec![],
+                assign_deny: vec![],
             }],
             true,
         );
@@ -4244,6 +4481,8 @@ mod tests {
                 tools_deny: vec![],
                 send_allow: vec![],
                 send_deny: vec![],
+                assign_allow: vec![],
+                assign_deny: vec![],
             }],
             true,
         );
@@ -4267,6 +4506,8 @@ mod tests {
                 tools_deny: vec!["shell".into()],
                 send_allow: vec![],
                 send_deny: vec![],
+                assign_allow: vec![],
+                assign_deny: vec![],
             }],
             true,
         );
@@ -4285,6 +4526,8 @@ mod tests {
                 tools_deny: vec!["file_write".into()],
                 send_allow: vec![],
                 send_deny: vec![],
+                assign_allow: vec![],
+                assign_deny: vec![],
             }],
             true,
         );
@@ -4308,6 +4551,8 @@ mod tests {
                     tools_deny: vec!["shell".into()],
                     send_allow: vec![],
                     send_deny: vec![],
+                    assign_allow: vec![],
+                    assign_deny: vec![],
                 },
                 crate::config::ScopeRule {
                     user: Some("uuid:alice".into()),
@@ -4317,6 +4562,8 @@ mod tests {
                     tools_deny: vec![],
                     send_allow: vec![],
                     send_deny: vec![],
+                    assign_allow: vec![],
+                    assign_deny: vec![],
                 },
             ],
             true,
@@ -4340,7 +4587,10 @@ mod tests {
                     tools_deny: vec!["shell".into()],
                     send_allow: vec![],
                     send_deny: vec![],
+                    assign_allow: vec![],
+                    assign_deny: vec![],
                 }],
+                assign_owners: vec![],
             },
             ..crate::config::AutonomyConfig::default()
         };

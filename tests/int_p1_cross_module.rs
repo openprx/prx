@@ -112,6 +112,8 @@ async fn int_cs_02_scope_rule_channel_differentiation() {
             tools_deny: vec!["shell".into()],
             send_allow: vec![],
             send_deny: vec![],
+            assign_allow: vec![],
+            assign_deny: vec![],
         }],
         scope_default_allow: true,
         ..SecurityPolicy::default()
@@ -677,6 +679,8 @@ async fn int_cs_03_decide_layers_scope_and_autonomy() {
             tools_deny: vec!["shell".into()],
             send_allow: vec![],
             send_deny: vec![],
+            assign_allow: vec![],
+            assign_deny: vec![],
         }],
         scope_default_allow: true,
         ..SecurityPolicy::default()

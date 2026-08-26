@@ -1087,6 +1087,8 @@ mod tests {
             tools_deny: vec![],
             send_allow: send_allow.iter().map(|entry| (*entry).to_string()).collect(),
             send_deny: send_deny.iter().map(|entry| (*entry).to_string()).collect(),
+            assign_allow: vec![],
+            assign_deny: vec![],
         }
     }
 
