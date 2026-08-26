@@ -218,6 +218,13 @@ pub trait AssignmentMailbox: Send + Sync {
         status: ResultStatus,
         summary: String,
     ) -> MailboxFuture<'_, AssignmentReceipt>;
+
+    /// Claim one assignment id, returning `false` when it was already taken.
+    ///
+    /// The mailbox is at-least-once, so this is what makes a redelivery cost
+    /// nothing: `false` means "work I already hold", which must still be
+    /// acknowledged and must not be run a second time.
+    fn accept(&self, assignment_id: &str) -> bool;
 }
 
 /// Chat's enrolment with one daemon, and the state that keeps it honest.
@@ -299,14 +306,6 @@ impl AssignmentClient {
         Ok((enrolment.session_id, enrolment.token))
     }
 
-    /// Claim one assignment id, returning `false` when it was already taken.
-    ///
-    /// `false` means "this is a redelivery of work I already have" — the caller
-    /// must still acknowledge it, and must not run it a second time.
-    pub fn accept(&self, assignment_id: &str) -> bool {
-        self.taken.lock().insert(assignment_id.to_string())
-    }
-
     /// Withdraw from the daemon's registry.
     ///
     /// Nothing on the daemon side removes a session on a clock — a session that
@@ -358,6 +357,10 @@ impl AssignmentMailbox for AssignmentClient {
             )
             .await
         })
+    }
+
+    fn accept(&self, assignment_id: &str) -> bool {
+        self.taken.lock().insert(assignment_id.to_string())
     }
 }
 
@@ -741,6 +744,119 @@ impl Drop for AssignmentTurnGuard {
     }
 }
 
+// ── How often a failing pull is allowed to say so ───────────────────────────
+
+/// How many distinct failure reasons this policy will ever announce.
+///
+/// The reason text comes from the daemon, so a peer whose message varies (an
+/// id, a counter, a clock) could otherwise grow this set without bound. Past
+/// the cap nothing new is announced and nothing new is remembered; the log
+/// still has every occurrence.
+const MAX_TRACKED_REASONS: usize = 16;
+
+/// One unbroken run of failing pulls, all with the same reason.
+#[derive(Debug, Clone)]
+struct FailingEpisode {
+    reason: String,
+    /// Failing pulls in this episode, announced or not — the number the
+    /// recovery line quotes.
+    pulls: u64,
+    /// Whether this episode's reason reached the screen. A recovery is only
+    /// announced for an episode that was, or the operator is told something
+    /// healed that they were never told had broken.
+    announced: bool,
+}
+
+/// Decides what a failing — and a recovering — pull is allowed to say.
+///
+/// # Why the obvious version was not enough
+///
+/// The first version kept the *last* failure text, skipped a repeat of it, and
+/// cleared it on any successful pull. That holds only while failure is
+/// sustained. The failure it was written against was not: the daemon rate
+/// limited the mailbox, so pulls alternated success, refusal, success, refusal
+/// — and every success cleared the key, so every refusal was "new" and printed
+/// again. The dedup was real and the flood was real at the same time.
+///
+/// So the key here is the reason itself and it is kept **across** recoveries:
+/// one distinct reason is stated once for the life of one poller, and its
+/// recovery once. Alternating failures collapse onto that one statement instead
+/// of resetting it, which is the property the flood needed and the previous
+/// version did not have. The ceiling is total, not per-interval: no failure
+/// mode, however it recurs, can cost more than two lines per distinct reason.
+///
+/// What that trades away is being told a second time that a reason that has
+/// already been announced and recovered is back. That is the deliberate side to
+/// err on: a stale silence costs an operator one `/sessions --daemon`, and a
+/// screen full of the same sentence costs them the chat they were using.
+#[derive(Debug, Default)]
+pub struct FailureNotices {
+    /// Reasons already put on screen. Kept across recoveries on purpose.
+    announced: std::collections::HashSet<String>,
+    /// Reasons whose recovery has already been put on screen.
+    recovered: std::collections::HashSet<String>,
+    episode: Option<FailingEpisode>,
+}
+
+impl FailureNotices {
+    /// Record a failing pull, returning the line to show — or `None` when this
+    /// reason has already said everything it is allowed to say.
+    pub fn failed(&mut self, reason: &str) -> Option<String> {
+        if self.episode.as_ref().is_none_or(|episode| episode.reason != reason) {
+            self.episode = Some(FailingEpisode {
+                reason: reason.to_string(),
+                pulls: 0,
+                announced: false,
+            });
+        }
+        let episode = self.episode.as_mut()?;
+        episode.pulls = episode.pulls.saturating_add(1);
+        if self.announced.contains(reason) || self.announced.len() >= MAX_TRACKED_REASONS {
+            tracing::debug!(reason, pulls = episode.pulls, "chat assignment pull is still failing");
+            return None;
+        }
+        self.announced.insert(reason.to_string());
+        episode.announced = true;
+        Some(pull_failure_notice(reason))
+    }
+
+    /// Record a successful pull, returning the line to show when it ends an
+    /// episode the operator was told about.
+    pub fn recovered(&mut self) -> Option<String> {
+        let episode = self.episode.take()?;
+        if !episode.announced || !self.recovered.insert(episode.reason.clone()) {
+            return None;
+        }
+        Some(pull_recovery_notice(&episode.reason, episode.pulls))
+    }
+
+    /// Whether a failing episode is currently open.
+    #[must_use]
+    pub const fn is_failing(&self) -> bool {
+        self.episode.is_some()
+    }
+}
+
+/// The line shown when this chat's mailbox cannot be reached.
+#[must_use]
+pub fn pull_failure_notice(reason: &str) -> String {
+    format!(
+        "Daemon assignments are not being received: {reason}\nThis chat keeps asking, and nothing else \
+         is affected. This reason will not be repeated here; further occurrences of it go to the log."
+    )
+}
+
+/// The line shown when the mailbox answers again after a run of failures.
+#[must_use]
+pub fn pull_recovery_notice(reason: &str, failed_pulls: u64) -> String {
+    let cause = reason.lines().next().unwrap_or(reason).trim();
+    let pulls = if failed_pulls == 1 { "pull" } else { "pulls" };
+    format!(
+        "Daemon assignments are being received again after {failed_pulls} failed {pulls} ({cause}). \
+         This chat can be assigned work again."
+    )
+}
+
 // ── The poll loop ───────────────────────────────────────────────────────────
 
 /// Where one pulled batch went, so the loop's ordering can be asserted.
@@ -769,7 +885,7 @@ pub struct BatchOutcome {
 /// MUTATION GUARD: move the `acks.push` above the `send` and
 /// `a_batch_is_acknowledged_only_after_it_reaches_the_local_queue` fails.
 pub async fn take_batch(
-    client: &AssignmentClient,
+    mailbox: &dyn AssignmentMailbox,
     batch: Vec<PulledAssignment>,
     input: &tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>,
     notify: &(dyn Fn(&str) + Send + Sync),
@@ -777,7 +893,7 @@ pub async fn take_batch(
     let mut outcome = BatchOutcome::default();
     for assignment in batch {
         let id = assignment.assignment_id.clone();
-        if !client.accept(&id) {
+        if !mailbox.accept(&id) {
             // A redelivery of work already queued here. Acknowledge it so the
             // daemon stops resending, and do not run it a second time.
             outcome.duplicates.push(id.clone());
@@ -846,26 +962,26 @@ pub async fn enrol_and_poll(
 /// daemon that every other request in this process gets, and the reason none of
 /// this needs a clock.
 pub async fn run_poller(
-    client: Arc<AssignmentClient>,
+    mailbox: Arc<dyn AssignmentMailbox>,
     in_flight: InFlightRegistry,
     input: tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>,
     notify: Arc<dyn Fn(&str) + Send + Sync>,
     cancel: CancellationToken,
 ) {
-    let session_ref = client.session_ref();
+    let session_ref = mailbox.session_ref();
     let row: InFlightGuard = register_in_flight_labeled(
         &in_flight,
         &format!("assignment poll {session_ref}"),
-        &client.base_url(),
+        &mailbox.base_url(),
         cancel.clone(),
     );
     let _row = row;
     let mut pending_acks: Vec<String> = Vec::new();
-    let mut last_failure: Option<String> = None;
+    let mut notices = FailureNotices::default();
     loop {
         let pull = tokio::select! {
             () = cancel.cancelled() => break,
-            pull = client.pull(pending_acks.clone()) => pull,
+            pull = mailbox.pull(pending_acks.clone()) => pull,
         };
         match pull {
             Ok(batch) => {
@@ -873,24 +989,22 @@ pub async fn run_poller(
                 // daemon answered, so they are spent. Anything new takes their
                 // place only once it is in the local queue.
                 pending_acks.clear();
-                last_failure = None;
-                let outcome = take_batch(&client, batch.assignments, &input, notify.as_ref()).await;
+                if let Some(line) = notices.recovered() {
+                    notify(&line);
+                }
+                let outcome = take_batch(mailbox.as_ref(), batch.assignments, &input, notify.as_ref()).await;
                 pending_acks = outcome.acks;
                 if outcome.input_closed {
                     break;
                 }
             }
             Err(error) => {
-                // Say it once per distinct reason. A daemon that is down stays
-                // down for many polls, and repeating the same line every
-                // interval would bury the chat the operator is using.
-                let text = format!("{error:#}");
-                if last_failure.as_deref() != Some(text.as_str()) {
-                    notify(&format!(
-                        "Daemon assignments are not being received: {text}\nThis chat keeps asking; nothing \
-                         else is affected."
-                    ));
-                    last_failure = Some(text);
+                // What is allowed to reach the screen is [`FailureNotices`]'s
+                // decision, not this loop's: a reason that recurs — including
+                // one that alternates with success — must cost a bounded number
+                // of lines, or the failure buries the chat somebody is using.
+                if let Some(line) = notices.failed(&format!("{error:#}")) {
+                    notify(&line);
                 }
             }
         }
@@ -934,23 +1048,37 @@ mod tests {
         AssignmentClient::new(&config)
     }
 
+    /// One scripted answer to a pull.
+    enum Answer {
+        /// Hand these assignments over.
+        Batch(Vec<PulledAssignment>),
+        /// Refuse with this reason.
+        Refuse(&'static str),
+    }
+
     /// Records every pull's `ack` array and every report, and answers from a
     /// script. Enough to assert the loop's ordering without a live daemon.
     struct RecordingMailbox {
         base_url: String,
         pulls: Mutex<Vec<Vec<String>>>,
         reports: Mutex<Vec<(String, ResultStatus, String)>>,
-        script: Mutex<Vec<Vec<PulledAssignment>>>,
+        script: Mutex<Vec<Answer>>,
+        taken: Mutex<HashSet<String>>,
         seq: AtomicUsize,
     }
 
     impl RecordingMailbox {
         fn new(script: Vec<Vec<PulledAssignment>>) -> Arc<Self> {
+            Self::scripted(script.into_iter().map(Answer::Batch).collect())
+        }
+
+        fn scripted(script: Vec<Answer>) -> Arc<Self> {
             Arc::new(Self {
                 base_url: "http://127.0.0.1:9".to_string(),
                 pulls: Mutex::new(Vec::new()),
                 reports: Mutex::new(Vec::new()),
                 script: Mutex::new(script),
+                taken: Mutex::new(HashSet::new()),
                 seq: AtomicUsize::new(0),
             })
         }
@@ -967,21 +1095,24 @@ mod tests {
 
         fn pull(&self, ack: Vec<String>) -> MailboxFuture<'_, AssignmentPull> {
             self.pulls.lock().push(ack);
-            let batch = {
+            let answer = {
                 let mut script = self.script.lock();
                 if script.is_empty() {
-                    Vec::new()
+                    Answer::Batch(Vec::new())
                 } else {
                     script.remove(0)
                 }
             };
             Box::pin(async move {
-                Ok(AssignmentPull {
-                    assignments: batch,
-                    acked: 0,
-                    requeued: 0,
-                    queued_remaining: 0,
-                })
+                match answer {
+                    Answer::Batch(assignments) => Ok(AssignmentPull {
+                        assignments,
+                        acked: 0,
+                        requeued: 0,
+                        queued_remaining: 0,
+                    }),
+                    Answer::Refuse(reason) => Err(anyhow::anyhow!("{reason}")),
+                }
             })
         }
 
@@ -1001,6 +1132,10 @@ mod tests {
                 })
             })
         }
+
+        fn accept(&self, assignment_id: &str) -> bool {
+            self.taken.lock().insert(assignment_id.to_string())
+        }
     }
 
     #[tokio::test]
@@ -1008,7 +1143,7 @@ mod tests {
         let client = client_for_tests();
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let outcome = take_batch(
-            &client,
+            client.as_ref(),
             vec![assignment("a-1", "summarise the repo", "queue")],
             &tx,
             silent().as_ref(),
@@ -1028,7 +1163,7 @@ mod tests {
         let (closed_tx, closed_rx) = tokio::sync::mpsc::channel(1);
         drop(closed_rx);
         let refused = take_batch(
-            &client2,
+            client2.as_ref(),
             vec![assignment("a-2", "do a thing", "queue")],
             &closed_tx,
             silent().as_ref(),
@@ -1047,7 +1182,7 @@ mod tests {
         let client = client_for_tests();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let first = take_batch(
-            &client,
+            client.as_ref(),
             vec![assignment("dup", "work", "queue")],
             &tx,
             silent().as_ref(),
@@ -1057,7 +1192,7 @@ mod tests {
 
         let mut again = assignment("dup", "work", "queue");
         again.deliveries = 2;
-        let second = take_batch(&client, vec![again], &tx, silent().as_ref()).await;
+        let second = take_batch(client.as_ref(), vec![again], &tx, silent().as_ref()).await;
         assert!(
             second.delivered.is_empty(),
             "a redelivery of held work must not be queued again: {:?}",
@@ -1087,7 +1222,7 @@ mod tests {
         for _ in 0..2u8 {
             let batch = mailbox.pull(pending.clone()).await.unwrap();
             pending.clear();
-            let outcome = take_batch(&client, batch.assignments, &tx, silent().as_ref()).await;
+            let outcome = take_batch(client.as_ref(), batch.assignments, &tx, silent().as_ref()).await;
             pending = outcome.acks;
         }
         let pulls = mailbox.pulls.lock().clone();
@@ -1169,6 +1304,166 @@ mod tests {
         );
     }
 
+    /// Collects every line the poller put on screen.
+    fn recording_notifier() -> (Arc<dyn Fn(&str) + Send + Sync>, Arc<Mutex<Vec<String>>>) {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&lines);
+        let notify: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |text: &str| sink.lock().push(text.to_string()));
+        (notify, lines)
+    }
+
+    /// Lines the poller printed to say the mailbox is failing, for a reason
+    /// containing `marker`. The recovery line quotes the reason it is about, so
+    /// counting occurrences of the reason alone would count that too.
+    fn complaints_about(said: &[String], marker: &str) -> usize {
+        said.iter()
+            .filter(|line| line.starts_with("Daemon assignments are not being received") && line.contains(marker))
+            .count()
+    }
+
+    /// Drive the poller over a script and hand back everything it said.
+    ///
+    /// `start_paused` because the loop sleeps a poll interval between pulls: the
+    /// interval is a sampling rate, and simulating it is what keeps a test about
+    /// twenty pulls from taking thirty seconds.
+    async fn lines_from_script(script: Vec<Answer>) -> Vec<String> {
+        let pulls_scripted = script.len();
+        let mailbox = RecordingMailbox::scripted(script);
+        let (notify, lines) = recording_notifier();
+        let registry = super::super::daemon::new_in_flight_registry();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(run_poller(
+            Arc::clone(&mailbox) as Arc<dyn AssignmentMailbox>,
+            registry,
+            tx,
+            notify,
+            cancel.clone(),
+        ));
+        for _ in 0..(pulls_scripted * 4 + 8) {
+            if mailbox.pulls.lock().len() > pulls_scripted {
+                break;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        cancel.cancel();
+        handle.await.expect("the poller must end when it is cancelled");
+        assert!(
+            mailbox.pulls.lock().len() > pulls_scripted,
+            "the script must have been driven to the end"
+        );
+        let said = lines.lock().clone();
+        said
+    }
+
+    const RATE_LIMITED: &str = "chat assignment pull failed with HTTP 429 Too Many Requests: \
+                                Too many API requests. Please retry later.";
+    const UNREACHABLE: &str = "cannot reach a running PRX process at http://127.0.0.1:9";
+
+    /// The flood this was written against: a mailbox that refuses every other
+    /// pull. The reason is identical every time, so it is worth exactly one
+    /// line however many times it comes back.
+    ///
+    /// MUTATION GUARD: clear `FailureNotices::announced` on a successful pull —
+    /// the shape of the dedup this replaced — and this fails with one line per
+    /// refusal.
+    #[tokio::test(start_paused = true)]
+    async fn one_failure_reason_is_stated_once_however_often_it_recurs() {
+        let said = lines_from_script(vec![
+            Answer::Refuse(RATE_LIMITED),
+            Answer::Batch(vec![]),
+            Answer::Refuse(RATE_LIMITED),
+            Answer::Batch(vec![]),
+            Answer::Refuse(RATE_LIMITED),
+            Answer::Refuse(RATE_LIMITED),
+            Answer::Batch(vec![]),
+            Answer::Refuse(RATE_LIMITED),
+        ])
+        .await;
+        assert_eq!(
+            complaints_about(&said, "429"),
+            1,
+            "one reason is worth one line, not one per failing pull; said:\n{said:#?}"
+        );
+        let recoveries = said.iter().filter(|line| line.contains("being received again")).count();
+        assert_eq!(
+            recoveries, 1,
+            "recovery is announced, and it is announced once; said:\n{said:#?}"
+        );
+    }
+
+    /// Going quiet about a failure is the other half of the bug: the operator
+    /// has to be told, once, and told again when it clears.
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_and_its_recovery_are_both_stated() {
+        let said = lines_from_script(vec![
+            Answer::Refuse(UNREACHABLE),
+            Answer::Refuse(UNREACHABLE),
+            Answer::Batch(vec![]),
+        ])
+        .await;
+        assert!(
+            said.iter().any(|line| line.contains("are not being received")),
+            "a mailbox that cannot be reached must say so; said:\n{said:#?}"
+        );
+        let recovery = said
+            .iter()
+            .find(|line| line.contains("being received again"))
+            .expect("recovery must be announced, or nobody knows when it healed");
+        assert!(
+            recovery.contains("2 failed pulls"),
+            "the recovery line says how long it was broken: {recovery}"
+        );
+    }
+
+    /// A different reason is a different fact, and is stated on its own.
+    #[tokio::test(start_paused = true)]
+    async fn a_changed_reason_is_stated_even_while_the_mailbox_is_still_failing() {
+        let said = lines_from_script(vec![
+            Answer::Refuse(RATE_LIMITED),
+            Answer::Refuse(RATE_LIMITED),
+            Answer::Refuse(UNREACHABLE),
+            Answer::Refuse(UNREACHABLE),
+        ])
+        .await;
+        assert_eq!(complaints_about(&said, "429"), 1, "said:\n{said:#?}");
+        assert_eq!(
+            complaints_about(&said, "cannot reach"),
+            1,
+            "a reason the operator has not seen must not be swallowed by the previous one; said:\n{said:#?}"
+        );
+    }
+
+    #[test]
+    fn a_recovery_is_never_announced_for_a_failure_that_was_never_announced() {
+        let mut notices = FailureNotices::default();
+        assert!(notices.recovered().is_none(), "nothing has failed yet");
+        assert!(notices.failed("reason a").is_some());
+        assert!(notices.failed("reason a").is_none());
+        assert!(notices.recovered().is_some());
+        // Second episode of the same reason: silent, so its recovery is silent
+        // too. Announcing "it works again" for something never reported broken
+        // is noise about a fact nobody was missing.
+        assert!(notices.failed("reason a").is_none());
+        assert!(notices.recovered().is_none());
+        assert!(!notices.is_failing());
+    }
+
+    #[test]
+    fn a_peer_whose_wording_keeps_changing_cannot_grow_the_policy_without_bound() {
+        let mut notices = FailureNotices::default();
+        let mut announced = 0;
+        for attempt in 0..(MAX_TRACKED_REASONS * 4) {
+            if notices.failed(&format!("refused, attempt {attempt}")).is_some() {
+                announced += 1;
+            }
+        }
+        assert_eq!(
+            announced, MAX_TRACKED_REASONS,
+            "a varying message must not buy unlimited screen space"
+        );
+    }
+
     #[tokio::test]
     async fn the_poller_is_listed_while_it_runs_and_a_kill_ends_it() {
         let registry = super::super::daemon::new_in_flight_registry();
@@ -1176,7 +1471,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let cancel = CancellationToken::new();
         let handle = tokio::spawn(run_poller(
-            Arc::clone(&client),
+            Arc::clone(&client) as Arc<dyn AssignmentMailbox>,
             Arc::clone(&registry),
             tx,
             silent(),
