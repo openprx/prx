@@ -2473,7 +2473,10 @@ mod tests {
             lineage,
         )
         .unwrap();
-        assert_eq!(get_job(&config, &agent.id).unwrap().delivery_principal.sender(), "alice");
+        assert_eq!(
+            get_job(&config, &agent.id).unwrap().delivery_principal.sender(),
+            "alice"
+        );
 
         // An unrelated patch leaves the identity alone.
         let renamed = update_job(

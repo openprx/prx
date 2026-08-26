@@ -1111,12 +1111,7 @@ mod tests {
     /// Persist an agent job whose announcement targets `channel:to`, created by
     /// `principal` (an anonymous principal models a job with no recorded
     /// creator).
-    fn announcing_job(
-        config: &Config,
-        principal: crate::cron::DeliveryPrincipal,
-        channel: &str,
-        to: &str,
-    ) -> CronJob {
+    fn announcing_job(config: &Config, principal: crate::cron::DeliveryPrincipal, channel: &str, to: &str) -> CronJob {
         cron::add_agent_job_with_lineage(
             config,
             Some("announce-test".to_string()),

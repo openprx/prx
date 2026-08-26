@@ -3161,9 +3161,13 @@ mod local_operator_scope_tests {
     /// the legacy `ScopeContext` at `src/chat/mod.rs:7142`.
     fn local_operator_context() -> ToolExecutionContext {
         ToolExecutionContext::new(
-            RuntimeEnvelope::chat_terminal("workspace-a", "chat:redux:draft-1", crate::memory::MemoryVisibility::Workspace)
-                .with_sender("user")
-                .with_channel("terminal"),
+            RuntimeEnvelope::chat_terminal(
+                "workspace-a",
+                "chat:redux:draft-1",
+                crate::memory::MemoryVisibility::Workspace,
+            )
+            .with_sender("user")
+            .with_channel("terminal"),
             "private",
         )
         .with_chat_id("terminal:user")
@@ -3214,7 +3218,10 @@ mod local_operator_scope_tests {
             "the terminal UI tuple must be recognised as the local operator, or \
              gateway config.patch/restart is unreachable for everyone"
         );
-        assert!(injected_trust(&local_operator_context(), serde_json::json!({"action": "restart"})));
+        assert!(injected_trust(
+            &local_operator_context(),
+            serde_json::json!({"action": "restart"})
+        ));
     }
 
     #[test]
@@ -3326,9 +3333,14 @@ mod local_operator_scope_tests {
             None,
         )
         .expect("normalize_arguments accepts a JSON object");
-        assert!(normalized.get("_prx_anything_else").is_none(), "forged _prx_ key survived");
+        assert!(
+            normalized.get("_prx_anything_else").is_none(),
+            "forged _prx_ key survived"
+        );
         assert_eq!(
-            normalized.get("_zc_approval_granted").and_then(serde_json::Value::as_bool),
+            normalized
+                .get("_zc_approval_granted")
+                .and_then(serde_json::Value::as_bool),
             Some(false),
             "forged approval flag must be overwritten by the runtime"
         );

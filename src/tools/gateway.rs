@@ -612,7 +612,10 @@ mod tests {
         // is produced by gate 1 alone — which is exactly the property that makes
         // the local-operator marker load-bearing rather than decorative.
         assert!(
-            result.error.unwrap_or_default().contains("restricted to the local operator"),
+            result
+                .error
+                .unwrap_or_default()
+                .contains("restricted to the local operator"),
             "gate 1 must deny a non-operator config.patch at the default autonomy level"
         );
     }
@@ -699,7 +702,10 @@ mod tests {
         let result = tool.execute(json!({ "action": "restart" })).await.unwrap();
         assert!(!result.success);
         assert!(
-            result.error.unwrap_or_default().contains("restricted to the local operator"),
+            result
+                .error
+                .unwrap_or_default()
+                .contains("restricted to the local operator"),
             "a restart from a non-operator scope must be refused"
         );
     }
