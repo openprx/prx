@@ -72,6 +72,16 @@ pub(crate) const RESULT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// this trip actually saw.
 const RESULT_POLL_BATCH: usize = 64;
 
+/// Which of the two things a relay carried, as it appears in the delivery log.
+///
+/// Both endings send, and only this field tells them apart: one says the chat
+/// session answered, the other says the answer was lost before it could be read.
+/// An operator reading the log needs that distinction, and the message body — the
+/// only other place it is written down — deliberately never reaches the log.
+const RELAY_RESULT: &str = "result";
+/// The relay carried an eviction notice rather than an answer. See [`RELAY_RESULT`].
+const RELAY_EVICTION: &str = "eviction";
+
 /// Everything a return trip needs, captured at assignment time.
 pub(crate) struct ReturnTrip {
     /// The assignment this trip is waiting for. Also the address an operator
@@ -209,11 +219,11 @@ pub(crate) async fn run_return_trip(trip: ReturnTrip, cancel: CancellationToken)
                     );
                     return TripEnding::OriginMismatch;
                 }
-                deliver(&trip, &result.origin, &render_result(&result)).await;
+                deliver(&trip, &result.origin, &render_result(&result), RELAY_RESULT).await;
                 return TripEnding::Delivered;
             }
             PollVerdict::Evicted => {
-                deliver(&trip, &trip.origin, &render_eviction(&trip)).await;
+                deliver(&trip, &trip.origin, &render_eviction(&trip), RELAY_EVICTION).await;
                 return TripEnding::ResultEvicted;
             }
             PollVerdict::Waiting { cursor: next } => cursor = next,
@@ -284,13 +294,33 @@ pub(crate) fn may_assign(policy: &SecurityPolicy, principal: &AssignPrincipal, l
     }
 }
 
-/// Put one relayed result on the channel, or record why it was withheld.
+/// Put one relayed result on the channel, and record what happened either way.
+///
+/// # What the log may and may not say
+///
+/// Every outcome — withheld, failed, sent — is logged with the same identifying
+/// fields (channel, recipient, session, assignment, relay kind), so the last hop
+/// of an assignment is legible from the
+/// server side alone instead of having to be inferred from the *absence* of a
+/// warning. Two rules hold across all three lines:
+///
+/// * **The recipient is never in the clear.** It appears only as the
+///   `op_id::ref_for_channel_recipient` fingerprint, the same function over the
+///   same two inputs that the assignment's refusal and the relay's registry row
+///   already use, so one correspondent reads identically everywhere. The channel
+///   name stays plaintext: it is not sensitive and it is what makes the row
+///   traceable.
+/// * **The body is never logged.** `bytes` is the only thing said about it —
+///   enough to tell a real answer from an empty one, and nothing more.
 ///
 /// MUTATION GUARD: drop the [`announce_is_authorized`] branch and
 /// `a_denied_recipient_is_withheld_and_never_sent` goes red — that test is the
 /// only thing standing between this path and an ungated outbound send, because
 /// the recipient here is never re-derived from anything the outbound ACL sees.
-async fn deliver(trip: &ReturnTrip, origin: &AssignPrincipal, text: &str) {
+/// Drop the success `info!` and `a_relayed_result_is_logged_without_the_recipient_or_the_body`
+/// goes red; write `trip.recipient` or `text` into any of the three lines and the
+/// same test goes red.
+async fn deliver(trip: &ReturnTrip, origin: &AssignPrincipal, text: &str, kind: &'static str) {
     let announce_origin = match origin {
         AssignPrincipal::Correspondent { sender, chat_type, .. } => AnnounceOrigin::from_parts(sender, chat_type),
         // No correspondent means nobody to reply to. The operator plane assigns
@@ -308,19 +338,34 @@ async fn deliver(trip: &ReturnTrip, origin: &AssignPrincipal, text: &str) {
             recipient = %trip.recipient_ref(),
             session = %trip.session_ref,
             assignment = %trip.assignment_id,
+            relay = kind,
             "Chat assignment result withheld: the configured scope rules do not permit this recipient"
         );
         return;
     }
     let message = SendMessage::new(text, &trip.recipient);
+    let bytes = text.len();
     if let Err(error) = trip.channel.send(&message).await {
         tracing::error!(
             channel = %channel_name,
             recipient = %trip.recipient_ref(),
+            session = %trip.session_ref,
             assignment = %trip.assignment_id,
+            relay = kind,
+            bytes,
             "Failed to relay chat assignment result: {error}"
         );
+        return;
     }
+    tracing::info!(
+        channel = %channel_name,
+        recipient = %trip.recipient_ref(),
+        session = %trip.session_ref,
+        assignment = %trip.assignment_id,
+        relay = kind,
+        bytes,
+        "Relayed chat assignment result"
+    );
 }
 
 /// Start the return trip for an accepted assignment and hand back the address of
@@ -376,9 +421,41 @@ mod tests {
     use crate::runtime::chat_sessions::Disposition;
     use async_trait::async_trait;
     use parking_lot::Mutex;
+    use std::io::Write;
+    use tracing_subscriber::fmt::writer::MakeWriter;
 
     const SENDER: &str = "+15550009999";
     const CHANNEL: &str = "wacli";
+
+    /// Collects formatted `tracing` output so a test can assert that a line was
+    /// actually emitted — and, just as importantly, what it does *not* contain.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock()).into_owned()
+        }
+    }
+
+    impl Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     struct RecordingChannel {
         sent: Arc<Mutex<Vec<SendMessage>>>,
@@ -663,7 +740,7 @@ mod tests {
             Arc::clone(&channel),
             security,
         );
-        deliver(&trip, &AssignPrincipal::operator_plane(), "anything").await;
+        deliver(&trip, &AssignPrincipal::operator_plane(), "anything", RELAY_RESULT).await;
         assert!(
             sent.lock().is_empty(),
             "the operator plane is not a correspondent and has no conversation to answer in"
@@ -695,6 +772,96 @@ mod tests {
             }
             other => panic!("the cursor must still see the result that arrives after it: {other:?}"),
         }
+        chat_sessions::deregister(&session_id);
+    }
+
+    /// The last hop of a chat assignment has to be legible from the server side
+    /// on its own. Before this line the only evidence a relay had succeeded was
+    /// the *absence* of a warning, which is not evidence at all — it looks
+    /// identical to a relay that never ran.
+    ///
+    /// The line is held to the same two rules as the refusals beside it: the
+    /// destination appears only as its `op_id` fingerprint, and the message body
+    /// does not appear at all. `bytes` is the whole of what is said about the
+    /// body, and it is asserted against what the channel actually carried so the
+    /// number cannot quietly become a placeholder.
+    ///
+    /// MUTATION GUARD: drop the success `info!` in `deliver`, or log
+    /// `trip.recipient` / `text` in place of the fingerprint and the length, and
+    /// this test goes red.
+    #[tokio::test]
+    async fn a_relayed_result_is_logged_without_the_recipient_or_the_body() {
+        const BODY: &str = "canary-summary-9f31c2: rebuilt the index";
+        let security = policy(&[], &[]);
+        let (channel, sent) = RecordingChannel::new();
+        let (session_id, token, assignment_id) = assign_one(&security, &correspondent());
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        // Thread-local: a `#[tokio::test]` drives its tasks on this very thread,
+        // so the spawned trip logs into this writer and no other test's output
+        // can land in it.
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let ending = tokio::spawn({
+            let trip = trip(
+                &assignment_id,
+                correspondent(),
+                Arc::clone(&channel),
+                Arc::clone(&security),
+            );
+            let cancel = CancellationToken::new();
+            async move { run_return_trip(trip, cancel).await }
+        });
+        chat_sessions::report(&session_id, &token, &assignment_id, ResultStatus::Completed, BODY)
+            .expect("result accepted");
+        assert_eq!(ending.await.expect("trip joined"), TripEnding::Delivered);
+        drop(guard);
+
+        let text = logs.text();
+        let relayed = sent.lock().first().map(|message| message.content.clone());
+        let relayed = relayed.expect("test: the relay must have sent something to log about");
+
+        assert!(text.contains("Relayed chat assignment result"), "test: {text}");
+        assert!(
+            text.contains(&format!("assignment={assignment_id}")),
+            "test: the line must name the assignment it closes: {text}"
+        );
+        assert!(
+            text.contains(&format!("channel={CHANNEL}")),
+            "test: the channel stays readable — it is what makes the hop traceable: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "recipient={}",
+                crate::security::op_id::ref_for_channel_recipient(CHANNEL, SENDER)
+            )),
+            "test: the destination must appear as the shared op_id fingerprint: {text}"
+        );
+        assert!(
+            text.contains("session=session-ref"),
+            "test: the session reference ties this line to the assign line: {text}"
+        );
+        assert!(
+            text.contains("relay=\"result\""),
+            "test: an answer and an eviction notice must not read alike: {text}"
+        );
+        assert!(
+            text.contains(&format!("bytes={}", relayed.len())),
+            "test: `bytes` must describe what was actually sent: {text}"
+        );
+        assert!(
+            !text.contains(SENDER),
+            "test: the plaintext recipient must never reach the log: {text}"
+        );
+        assert!(
+            !text.contains(BODY) && !text.contains("rebuilt the index"),
+            "test: the relayed body must never reach the log: {text}"
+        );
         chat_sessions::deregister(&session_id);
     }
 
