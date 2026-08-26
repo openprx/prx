@@ -516,6 +516,10 @@ mod tests {
     }
 
     fn test_app_state(config: Config) -> AppState {
+        test_app_state_with_api_limit(config, 10_000)
+    }
+
+    fn test_app_state_with_api_limit(config: Config, api_per_minute: u32) -> AppState {
         let workspace = config.workspace_dir.clone();
         let memory = SqliteMemory::new(&workspace).expect("test: sqlite memory");
         AppState {
@@ -533,7 +537,7 @@ mod tests {
             webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(true, &[TOKEN.to_string()])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(10_000, 10_000, 10_000, 10_000)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(10_000, 10_000, api_per_minute, 10_000)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             signal: None,
@@ -1000,6 +1004,161 @@ mod tests {
             })
         });
         assert!(cancelled, "test: {body}");
+        server.abort();
+    }
+
+    /// Several chats polling their mailboxes at once must not throttle each
+    /// other, or the operator, out of the daemon.
+    ///
+    /// Every `prx chat` on a host polls the same daemon from the same address,
+    /// and with pairing on it presents the same operator bearer token, so both
+    /// of the API limiter's keys put every chat on the host into one bucket:
+    /// the quota was divided by however many chats were open, and at the
+    /// shipped default it broke at *two*. The mailbox is an internal poll
+    /// between local processes and is not metered at all — the point of this
+    /// test is that four sessions each spend a full minute of polls, far past
+    /// the quota, and are all served, and that an operator call afterwards is
+    /// served too.
+    #[tokio::test]
+    async fn mailbox_polling_is_never_throttled_by_the_api_quota() {
+        const SESSIONS: u32 = 4;
+
+        let api_limit = Config::default().gateway.api_rate_limit_per_minute;
+        let window_millis = u128::from(crate::gateway::RATE_LIMIT_WINDOW_SECS) * 1_000;
+        let poll_millis = crate::chat::sessions::assignment::POLL_INTERVAL.as_millis().max(1);
+        let polls_per_minute = u32::try_from(window_millis / poll_millis).unwrap_or(u32::MAX);
+
+        // Without this the test would pass on a quota that still applied.
+        assert!(
+            u64::from(polls_per_minute) * u64::from(SESSIONS) > u64::from(api_limit),
+            "{SESSIONS} sessions at {polls_per_minute} polls/min must exceed the {api_limit}/min quota"
+        );
+
+        let workspace = TempDir::new().expect("test: workspace");
+        let config = config_with(workspace.path(), vec![], &[]);
+        let (base_url, server) = serve(test_app_state_with_api_limit(config, api_limit)).await;
+
+        let mut sessions = Vec::new();
+        for _ in 0..SESSIONS {
+            let (session_id, session_token) = register_session(&base_url).await;
+            let (status, body) = post(
+                &base_url,
+                &format!("/chat-sessions/{session_id}/assign"),
+                Some(TOKEN),
+                None,
+                serde_json::json!({"task": "one task each"}),
+            )
+            .await;
+            assert_eq!(status, 202, "test: body was {body}");
+            sessions.push((session_id, session_token, string_at(&body, "/assignment_id")));
+        }
+
+        for poll in 1..=polls_per_minute {
+            for (session_id, session_token, _) in &sessions {
+                let (status, body) = post(
+                    &base_url,
+                    &format!("/chat-sessions/{session_id}/inbox/pull"),
+                    Some(TOKEN),
+                    Some(session_token),
+                    serde_json::json!({}),
+                )
+                .await;
+                assert_eq!(
+                    status, 200,
+                    "test: poll {poll} of {session_id} answered {status}: {body}"
+                );
+            }
+        }
+
+        // Reporting an answer is the other half of the same poll and is exempt
+        // for the same reason.
+        for (session_id, session_token, assignment_id) in &sessions {
+            let (status, body) = post(
+                &base_url,
+                &format!("/chat-sessions/{session_id}/result"),
+                Some(TOKEN),
+                Some(session_token),
+                serde_json::json!({"assignment_id": assignment_id, "status": "completed", "summary": "done"}),
+            )
+            .await;
+            assert_eq!(status, 200, "test: body was {body}");
+        }
+
+        // Exempt from the quota, never from authentication: the mailbox is off
+        // the rate-limit layer, not off the bearer check.
+        let unauthenticated = sessions
+            .first()
+            .map(|(session_id, session_token, _)| (session_id.clone(), session_token.clone()))
+            .unwrap_or_default();
+        let (status, body) = post(
+            &base_url,
+            &format!("/chat-sessions/{}/inbox/pull", unauthenticated.0),
+            None,
+            Some(&unauthenticated.1),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, 401, "test: body was {body}");
+
+        // And the operator, whose budget the polling never touched, is served.
+        let (status, body) = get(&base_url, "/chat-sessions").await;
+        assert_eq!(status, 200, "test: body was {body}");
+
+        server.abort();
+    }
+
+    /// The exemption covers the mailbox and stops there.
+    ///
+    /// `assign` is the reachable end of this feature — an agent handling a
+    /// message on a channel calls it — so it stays metered with the rest of the
+    /// API. Sharing a file with two exempt routes must not be enough to make it
+    /// one of them.
+    #[tokio::test]
+    async fn assigning_work_is_still_rate_limited() {
+        const API_LIMIT: u32 = 4;
+
+        let workspace = TempDir::new().expect("test: workspace");
+        let config = config_with(workspace.path(), vec![], &[]);
+        let (base_url, server) = serve(test_app_state_with_api_limit(config, API_LIMIT)).await;
+
+        // Registering spends the first of the four.
+        let (session_id, session_token) = register_session(&base_url).await;
+
+        for attempt in 2..=API_LIMIT {
+            let (status, body) = post(
+                &base_url,
+                &format!("/chat-sessions/{session_id}/assign"),
+                Some(TOKEN),
+                None,
+                serde_json::json!({"task": "within the quota"}),
+            )
+            .await;
+            assert_eq!(status, 202, "test: attempt {attempt} answered {status}: {body}");
+        }
+
+        let (status, body) = post(
+            &base_url,
+            &format!("/chat-sessions/{session_id}/assign"),
+            Some(TOKEN),
+            None,
+            serde_json::json!({"task": "over the quota"}),
+        )
+        .await;
+        assert_eq!(status, 429, "test: body was {body}");
+        assert!(body.contains("Too many API requests"), "test: {body}");
+
+        // The other half of the same shared quota: the mailbox of the very
+        // session that just exhausted it still answers.
+        let (status, body) = post(
+            &base_url,
+            &format!("/chat-sessions/{session_id}/inbox/pull"),
+            Some(TOKEN),
+            Some(&session_token),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, 200, "test: body was {body}");
+
         server.abort();
     }
 }
