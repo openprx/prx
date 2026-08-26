@@ -467,6 +467,37 @@ in `gateway.paired_tokens` as a hash, not as plaintext, so the value here is the
 one handed out once at pairing time — a hash copied from the config file will
 not authenticate.
 
+#### Being assigned work
+
+The same two keys decide whether this chat *takes* work as well as sends it.
+When either `chat.daemon.url` or a usable credential is present, chat registers
+itself with the daemon at startup, polls its mailbox, runs what it is handed
+through the ordinary turn machinery, and reports the reply back. With neither
+set it does not try: the fallback daemon address is `[gateway]`'s own bind,
+which every chat has whether or not a daemon listens there, so an unconfigured
+chat that tried anyway would announce a refusal on every start.
+
+- **It never blocks startup.** Registration runs in the background; a daemon
+  that is down costs this chat the ability to be assigned work and nothing else,
+  and says so once in the transcript.
+- **It registers under the workspace directory's name.** That is the `{label}`
+  segment an `assign_allow` entry matches. The daemon treats it as self-declared
+  and does not verify it, so name the session id instead when that matters.
+- **Assigned work is never silent.** Each arrival is announced with the channel
+  and redacted sender it came from and how it was dispatched, and each result
+  handed back is announced too.
+- **The poller is ordinary in-flight work.** `/sessions` lists it and
+  `/kill --daemon d<N>` ends it, the same as any other daemon request.
+- **Exiting withdraws the session.** Nothing on the daemon side expires a chat
+  session, so a chat killed with `SIGKILL` leaves a row listed as `silent` until
+  an operator reaps it with `DELETE /api/chat-sessions/{id}`.
+
+The three dispositions map onto paths chat already had: `queue` joins the input
+backlog, `steer` joins it in front (the same place `/now` puts a typed line),
+and `interrupt` ends the turn in flight through the same local path `Ctrl+C`
+uses and *then* joins it in front. `interrupt` is an explicit act by whoever
+assigned the work — never a timeout, and nothing here runs a clock.
+
 Agentic delegates fail closed when `allowed_tools` is missing or empty. Named
 entries select only matching eligible parent tools. Use `allowed_tools = ["*"]`
 to explicitly inherit every eligible parent tool except `delegate`; the
