@@ -55,6 +55,21 @@ impl TasksEndpoint {
         &self.base_url
     }
 
+    /// A request that authenticates as this *session* as well as this
+    /// operator. Both credentials ride along: the bearer says the caller may
+    /// talk to this daemon at all, the session token says which mailbox is its
+    /// own.
+    fn session_request(
+        &self,
+        client: &reqwest::Client,
+        method: reqwest::Method,
+        path: &str,
+        session_token: &str,
+    ) -> reqwest::RequestBuilder {
+        self.request(client, method, path)
+            .header(CHAT_SESSION_TOKEN_HEADER, session_token)
+    }
+
     fn request(&self, client: &reqwest::Client, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         let builder = client.request(method, format!("{}{path}", self.base_url));
         match &self.token {
@@ -328,6 +343,184 @@ pub async fn request_channel_send(
         .await
         .map_err(|error| unreachable_hint(endpoint, &error))?;
     decode(endpoint, response, "channel send").await
+}
+
+/// Header the daemon's chat-session mailbox authenticates a *session* with.
+///
+/// The bearer token authenticates a local **operator**, and every process on
+/// this host that can read the config is one. That is the right level for
+/// looking at work and killing it, and the wrong level for a mailbox: pulling
+/// another chat's assignments would take its work away from it, and reporting
+/// on its behalf would put words in its mouth. The per-session token minted at
+/// registration is what tells the two apart, so the mailbox calls carry both.
+pub const CHAT_SESSION_TOKEN_HEADER: &str = "X-Prx-Session-Token";
+
+/// What registering a chat session with a daemon yields.
+///
+/// `token` is returned exactly once — the daemon keeps only its hash — so a
+/// caller that drops it has to register again under a new id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatSessionRegistration {
+    pub session_id: String,
+    /// Redacted handle the daemon uses for this session in refusals and rows.
+    pub session_ref: String,
+    pub token: String,
+    pub label: String,
+    pub registered_at_unix_ms: u64,
+}
+
+/// One assignment handed to this chat session by the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PulledAssignment {
+    pub assignment_id: String,
+    pub session_id: String,
+    pub task: String,
+    /// `queue`, `steer` or `interrupt`. Kept as the server's own string: the
+    /// client maps it to behaviour and must be able to see a word it does not
+    /// know rather than have it silently become a known one.
+    pub disposition: String,
+    /// Greater than one means this is a redelivery. The mailbox is
+    /// at-least-once, so `assignment_id` is the idempotency key.
+    #[serde(default = "one")]
+    pub deliveries: u32,
+    #[serde(default)]
+    pub created_at_unix_ms: u64,
+    #[serde(default)]
+    pub work_id: String,
+    /// Channel the assignment came in on, in plaintext. Non-sensitive, and
+    /// without it nobody can say where a task came from.
+    #[serde(default)]
+    pub origin_channel: String,
+    /// Redacted origin fingerprint; absent for the operator plane, which has no
+    /// correspondent to protect.
+    #[serde(default)]
+    pub origin_ref: Option<String>,
+}
+
+const fn one() -> u32 {
+    1
+}
+
+/// One mailbox pull: the batch handed over, plus what the daemon did with the
+/// acknowledgements that rode along.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssignmentPull {
+    pub assignments: Vec<PulledAssignment>,
+    #[serde(default)]
+    pub acked: usize,
+    /// Assignments delivered last time, never acknowledged, and now put back at
+    /// the head of the queue.
+    #[serde(default)]
+    pub requeued: usize,
+    #[serde(default)]
+    pub queued_remaining: usize,
+}
+
+/// The daemon's receipt for one reported assignment result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssignmentReceipt {
+    pub assignment_id: String,
+    pub status: String,
+    pub seq: u64,
+}
+
+/// What deregistering a chat session took down with it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatSessionDeregistration {
+    pub session_id: String,
+    /// Outstanding assignments the daemon cancelled because nobody is left to
+    /// run them.
+    #[serde(default)]
+    pub discarded: usize,
+}
+
+/// Enrol a `prx chat` session so the daemon can hand it work.
+pub async fn register_chat_session(
+    endpoint: &TasksEndpoint,
+    label: &str,
+    pid: Option<u32>,
+) -> Result<ChatSessionRegistration> {
+    let client = client()?;
+    let response = endpoint
+        .request(&client, reqwest::Method::POST, "/api/chat-sessions/register")
+        .json(&serde_json::json!({ "label": label, "pid": pid }))
+        .send()
+        .await
+        .map_err(|error| unreachable_hint(endpoint, &error))?;
+    decode(endpoint, response, "chat session registration").await
+}
+
+/// Take this session's queued work, acknowledging the previous batch.
+///
+/// `ack` carries the ids handed over by the *previous* call and now safely in
+/// the caller's hands. Acknowledging on the next pull rather than on receipt is
+/// what makes a client that dies between the two lose nothing: the daemon puts
+/// anything unacknowledged back at the head of the queue.
+///
+/// As everywhere else in this client there is no request timeout — the poll
+/// interval is a sampling rate, not a deadline, and an answer that takes its
+/// time is an answer.
+pub async fn pull_chat_assignments(
+    endpoint: &TasksEndpoint,
+    session_id: &str,
+    session_token: &str,
+    ack: &[String],
+    max: Option<usize>,
+) -> Result<AssignmentPull> {
+    let client = client()?;
+    let path = format!("/api/chat-sessions/{}/inbox/pull", urlencoding::encode(session_id));
+    let response = endpoint
+        .session_request(&client, reqwest::Method::POST, &path, session_token)
+        .json(&serde_json::json!({ "ack": ack, "max": max }))
+        .send()
+        .await
+        .map_err(|error| unreachable_hint(endpoint, &error))?;
+    decode(endpoint, response, "chat assignment pull").await
+}
+
+/// Tell the daemon what this session made of one assignment.
+///
+/// `status` is one of `completed`, `failed`, `rejected`. `cancelled` is the
+/// daemon's own verdict about work *it* ended and is refused here, so an
+/// operator kill can never be confused with a client giving up.
+pub async fn report_chat_assignment(
+    endpoint: &TasksEndpoint,
+    session_id: &str,
+    session_token: &str,
+    assignment_id: &str,
+    status: &str,
+    summary: &str,
+) -> Result<AssignmentReceipt> {
+    let client = client()?;
+    let path = format!("/api/chat-sessions/{}/result", urlencoding::encode(session_id));
+    let response = endpoint
+        .session_request(&client, reqwest::Method::POST, &path, session_token)
+        .json(&serde_json::json!({
+            "assignment_id": assignment_id,
+            "status": status,
+            "summary": summary,
+        }))
+        .send()
+        .await
+        .map_err(|error| unreachable_hint(endpoint, &error))?;
+    decode(endpoint, response, "chat assignment result").await
+}
+
+/// Withdraw this chat session from the daemon's registry.
+///
+/// Nothing on the daemon expires a session on a clock, by design: a session
+/// that stopped pulling is *reported* as silent, never evicted. Deregistering
+/// is therefore the only thing that removes the row, and skipping it on exit
+/// leaves a permanent zombie that assignments can still be addressed to.
+pub async fn deregister_chat_session(endpoint: &TasksEndpoint, session_id: &str) -> Result<ChatSessionDeregistration> {
+    let client = client()?;
+    let path = format!("/api/chat-sessions/{}", urlencoding::encode(session_id));
+    let response = endpoint
+        .request(&client, reqwest::Method::DELETE, &path)
+        .send()
+        .await
+        .map_err(|error| unreachable_hint(endpoint, &error))?;
+    decode(endpoint, response, "chat session deregistration").await
 }
 
 /// Fetch connection-pool occupancy and saturation counters.
