@@ -47,7 +47,14 @@
     clippy::cast_sign_loss,
     clippy::doc_markdown,
     clippy::missing_const_for_fn,
-    clippy::match_same_arms
+    clippy::match_same_arms,
+    // The fake daemon below shares its recorded state between the test thread
+    // and the thread serving HTTP. `parking_lot` is a library dependency and is
+    // not reachable from an integration test, and the project's ban on
+    // `std::sync::Mutex` exempts test code for exactly this reason: there is no
+    // production path here to poison.
+    clippy::disallowed_types,
+    clippy::disallowed_methods
 )]
 
 use std::io::{Read, Write};

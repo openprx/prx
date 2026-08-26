@@ -571,15 +571,12 @@ fn origin_label(assignment: &PulledAssignment) -> String {
     } else {
         assignment.origin_channel.trim()
     };
-    match assignment
+    assignment
         .origin_ref
         .as_deref()
         .map(str::trim)
-        .filter(|r| !r.is_empty())
-    {
-        Some(origin_ref) => format!("{channel} {origin_ref}"),
-        None => channel.to_string(),
-    }
+        .filter(|origin_ref| !origin_ref.is_empty())
+        .map_or_else(|| channel.to_string(), |origin_ref| format!("{channel} {origin_ref}"))
 }
 
 fn preview_of(task: &str) -> String {
@@ -677,7 +674,7 @@ impl AssignmentTurnGuard {
     /// Used where the input is put back on the backlog: reporting there would
     /// answer for a turn that is still going to happen, and the daemon would
     /// then refuse the real report as unknown.
-    pub fn disarm(&mut self) {
+    pub const fn disarm(&mut self) {
         self.armed = false;
     }
 

@@ -17915,6 +17915,9 @@ mod p3_directional_switch_tests {
         let msg = assigned_msg("assign-1", "count the crates", disposition);
         let (tx, mut input_rx) = mpsc::channel(4);
         drop(tx);
+        // The output sink is read back: an assignment must never emit a local
+        // command answer, which is what it would mean for it to be handled as
+        // one instead of run as a turn.
         let mut outputs = Vec::<String>::new();
         let mut emit = |text: &str| outputs.push(text.to_string());
         let mut backlog = std::collections::VecDeque::new();
@@ -17967,6 +17970,10 @@ mod p3_directional_switch_tests {
         )
         .await;
 
+        assert!(
+            outputs.is_empty(),
+            "an assignment must be run as a turn, not answered as a local command: {outputs:?}"
+        );
         let queued = backlog
             .iter()
             .map(|entry| (entry.priority, entry.msg.content.clone()))
