@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.68] - 2026-08-31
+
+### Fixed
+
+- Included configured wacli channels in `prx channel list`, `prx channel doctor`,
+  and `prx status`, and documented wacli in the channel command help.
+
 ## [0.8.67] - 2026-08-31
 
 ### Fixed
