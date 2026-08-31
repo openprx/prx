@@ -5265,6 +5265,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 bot_jid: wc.bot_jid.clone(),
                 bot_number: wc.bot_number.clone(),
                 bot_lid: wc.bot_lid.clone(),
+                self_chat_mode: wc.self_chat_mode,
                 outbound_media_workspace_only: wc.outbound_media_workspace_only,
             })),
         ));
@@ -5793,6 +5794,7 @@ pub async fn start_channels_with_config(
                 bot_jid: wc.bot_jid.clone(),
                 bot_number: wc.bot_number.clone(),
                 bot_lid: wc.bot_lid.clone(),
+                self_chat_mode: wc.self_chat_mode,
                 outbound_media_workspace_only: wc.outbound_media_workspace_only,
             })
             .with_media_artifacts(

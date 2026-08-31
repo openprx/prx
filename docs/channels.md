@@ -28,6 +28,15 @@ webhook_secret = "replace-with-secret"
 store_dir = "/path/to/wacli-store"
 ```
 
+To treat messages you type in WhatsApp's **Message Yourself** chat as owner
+commands, configure `bot_jid` (or `bot_number`) and set
+`self_chat_mode = true`. This mode requires a wacli build with the experimental
+`send text --allow-self-send` flag. PRX correlates every reply with wacli's
+returned message ID and drops only that outbound webhook echo, preventing the
+reply from starting another agent turn. wacli still cannot guarantee that
+WhatsApp will deliver a self-send merely because the server acknowledged it,
+so verify delivery with the linked account before relying on this mode.
+
 Newer wacli webhook payloads can carry the resolved `ChatName`. OpenPRX also
 uses `store_dir/wacli.db` as a read-only fallback for group titles when a
 webhook payload does not include that field.

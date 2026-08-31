@@ -4845,6 +4845,7 @@ impl WhatsAppConfig {
 /// store_dir = "/home/ck/.wacli"
 /// bot_jid = "1234567890@s.whatsapp.net"
 /// bot_number = "1234567890"
+/// self_chat_mode = true
 /// allowed_from = ["*"]
 /// group_reply_mode = "smart"
 /// ```
@@ -4888,6 +4889,12 @@ pub struct WacliConfig {
     /// 设备后缀（`:3` 等）会自动去除。
     #[serde(default)]
     pub bot_lid: Option<String>,
+    /// Treat messages authored by the linked account in WhatsApp's Message
+    /// Yourself chat as owner input. Disabled by default. When enabled, PRX
+    /// invokes wacli's experimental self-send path and suppresses reply echoes
+    /// by their outbound message IDs.
+    #[serde(default)]
+    pub self_chat_mode: bool,
     /// Confine **outbound** media markers (`[IMAGE:…]` and friends) to the
     /// workspace again.
     ///
@@ -4940,6 +4947,7 @@ impl Default for WacliConfig {
             bot_jid: None,
             bot_number: None,
             bot_lid: None,
+            self_chat_mode: false,
             outbound_media_workspace_only: false,
             mention_only: false,
             group_reply_mode: None,
@@ -5039,10 +5047,14 @@ impl WacliConfig {
         // mention would be missed. Warn rather than hard-fail (smart still works
         // via the LLM gate; mentions just degrade).
         let smart = matches!(self.group_reply_mode, Some(GroupReplyMode::Smart));
-        let needs_identity = self.mention_only || smart;
         let has_identity = self.bot_jid.as_deref().map(str::trim).is_some_and(|s| !s.is_empty())
             || self.bot_number.as_deref().map(str::trim).is_some_and(|s| !s.is_empty());
-        if needs_identity && !has_identity {
+        if self.self_chat_mode && !has_identity {
+            anyhow::bail!(
+                "channels_config.wacli.self_chat_mode requires bot_jid or bot_number so PRX can distinguish Message Yourself from ordinary outgoing chats"
+            );
+        }
+        if (self.mention_only || smart) && !has_identity {
             tracing::warn!(
                 "channels_config.wacli: mention_only/smart enabled but neither bot_jid nor \
                  bot_number is set; @-mention detection will not work (set bot_jid)"
@@ -9609,6 +9621,7 @@ classifier_timeout_secs = 8
         assert_eq!(cfg.webhook_path, "/wacli");
         assert!(cfg.webhook_secret.is_none());
         assert!(!cfg.allow_unsigned_loopback);
+        assert!(!cfg.self_chat_mode);
         assert!(cfg.host.is_none() && cfg.port.is_none());
         assert!(cfg.validate().is_err(), "configured wacli requires authentication");
     }
@@ -9621,12 +9634,28 @@ classifier_timeout_secs = 8
             webhook_secret = "s3cr3t"
             store_dir = "/home/ck/.wacli"
             bot_jid = "123@s.whatsapp.net"
+            self_chat_mode = true
             group_reply_mode = "smart"
         "#;
         let cfg: WacliConfig = toml::from_str(toml).expect("parse wacli config");
         assert_eq!(cfg.webhook_secret.as_deref(), Some("s3cr3t"));
         assert_eq!(cfg.group_reply_mode, Some(GroupReplyMode::Smart));
+        assert!(cfg.self_chat_mode);
         cfg.validate().expect("valid wacli config");
+    }
+
+    #[test]
+    async fn wacli_self_chat_requires_owner_identity() {
+        let cfg = WacliConfig {
+            webhook_secret: Some("s3cr3t".into()),
+            self_chat_mode: true,
+            ..WacliConfig::default()
+        };
+        let err = cfg.validate().expect_err("self-chat without bot identity must fail");
+        assert!(
+            err.to_string()
+                .contains("self_chat_mode requires bot_jid or bot_number")
+        );
     }
 
     #[test]

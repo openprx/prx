@@ -82,7 +82,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 // ── Tunables ────────────────────────────────────────────────────────────────
 
@@ -121,6 +121,14 @@ const REPLAY_TTL: Duration = Duration::from_mins(5);
 
 /// Maximum number of keys retained in the replay cache.
 const REPLAY_MAX_KEYS: usize = 10_000;
+
+/// Keep successful self-chat outbound message IDs long enough to reject their
+/// webhook echoes even when WhatsApp reconnects or retries delivery.
+const SELF_OUTBOUND_TTL: Duration = Duration::from_mins(10);
+
+/// If a successful self-send cannot be decoded, briefly fail closed instead of
+/// treating its echo as a fresh owner command and starting a reply loop.
+const UNKNOWN_SELF_OUTBOUND_TTL: Duration = Duration::from_secs(30);
 
 // ── Inbound payload (official wa.ParsedMessage, PascalCase) ──────────────────
 
@@ -641,6 +649,115 @@ impl ReplayCache {
     }
 }
 
+#[derive(Debug, Default)]
+struct SelfOutboundState {
+    in_flight: usize,
+    sent_ids: HashMap<String, Instant>,
+    suppress_unknown_until: Option<Instant>,
+}
+
+/// Correlates opt-in Message Yourself sends with their webhook echoes.
+///
+/// The webhook can race the `wacli send` subprocess response. While a send is
+/// in flight, inbound self-chat requests wait for the returned message ID and
+/// then classify against it. Unrelated phone-authored messages are released as
+/// soon as the send completes.
+#[derive(Debug, Default)]
+struct SelfOutboundTracker {
+    state: Mutex<SelfOutboundState>,
+    changed: Notify,
+}
+
+impl SelfOutboundTracker {
+    fn begin(self: &Arc<Self>) -> SelfSendPermit {
+        let mut state = self.state.lock();
+        state.in_flight = state.in_flight.saturating_add(1);
+        drop(state);
+        SelfSendPermit {
+            tracker: Arc::clone(self),
+            finished: false,
+        }
+    }
+
+    fn finish(&self, sent_id: Option<&str>, suppress_unknown: bool) {
+        let now = Instant::now();
+        let mut state = self.state.lock();
+        state
+            .sent_ids
+            .retain(|_, at| now.duration_since(*at) < SELF_OUTBOUND_TTL);
+        if let Some(id) = sent_id.map(str::trim).filter(|id| !id.is_empty()) {
+            if state.sent_ids.len() >= REPLAY_MAX_KEYS
+                && let Some(oldest) = state
+                    .sent_ids
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(id, _)| id.clone())
+            {
+                state.sent_ids.remove(&oldest);
+            }
+            state.sent_ids.insert(id.to_string(), now);
+        } else if suppress_unknown {
+            state.suppress_unknown_until = Some(now + UNKNOWN_SELF_OUTBOUND_TTL);
+        }
+        state.in_flight = state.in_flight.saturating_sub(1);
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    async fn is_local_echo(&self, id: &str) -> bool {
+        let deadline = tokio::time::Instant::now() + SEND_TIMEOUT;
+        loop {
+            let changed = self.changed.notified();
+            {
+                let now = Instant::now();
+                let mut state = self.state.lock();
+                state
+                    .sent_ids
+                    .retain(|_, at| now.duration_since(*at) < SELF_OUTBOUND_TTL);
+                if state.sent_ids.contains_key(id.trim()) {
+                    return true;
+                }
+                if state.suppress_unknown_until.is_some_and(|until| now < until) {
+                    return true;
+                }
+                state.suppress_unknown_until = None;
+                if state.in_flight == 0 {
+                    return false;
+                }
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                tracing::warn!("wacli: timed out waiting to classify an in-flight self-chat message");
+                return true;
+            }
+        }
+    }
+}
+
+struct SelfSendPermit {
+    tracker: Arc<SelfOutboundTracker>,
+    finished: bool,
+}
+
+impl SelfSendPermit {
+    fn record(mut self, sent_id: &str) {
+        self.tracker.finish(Some(sent_id), false);
+        self.finished = true;
+    }
+
+    fn suppress_unknown(mut self) {
+        self.tracker.finish(None, true);
+        self.finished = true;
+    }
+}
+
+impl Drop for SelfSendPermit {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.tracker.finish(None, false);
+        }
+    }
+}
+
 // ── Config ──────────────────────────────────────────────────────────────────
 
 /// Runtime configuration for the wacli channel (webhook + CLI).
@@ -669,6 +786,10 @@ pub struct WacliChannelConfig {
     pub bot_number: Option<String>,
     /// Bot 的 WhatsApp LID（裸数字或含 `@lid` 域名）。
     pub bot_lid: Option<String>,
+    /// Accept operator-authored messages in WhatsApp's Message Yourself chat.
+    /// Outbound replies use wacli's explicit experimental self-send flag and
+    /// are correlated by message ID to prevent webhook reply loops.
+    pub self_chat_mode: bool,
     /// Re-enable the workspace confinement for **outbound** media sources.
     ///
     /// `false` (default) lets a marker name any path the daemon can read, which
@@ -693,6 +814,7 @@ impl Default for WacliChannelConfig {
             bot_jid: None,
             bot_number: None,
             bot_lid: None,
+            self_chat_mode: false,
             outbound_media_workspace_only: false,
         }
     }
@@ -716,8 +838,32 @@ struct WebhookState {
     secret: Option<Arc<str>>,
     tx: mpsc::Sender<ChannelMessage>,
     replay: Arc<ReplayCache>,
+    self_outbound: Arc<SelfOutboundTracker>,
     artifact_owner: Option<Arc<MediaArtifactOwner>>,
     max_image_bytes: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct WacliSendEnvelope {
+    success: bool,
+    data: Option<WacliSendData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WacliSendData {
+    id: String,
+}
+
+fn parse_wacli_send_id(stdout: &[u8]) -> Result<String> {
+    let envelope: WacliSendEnvelope = serde_json::from_slice(stdout).context("decode wacli JSON send output")?;
+    if !envelope.success {
+        anyhow::bail!("wacli JSON send output reported failure");
+    }
+    envelope
+        .data
+        .map(|data| data.id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .context("wacli JSON send output did not contain data.id")
 }
 
 // ── Channel implementation ──────────────────────────────────────────────────
@@ -726,6 +872,7 @@ struct WebhookState {
 pub struct WacliChannel {
     config: Arc<WacliChannelConfig>,
     replay: Arc<ReplayCache>,
+    self_outbound: Arc<SelfOutboundTracker>,
     artifact_owner: Option<Arc<MediaArtifactOwner>>,
     max_image_bytes: usize,
 }
@@ -736,6 +883,7 @@ impl WacliChannel {
         Self {
             config: Arc::new(config),
             replay: Arc::new(ReplayCache::new(REPLAY_TTL, REPLAY_MAX_KEYS)),
+            self_outbound: Arc::new(SelfOutboundTracker::default()),
             artifact_owner: None,
             max_image_bytes: DEFAULT_MAX_IMAGE_BYTES,
         }
@@ -775,13 +923,22 @@ impl WacliChannel {
             message
         };
 
+        let self_send = self.config.self_chat_mode && bot_identity_matches(&self.config, recipient);
+        let permit = self_send.then(|| self.self_outbound.begin());
+
         let mut cmd = tokio::process::Command::new(self.cli_binary());
+        if self_send {
+            cmd.arg("--json");
+        }
         cmd.arg("send")
             .arg("text")
             .arg("--to")
             .arg(recipient)
             .arg("--message")
             .arg(text);
+        if self_send {
+            cmd.arg("--allow-self-send");
+        }
         if let Some(store) = self.config.store_dir.as_deref() {
             if !store.trim().is_empty() {
                 cmd.arg("--store").arg(store);
@@ -802,6 +959,15 @@ impl WacliChannel {
                 output.status.code().unwrap_or(-1),
                 stderr.trim()
             );
+        }
+        if let Some(permit) = permit {
+            match parse_wacli_send_id(&output.stdout) {
+                Ok(id) => permit.record(&id),
+                Err(error) => {
+                    permit.suppress_unknown();
+                    return Err(error).context("wacli self-send succeeded without a usable message id");
+                }
+            }
         }
         Ok(())
     }
@@ -1389,6 +1555,27 @@ fn normalize_jid_local(jid: &str) -> &str {
     }
 }
 
+fn bot_identity_matches(cfg: &WacliChannelConfig, jid: &str) -> bool {
+    let candidate = normalize_jid_local(jid);
+    !candidate.is_empty()
+        && [
+            cfg.bot_jid.as_deref(),
+            cfg.bot_number.as_deref(),
+            cfg.bot_lid.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(normalize_jid_local)
+        .any(|identity| !identity.is_empty() && identity == candidate)
+}
+
+fn is_self_chat_message(cfg: &WacliChannelConfig, msg: &WacliParsedMessage) -> bool {
+    cfg.self_chat_mode
+        && msg.from_me
+        && bot_identity_matches(cfg, msg.chat.trim())
+        && bot_identity_matches(cfg, msg.sender_jid.trim())
+}
+
 /// Heuristic mention detection (the official payload has no `mentionedJids`).
 ///
 /// Checks:
@@ -1483,14 +1670,22 @@ async fn handle_wacli_webhook(
         return StatusCode::BAD_REQUEST;
     }
 
-    // 4. Skip our own messages.
-    if msg.from_me {
+    // 4. Skip ordinary messages sent by the linked account. In explicit
+    // Message Yourself mode, phone-authored self-chat messages are owner input,
+    // while message IDs returned by our own wacli sends remain loop-suppressed.
+    let self_chat = is_self_chat_message(state.cfg.as_ref(), &msg);
+    if msg.from_me && !self_chat {
+        tracing::debug!("wacli: skipping FromMe message outside self-chat mode");
+        return StatusCode::OK;
+    }
+    if self_chat && state.self_outbound.is_local_echo(&msg.id).await {
+        tracing::debug!("wacli: dropping local self-chat reply echo");
         return StatusCode::OK;
     }
 
     // 5. Allowlist on the sender JID.
     let cfg = state.cfg.as_ref();
-    if !sender_allowed(&cfg.allowed_from, msg.sender_jid.trim()) {
+    if !self_chat && !sender_allowed(&cfg.allowed_from, msg.sender_jid.trim()) {
         tracing::debug!("wacli: dropping message from non-allowlisted sender");
         return StatusCode::OK;
     }
@@ -1697,6 +1892,7 @@ impl Channel for WacliChannel {
             secret,
             tx,
             replay: self.replay.clone(),
+            self_outbound: self.self_outbound.clone(),
             artifact_owner: self.artifact_owner.clone(),
             max_image_bytes: self.max_image_bytes,
         };
@@ -1784,6 +1980,7 @@ mod tests {
             secret,
             tx,
             replay: Arc::new(ReplayCache::new(REPLAY_TTL, REPLAY_MAX_KEYS)),
+            self_outbound: Arc::new(SelfOutboundTracker::default()),
             artifact_owner: None,
             max_image_bytes: DEFAULT_MAX_IMAGE_BYTES,
         }
@@ -2694,6 +2891,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handler_accepts_owner_message_in_explicit_self_chat_mode() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let cfg = WacliChannelConfig {
+            self_chat_mode: true,
+            allowed_from: Vec::new(),
+            ..cfg_with_secret()
+        };
+        let app = router_for(state_for(cfg, tx));
+        let body = r#"{"Chat":"99550001@s.whatsapp.net","ID":"owner-1","SenderJID":"99550001@s.whatsapp.net","FromMe":true,"Text":"tester"}"#
+            .as_bytes()
+            .to_vec();
+        let sig = sign("topsecret", &body);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/wacli")
+            .header("X-Wacli-Signature", sig)
+            .body(Body::from(body))
+            .expect("test: build req");
+        let resp = app.oneshot(req).await.expect("test: response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let msg = rx.try_recv().expect("self-chat owner message must be forwarded");
+        assert_eq!(msg.id, "owner-1");
+        assert_eq!(msg.content, "99550001@s.whatsapp.net: tester");
+    }
+
+    #[tokio::test]
+    async fn handler_drops_the_tracked_self_chat_reply_echo() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let cfg = WacliChannelConfig {
+            self_chat_mode: true,
+            allowed_from: Vec::new(),
+            ..cfg_with_secret()
+        };
+        let state = state_for(cfg, tx);
+        let permit = state.self_outbound.begin();
+        permit.record("bot-reply-1");
+        let app = router_for(state);
+        let body = r#"{"Chat":"99550001@s.whatsapp.net","ID":"bot-reply-1","SenderJID":"99550001@s.whatsapp.net","FromMe":true,"Text":"agent reply"}"#
+            .as_bytes()
+            .to_vec();
+        let sig = sign("topsecret", &body);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/wacli")
+            .header("X-Wacli-Signature", sig)
+            .body(Body::from(body))
+            .expect("test: build req");
+        let resp = app.oneshot(req).await.expect("test: response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(rx.try_recv().is_err(), "the tracked reply echo must not start a turn");
+    }
+
+    #[tokio::test]
+    async fn self_outbound_tracker_waits_for_id_and_drops_only_the_echo() {
+        let tracker = Arc::new(SelfOutboundTracker::default());
+        let permit = tracker.begin();
+        let waiting = {
+            let tracker = Arc::clone(&tracker);
+            tokio::spawn(async move { tracker.is_local_echo("reply-1").await })
+        };
+
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "classification must wait while the send id is pending"
+        );
+        permit.record("reply-1");
+
+        assert!(
+            waiting.await.expect("tracker task"),
+            "the returned outbound id must be dropped"
+        );
+        assert!(
+            !tracker.is_local_echo("owner-2").await,
+            "an unrelated owner message must pass"
+        );
+    }
+
+    #[test]
+    fn parses_wacli_json_send_id() {
+        let output =
+            br#"{"success":true,"data":{"sent":true,"to":"99550001@s.whatsapp.net","id":"3EB0ABC"},"error":null}"#;
+        assert_eq!(parse_wacli_send_id(output).unwrap(), "3EB0ABC");
+    }
+
+    #[tokio::test]
     async fn handler_rejects_missing_required_fields() {
         let (tx, _rx) = mpsc::channel(4);
         let app = router_for(state_for(cfg_with_secret(), tx));
@@ -2887,6 +3174,7 @@ mod tests {
             bot_jid: bot_jid.map(str::to_owned),
             bot_number: bot_number.map(str::to_owned),
             bot_lid: bot_lid.map(str::to_owned),
+            self_chat_mode: false,
             outbound_media_workspace_only: false,
         }
     }
@@ -2962,6 +3250,36 @@ mod outbound_media_tests {
 
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
+
+    #[tokio::test]
+    async fn self_chat_text_send_opts_in_and_tracks_the_returned_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let argv_log = dir.path().join("argv.log");
+        let bin = dir.path().join("fake-wacli");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '{{\"success\":true,\"data\":{{\"sent\":true,\"id\":\"3EB0SELFREPLY\"}},\"error\":null}}'\n",
+            argv_log.display()
+        );
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let channel = WacliChannel::new(WacliChannelConfig {
+            cli_path: Some(bin.to_string_lossy().into_owned()),
+            bot_jid: Some("99550001@s.whatsapp.net".into()),
+            bot_number: Some("99550001".into()),
+            self_chat_mode: true,
+            ..WacliChannelConfig::default()
+        });
+
+        channel
+            .send_text("99550001@s.whatsapp.net", "self reply")
+            .await
+            .expect("self-send should succeed");
+
+        let argv = std::fs::read_to_string(argv_log).unwrap();
+        assert!(argv.lines().any(|arg| arg == "--json"), "argv={argv}");
+        assert!(argv.lines().any(|arg| arg == "--allow-self-send"), "argv={argv}");
+        assert!(channel.self_outbound.is_local_echo("3EB0SELFREPLY").await);
+    }
 
     /// A stand-in `wacli` that appends its `argv` to a log and never talks to
     /// WhatsApp.

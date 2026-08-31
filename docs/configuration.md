@@ -216,6 +216,10 @@ webhook_listen = "127.0.0.1:16868"
 webhook_path = "/wacli"
 webhook_secret = "replace-with-secret"
 store_dir = "/path/to/wacli-store" # required for group-title fallback and inbound downloaded images
+# Optional Message Yourself owner-command mode. Requires bot_jid or bot_number
+# and a wacli build with `send text --allow-self-send`.
+# bot_jid = "1234567890@s.whatsapp.net"
+# self_chat_mode = true
 # Outbound [IMAGE:…]/[DOCUMENT:…] markers may name any readable path by default.
 # Set to true to confine them to the workspace again (see docs/channels.md).
 outbound_media_workspace_only = false

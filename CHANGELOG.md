@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.69] - 2026-08-31
+
+### Added
+
+- Added an explicit wacli Message Yourself mode that accepts linked-account
+  messages as owner input and uses wacli's opt-in self-send path for replies.
+
+### Fixed
+
+- Correlated self-chat replies with wacli's returned outbound message IDs so
+  webhook echoes cannot re-enter the agent as new commands, including the race
+  where an echo arrives before the send subprocess returns.
+
 ## [0.8.68] - 2026-08-31
 
 ### Fixed
