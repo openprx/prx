@@ -3385,6 +3385,7 @@ async fn run_one_stream_pass(
     let mut usage_accumulator = ProviderUsageAccumulator::new();
     let mut iter_text = String::new();
     let mut iter_reasoning = String::new();
+    let mut emitted_model_output = false;
 
     loop {
         tokio::select! {
@@ -3399,6 +3400,9 @@ async fn run_one_stream_pass(
             next = stream.next() => {
                 match next {
                     Some(Ok(StreamChunk { delta, reasoning, is_final, usage, tool_calls, .. })) => {
+                        emitted_model_output |= !delta.is_empty()
+                            || reasoning.as_ref().is_some_and(|value| !value.is_empty())
+                            || !tool_calls.is_empty();
                         if let Some(usage) = usage {
                             usage_accumulator.record(usage);
                         }
@@ -3433,6 +3437,18 @@ async fn run_one_stream_pass(
                         }
                     }
                     Some(Err(err)) => {
+                        // Once the provider has emitted any model output, replaying
+                        // the request is unsafe: visible text/reasoning would be
+                        // duplicated and a partial tool call could be rebuilt with
+                        // different arguments. Fail this turn explicitly instead.
+                        if emitted_model_output {
+                            return StreamPassOutcome::HardError {
+                                err: format!(
+                                    "stream interrupted after model output; refusing unsafe request replay: {err}"
+                                ),
+                                retryable: false,
+                            };
+                        }
                         // S3 T3-1: 错误分类 — overflow / network timeout / hard error.
                         if stream_error_is_context_overflow(&err) {
                             return StreamPassOutcome::ContextOverflow { err: err.to_string() };
@@ -11431,6 +11447,111 @@ mod real_mode_tests {
             "must emit at least one StreamRetryAttempt (got {retry_attempts})"
         );
         assert!(saw_completion, "must complete after backoff retries");
+    }
+
+    /// A network error after any model output is not safe to retry: replaying
+    /// the request would duplicate streamed text/reasoning and could rebuild a
+    /// partial tool call with different arguments.
+    #[tokio::test]
+    async fn driver_does_not_retry_network_error_after_reasoning_output() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamError,
+            StreamOptions, StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct PartialThenErrorProvider {
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl Provider for PartialThenErrorProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat_with_history(
+                &self,
+                _: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                stream::iter(vec![
+                    Ok(StreamChunk::reasoning_delta("partial reasoning")),
+                    Err(StreamError::Io(std::io::Error::other("stream interrupted"))),
+                ])
+                .boxed()
+            }
+
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(PartialThenErrorProvider {
+            calls: Arc::clone(&calls),
+        });
+        let executor = EffectExecutor::new_with_deps(deps);
+        executor
+            .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
+                draft_id: "draft-partial-network-error".into(),
+                history: Vec::new(),
+                compaction_guard_history: None,
+                compaction_config: None,
+                cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
+            })
+            .await;
+
+        let mut retry_attempts = 0_u8;
+        let failed = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                match action_rx.recv().await {
+                    Some(Action::StreamRetryAttempt { attempt, .. }) => retry_attempts = retry_attempts.max(attempt),
+                    Some(Action::StreamFailed { err, retryable, .. }) => break (err, retryable),
+                    Some(_) => {}
+                    None => panic!("action channel closed before StreamFailed"),
+                }
+            }
+        })
+        .await
+        .expect("partial stream must fail promptly");
+
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            1,
+            "partial response must not be replayed"
+        );
+        assert_eq!(retry_attempts, 0, "partial response must not enter the retry loop");
+        assert!(!failed.1, "a partial response cannot be retried safely");
+        assert!(failed.0.contains("after model output"), "err={}", failed.0);
     }
 
     /// **S3 T3-1 Step 5**: io error 持续 → 重试耗尽 → StreamFailed(retryable=false).

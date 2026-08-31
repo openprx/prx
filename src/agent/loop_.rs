@@ -5100,6 +5100,7 @@ async fn run_streaming_provider_turn(
         let mut call_aggregator = SharedToolCallAggregator::default();
         let mut usage = ProviderUsageAccumulator::new();
         let mut route_attempts = Vec::new();
+        let mut emitted_model_output = false;
 
         let stream_result: Result<()> = loop {
             let next = if let Some(token) = cancellation {
@@ -5132,6 +5133,9 @@ async fn run_streaming_provider_turn(
                     if let Some(chunk_usage) = chunk_usage {
                         usage.record(chunk_usage);
                     }
+                    emitted_model_output |= !delta.is_empty()
+                        || reasoning_delta.as_ref().is_some_and(|value| !value.is_empty())
+                        || !tool_calls.is_empty();
                     for chunk in tool_calls {
                         if let Some(call) = call_aggregator.ingest(chunk) {
                             calls.push(call);
@@ -5197,6 +5201,15 @@ async fn run_streaming_provider_turn(
                 let Some(stream_error) = error.downcast_ref::<crate::providers::traits::StreamError>() else {
                     return Err(error);
                 };
+                if emitted_model_output {
+                    return Err(StreamingProviderFailure {
+                        message: format!(
+                            "stream interrupted after model output; refusing unsafe request replay: {stream_error}"
+                        ),
+                        retryable: false,
+                    }
+                    .into());
+                }
                 if streaming_error_is_context_overflow(stream_error) {
                     return Err(anyhow::anyhow!(stream_error.to_string()));
                 }

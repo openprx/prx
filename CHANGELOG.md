@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.67] - 2026-08-31
+
+### Fixed
+
+- Prevented healthy OpenAI-compatible SSE generations from being terminated by
+  the non-streaming two-minute whole-response timeout.
+- Prevented Chat and Agent streaming paths from replaying a request after any
+  text, reasoning, or tool-call output has already been emitted.
+
 ## [0.8.20] - 2026-07-26
 
 ### Added

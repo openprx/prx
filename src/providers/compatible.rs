@@ -62,9 +62,8 @@ impl OpenAiCompatibleProvider {
         self.requires_http1_only()
     }
 
-    fn http_client_builder(&self) -> reqwest::ClientBuilder {
+    fn base_http_client_builder(&self) -> reqwest::ClientBuilder {
         let builder = Client::builder()
-            .timeout(std::time::Duration::from_mins(2))
             .connect_timeout(std::time::Duration::from_secs(10))
             .user_agent("OpenPRX/0.1");
         let builder = if self.requires_http1_only() {
@@ -74,6 +73,19 @@ impl OpenAiCompatibleProvider {
         };
 
         crate::config::apply_runtime_proxy_to_builder(builder, "provider.compatible")
+    }
+
+    fn http_client_builder(&self) -> reqwest::ClientBuilder {
+        self.base_http_client_builder()
+            .timeout(std::time::Duration::from_mins(2))
+    }
+
+    /// Streaming responses may legitimately run for many minutes. A reqwest
+    /// client-level timeout covers the entire response body, not just the
+    /// connection handshake, so applying the non-streaming two-minute limit
+    /// here truncates healthy SSE streams while tokens are still arriving.
+    fn streaming_http_client_builder(&self) -> reqwest::ClientBuilder {
+        self.base_http_client_builder()
     }
 
     pub fn new(name: &str, base_url: &str, credential: Option<&str>, auth_style: AuthStyle) -> Self {
@@ -164,13 +176,21 @@ impl OpenAiCompatibleProvider {
     }
 
     fn http_client(&self) -> Client {
+        self.build_http_client(self.http_client_builder())
+    }
+
+    fn streaming_http_client(&self) -> Client {
+        self.build_http_client(self.streaming_http_client_builder())
+    }
+
+    fn build_http_client(&self, builder: reqwest::ClientBuilder) -> Client {
         if let Some(ua) = self.user_agent.as_deref() {
             let mut headers = HeaderMap::new();
             if let Ok(value) = HeaderValue::from_str(ua) {
                 headers.insert(USER_AGENT, value);
             }
 
-            let builder = self.http_client_builder().default_headers(headers);
+            let builder = builder.default_headers(headers);
 
             return builder
                 .build()
@@ -181,7 +201,7 @@ impl OpenAiCompatibleProvider {
                 .unwrap_or_else(|_| Client::new());
         }
 
-        self.http_client_builder()
+        builder
             .build()
             .map_err(|error| {
                 tracing::error!("proxy build failed for provider.compatible, using direct: {error}");
@@ -2181,7 +2201,7 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let url = self.chat_completions_url();
-        let client = self.http_client();
+        let client = self.streaming_http_client();
         let auth_header = self.auth_header.clone();
         let provider_name = self.name.clone();
 
@@ -2281,7 +2301,7 @@ impl Provider for OpenAiCompatibleProvider {
         let count_tokens = options.count_tokens;
         let request = self.build_streaming_history_request(messages, model, temperature, options);
         let url = self.chat_completions_url();
-        let client = self.http_client();
+        let client = self.streaming_http_client();
         let auth_header = self.auth_header.clone();
         let provider_name = self.name.clone();
 
