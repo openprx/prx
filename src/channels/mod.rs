@@ -5000,6 +5000,35 @@ async fn maybe_restart_managed_daemon_service() -> Result<bool> {
     Ok(false)
 }
 
+/// Return the configured state of every real-time channel supported by this build.
+///
+/// CLI diagnostics share this list so newly added channels cannot disappear from
+/// one status command while remaining visible in another.
+pub fn channel_configuration_statuses(config: &Config) -> Vec<(&'static str, bool)> {
+    vec![
+        ("Telegram", config.channels_config.telegram.is_some()),
+        ("Discord", config.channels_config.discord.is_some()),
+        ("Slack", config.channels_config.slack.is_some()),
+        ("Mattermost", config.channels_config.mattermost.is_some()),
+        ("Webhook", config.channels_config.webhook.is_some()),
+        ("iMessage", config.channels_config.imessage.is_some()),
+        (
+            "Matrix",
+            cfg!(feature = "channel-matrix") && config.channels_config.matrix.is_some(),
+        ),
+        ("Signal", config.channels_config.signal.is_some()),
+        ("WhatsApp", config.channels_config.whatsapp.is_some()),
+        ("Wacli", config.channels_config.wacli.is_some()),
+        ("Linq", config.channels_config.linq.is_some()),
+        ("Nextcloud Talk", config.channels_config.nextcloud_talk.is_some()),
+        ("Email", config.channels_config.email.is_some()),
+        ("IRC", config.channels_config.irc.is_some()),
+        ("Lark", config.channels_config.lark.is_some()),
+        ("DingTalk", config.channels_config.dingtalk.is_some()),
+        ("QQ", config.channels_config.qq.is_some()),
+    ]
+}
+
 pub async fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
     match command {
         crate::ChannelCommands::Start => {
@@ -5011,27 +5040,7 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
         crate::ChannelCommands::List => {
             println!("Channels:");
             println!("  ✅ CLI (always available)");
-            for (name, configured) in [
-                ("Telegram", config.channels_config.telegram.is_some()),
-                ("Discord", config.channels_config.discord.is_some()),
-                ("Slack", config.channels_config.slack.is_some()),
-                ("Mattermost", config.channels_config.mattermost.is_some()),
-                ("Webhook", config.channels_config.webhook.is_some()),
-                ("iMessage", config.channels_config.imessage.is_some()),
-                (
-                    "Matrix",
-                    cfg!(feature = "channel-matrix") && config.channels_config.matrix.is_some(),
-                ),
-                ("Signal", config.channels_config.signal.is_some()),
-                ("WhatsApp", config.channels_config.whatsapp.is_some()),
-                ("Linq", config.channels_config.linq.is_some()),
-                ("Nextcloud Talk", config.channels_config.nextcloud_talk.is_some()),
-                ("Email", config.channels_config.email.is_some()),
-                ("IRC", config.channels_config.irc.is_some()),
-                ("Lark", config.channels_config.lark.is_some()),
-                ("DingTalk", config.channels_config.dingtalk.is_some()),
-                ("QQ", config.channels_config.qq.is_some()),
-            ] {
+            for (name, configured) in channel_configuration_statuses(config) {
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
             }
             if !cfg!(feature = "channel-matrix") {
@@ -5240,6 +5249,25 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 );
             }
         }
+    }
+
+    if let Some(ref wc) = config.channels_config.wacli {
+        channels.push((
+            "Wacli",
+            Arc::new(WacliChannel::new(wacli::WacliChannelConfig {
+                webhook_listen: wc.webhook_listen.clone(),
+                webhook_path: wc.webhook_path.clone(),
+                webhook_secret: wc.webhook_secret.clone(),
+                allow_unsigned_loopback: wc.allow_unsigned_loopback,
+                allowed_from: wc.allowed_from.clone(),
+                cli_path: wc.cli_path.clone(),
+                store_dir: wc.store_dir.clone(),
+                bot_jid: wc.bot_jid.clone(),
+                bot_number: wc.bot_number.clone(),
+                bot_lid: wc.bot_lid.clone(),
+                outbound_media_workspace_only: wc.outbound_media_workspace_only,
+            })),
+        ));
     }
 
     if let Some(ref lq) = config.channels_config.linq {
@@ -6202,6 +6230,19 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tempfile::TempDir;
+
+    #[test]
+    fn channel_configuration_statuses_include_wacli() {
+        let mut config = Config::default();
+        config.channels_config.wacli = Some(crate::config::WacliConfig::default());
+
+        let statuses = channel_configuration_statuses(&config);
+
+        assert_eq!(
+            statuses.iter().find(|(name, _)| *name == "Wacli"),
+            Some(&("Wacli", true))
+        );
+    }
 
     fn smart_test_msg(sender: &str, reply_target: &str) -> traits::ChannelMessage {
         traits::ChannelMessage {

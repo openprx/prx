@@ -736,13 +736,13 @@ Examples:
     /// List supported AI providers
     Providers,
 
-    /// Manage channels (telegram, discord, slack)
+    /// Manage channels (telegram, discord, slack, wacli)
     #[command(long_about = "\
 Manage communication channels.
 
 Add, remove, list, and health-check channels that connect OpenPRX \
 to messaging platforms. Supported channel types: telegram, discord, \
-slack, whatsapp, matrix, imessage, email.
+slack, whatsapp, wacli, matrix, imessage, email.
 
 Examples:
   prx channel list
