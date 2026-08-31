@@ -37,3 +37,7 @@ pdk/rust/examples/voice-talk-realtime/target/
 # Chat session exports (E2E test artifacts — never commit)
 prx_chat_*.md
 .claude/
+
+# Local collaboration handoff artifacts
+/collab-inbox/
+/collab-outbox/

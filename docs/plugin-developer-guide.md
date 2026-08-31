@@ -1465,9 +1465,8 @@ KV storage is backed by PRX's persistent store. If PRX is configured in ephemera
 ## Further Reading
 
 - [Host Function Reference](host-function-reference.md) — detailed API reference with WIT signatures
-- [WASM Plugin Specification](wasm-plugin-spec.md) — architecture and design decisions
+- [Plugin Runtime Lifecycle](plugin-runtime-lifecycle.md) — runtime architecture and lifecycle guarantees
 - [Rust PDK](../pdk/rust/README.md) — Rust plugin development
 - [Python PDK](../pdk/python/README.md) — Python plugin development
 - [JavaScript PDK](../pdk/javascript/README.md) — TypeScript/JavaScript plugin development
 - [Go PDK](../pdk/go/README.md) — Go/TinyGo plugin development
-- [P5 Implementation Plan](P5-implementation-plan.md) — what was built in each phase
