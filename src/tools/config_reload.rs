@@ -269,7 +269,7 @@ default_temperature = 0.7
             config_d.join("agent.toml"),
             r#"
 [agent]
-max_history_messages = 123
+priority_scheduling_enabled = true
 "#,
         )
         .await
@@ -278,7 +278,7 @@ max_history_messages = 123
         let mut cfg = Config::default();
         cfg.config_path = config_path;
         cfg.workspace_dir = tmpdir.path().join("workspace");
-        cfg.agent.max_history_messages = 50;
+        cfg.agent.priority_scheduling_enabled = false;
         tokio::fs::create_dir_all(&cfg.workspace_dir).await.unwrap();
 
         let shared = new_shared(cfg);
@@ -295,6 +295,6 @@ max_history_messages = 123
         );
 
         let updated = shared.load_full();
-        assert_eq!(updated.agent.max_history_messages, 123);
+        assert!(updated.agent.priority_scheduling_enabled);
     }
 }

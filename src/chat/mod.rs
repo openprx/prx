@@ -116,9 +116,6 @@ use tracing::info;
 /// Window (ms) for double Ctrl+C to trigger exit.
 const DOUBLE_CTRLC_WINDOW_MS: u64 = 500;
 
-/// Max retries on context window overflow (compact history + retry).
-const MAX_CONTEXT_OVERFLOW_RETRIES: usize = 2;
-
 /// Keep last N non-system messages during history compaction.
 const COMPACT_KEEP_MESSAGES: usize = 8;
 
@@ -725,7 +722,7 @@ fn refresh_context_budget_for_tui(
     );
 }
 
-async fn build_chat_compaction_patch_with_timeout(
+async fn build_chat_compaction_patch(
     budget_history: &[ChatMessage],
     source_history: &[ChatMessage],
     provider: &dyn Provider,
@@ -733,33 +730,21 @@ async fn build_chat_compaction_patch_with_timeout(
     config: &crate::config::AgentCompactionConfig,
     audit: Option<&DocumentIngestRuntime>,
     trigger: &str,
-    timeout_duration: Duration,
 ) -> Option<crate::agent::loop_::CompactionPatch> {
-    match tokio::time::timeout(
-        timeout_duration,
-        build_configurable_compaction_patch_with_source_history(
-            budget_history,
-            source_history,
-            provider,
-            model,
-            config,
-            audit,
-            trigger,
-        ),
+    match build_configurable_compaction_patch_with_source_history(
+        budget_history,
+        source_history,
+        provider,
+        model,
+        config,
+        audit,
+        trigger,
     )
     .await
     {
-        Ok(Ok(patch)) => patch,
-        Ok(Err(error)) => {
+        Ok(patch) => patch,
+        Err(error) => {
             tracing::warn!(%error, trigger, "chat summary compaction failed; falling back to deterministic trim");
-            None
-        }
-        Err(_) => {
-            tracing::warn!(
-                ?timeout_duration,
-                trigger,
-                "chat summary compaction timed out; falling back to deterministic trim"
-            );
             None
         }
     }
@@ -2822,7 +2807,7 @@ mod compact_command_tests {
     }
 
     #[tokio::test]
-    async fn configurable_summary_compaction_timeout_returns_none_for_fallback() {
+    async fn slow_summary_compaction_is_awaited_without_wall_clock_timeout() {
         let config = crate::config::AgentCompactionConfig {
             mode: crate::config::AgentCompactionMode::Safeguard,
             reserve_tokens: 0,
@@ -2839,22 +2824,18 @@ mod compact_command_tests {
             ChatMessage::user("recent ".repeat(40)),
         ];
 
-        let patch = build_chat_compaction_patch_with_timeout(
+        let patch = build_chat_compaction_patch(
             &history,
             &history,
             &SlowSummaryProvider,
             "slow-model",
             &config,
             None,
-            "test_timeout",
-            Duration::from_millis(1),
+            "test_slow_summary",
         )
         .await;
 
-        assert!(
-            patch.is_none(),
-            "timeout must let caller fall back to deterministic trim"
-        );
+        assert!(patch.is_some(), "slow summary must be awaited to completion");
     }
 
     #[tokio::test]
@@ -2886,7 +2867,7 @@ mod compact_command_tests {
             ChatMessage::user("[Memory context]\nlatest visible question"),
         ];
 
-        let patch = build_chat_compaction_patch_with_timeout(
+        let patch = build_chat_compaction_patch(
             &enriched_history,
             &persisted_history,
             &ImmediateSummaryProvider,
@@ -2894,7 +2875,6 @@ mod compact_command_tests {
             &config,
             None,
             "test_persisted_guard",
-            Duration::from_secs(1),
         )
         .await
         .expect("budget-overflowing enriched history should produce a persisted-source patch");
@@ -5937,7 +5917,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
             let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
             let turns_before = history.len().saturating_sub(system_count);
             let tokens_before = estimate_chat_history_tokens(&history);
-            if let Some(patch) = build_chat_compaction_patch_with_timeout(
+            if let Some(patch) = build_chat_compaction_patch(
                 &history,
                 &compact_source_history,
                 provider.as_ref(),
@@ -5945,7 +5925,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 &compact_context.config,
                 None,
                 "chat_manual_compact",
-                Duration::from_secs(crate::agent::loop_::COMPACTION_TIMEOUT_SECS),
             )
             .await
             {
@@ -7395,12 +7374,11 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // ── Retry loop (context overflow recovery) ──
         //
         // Mirrors the retry strategy in channels/mod.rs process_channel_message:
-        //  - Context overflow: compact history, retry up to MAX_CONTEXT_OVERFLOW_RETRIES
+        //  - Context overflow: compact history and retry while compaction makes progress
         //
         // There is deliberately no wall-clock budget around the turn. A chat turn
         // ends when it finishes, when the user cancels it, or when the stall
         // detector in `crate::agent::idle` finds it has stopped making progress.
-        let mut context_overflow_retries = 0usize;
         #[cfg(feature = "terminal-tui")]
         let mut history_len_before_tools;
 
@@ -8078,7 +8056,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
             let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
             let turns_before = history.len().saturating_sub(system_count);
             let tokens_before = estimate_chat_history_tokens(&history);
-            if let Some(patch) = build_chat_compaction_patch_with_timeout(
+            if let Some(patch) = build_chat_compaction_patch(
                 &history,
                 &persisted_history_for_turn,
                 provider.as_ref(),
@@ -8086,7 +8064,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 &effective_compaction.config,
                 memory_runtime.ingest(),
                 "chat_preflight",
-                Duration::from_secs(crate::agent::loop_::COMPACTION_TIMEOUT_SECS),
             )
             .await
             {
@@ -8206,7 +8183,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         .len()
                         .saturating_sub(usize::from(history.first().is_some_and(|m| m.role == "system")));
                     let tokens_before = estimate_chat_history_tokens(&history);
-                    if let Some(patch) = build_chat_compaction_patch_with_timeout(
+                    if let Some(patch) = build_chat_compaction_patch(
                         &history,
                         &persisted_history_for_turn,
                         provider.as_ref(),
@@ -8214,7 +8191,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         &effective_compaction.config,
                         memory_runtime.ingest(),
                         "chat_context_overflow",
-                        Duration::from_secs(crate::agent::loop_::COMPACTION_TIMEOUT_SECS),
                     )
                     .await
                     {
@@ -8265,24 +8241,22 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     );
                     surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &compact_msg);
                     let compacted_chars: usize = history.iter().map(|m| m.content.chars().count()).sum();
+                    let made_progress = turns_after < turns_before || tokens_after < tokens_before;
                     tracing::warn!(
-                        retries = context_overflow_retries,
                         compacted_chars,
+                        made_progress,
                         "Context window overflow, history compacted"
                     );
 
-                    if context_overflow_retries < MAX_CONTEXT_OVERFLOW_RETRIES {
-                        context_overflow_retries += 1;
+                    if made_progress {
                         continue;
                     }
-                    // Exhausted overflow retries
+                    // A minimal history that still overflows cannot be repaired
+                    // by repeating the same operation.
                     if let Some(ref d_id) = draft_id {
                         let _ = terminal.cancel_draft("user", d_id).await;
                     }
-                    eprintln!(
-                        "\nError: context window exceeded after {} compaction retries\n",
-                        MAX_CONTEXT_OVERFLOW_RETRIES
-                    );
+                    eprintln!("\nError: context window exceeded and compaction made no progress: {e}\n");
                     if plain_mode {
                         plain_mode_turn_failed = true;
                     }
@@ -8291,13 +8265,13 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         hooks
                             .emit(
                                 HookEvent::Error,
-                                payload_error("chat-turn", "context-overflow-exhausted"),
+                                payload_error("chat-turn", "context-overflow-no-progress"),
                             )
                             .await;
                     }
-                    // S2-A: compaction retries exhausted — non-retryable.
+                    // No-progress overflow is non-retryable.
                     break TurnOutcome::FailedWithError {
-                        err: "context-overflow-exhausted".to_string(),
+                        err: "context-overflow-no-progress".to_string(),
                         retryable: false,
                     };
                 }
@@ -8399,7 +8373,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 }
                 // FIX-P1-15 (#27): the success path below records a
                 // `ProviderExecutionOutcome` + control-ladder trace, but a
-                // failed turn (timeout / context-overflow-exhausted / provider
+                // failed turn (timeout / context-overflow-no-progress / provider
                 // error) used to `continue` without emitting any provider
                 // outcome, leaving the routing/provider timeline blind to
                 // failed turns. Record a `failed_for_decision` outcome here so

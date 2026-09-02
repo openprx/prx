@@ -1616,7 +1616,7 @@ fn stream_error_is_network_timeout(err: &crate::providers::traits::StreamError) 
 
 /// **S3 T3-1**: 识别 context overflow / context_length_exceeded 类错误.
 ///
-/// 命中 → driver 触发一次 history compaction + 单次重试。判定走 `StreamError::Provider`
+/// 命中 → driver 压缩 history，并在每次压缩有进展时继续重试。判定走 `StreamError::Provider`
 /// 的 message 子串匹配（OpenAI 返回 "maximum context length"、Anthropic 返回
 /// "prompt is too long"、Gemini 返回 "input token count" 等）。
 ///
@@ -1761,8 +1761,6 @@ struct ResolvedToolCall {
 
 /// **S3 T3-1**: 网络瞬时故障 backoff retry 上限（次）.
 const MAX_NETWORK_RETRIES: u8 = 3;
-/// **S3 T3-1**: context overflow 自动 compact + retry 上限（仅 1 次防无限循环）.
-const MAX_CONTEXT_OVERFLOW_RETRIES: u8 = 1;
 /// **S3 T3-1**: backoff 起步 sleep（毫秒，第 1 次重试前 sleep 500ms，第 2 次 1s，第 3 次 2s）.
 const BACKOFF_BASE_MS: u64 = 500;
 
@@ -1779,7 +1777,7 @@ enum StreamPassOutcome {
     },
     /// 网络瞬时错误（可走 backoff retry，不消耗 iteration 配额）.
     TransientNetworkError { err: String },
-    /// context overflow（可走 compact + retry 一次）.
+    /// context overflow（可走 compact + progress-based retry）.
     ContextOverflow { err: String },
     /// 非可重试的硬错误 — driver 终止并发 StreamFailed.
     HardError { err: String, retryable: bool },
@@ -1836,32 +1834,21 @@ async fn apply_redux_summary_compaction(
         return Ok(None);
     }
 
-    let patch = match tokio::time::timeout(
-        std::time::Duration::from_secs(crate::agent::loop_::COMPACTION_TIMEOUT_SECS),
-        crate::agent::loop_::build_configurable_compaction_patch_with_source_history(
-            history,
-            compaction_guard_history,
-            provider,
-            model,
-            config,
-            None,
-            trigger,
-        ),
+    let patch = match crate::agent::loop_::build_configurable_compaction_patch_with_source_history(
+        history,
+        compaction_guard_history,
+        provider,
+        model,
+        config,
+        None,
+        trigger,
     )
     .await
     {
-        Ok(Ok(Some(patch))) => patch,
-        Ok(Ok(None)) => return Ok(None),
-        Ok(Err(error)) => {
+        Ok(Some(patch)) => patch,
+        Ok(None) => return Ok(None),
+        Err(error) => {
             tracing::warn!(error = %error, trigger, "redux driver summary compaction failed; falling back to trim");
-            return Ok(None);
-        }
-        Err(_) => {
-            tracing::warn!(
-                timeout_secs = crate::agent::loop_::COMPACTION_TIMEOUT_SECS,
-                trigger,
-                "redux driver summary compaction timed out; falling back to trim"
-            );
             return Ok(None);
         }
     };
@@ -2458,7 +2445,6 @@ async fn drive_start_turn_stream_legacy(
     let mut accumulated = String::new();
     let mut reasoning_buf = String::new();
     let mut usage_accumulator = ProviderUsageAccumulator::new();
-    let mut overflow_retries: u8 = 0;
     let mut last_compaction_feedback: Option<String> = None;
     let mut last_injection_overbudget_feedback: Option<String> = None;
     // 已经执行过的 tool_call_id（防 context overflow 重试后重复执行同一工具）.
@@ -2592,18 +2578,8 @@ async fn drive_start_turn_stream_legacy(
                 break 'outer;
             }
             StreamPassOutcome::ContextOverflow { err } => {
-                if overflow_retries >= MAX_CONTEXT_OVERFLOW_RETRIES {
-                    let action = Action::StreamFailed {
-                        draft_id: draft_id.clone(),
-                        err: format!("context overflow after {MAX_CONTEXT_OVERFLOW_RETRIES} retry: {err}"),
-                        retryable: false,
-                    };
-                    if let Err(e) = action_tx.send(action).await {
-                        tracing::debug!(error = %e, "StartTurn: action_tx closed on overflow-exhausted");
-                    }
-                    return;
-                }
-                overflow_retries = overflow_retries.saturating_add(1);
+                let turns_before_compaction = chat_history_turn_count(&history);
+                let tokens_before_compaction = super::estimate_chat_history_tokens(&history);
                 let compaction_feedback_before = compaction_config.as_ref().map(|config| {
                     (
                         chat_history_turn_count(&history),
@@ -2687,6 +2663,19 @@ async fn drive_start_turn_stream_legacy(
                     {
                         return;
                     }
+                }
+                let made_progress = chat_history_turn_count(&history) < turns_before_compaction
+                    || super::estimate_chat_history_tokens(&history) < tokens_before_compaction;
+                if !made_progress {
+                    let action = Action::StreamFailed {
+                        draft_id: draft_id.clone(),
+                        err: format!("context overflow and compaction made no progress: {err}"),
+                        retryable: false,
+                    };
+                    if let Err(e) = action_tx.send(action).await {
+                        tracing::debug!(error = %e, "StartTurn: action_tx closed on overflow-no-progress");
+                    }
+                    return;
                 }
                 continue 'outer;
             }
@@ -8490,7 +8479,7 @@ mod real_mode_tests {
         assert_eq!(call_id, Some("call-ping"));
     }
 
-    /// **S3 T3-1 Step 3**: context overflow → 自动 compact + 单次重试 → success.
+    /// **S3 T3-1 Step 3**: context overflow → 自动 compact + 有进展重试 → success.
     ///
     /// Provider 第 1 次发 StreamError::Provider("maximum context length exceeded")，
     /// 第 2 次成功完成。driver 应：emit HistoryCompacted{ContextOverflow} → 再调
@@ -8563,10 +8552,12 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 provider_turn_task_id: None,
                 draft_id: "draft-overflow".into(),
-                history: vec![crate::providers::traits::ChatMessage {
-                    role: "user".into(),
-                    content: "hello".into(),
-                }],
+                history: (0..30)
+                    .map(|index| crate::providers::traits::ChatMessage {
+                        role: "user".into(),
+                        content: format!("history turn {index}"),
+                    })
+                    .collect(),
                 compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
@@ -10063,7 +10054,7 @@ mod real_mode_tests {
         assert_eq!(
             summary_calls.load(AtomicOrdering::SeqCst),
             2,
-            "Safeguard mode may retry once, but must not issue unbounded summary calls"
+            "Safeguard mode must stop requesting summaries once compaction cannot progress"
         );
         assert!(
             first_tokens.load(AtomicOrdering::SeqCst) <= 110,
@@ -10156,7 +10147,7 @@ mod real_mode_tests {
             reserve_tokens: 10,
             keep_recent_messages: 2,
             memory_flush: false,
-            max_context_tokens: 400,
+            max_context_tokens: 2_500,
             max_context_tokens_explicit: true,
             ..crate::config::AgentCompactionConfig::default()
         };
@@ -10206,9 +10197,9 @@ mod real_mode_tests {
                     max_context_tokens: Some(max),
                 } => {
                     saw_context_update = true;
-                    assert_eq!(max, 400);
+                    assert_eq!(max, 2_500);
                     assert!(
-                        used <= 390,
+                        used <= 2_490,
                         "overflow context window update should use compacted history: {used}"
                     );
                 }
@@ -10241,7 +10232,7 @@ mod real_mode_tests {
         assert_eq!(
             stream_calls.load(AtomicOrdering::SeqCst),
             2,
-            "overflow retry must perform exactly one retry"
+            "this fixture should recover on its first progress-making retry"
         );
         let retry = retry_history.lock().clone().expect("retry history");
         assert!(

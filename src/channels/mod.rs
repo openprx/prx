@@ -1285,6 +1285,11 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, key: &ConversationKey) ->
     if canonical_turns.is_empty() {
         return false;
     }
+    let before_len = canonical_turns.len();
+    let before_chars = canonical_turns
+        .iter()
+        .map(|turn| turn.content.chars().count())
+        .sum::<usize>();
 
     let keep_from = canonical_turns
         .len()
@@ -1320,11 +1325,13 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, key: &ConversationKey) ->
     // entry is never removed or rewritten.
     if compacted.is_empty() {
         histories.remove(&key.canonical);
-        return false;
+        return true;
     }
 
+    let after_len = compacted.len();
+    let after_chars = compacted.iter().map(|turn| turn.content.chars().count()).sum::<usize>();
     histories.insert(key.canonical.clone(), compacted);
-    true
+    after_len < before_len || after_chars < before_chars
 }
 
 /// Resolve the inbound gate for this message. Production always uses the
@@ -3693,8 +3700,6 @@ async fn run_channel_turn(
         ContextOverflowExhausted,
     }
 
-    const MAX_CONTEXT_OVERFLOW_RETRIES: usize = 2;
-
     let scope_owner_id = runtime_envelope.resolved_owner_id();
     // Borrow the policy derived from this message's pinned ConfigGeneration for
     // the entire tool-call loop.
@@ -3730,7 +3735,6 @@ async fn run_channel_turn(
         )
     });
 
-    let mut context_overflow_retries = 0usize;
     // No wall clock wraps this loop. A turn runs for as long as it keeps
     // working; the only automatic end is the stall detector inside
     // `run_tool_call_loop_outcome` (see `crate::agent::idle`), and the only
@@ -3831,8 +3835,7 @@ async fn run_channel_turn(
                             compacted_chars
                         );
 
-                        if context_overflow_retries < MAX_CONTEXT_OVERFLOW_RETRIES {
-                            context_overflow_retries += 1;
+                        if compacted {
                             // Restart the draft accumulator for the retried
                             // attempt. The accumulator used to live for the whole
                             // turn, so a retry's deltas were appended to the
@@ -8251,6 +8254,20 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    fn seed_channel_history_for_overflow_progress(ctx: &ChannelRuntimeContext, message: &traits::ChannelMessage) {
+        let key = ConversationKey::from_message(message);
+        let turns = (0..20)
+            .map(|index| {
+                if index % 2 == 0 {
+                    ChatMessage::user(format!("older user turn {index}"))
+                } else {
+                    ChatMessage::assistant(format!("older assistant turn {index}"))
+                }
+            })
+            .collect();
+        ctx.conversation_histories.lock().insert(key.canonical, turns);
+    }
+
     /// A replayed channel turn must re-ask the model without re-running the
     /// tools the aborted attempt already executed.
     #[tokio::test]
@@ -8317,27 +8334,24 @@ BTC is currently around $65,000 based on latest tool output."#
             test_inbound_authorizer: None,
         });
 
-        process_channel_message(
-            Arc::clone(&runtime_ctx),
-            traits::ChannelMessage {
-                id: "msg-replay-1".to_string(),
-                sender: "alice".to_string(),
-                reply_target: "chat-replay".to_string(),
-                content: "Append one line please".to_string(),
-                channel: "test-channel".to_string(),
-                timestamp: 1,
-                thread_ts: None,
-                chat_kind: crate::channels::traits::ChatKind::Dm,
-                chat_title: None,
-                sender_display: None,
-                mentioned_uuids: vec![],
-                mentioned: false,
-                is_group_hint: false,
-                sender_is_bot: false,
-            },
-            CancellationToken::new(),
-        )
-        .await;
+        let message = traits::ChannelMessage {
+            id: "msg-replay-1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-replay".to_string(),
+            content: "Append one line please".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
+            mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
+            sender_is_bot: false,
+        };
+        seed_channel_history_for_overflow_progress(runtime_ctx.as_ref(), &message);
+        process_channel_message(Arc::clone(&runtime_ctx), message, CancellationToken::new()).await;
 
         let evidence = provider.saw_tool_evidence.lock().clone();
         assert!(
@@ -8978,12 +8992,9 @@ BTC is currently around $65,000 based on latest tool output."#
             Arc::clone(&channel_impl) as Arc<dyn Channel>,
         );
 
-        process_channel_message(
-            ctx,
-            evidence_message("msg-batch-replay-1", "append both lines please"),
-            CancellationToken::new(),
-        )
-        .await;
+        let message = evidence_message("msg-batch-replay-1", "append both lines please");
+        seed_channel_history_for_overflow_progress(ctx.as_ref(), &message);
+        process_channel_message(ctx, message, CancellationToken::new()).await;
 
         let evidence = provider.saw_tool_evidence.lock().clone();
         assert!(

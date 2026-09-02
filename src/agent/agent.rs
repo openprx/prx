@@ -33,7 +33,7 @@ pub struct Agent {
     prompt_builder: SystemPromptBuilder,
     tool_dispatcher: Box<dyn ToolDispatcher>,
     memory_loader: Box<dyn MemoryLoader>,
-    config: crate::config::AgentConfig,
+    _config: crate::config::AgentConfig,
     model_name: String,
     temperature: f64,
     workspace_dir: std::path::PathBuf,
@@ -241,7 +241,7 @@ impl AgentBuilder {
             memory_loader: self
                 .memory_loader
                 .unwrap_or_else(|| Box::new(DefaultMemoryLoader::default())),
-            config: self.config.unwrap_or_default(),
+            _config: self.config.unwrap_or_default(),
             model_name: self
                 .model_name
                 .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into()),
@@ -281,33 +281,6 @@ impl Agent {
         if let Err(error) = append_control_ladder_trace(&self.workspace_dir, trace) {
             tracing::warn!("failed to append control ladder trace: {error}");
         }
-    }
-
-    fn trim_history(&mut self) {
-        let max = self.config.max_history_messages;
-        if self.history.len() <= max {
-            return;
-        }
-
-        let mut system_messages = Vec::new();
-        let mut other_messages = Vec::new();
-
-        for msg in self.history.drain(..) {
-            match &msg {
-                ConversationMessage::Chat(chat) if chat.role == "system" => {
-                    system_messages.push(msg);
-                }
-                _ => other_messages.push(msg),
-            }
-        }
-
-        if other_messages.len() > max {
-            let drop_count = other_messages.len() - max;
-            other_messages.drain(0..drop_count);
-        }
-
-        self.history = system_messages;
-        self.history.extend(other_messages);
     }
 
     fn build_system_prompt(&self) -> Result<String> {
@@ -853,11 +826,8 @@ impl Agent {
 
         self.append_control_ladder_trace(&control_ladder_trace);
 
-        // FIX-P1-12: bounded counter for context-overflow compaction retries on
-        // the direct `Agent::turn` tool-loop path (see the provider-error arm
-        // below). Shared across loop iterations so a runaway model cannot spin
-        // forever on repeated overflows.
-        let mut turn_overflow_retries = 0usize;
+        // Context-overflow retries on this direct path are progress-based: each
+        // retry must remove history, so a minimal history cannot spin forever.
         loop {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
             for tool in &self.tools {
@@ -923,21 +893,12 @@ impl Agent {
                     // routes provider errors through the shared overflow detector
                     // (`recovery::overflow::is_context_overflow_error`): a context
                     // overflow compacts the oldest non-system turns out of
-                    // `self.history` and retries the loop iteration
-                    // (compaction-then-retry), bounded by MAX_TURN_OVERFLOW_RETRIES.
-                    // Non-overflow errors, an already-minimal history, or an
-                    // exhausted budget propagate unchanged.
-                    const MAX_TURN_OVERFLOW_RETRIES: usize = 3;
+                    // `self.history` and retries while compaction makes progress.
+                    // Non-overflow errors or an already-minimal history propagate.
                     if crate::recovery::overflow::is_context_overflow_error(&err)
-                        && turn_overflow_retries < MAX_TURN_OVERFLOW_RETRIES
                         && Self::compact_conversation_history(&mut self.history, 2) > 0
                     {
-                        turn_overflow_retries += 1;
-                        tracing::warn!(
-                            attempt = turn_overflow_retries,
-                            max = MAX_TURN_OVERFLOW_RETRIES,
-                            "agent.turn: context overflow, compacted history and retrying"
-                        );
+                        tracing::warn!("agent.turn: context overflow, compacted history and retrying");
                         continue;
                     }
                     #[cfg(feature = "llm-router")]
@@ -1063,7 +1024,6 @@ impl Agent {
 
                 self.history
                     .push(ConversationMessage::Chat(ChatMessage::assistant(final_text.clone())));
-                self.trim_history();
 
                 // Note: assistant responses are intentionally NOT auto-saved here.
                 // Only user messages are persisted via auto_save to avoid storing
@@ -1134,7 +1094,6 @@ impl Agent {
             let results = self.execute_tools(&calls).await;
             let formatted = self.tool_dispatcher.format_results(&results);
             self.history.push(formatted);
-            self.trim_history();
         }
     }
 

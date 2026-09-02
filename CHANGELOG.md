@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.78] - 2 September 2026
+
+### Fixed
+
+- Removed the five-minute wall-clock timeout from summary compaction. Slow
+  local inference is now awaited and falls back to deterministic trimming only
+  on a real provider error.
+- Removed fixed context-overflow retry counts from Agent, Chat, Redux TUI and
+  channel execution paths. Retries now continue while compaction measurably
+  reduces history and stop only when no further progress is possible.
+- Removed the hidden 1,000-message mid-turn trim and retired
+  `agent.max_history_messages`; context retention is now governed by the
+  configured token budget rather than arbitrary message counts.
+- Calculated proactive compaction and OS-paging thresholds consistently from
+  the usable input window after response-token reservation.
+- Identified cl100k token measurements as a proxy instead of reporting them as
+  the active model's real tokenizer.
+
 ## [0.8.77] - 2 September 2026
 
 ### Fixed

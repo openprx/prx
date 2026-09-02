@@ -411,25 +411,12 @@ const MAX_TOOL_RESULT_INLINE_CHARS: usize = 48_000;
 /// 🟡 Behavior-limits Phase 1: raised 2048 -> 4096 (fewer chunks per big output).
 const TOOL_OUTPUT_DOCUMENT_CHUNK_TOKENS: usize = 4_096;
 
-/// Timeout (seconds) for apply_configurable_compaction before falling back to aggressive trim.
-pub(crate) const COMPACTION_TIMEOUT_SECS: u64 = 300;
-
-/// Maximum number of times to retry an LLM call after a context overflow error.
-const MAX_OVERFLOW_RETRIES: usize = 3;
-
 /// Fraction of `max_context_tokens` above which a pre-turn memory flush is triggered.
 pub(crate) const PRE_TURN_FLUSH_THRESHOLD: f64 = 0.85;
 
-/// Safety multiplier used when the real tokenizer is unavailable and the
+/// Safety multiplier used when the cl100k proxy is unavailable and the
 /// fallback char heuristic is the only available measurement.
 const TOKEN_HEURISTIC_BUDGET_MULTIPLIER: usize = 2;
-
-/// Fallback count-based safety net: if history grows beyond this many messages
-/// and no compaction config is available, trim back to `DEFAULT_MAX_HISTORY_MESSAGES`.
-/// 🟡 Behavior-limits Phase 1: raised 200 -> 1000 (5x). With os_paging on by
-/// default, long history is primarily managed by non-destructive paging; this
-/// remains a finite safety net for the no-compaction-config path.
-const HISTORY_SAFETY_NET_LIMIT: usize = 1000;
 
 #[allow(clippy::expect_used)]
 static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -536,10 +523,8 @@ pub(crate) fn redact_sensitive_json_keys(value: &serde_json::Value) -> serde_jso
     }
 }
 
-/// Default trigger for auto-compaction when non-system message count exceeds this threshold.
-/// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
-/// used when callers omit the parameter.
-/// 🟡 Behavior-limits Phase 1: raised 50 -> 300 to match `default_agent_max_history_messages`.
+/// Legacy count-based trimming helpers retained only for their focused tests.
+#[cfg(test)]
 const DEFAULT_MAX_HISTORY_MESSAGES: usize = 300;
 
 /// Keep this many most-recent non-system messages after compaction.
@@ -934,6 +919,7 @@ fn bounded_compaction_projection(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     projected
 }
 
+#[cfg(test)]
 fn apply_compaction_summary(history: &mut Vec<ChatMessage>, start: usize, compact_end: usize, summary: &str) {
     let summary_msg = ChatMessage::assistant(format!("[Compaction summary]\n{}", summary.trim()));
     history.splice(start..compact_end, std::iter::once(summary_msg));
@@ -1002,7 +988,8 @@ fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TokenMeasurementSource {
-    RealTokenizer,
+    /// OpenAI cl100k is a stable local proxy, not the active model's tokenizer.
+    Cl100kProxy,
     Heuristic,
 }
 
@@ -1029,7 +1016,7 @@ fn estimate_history_tokens_with_source(history: &[ChatMessage]) -> TokenMeasurem
     // Per-message framing overhead (role marker, separators) approximated as a
     // small constant added on top of the tokenized role and content.
     const PER_MESSAGE_FRAMING_TOKENS: usize = 3;
-    let mut source = TokenMeasurementSource::RealTokenizer;
+    let mut source = TokenMeasurementSource::Cl100kProxy;
     let tokens = history.iter().fold(0usize, |total, msg| {
         let role = count_tokens_with_source(&msg.role);
         let content = count_tokens_with_source(&msg.content);
@@ -1057,13 +1044,15 @@ pub(crate) fn plan_context_budget(
 ) -> ContextBudgetSnapshot {
     let measured = estimate_history_tokens_with_source(history);
     let used_tokens = match measured.source {
-        TokenMeasurementSource::RealTokenizer => measured.tokens,
+        TokenMeasurementSource::Cl100kProxy => measured.tokens,
         TokenMeasurementSource::Heuristic => measured.tokens.saturating_mul(TOKEN_HEURISTIC_BUDGET_MULTIPLIER),
     };
     let available_input_tokens = config.max_context_tokens.saturating_sub(config.reserve_tokens);
     let warning_ratio = warning_ratio.clamp(0.0, 1.0);
-    let warning_threshold_tokens = ((config.max_context_tokens as f64) * warning_ratio) as usize;
-    let warning_threshold_tokens = warning_threshold_tokens.min(available_input_tokens);
+    // Apply warning ratios to the usable input window. Reserve tokens belong to
+    // the response and must not make a warning threshold exceed the hard input
+    // limit or trigger unexpectedly early on a smaller configured window.
+    let warning_threshold_tokens = ((available_input_tokens as f64) * warning_ratio) as usize;
     ContextBudgetSnapshot {
         used_tokens,
         measured_tokens: measured.tokens,
@@ -1168,7 +1157,7 @@ fn count_tokens_with_source(text: &str) -> TokenMeasurement {
         if let Some(bpe) = ENCODER.as_ref() {
             return TokenMeasurement {
                 tokens: bpe.encode_with_special_tokens(text).len(),
-                source: TokenMeasurementSource::RealTokenizer,
+                source: TokenMeasurementSource::Cl100kProxy,
             };
         }
     }
@@ -1573,7 +1562,12 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     let Some(limit) = compaction_trigger_limit(config) else {
         return Ok(None);
     };
-    if estimate_history_tokens(budget_history) <= limit {
+    // A provider overflow is authoritative even when the cl100k proxy says the
+    // request fits. Force a compaction attempt so tokenizer differences can be
+    // repaired; ordinary preflight compaction still follows the configured
+    // hard input limit.
+    let provider_reported_overflow = trigger.contains("overflow");
+    if !provider_reported_overflow && estimate_history_tokens(budget_history) <= limit {
         return Ok(None);
     }
 
@@ -1809,22 +1803,12 @@ async fn preflight_context_budget_before_provider_call(
 
     let mut replacement_len = None;
     if !matches!(config.mode, crate::config::AgentCompactionMode::Off) {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(COMPACTION_TIMEOUT_SECS),
-            apply_configurable_compaction_with_replacement_len(history, provider, model, config, audit, trigger),
-        )
-        .await
+        match apply_configurable_compaction_with_replacement_len(history, provider, model, config, audit, trigger).await
         {
-            Ok(Ok(applied_replacement_len)) => {
+            Ok(applied_replacement_len) => {
                 replacement_len = applied_replacement_len;
             }
-            Ok(Err(error)) => return Err(error),
-            Err(_) => {
-                tracing::warn!(
-                    "Context budget preflight compaction timed out after {}s; applying token-aware trim",
-                    COMPACTION_TIMEOUT_SECS
-                );
-            }
+            Err(error) => return Err(error),
         }
     }
 
@@ -1879,7 +1863,7 @@ fn build_page_transcript(messages: &[ChatMessage]) -> String {
 
 /// OS-paging eviction (Letta/MemGPT style), FIX-P3-05.
 ///
-/// When the hot window exceeds `eviction_threshold * max_context_tokens`, the
+/// When the hot window exceeds `eviction_threshold * available_input_tokens`, the
 /// oldest non-system messages (beyond `keep_recent_messages`) are evicted to the
 /// durable document store via `Memory::ingest_document`, preserving full content
 /// for later semantic recall. A short breadcrumb replaces them in the hot window.
@@ -1888,8 +1872,6 @@ fn build_page_transcript(messages: &[ChatMessage]) -> String {
 /// the function returns `Ok(false)` (or propagates only on genuinely fatal
 /// errors) so the caller can fall back to legacy compaction without regression.
 ///
-/// This path is only reached when `os_paging.enabled = true`; otherwise the
-/// legacy compaction pipeline runs unchanged.
 async fn apply_os_paging(
     history: &mut Vec<ChatMessage>,
     config: &crate::config::AgentCompactionConfig,
@@ -1899,9 +1881,8 @@ async fn apply_os_paging(
     if config.max_context_tokens == 0 {
         return Ok(false);
     }
-    let threshold_ratio = paging.eviction_threshold.clamp(0.0, 1.0);
-    let threshold = (config.max_context_tokens as f64 * threshold_ratio) as usize;
-    if estimate_history_tokens(history) <= threshold {
+    let budget = plan_context_budget(history, config, paging.eviction_threshold);
+    if !budget.over_warning {
         return Ok(false);
     }
 
@@ -2104,126 +2085,6 @@ fn latest_user_query(history: &[ChatMessage]) -> Option<&str> {
                 && !m.content.starts_with(OS_PAGING_RECALL_MARKER)
         })
         .map(|m| m.content.as_str())
-}
-
-/// Extract key facts from messages about to be compacted and store them in memory.
-/// This prevents permanent loss of important context during auto-compaction.
-/// Failures are soft — compaction must not be blocked by a flush error.
-async fn pre_compaction_flush(
-    messages_to_compact: &[ChatMessage],
-    mem: &dyn Memory,
-    provider: &dyn Provider,
-    model: &str,
-) -> anyhow::Result<()> {
-    // Build a transcript of user/assistant turns only
-    let transcript: String = messages_to_compact
-        .iter()
-        .filter(|m| m.role == "user" || m.role == "assistant")
-        .map(|m| {
-            let end = m.content.len().min(500);
-            let safe_end = m.content.floor_char_boundary(end);
-            let snippet = &m.content[..safe_end];
-            format!("[{}]: {}", m.role, snippet)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    if transcript.trim().is_empty() {
-        return Ok(());
-    }
-
-    let extract_prompt = format!(
-        "Extract key facts, decisions, preferences, and unresolved tasks from this conversation. \
-         Output as a concise bullet list (max 8 items). Only include durable information worth \
-         remembering long-term. If nothing is worth remembering, output 'NONE'.\n\n{transcript}"
-    );
-
-    let extraction = provider
-        .chat_with_system(
-            Some("You extract key facts from conversations for long-term memory storage."),
-            &extract_prompt,
-            model,
-            0.0,
-        )
-        .await;
-
-    if let Ok(text) = extraction {
-        let text = text.trim().to_string();
-        if !text.is_empty() && text.to_uppercase() != "NONE" {
-            let date = chrono::Local::now().format("%Y-%m-%d_%H-%M");
-            let key = format!("compaction_flush_{date}");
-            mem.store(&key, &text, MemoryCategory::Conversation, None).await?;
-            tracing::info!(
-                chars = text.len(),
-                key = %key,
-                "Pre-compaction flush: key facts saved to memory"
-            );
-        }
-    }
-
-    Ok(())
-}
-
-async fn auto_compact_history(
-    history: &mut Vec<ChatMessage>,
-    provider: &dyn Provider,
-    model: &str,
-    max_history: usize,
-    mem: &dyn Memory,
-) -> Result<bool> {
-    let has_system = history.first().map_or(false, |m| m.role == "system");
-    let non_system_count = if has_system {
-        history.len().saturating_sub(1)
-    } else {
-        history.len()
-    };
-
-    if non_system_count <= max_history {
-        return Ok(false);
-    }
-
-    let start = if has_system { 1 } else { 0 };
-    let keep_recent = COMPACTION_KEEP_RECENT_MESSAGES.min(non_system_count);
-    let compact_count = non_system_count.saturating_sub(keep_recent);
-    if compact_count == 0 {
-        return Ok(false);
-    }
-
-    let compact_end = start + compact_count;
-    let source_projection = history
-        .get(start..compact_end)
-        .map(bounded_compaction_projection)
-        .unwrap_or_default();
-    if source_projection.is_empty() {
-        return Ok(false);
-    }
-
-    // Pre-compaction flush: extract and persist key facts before they are lost.
-    pre_compaction_flush(&source_projection, mem, provider, model)
-        .await
-        .ok(); // soft failure — never block compaction
-
-    let transcript = build_compaction_transcript(&source_projection);
-
-    let summarizer_system = "You are a conversation compaction engine. Summarize older chat history into concise context for future turns. Preserve: user preferences, commitments, decisions, unresolved tasks, key facts. Omit: filler, repeated chit-chat, verbose tool logs. Output plain text bullet points only.";
-
-    let summarizer_user = format!(
-        "Summarize the following conversation history for context preservation. Keep it short (max 12 bullet points).\n\n{}",
-        transcript
-    );
-
-    let summary_raw = provider
-        .chat_with_system(Some(summarizer_system), &summarizer_user, model, 0.2)
-        .await
-        .unwrap_or_else(|_| {
-            // Fallback to deterministic local truncation when summarization fails.
-            truncate_with_ellipsis(&transcript, COMPACTION_MAX_SUMMARY_CHARS)
-        });
-
-    let summary = truncate_with_ellipsis(&summary_raw, COMPACTION_MAX_SUMMARY_CHARS);
-    apply_compaction_summary(history, start, compact_end, &summary);
-
-    Ok(true)
 }
 
 /// Build context preamble by searching memory for relevant entries.
@@ -5993,34 +5854,22 @@ async fn run_tool_call_loop_outcome_unguarded(
     // P1-3: Proactive pre-turn memory flush — compact before starting the loop
     // if the context is already above 85% of the token budget.
     if let Some(config) = compaction_config {
-        let token_estimate = estimate_history_tokens(history);
-        let threshold = (config.max_context_tokens as f64 * PRE_TURN_FLUSH_THRESHOLD) as usize;
-        if token_estimate > threshold {
+        let budget = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
+        if budget.over_warning {
             tracing::info!(
-                token_estimate,
-                threshold,
+                token_estimate = budget.used_tokens,
+                threshold = budget.warning_threshold_tokens,
                 "Pre-turn memory flush: context near limit, running pre-emptive compaction"
             );
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(COMPACTION_TIMEOUT_SECS),
-                apply_configurable_compaction(history, provider, model, config, document_ingest.as_ref(), "pre_turn"),
-            )
-            .await
+            if let Err(e) =
+                apply_configurable_compaction(history, provider, model, config, document_ingest.as_ref(), "pre_turn")
+                    .await
             {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => tracing::warn!("Pre-turn compaction failed: {e}"),
-                Err(_) => {
-                    tracing::warn!(
-                        "Pre-turn compaction timed out after {}s, applying aggressive trim",
-                        COMPACTION_TIMEOUT_SECS
-                    );
-                    apply_aggressive_trim(history, config.keep_recent_messages);
-                }
+                tracing::warn!("Pre-turn compaction failed: {e}");
             }
         }
     }
 
-    let mut overflow_retries: usize = 0;
     let mut consecutive_failures: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut unrecoverable_failures: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     let mut tool_summary_retry_attempted = false;
@@ -6275,19 +6124,15 @@ async fn run_tool_call_loop_outcome_unguarded(
             }
         };
 
-        // P0-1: On context overflow, run compaction and retry (up to MAX_OVERFLOW_RETRIES).
+        // On context overflow, compact and retry for as long as each pass makes
+        // measurable progress. This has no arbitrary retry ceiling and cannot
+        // spin forever once history reaches its minimal representation.
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
             match chat_processed {
-                Err(ref e)
-                    if crate::recovery::overflow::is_context_overflow_error(e)
-                        && overflow_retries < MAX_OVERFLOW_RETRIES =>
-                {
-                    overflow_retries += 1;
-                    tracing::warn!(
-                        attempt = overflow_retries,
-                        max = MAX_OVERFLOW_RETRIES,
-                        "Context overflow detected; running compaction and retrying LLM call"
-                    );
+                Err(ref e) if crate::recovery::overflow::is_context_overflow_error(e) => {
+                    let messages_before_compaction = history.len();
+                    let tokens_before_compaction = estimate_history_tokens(history);
+                    tracing::warn!("Context overflow detected; running compaction and retrying LLM call");
                     let mut emitted_exact_patch = false;
                     if let Some(config) = compaction_config {
                         if runtime_adapter.stream_provider {
@@ -6295,20 +6140,17 @@ async fn run_tool_call_loop_outcome_unguarded(
                                 history.first().is_some_and(|message| message.role == "system"),
                             ));
                             let tokens_before = estimate_history_tokens(history);
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(COMPACTION_TIMEOUT_SECS),
-                                build_configurable_compaction_patch(
-                                    history,
-                                    provider,
-                                    model,
-                                    config,
-                                    document_ingest.as_ref(),
-                                    "overflow_retry",
-                                ),
+                            match build_configurable_compaction_patch(
+                                history,
+                                provider,
+                                model,
+                                config,
+                                document_ingest.as_ref(),
+                                "overflow_retry",
                             )
                             .await
                             {
-                                Ok(Ok(Some(patch))) => {
+                                Ok(Some(patch)) => {
                                     let replacement_len = patch.replacement.len();
                                     apply_compaction_patch_exact(history, &patch);
                                     trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
@@ -6337,38 +6179,27 @@ async fn run_tool_call_loop_outcome_unguarded(
                                     .await?;
                                     emitted_exact_patch = true;
                                 }
-                                Ok(Ok(None)) => {
+                                Ok(None) => {
                                     trim_history_to_context_budget(history, config);
                                 }
-                                Ok(Err(error)) => {
+                                Err(error) => {
                                     tracing::warn!("Overflow retry compaction failed: {error}");
-                                    apply_aggressive_trim(history, config.keep_recent_messages);
-                                }
-                                Err(_) => {
-                                    tracing::warn!("Overflow retry compaction timed out, applying aggressive trim");
                                     apply_aggressive_trim(history, config.keep_recent_messages);
                                 }
                             }
                         } else {
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(COMPACTION_TIMEOUT_SECS),
-                                apply_configurable_compaction(
-                                    history,
-                                    provider,
-                                    model,
-                                    config,
-                                    document_ingest.as_ref(),
-                                    "overflow_retry",
-                                ),
+                            if let Err(error) = apply_configurable_compaction(
+                                history,
+                                provider,
+                                model,
+                                config,
+                                document_ingest.as_ref(),
+                                "overflow_retry",
                             )
                             .await
                             {
-                                Ok(Ok(_)) => {}
-                                Ok(Err(error)) => tracing::warn!("Overflow retry compaction failed: {error}"),
-                                Err(_) => {
-                                    tracing::warn!("Overflow retry compaction timed out, applying aggressive trim");
-                                    apply_aggressive_trim(history, config.keep_recent_messages);
-                                }
+                                tracing::warn!("Overflow retry compaction failed: {error}");
+                                apply_aggressive_trim(history, config.keep_recent_messages);
                             }
                         }
                     } else {
@@ -6376,6 +6207,11 @@ async fn run_tool_call_loop_outcome_unguarded(
                     }
                     if !(emitted_exact_patch || runtime_adapter.stream_provider && compaction_config.is_some()) {
                         emit_tool_loop_event(&runtime_adapter, ToolLoopEvent::ContextCompacted).await?;
+                    }
+                    let made_progress = history.len() < messages_before_compaction
+                        || estimate_history_tokens(history) < tokens_before_compaction;
+                    if !made_progress {
+                        anyhow::bail!("context overflow persisted and compaction made no progress: {e}");
                     }
                     continue;
                 }
@@ -6691,16 +6527,6 @@ async fn run_tool_call_loop_outcome_unguarded(
                 tracing::warn!(mid_turn_tokens, mid_turn_limit, "Mid-turn token trim triggered");
                 trim_history_token_aware(history, mid_turn_limit);
             }
-        }
-        // Secondary count-based safety net to catch cases with no compaction config.
-        if history.len() > HISTORY_SAFETY_NET_LIMIT {
-            let before = history.len();
-            trim_history(history, DEFAULT_MAX_HISTORY_MESSAGES);
-            tracing::info!(
-                before,
-                after = history.len(),
-                "Mid-turn count-based safety trim triggered",
-            );
         }
         if let Some(tool_name) = repeated_unrecoverable {
             anyhow::bail!(
@@ -7638,25 +7464,9 @@ pub(crate) async fn run_with_runtime_envelope(
                         history.push(ChatMessage::assistant(approval_msg.clone()));
                         final_output = approval_msg.clone();
                         println!("{approval_msg}\n");
-                        // CTE-REVIEW-3: an AskApproval early-exit still pushes a
-                        // user+assistant pair into the persistent REPL history, so
-                        // run the same auto-compaction + hard trim a normal turn
-                        // completion does. Without this, repeated AskApproval turns
-                        // could grow history unbounded until the next normal turn.
-                        if let Ok(compacted) = auto_compact_history(
-                            &mut history,
-                            provider.as_ref(),
-                            model_name,
-                            config.agent.max_history_messages,
-                            mem.as_ref(),
-                        )
-                        .await
-                        {
-                            if compacted {
-                                println!("🧹 Auto-compaction complete");
-                            }
-                        }
-                        trim_history(&mut history, config.agent.max_history_messages);
+                        // The next provider preflight applies the same token
+                        // budget as every other path; no count-based trim runs
+                        // on this early exit.
                         continue;
                     }
                     crate::causal_tree::BranchLabel::RetrieveThenAnswer => {
@@ -7825,24 +7635,6 @@ pub(crate) async fn run_with_runtime_envelope(
                     }),
                 )
                 .await;
-
-            // Auto-compaction before hard trimming to preserve long-context signal.
-            if let Ok(compacted) = auto_compact_history(
-                &mut history,
-                provider.as_ref(),
-                model_name,
-                config.agent.max_history_messages,
-                mem.as_ref(),
-            )
-            .await
-            {
-                if compacted {
-                    println!("🧹 Auto-compaction complete");
-                }
-            }
-
-            // Hard cap as a safety net.
-            trim_history(&mut history, config.agent.max_history_messages);
         }
     }
 
@@ -13302,7 +13094,7 @@ Let me check the result."#;
 
     #[cfg(feature = "llm-router")]
     #[test]
-    fn plan_context_budget_uses_real_tokenizer_for_hard_budget() {
+    fn plan_context_budget_uses_cl100k_proxy_for_hard_budget() {
         let config = crate::config::AgentCompactionConfig {
             mode: crate::config::AgentCompactionMode::Safeguard,
             reserve_tokens: 1,
@@ -13314,7 +13106,7 @@ Let me check the result."#;
 
         let budget = plan_context_budget(&history, &config, PRE_TURN_FLUSH_THRESHOLD);
 
-        assert_eq!(budget.measurement_source, TokenMeasurementSource::RealTokenizer);
+        assert_eq!(budget.measurement_source, TokenMeasurementSource::Cl100kProxy);
         assert_eq!(count_tokens("tiktoken"), 3);
         assert!(
             budget.measured_tokens >= 7,

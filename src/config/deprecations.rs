@@ -61,6 +61,9 @@ const REASON_NO_TIMEOUT: &str =
 /// Agentic loops now converge through completion, explicit failure, or cancellation.
 const REASON_NO_ITERATION_LIMIT: &str = "prx no longer stops a progressing agent after an arbitrary number of tool rounds; use cancellation or `prx tasks kill` to end it";
 
+/// Conversation retention is governed by the model-aware token budget.
+const REASON_TOKEN_BUDGETED_HISTORY: &str = "prx no longer drops conversation history after an arbitrary message count; retention is governed by the configured context-token budget";
+
 /// The key described an enforcement that never existed.
 const REASON_NEVER_ENFORCED: &str = "this limit was never enforced by any code path and has been removed rather than \
                                      left as a false assurance";
@@ -80,6 +83,11 @@ pub(crate) const DEPRECATED_CONFIG_KEYS: &[DeprecatedKey] = &[
         path: &["agent", "max_tool_iterations"],
         shape: DeprecatedShape::Field,
         reason: REASON_NO_ITERATION_LIMIT,
+    },
+    DeprecatedKey {
+        path: &["agent", "max_history_messages"],
+        shape: DeprecatedShape::Field,
+        reason: REASON_TOKEN_BUDGETED_HISTORY,
     },
     DeprecatedKey {
         path: &["runtime", "idle_hang_max_total_secs"],

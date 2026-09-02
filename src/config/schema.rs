@@ -923,9 +923,6 @@ pub struct AgentConfig {
     /// When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models.
     #[serde(default)]
     pub compact_context: bool,
-    /// Maximum conversation history messages retained per session. Default: `300`.
-    #[serde(default = "default_agent_max_history_messages")]
-    pub max_history_messages: usize,
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
@@ -1025,7 +1022,8 @@ pub enum RetrievalInjectionRole {
 /// Always active; configuration controls its thresholds and recall behavior.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct OsPagingConfig {
-    /// Token capacity ratio (0.0-1.0, relative to `max_context_tokens`) above
+    /// Token capacity ratio (0.0-1.0, relative to the input window after
+    /// subtracting reserved response tokens) above
     /// which eviction is triggered. Letta recommends ~0.70; the legacy
     /// compaction path uses 0.85.
     #[serde(default = "default_os_paging_eviction_threshold")]
@@ -1170,13 +1168,6 @@ impl Default for SelfSystemConfig {
     }
 }
 
-const fn default_agent_max_history_messages() -> usize {
-    // Behavior-limits Phase 1: raised 50 -> 300 so the agent retains more
-    // context. For truly long sessions the recommended path is os_paging
-    // (`[agent.compaction.os_paging] enabled = true`), now on by default.
-    300
-}
-
 fn default_agent_tool_dispatcher() -> String {
     "auto".into()
 }
@@ -1213,7 +1204,6 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             compact_context: false,
-            max_history_messages: default_agent_max_history_messages(),
             tool_dispatcher: default_agent_tool_dispatcher(),
             read_only_tool_concurrency_window: default_read_only_tool_concurrency_window(),
             priority_scheduling_enabled: false,
@@ -7176,8 +7166,6 @@ reasoning_enabled = false
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(!cfg.compact_context);
-        // Behavior-limits Phase 1: raised history default to 300.
-        assert_eq!(cfg.max_history_messages, 300);
         assert_eq!(cfg.tool_dispatcher, "auto");
         assert_eq!(cfg.read_only_tool_concurrency_window, 2);
         assert!(!cfg.priority_scheduling_enabled);
@@ -7262,7 +7250,6 @@ provider = "openrouter"
 default_temperature = 0.7
 [agent]
 compact_context = true
-max_history_messages = 80
 tool_dispatcher = "xml"
 read_only_tool_concurrency_window = 4
 priority_scheduling_enabled = true
@@ -7270,7 +7257,6 @@ low_priority_tools = ["sessions_spawn", "delegate"]
 "#;
         let parsed: Config = toml::from_str(raw).unwrap();
         assert!(parsed.agent.compact_context);
-        assert_eq!(parsed.agent.max_history_messages, 80);
         assert_eq!(parsed.agent.tool_dispatcher, "xml");
         assert_eq!(parsed.agent.read_only_tool_concurrency_window, 4);
         assert!(parsed.agent.priority_scheduling_enabled);

@@ -177,12 +177,6 @@ fn log_diff(old: &Config, fresh: &Config) {
             old.default_temperature, fresh.default_temperature
         ));
     }
-    if old.agent.max_history_messages != fresh.agent.max_history_messages {
-        changes.push(format!(
-            "agent.max_history_messages: {} → {}",
-            old.agent.max_history_messages, fresh.agent.max_history_messages
-        ));
-    }
     if old.agent.read_only_tool_concurrency_window != fresh.agent.read_only_tool_concurrency_window {
         changes.push(format!(
             "agent.read_only_tool_concurrency_window: {} → {}",

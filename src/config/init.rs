@@ -763,10 +763,7 @@ adopt_legacy_tasks = false
 fn agent_template(spec: Spec) -> String {
     match spec {
         Spec::Minimal => r#"# Agent configuration (minimal)
-# Behavior-limits Phase 1: opened defaults (long-task iterations + history).
-
-[agent]
-max_history_messages = 300
+# Context retention follows the model-aware token budget.
 
 # OS-paging (non-destructive history eviction + semantic recall) on by default so
 # the agent "remembers" long conversations instead of hard-dropping old messages.
@@ -779,10 +776,7 @@ max_recalled_pages = 10
 
         Spec::Server => r#"# Agent configuration (server)
 # Orchestration, session spawning, and self-system.
-# Behavior-limits Phase 1: opened defaults.
-
-[agent]
-max_history_messages = 300
+# Context retention follows the model-aware token budget.
 
 [agent.compaction]
 mode = "safeguard"                     # off | safeguard | aggressive
@@ -800,10 +794,7 @@ max_recalled_pages = 10
 
         Spec::Full => r#"# Agent configuration (full)
 # Agent orchestration, sessions, self-system, causal tree, and delegates.
-# Behavior-limits Phase 1: opened defaults.
-
-[agent]
-max_history_messages = 300
+# Context retention follows the model-aware token budget.
 
 # Context compaction to manage long conversations.
 [agent.compaction]

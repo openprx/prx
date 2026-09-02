@@ -560,33 +560,21 @@ async fn turn_propagates_provider_error() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn history_trims_after_max_messages() {
-    let max_history = 6;
+async fn history_is_not_trimmed_by_an_arbitrary_message_count() {
+    let turn_count = 11;
     let mut responses = vec![];
-    for _ in 0..max_history + 5 {
+    for _ in 0..turn_count {
         responses.push(text_response("ok"));
     }
 
     let provider = Box::new(ScriptedProvider::new(responses));
-    let config = AgentConfig {
-        max_history_messages: max_history,
-        ..AgentConfig::default()
-    };
+    let mut agent = build_agent_with_config(provider, vec![], AgentConfig::default());
 
-    let mut agent = build_agent_with_config(provider, vec![], config);
-
-    for i in 0..max_history + 5 {
+    for i in 0..turn_count {
         let _ = agent.turn(&format!("msg {i}")).await.unwrap();
     }
 
-    // System prompt (1) + trimmed messages
-    // Should not exceed max_history + 1 (system prompt)
-    assert!(
-        agent.history().len() <= max_history + 1,
-        "History length {} exceeds max {} + 1 (system)",
-        agent.history().len(),
-        max_history,
-    );
+    assert_eq!(agent.history().len(), turn_count * 2 + 1);
 
     // System prompt should always be preserved
     let first = &agent.history()[0];
