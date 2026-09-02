@@ -3461,6 +3461,17 @@ trait TerminalModeOps {
 
 struct CrosstermTerminalModeOps;
 
+fn chat_keyboard_enhancement_flags() -> crossterm::event::KeyboardEnhancementFlags {
+    // Crossterm 0.29 does not expose kitty's REPORT_ASSOCIATED_TEXT flag.
+    // REPORT_ALL_KEYS_AS_ESCAPE_CODES without associated text causes IME
+    // commits (for example, Chinese input in iTerm2) to lose their text.
+    // Keep ordinary text as UTF-8 while retaining the enhancements needed for
+    // unambiguous shortcuts and key press/release handling.
+    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | crossterm::event::KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+}
+
 impl TerminalModeOps for CrosstermTerminalModeOps {
     fn enable_raw_mode(&mut self) -> std::io::Result<()> {
         crossterm::terminal::enable_raw_mode()
@@ -3475,10 +3486,7 @@ impl TerminalModeOps for CrosstermTerminalModeOps {
     }
 
     fn push_keyboard_enhancement_flags(&mut self) -> std::io::Result<()> {
-        let flags = crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-            | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
-            | crossterm::event::KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-            | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES;
+        let flags = chat_keyboard_enhancement_flags();
         crossterm::execute!(std::io::stdout(), crossterm::event::PushKeyboardEnhancementFlags(flags)).map(|_| ())
     }
 
@@ -16046,6 +16054,20 @@ mod terminal_guard_tests {
             mouse_capture_active: AtomicBool::new(true),
             alternate_screen_active: AtomicBool::new(true),
         }
+    }
+
+    #[test]
+    fn keyboard_enhancements_preserve_plain_utf8_for_ime() {
+        use crossterm::event::KeyboardEnhancementFlags;
+
+        let flags = chat_keyboard_enhancement_flags();
+        assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+        assert!(
+            !flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES),
+            "REPORT_ALL requires associated-text support or IME text is lost"
+        );
     }
 
     #[test]

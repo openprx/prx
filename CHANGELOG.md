@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.74] - 2 September 2026
+
+### Fixed
+
+- Preserved plain UTF-8 text while enabling terminal keyboard enhancements so
+  Chinese and other IME-composed input renders correctly in the full-screen
+  chat composer, including direct iTerm2 and tmux sessions.
+
 ## [0.8.73] - 2 September 2026
 
 ### Fixed
