@@ -6,10 +6,12 @@
 //! persisted in SQLite for crash recovery.
 
 pub(crate) mod builtin;
+mod cli;
 pub mod config;
 pub mod evolution;
 pub(crate) mod runner;
 pub(crate) mod store;
 pub(crate) mod types;
 
+pub use cli::handle_command;
 pub use config::XinConfig;

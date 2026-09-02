@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Task lifecycle: Pending → Running → Completed | Failed | Stale.
+/// Task lifecycle: Pending → Running → Completed | Failed | Stale | Cancelled.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskStatus {
@@ -12,6 +12,7 @@ pub enum TaskStatus {
     Completed,
     Failed,
     Stale,
+    Cancelled,
 }
 
 impl TaskStatus {
@@ -22,6 +23,7 @@ impl TaskStatus {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Stale => "stale",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -31,6 +33,7 @@ impl TaskStatus {
             "completed" => Self::Completed,
             "failed" => Self::Failed,
             "stale" => Self::Stale,
+            "cancelled" => Self::Cancelled,
             _ => Self::Pending,
         }
     }
@@ -214,6 +217,18 @@ pub struct XinTaskEvent {
     pub status: Option<String>,
     pub payload_json: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+/// One persisted execution attempt for a legacy/recurring Xin task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct XinRun {
+    pub id: i64,
+    pub task_id: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub status: String,
+    pub output: Option<String>,
+    pub duration_ms: i64,
 }
 
 /// Goal-level status: the user-visible progress of a multi-step intent.
@@ -432,6 +447,7 @@ mod tests {
             TaskStatus::Completed,
             TaskStatus::Failed,
             TaskStatus::Stale,
+            TaskStatus::Cancelled,
         ] {
             assert_eq!(TaskStatus::from_str_lossy(status.as_str()), status);
         }

@@ -9,7 +9,7 @@
 | **Memory** | `memory_store`, `memory_recall`, `memory_search`, `memory_get`, `memory_forget` |
 | **Messaging** | `message_send` |
 | **Sessions** | `sessions_spawn`, `sessions_send`, `sessions_list`, `sessions_history`, `session_status`, `subagents`, `delegate` |
-| **Scheduling** | `cron` (unified — actions: add/schedule, once, list, get, remove/cancel, update/patch, run, runs/history, events, pause, resume, status) |
+| **Scheduling** | `cron` (calendar/time scheduling), `xin` (autonomous task and durable Goal/Step workflows) |
 | **Images** | `image`, `image_info` |
 | **MCP** | `mcp` (Model Context Protocol client — connect to any MCP server) |
 | **Remote Nodes** | `nodes` (control paired devices — camera, screen, location, run commands) |
@@ -17,6 +17,17 @@
 | **Integrations** | `composio` (1000+ OAuth apps), `pushover` (notifications) |
 
 `cron` schedules with `kind: "at"` are one-shot regardless of physical retention: after their final success or failure they expose a typed terminal state and are never due again. `delete_after_run` atomically removes the job with its successful terminal commit; failures remain visible for run and event audit. The cron tool's update action can re-arm a retained terminal job with a new future `at` schedule; setting `enabled: true` alone does not, and an in-flight `at` schedule cannot be replaced. Manual `run` remains available for paused or terminal jobs; only a nonterminal `at` is consumed into terminal state. The CLI supports creating and displaying `at` jobs but does not expose an `at`-schedule update flag.
+
+`xin` task actions are `list`, `get`, `add`, `update`, `remove`, `pause`,
+`resume`, `cancel`, `run`, `runs`, `events`, and `status`. Durable workflow
+actions are `goal_list`, `goal_get`, `goal_add`, `goal_pause`, `goal_resume`,
+`goal_cancel`, `goal_remove`, `step_list`, `step_get`, `step_add`, and
+`step_retry`. `pause` prevents future scheduling but lets a currently leased
+execution finish; `cancel` revokes the lease and cooperatively stops active
+work. Completed user and agent tasks remain available for `get`, `runs`, and
+`events` until explicitly removed. When a trusted channel owner scope is
+present, reads and mutations are restricted to that owner; local operator calls
+without a channel scope retain workspace-wide visibility.
 
 `message_send` normally replies on the channel the turn arrived on. An optional
 `channel` argument names a different configured channel instead — resolved

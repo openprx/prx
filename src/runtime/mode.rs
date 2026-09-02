@@ -45,7 +45,7 @@ use crate::{
 };
 use crate::{
     handle_approval_command, handle_audit_command, handle_auth_command, handle_memory_command, handle_tasks_command,
-    redact_config_show_value,
+    handle_xin_command, redact_config_show_value,
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -424,6 +424,8 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
         } => evolution_cli::handle_command(evolution_command, json, &config).await,
 
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
+
+        Commands::Xin { xin_command } => handle_xin_command(xin_command, &config).await,
 
         Commands::Models { model_command } => match model_command.unwrap_or(ModelCommands::List { provider: None }) {
             ModelCommands::List { provider } => onboard::run_models_list(&config, provider.as_deref()),

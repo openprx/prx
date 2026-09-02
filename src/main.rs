@@ -91,9 +91,9 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use dialoguer::{Input, Password};
 use openprx::{
     CHAT_TRACING_RELOAD, ChannelCommands, ChatFmtLayer, Config, CronCommands, EvolutionCommands, IntegrationCommands,
-    MigrateCommands, ServiceCommands, SkillCommands, acl, agent, auth, channels, chat, config, cron, daemon, doctor,
-    evolution_cli, gateway, integrations, memory, migration, onboard, providers, runtime, security, service,
-    session_worker, skills,
+    MigrateCommands, ServiceCommands, SkillCommands, XinCommands, acl, agent, auth, channels, chat, config, cron,
+    daemon, doctor, evolution_cli, gateway, handle_xin_command, integrations, memory, migration, onboard, providers,
+    runtime, security, service, session_worker, skills,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -725,6 +725,24 @@ Examples:
     Cron {
         #[command(subcommand)]
         cron_command: CronCommands,
+    },
+
+    /// Manage Xin autonomous tasks and durable goal workflows.
+    #[command(long_about = "\
+Manage Xin autonomous tasks, execution history, and durable Goal/Step workflows.
+
+Examples:
+  prx xin status
+  prx xin list
+  prx xin add nightly-check 'Inspect service health' --recurring --interval-secs 3600
+  prx xin update <task-id> --priority high
+  prx xin run <task-id>
+  prx xin cancel <task-id>
+  prx xin goals add release-checklist
+  prx xin steps add <goal-id> verify 'Verify the release artifacts'")]
+    Xin {
+        #[command(subcommand)]
+        xin_command: XinCommands,
     },
 
     /// Manage provider model catalogs
@@ -3528,6 +3546,52 @@ mod tests {
             } => assert_eq!(target_version, "7"),
             other => panic!("expected migrate plan command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn xin_task_and_goal_step_commands_parse() {
+        let cli = Cli::try_parse_from([
+            "prx",
+            "xin",
+            "add",
+            "health-watch",
+            "inspect health",
+            "--recurring",
+            "--interval-secs",
+            "300",
+        ])
+        .expect("xin add should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Xin {
+                xin_command: XinCommands::Add {
+                    recurring: true,
+                    interval_secs: 300,
+                    ..
+                }
+            }
+        ));
+
+        let cli = Cli::try_parse_from([
+            "prx",
+            "xin",
+            "steps",
+            "add",
+            "goal-1",
+            "verify",
+            "verify artifacts",
+            "--sequence",
+            "2",
+        ])
+        .expect("xin steps add should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Xin {
+                xin_command: XinCommands::Steps {
+                    step_command: openprx::XinStepCommands::Add { sequence: Some(2), .. }
+                }
+            }
+        ));
     }
 
     #[test]

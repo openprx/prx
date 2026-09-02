@@ -136,6 +136,8 @@ pub(crate) mod util;
 pub mod webhook;
 pub(crate) mod xin;
 
+pub use xin::handle_command as handle_xin_command;
+
 /// Subscriber stack wrapped by the reloadable chat tracing layer.
 pub type ChatSubscriber =
     tracing_subscriber::layer::Layered<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
@@ -325,6 +327,129 @@ pub enum CronCommands {
     },
 }
 
+/// Xin autonomous-task subcommands.
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum XinCommands {
+    /// Show task, goal, and step counts.
+    Status,
+    /// List legacy and recurring tasks.
+    List,
+    /// Show one task.
+    Get { id: String },
+    /// Add a task.
+    Add {
+        name: String,
+        payload: String,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long, default_value = "agent_session", value_parser = ["agent_session", "shell"])]
+        execution_mode: String,
+        #[arg(long, default_value = "normal", value_parser = ["low", "normal", "high", "critical"])]
+        priority: String,
+        #[arg(long)]
+        recurring: bool,
+        #[arg(long, default_value_t = 0)]
+        interval_secs: u64,
+    },
+    /// Update editable task fields.
+    Update {
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long, value_parser = ["low", "normal", "high", "critical"])]
+        priority: Option<String>,
+        #[arg(long)]
+        payload: Option<String>,
+        #[arg(long)]
+        interval_secs: Option<u64>,
+    },
+    /// Delete a task and its retained run records.
+    Remove { id: String },
+    /// Pause future task scheduling.
+    Pause { id: String },
+    /// Resume a paused or cancelled task.
+    Resume { id: String },
+    /// Cancel a task and revoke an active execution lease.
+    Cancel { id: String },
+    /// Execute a task immediately through the normal runner path.
+    Run { id: String },
+    /// Show newest task execution attempts.
+    Runs {
+        id: String,
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=50))]
+        limit: u32,
+    },
+    /// Show task or goal lifecycle events.
+    Events { id: String },
+    /// Manage durable goals.
+    Goals {
+        #[command(subcommand)]
+        goal_command: XinGoalCommands,
+    },
+    /// Manage ordered goal steps.
+    Steps {
+        #[command(subcommand)]
+        step_command: XinStepCommands,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum XinGoalCommands {
+    List,
+    Get {
+        id: String,
+    },
+    Add {
+        name: String,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long, default_value = "normal", value_parser = ["low", "normal", "high", "critical"])]
+        priority: String,
+        #[arg(long)]
+        target_completion_at: Option<String>,
+    },
+    Pause {
+        id: String,
+    },
+    Resume {
+        id: String,
+    },
+    Cancel {
+        id: String,
+    },
+    Remove {
+        id: String,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum XinStepCommands {
+    List {
+        goal_id: String,
+    },
+    Get {
+        id: String,
+    },
+    Add {
+        goal_id: String,
+        name: String,
+        payload: String,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        sequence: Option<u32>,
+        #[arg(long, default_value = "agent_session", value_parser = ["agent_session", "shell"])]
+        execution_mode: String,
+        #[arg(long, default_value_t = 0)]
+        lease_ttl_secs: u64,
+    },
+    Retry {
+        id: String,
+    },
+}
+
 #[cfg(test)]
 mod module_ownership_tests {
     #[test]
@@ -388,6 +513,9 @@ mod module_ownership_tests {
             "enum SkillCommands",
             "enum MigrateCommands",
             "enum CronCommands",
+            "enum XinCommands",
+            "enum XinGoalCommands",
+            "enum XinStepCommands",
             "enum EvolutionCommands",
             "enum EvolutionLayerArg",
             "enum IntegrationCommands",

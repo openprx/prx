@@ -516,6 +516,30 @@ In that heartbeat-only mode, ordinary Xin tasks and goals stay disabled.
 Reordering the file preserves task IDs, removed entries are disabled, and the
 configured prompt, interval, and active-hour window remain authoritative.
 
+Xin has an operator CLI matching the LLM tool management surface:
+
+```bash
+prx xin status
+prx xin list
+prx xin add health-watch "Inspect service health" --recurring --interval-secs 3600
+prx xin update <task-id> --priority high
+prx xin run <task-id>
+prx xin runs <task-id> --limit 20
+prx xin pause <task-id>
+prx xin resume <task-id>
+prx xin cancel <task-id>
+
+prx xin goals add release-checklist
+prx xin steps add <goal-id> verify "Verify release artifacts"
+prx xin goals get <goal-id>
+prx xin goals cancel <goal-id>
+```
+
+Use `pause` to prevent future claims while allowing active work to finish. Use
+`cancel` to revoke an active task/step lease and stop that execution. Calendar,
+timezone, and delayed scheduling remain the responsibility of `prx cron`; Xin
+owns autonomous interval work and durable ordered workflows.
+
 ## Shared Memory Fabric
 
 PRX treats `chat`, `agent`, `gateway`, `channel`, `delegate`, and `sessions_spawn` as different message entrypoints over one workspace memory fabric.

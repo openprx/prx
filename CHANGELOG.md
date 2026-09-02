@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Completed Xin task management with editable tasks, immediate execution,
+  retained run history, explicit cancellation, trusted-owner isolation, and a
+  `prx xin` CLI.
+- Exposed durable Goal/Step authoring and operations through both the `xin` LLM
+  tool and CLI, including pause, resume, cancellation, removal, append, and
+  ordered retry.
+
+### Changed
+
+- Retained completed user and agent Xin tasks until explicit removal so their
+  execution results and run history remain inspectable.
+- Active Xin task and Goal/Step leases now observe operator cancellation within
+  one second and stop through the existing cooperative cancellation path.
+
 ## [0.8.78] - 2 September 2026
 
 ### Fixed

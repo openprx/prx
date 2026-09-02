@@ -26,6 +26,14 @@ use tokio_util::sync::CancellationToken;
 const XIN_COMPONENT: &str = "xin";
 /// Floor for the heartbeat interval so very short leases still renew sanely.
 const MIN_HEARTBEAT_SECS: u64 = 5;
+const AUTHORITY_POLL_SECS: u64 = 1;
+
+#[derive(Debug, Clone)]
+pub struct XinManualRun {
+    pub task_id: String,
+    pub success: bool,
+    pub output: String,
+}
 
 tokio::task_local! {
     static CONFIG_GENERATION: Arc<crate::config::ConfigGeneration>;
@@ -280,7 +288,7 @@ async fn execute_due_tasks(
         let config = config.clone();
         let security = Arc::clone(security);
         let registry = Arc::clone(registry);
-        async move { execute_single_task(&config, &security, &registry, &task).await }
+        async move { execute_single_task(&config, &security, &registry, &task, false).await }
     }))
     .buffer_unordered(concurrency);
 
@@ -289,7 +297,7 @@ async fn execute_due_tasks(
         ..XinTickSummary::default()
     };
 
-    while let Some((success, task_id)) = results.next().await {
+    while let Some((success, task_id, _output)) = results.next().await {
         summary.tasks_executed += 1;
         if success {
             summary.tasks_completed += 1;
@@ -313,21 +321,31 @@ async fn execute_single_task(
     security: &SecurityPolicy,
     registry: &BuiltinRegistry,
     task: &XinTask,
-) -> (bool, String) {
+    manual: bool,
+) -> (bool, String, String) {
     let task_id = task.id.clone();
     let lease_ttl_secs = u64::from(config.xin.stale_timeout_minutes.max(1)).saturating_mul(60);
     let worker = worker_id();
 
     // Atomically claim the task (prevents duplicate execution)
-    let initial_lease = match store::claim_task_with_lease(config, &task_id, &worker, lease_ttl_secs) {
+    let claim = if manual {
+        store::claim_task_for_manual_run(config, &task_id, &worker, lease_ttl_secs)
+    } else {
+        store::claim_task_with_lease(config, &task_id, &worker, lease_ttl_secs)
+    };
+    let initial_lease = match claim {
         Ok(Some(lease)) => lease,
         Ok(None) => {
             tracing::debug!(target: "xin", task_id = %task_id, "task already claimed or disabled, skipping");
-            return (true, task_id); // not a failure — another worker got it
+            return (
+                !manual,
+                task_id,
+                "task is already running, disabled, or cancelled".to_string(),
+            );
         }
         Err(e) => {
             tracing::warn!(target: "xin", task_id = %task_id, "failed to claim task: {e}");
-            return (false, task_id);
+            return (false, task_id, format!("failed to claim task: {e}"));
         }
     };
 
@@ -348,6 +366,7 @@ async fn execute_single_task(
     let heartbeat_handle = tokio::spawn(async move {
         let mut current_lease = heartbeat_lease.lock().clone();
         let mut ticker = time::interval(Duration::from_secs(heartbeat_secs));
+        let mut authority_poll = time::interval(Duration::from_secs(AUTHORITY_POLL_SECS));
         ticker.tick().await;
         let lease_deadline = time::sleep(initial_deadline);
         tokio::pin!(lease_deadline);
@@ -384,6 +403,19 @@ async fn execute_single_task(
                         }
                     }
                 }
+                _ = authority_poll.tick() => {
+                    match store::task_lease_is_current(&hb_config, &hb_task_id, &current_lease, Utc::now()) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::info!(target: "xin", task_id = %hb_task_id, "task cancellation observed");
+                            lease_lost_hb.cancel();
+                            return true;
+                        }
+                        Err(error) => {
+                            tracing::warn!(target: "xin", task_id = %hb_task_id, "task authority poll failed: {error}");
+                        }
+                    }
+                }
                 () = heartbeat_stop_child.cancelled() => return false,
             }
         }
@@ -413,10 +445,10 @@ async fn execute_single_task(
         }
     };
     let Some((success, output)) = result else {
-        return (false, task_id);
+        return (false, task_id, "task cancelled after lease revocation".to_string());
     };
     if authority_lost {
-        return (false, task_id);
+        return (false, task_id, "task lost execution authority".to_string());
     }
     let lease = exact_lease.lock().clone();
 
@@ -444,7 +476,26 @@ async fn execute_single_task(
         }
     };
 
-    (success && committed, task_id)
+    (success && committed, task_id, output)
+}
+
+/// Execute one task immediately through the same claim, heartbeat, security and
+/// persistence path used by the background runner.
+pub async fn run_task_now(config: &Config, security: &SecurityPolicy, task_id: &str) -> Result<XinManualRun> {
+    let task = store::get_task(config, task_id)?;
+    if task.status == crate::xin::types::TaskStatus::Running {
+        anyhow::bail!("Xin task '{task_id}' is already running");
+    }
+    if task.status == crate::xin::types::TaskStatus::Cancelled {
+        anyhow::bail!("Xin task '{task_id}' is cancelled; resume it before running");
+    }
+    let registry = BuiltinRegistry::new();
+    let (success, task_id, output) = execute_single_task(config, security, &registry, &task, true).await;
+    Ok(XinManualRun {
+        task_id,
+        success,
+        output,
+    })
 }
 
 // ── Goal / Step execution (FIX-P2-16, d09) ──────────────────────────────
@@ -665,6 +716,7 @@ async fn execute_step_with_heartbeat(
     let hb_handle = tokio::spawn(async move {
         let mut current_lease = heartbeat_lease.lock().clone();
         let mut ticker = time::interval(Duration::from_secs(heartbeat_secs));
+        let mut authority_poll = time::interval(Duration::from_secs(AUTHORITY_POLL_SECS));
         // Skip the immediate first tick (lease was just set by claim).
         ticker.tick().await;
         let lease_deadline = time::sleep(initial_deadline);
@@ -695,6 +747,19 @@ async fn execute_step_with_heartbeat(
                         }
                         Err(e) => {
                             tracing::warn!(target: "xin", step_id = %hb_step_id, "heartbeat renewal failed: {e}");
+                        }
+                    }
+                }
+                _ = authority_poll.tick() => {
+                    match store::step_lease_is_current(&hb_config, &hb_step_id, &current_lease, Utc::now()) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::info!(target: "xin", step_id = %hb_step_id, "step cancellation observed");
+                            lease_lost_hb.cancel();
+                            return true;
+                        }
+                        Err(error) => {
+                            tracing::warn!(target: "xin", step_id = %hb_step_id, "step authority poll failed: {error}");
                         }
                     }
                 }

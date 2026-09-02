@@ -6,7 +6,7 @@
 use crate::config::Config;
 use crate::xin::types::{
     ExecutionMode, GoalStatus, NewXinGoal, NewXinStep, NewXinTask, StepStatus, TaskKind, TaskPriority, TaskStatus,
-    XinGoal, XinStep, XinTask, XinTaskEvent, XinTaskPatch, default_lease_ttl_secs,
+    XinGoal, XinRun, XinStep, XinTask, XinTaskEvent, XinTaskPatch, default_lease_ttl_secs,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -306,6 +306,61 @@ pub fn claim_task_with_lease(
     })
 }
 
+/// Claim a task for an explicit operator-requested run. Paused tasks may be
+/// run once without changing their paused state; cancelled and already-running
+/// tasks remain ineligible.
+pub fn claim_task_for_manual_run(
+    config: &Config,
+    task_id: &str,
+    worker_id: &str,
+    lease_ttl_secs: u64,
+) -> Result<Option<XinTaskLease>> {
+    with_immediate_connection(config, |conn| {
+        let now = authoritative_now(conn)?;
+        let expires_at = now + chrono::Duration::seconds(i64::try_from(lease_ttl_secs.max(1)).unwrap_or(i64::MAX));
+        let changed = conn.execute(
+            "UPDATE xin_tasks
+             SET status = 'running', lease_owner = ?1, lease_epoch = lease_epoch + 1,
+                 lease_expires_at = ?2, last_heartbeat_at = ?3, updated_at = ?3
+             WHERE id = ?4 AND status != 'running' AND status != 'cancelled'",
+            params![worker_id, expires_at.to_rfc3339(), now.to_rfc3339(), task_id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let epoch_i64: i64 = conn.query_row(
+            "SELECT lease_epoch FROM xin_tasks WHERE id = ?1",
+            params![task_id],
+            |row| row.get(0),
+        )?;
+        let epoch = u64::try_from(epoch_i64).context("xin task lease epoch is negative")?;
+        if let Some(lineage) = load_task_lineage(conn, task_id)? {
+            insert_task_event(
+                conn,
+                &workspace_id(config),
+                task_id,
+                lineage,
+                "xin.task.manual_run_claimed",
+                Some("running"),
+                Some(
+                    serde_json::json!({
+                        "lease_owner": worker_id,
+                        "lease_epoch": epoch,
+                        "lease_expires_at": expires_at.to_rfc3339(),
+                    })
+                    .to_string(),
+                )
+                .as_deref(),
+            )?;
+        }
+        Ok(Some(XinTaskLease {
+            worker_id: worker_id.to_string(),
+            epoch,
+            expires_at,
+        }))
+    })
+}
+
 /// Compatibility claim for callers that do not commit a production execution.
 #[cfg(test)]
 pub fn claim_task(config: &Config, task_id: &str) -> Result<bool> {
@@ -486,6 +541,81 @@ pub fn reschedule_recurring(config: &Config, task_id: &str) -> Result<()> {
     })
 }
 
+/// Pause future scheduling without interrupting an execution that already owns
+/// a valid lease.
+pub fn pause_task(config: &Config, task_id: &str) -> Result<XinTask> {
+    set_task_control_state(config, task_id, "pause")
+}
+
+/// Resume future scheduling. A previously cancelled task is reset to pending.
+pub fn resume_task(config: &Config, task_id: &str) -> Result<XinTask> {
+    set_task_control_state(config, task_id, "resume")
+}
+
+/// Cancel a task and revoke any active lease. Runners observe the revoked lease
+/// and cooperatively stop the active execution.
+pub fn cancel_task(config: &Config, task_id: &str) -> Result<XinTask> {
+    set_task_control_state(config, task_id, "cancel")
+}
+
+fn set_task_control_state(config: &Config, task_id: &str, action: &str) -> Result<XinTask> {
+    with_immediate_connection(config, |conn| {
+        let now = authoritative_now(conn)?;
+        let exists = load_task_lineage(conn, task_id)?.is_some();
+        if !exists {
+            anyhow::bail!("Xin task '{task_id}' not found");
+        }
+        match action {
+            "pause" => {
+                conn.execute(
+                    "UPDATE xin_tasks SET enabled = 0, updated_at = ?1 WHERE id = ?2",
+                    params![now.to_rfc3339(), task_id],
+                )?;
+            }
+            "resume" => {
+                conn.execute(
+                    "UPDATE xin_tasks
+                     SET enabled = 1,
+                         status = CASE WHEN status = 'cancelled' THEN 'pending' ELSE status END,
+                         next_run_at = CASE WHEN status = 'cancelled' THEN ?1 ELSE next_run_at END,
+                         updated_at = ?1
+                     WHERE id = ?2",
+                    params![now.to_rfc3339(), task_id],
+                )?;
+            }
+            "cancel" => {
+                conn.execute(
+                    "UPDATE xin_tasks
+                     SET enabled = 0, status = 'cancelled', lease_owner = NULL,
+                         lease_expires_at = NULL, last_heartbeat_at = NULL, updated_at = ?1
+                     WHERE id = ?2",
+                    params![now.to_rfc3339(), task_id],
+                )?;
+            }
+            _ => anyhow::bail!("Unsupported Xin task control action '{action}'"),
+        }
+        let lineage = load_task_lineage(conn, task_id)?
+            .ok_or_else(|| anyhow::anyhow!("Xin task '{task_id}' disappeared during {action}"))?;
+        let event_type = match action {
+            "pause" => "xin.task.paused",
+            "resume" => "xin.task.resumed",
+            "cancel" => "xin.task.cancelled",
+            _ => anyhow::bail!("Unsupported Xin task control action '{action}'"),
+        };
+        insert_task_event(
+            conn,
+            &workspace_id(config),
+            task_id,
+            lineage.clone(),
+            event_type,
+            lineage.status.as_deref(),
+            None,
+        )?;
+        Ok(())
+    })?;
+    get_task(config, task_id)
+}
+
 /// Delete a task by ID.
 pub fn remove_task(config: &Config, task_id: &str) -> Result<()> {
     let changed = with_connection(config, |conn| {
@@ -510,11 +640,16 @@ pub fn remove_task(config: &Config, task_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Remove all completed (non-recurring) tasks.
+/// Remove completed one-shot system tasks. User/agent tasks are retained until
+/// explicit removal so their result and `xin_runs` history remain queryable.
 pub fn remove_completed(config: &Config) -> Result<usize> {
     with_connection(config, |conn| {
-        conn.execute("DELETE FROM xin_tasks WHERE status = 'completed' AND recurring = 0", [])
-            .context("Failed to clean completed xin tasks")
+        conn.execute(
+            "DELETE FROM xin_tasks
+             WHERE status = 'completed' AND recurring = 0 AND kind = 'system'",
+            [],
+        )
+        .context("Failed to clean completed xin tasks")
     })
 }
 
@@ -941,6 +1076,41 @@ pub fn record_run(
     })
 }
 
+/// List the newest persisted execution attempts for a task.
+pub fn list_runs(config: &Config, task_id: &str, limit: usize) -> Result<Vec<XinRun>> {
+    // Keep the public query bounded to the same retention window used by the
+    // writer. A zero limit is treated as the useful default.
+    let limit = if limit == 0 { 20 } else { limit.min(50) };
+    with_connection(config, |conn| {
+        let exists = conn
+            .query_row("SELECT 1 FROM xin_tasks WHERE id = ?1", params![task_id], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            anyhow::bail!("Xin task '{task_id}' not found");
+        }
+        let mut stmt = conn.prepare(
+            "SELECT id, task_id, started_at, finished_at, status, output, duration_ms
+             FROM xin_runs WHERE task_id = ?1
+             ORDER BY started_at DESC, id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![task_id, i64::try_from(limit).unwrap_or(50)], |row| {
+            let started_at: String = row.get(2)?;
+            let finished_at: String = row.get(3)?;
+            Ok(XinRun {
+                id: row.get(0)?,
+                task_id: row.get(1)?,
+                started_at: parse_rfc3339(&started_at).map_err(sql_err)?,
+                finished_at: parse_rfc3339(&finished_at).map_err(sql_err)?,
+                status: row.get(4)?,
+                output: row.get(5)?,
+                duration_ms: row.get::<_, Option<i64>>(6)?.unwrap_or_default(),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    })
+}
+
 /// List append-only lifecycle events for a Xin task.
 pub fn list_task_events(config: &Config, task_id: &str) -> Result<Vec<XinTaskEvent>> {
     with_connection(config, |conn| {
@@ -1087,11 +1257,21 @@ pub fn add_step(config: &Config, goal_id: &str, step: &NewXinStep) -> Result<Xin
     let now = Utc::now();
     let step_id = with_immediate_connection(config, |conn| {
         let id = insert_step_row(conn, goal_id, step, now)?;
-        conn.execute(
-            "UPDATE xin_goals SET steps_total = steps_total + 1, updated_at = ?1 WHERE id = ?2",
-            params![now.to_rfc3339(), goal_id],
-        )
-        .context("Failed to bump goal steps_total")?;
+        let changed = conn
+            .execute(
+                "UPDATE xin_goals
+                 SET steps_total = steps_total + 1,
+                     status = CASE WHEN status = 'completed' THEN 'running' ELSE status END,
+                     completed_at = CASE WHEN status = 'completed' THEN NULL ELSE completed_at END,
+                     final_output = CASE WHEN status = 'completed' THEN NULL ELSE final_output END,
+                     updated_at = ?1
+                 WHERE id = ?2",
+                params![now.to_rfc3339(), goal_id],
+            )
+            .context("Failed to bump goal steps_total")?;
+        if changed == 0 {
+            anyhow::bail!("Xin goal '{goal_id}' not found");
+        }
         Ok(id)
     })?;
     get_step(config, &step_id)
@@ -1143,6 +1323,149 @@ pub fn list_goals(config: &Config) -> Result<Vec<XinGoal>> {
         let rows = stmt.query_map([], map_goal_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     })
+}
+
+pub fn pause_goal(config: &Config, goal_id: &str) -> Result<XinGoal> {
+    set_goal_control_state(config, goal_id, "pause")
+}
+
+pub fn resume_goal(config: &Config, goal_id: &str) -> Result<XinGoal> {
+    set_goal_control_state(config, goal_id, "resume")
+}
+
+pub fn cancel_goal(config: &Config, goal_id: &str) -> Result<XinGoal> {
+    set_goal_control_state(config, goal_id, "cancel")
+}
+
+fn set_goal_control_state(config: &Config, goal_id: &str, action: &str) -> Result<XinGoal> {
+    with_immediate_connection(config, |conn| {
+        let now = authoritative_now(conn)?;
+        let exists = conn
+            .query_row("SELECT 1 FROM xin_goals WHERE id = ?1", params![goal_id], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            anyhow::bail!("Xin goal '{goal_id}' not found");
+        }
+        match action {
+            "pause" => {
+                conn.execute(
+                    "UPDATE xin_goals SET enabled = 0, updated_at = ?1 WHERE id = ?2",
+                    params![now.to_rfc3339(), goal_id],
+                )?;
+            }
+            "resume" => {
+                conn.execute(
+                    "UPDATE xin_goals
+                     SET enabled = 1,
+                         status = CASE
+                             WHEN status = 'cancelled' AND steps_completed = 0 THEN 'pending'
+                             WHEN status = 'cancelled' THEN 'running'
+                             ELSE status
+                         END,
+                         completed_at = CASE WHEN status = 'cancelled' THEN NULL ELSE completed_at END,
+                         updated_at = ?1
+                     WHERE id = ?2",
+                    params![now.to_rfc3339(), goal_id],
+                )?;
+            }
+            "cancel" => {
+                conn.execute(
+                    "UPDATE xin_goals
+                     SET enabled = 0, status = 'cancelled', completed_at = ?1, updated_at = ?1
+                     WHERE id = ?2",
+                    params![now.to_rfc3339(), goal_id],
+                )?;
+                conn.execute(
+                    "UPDATE xin_steps
+                     SET status = CASE WHEN status IN ('claimed', 'running') THEN 'stale' ELSE status END,
+                         lease_owner = NULL, lease_expires_at = NULL, last_heartbeat_at = NULL, updated_at = ?1
+                     WHERE goal_id = ?2 AND status IN ('claimed', 'running')",
+                    params![now.to_rfc3339(), goal_id],
+                )?;
+            }
+            _ => anyhow::bail!("Unsupported Xin goal control action '{action}'"),
+        }
+        let event_type = match action {
+            "pause" => "xin.goal.paused",
+            "resume" => "xin.goal.resumed",
+            "cancel" => "xin.goal.cancelled",
+            _ => anyhow::bail!("Unsupported Xin goal control action '{action}'"),
+        };
+        let status: String = conn.query_row("SELECT status FROM xin_goals WHERE id = ?1", params![goal_id], |row| {
+            row.get(0)
+        })?;
+        emit_goal_event(conn, config, goal_id, event_type, Some(&status))?;
+        Ok(())
+    })?;
+    get_goal(config, goal_id)
+}
+
+pub fn remove_goal(config: &Config, goal_id: &str) -> Result<()> {
+    let changed = with_immediate_connection(config, |conn| {
+        if conn
+            .query_row("SELECT 1 FROM xin_goals WHERE id = ?1", params![goal_id], |_| Ok(()))
+            .optional()?
+            .is_none()
+        {
+            return Ok(0);
+        }
+        emit_goal_event(conn, config, goal_id, "xin.goal.removed", None)?;
+        conn.execute("DELETE FROM xin_goals WHERE id = ?1", params![goal_id])
+            .context("Failed to delete xin goal")
+    })?;
+    if changed == 0 {
+        anyhow::bail!("Xin goal '{goal_id}' not found");
+    }
+    Ok(())
+}
+
+/// Re-run a step and every later step so ordered workflow outputs cannot become
+/// inconsistent with an earlier retried result.
+pub fn retry_step(config: &Config, step_id: &str) -> Result<XinStep> {
+    with_immediate_connection(config, |conn| {
+        let (goal_id, sequence): (String, i64) = conn
+            .query_row(
+                "SELECT goal_id, sequence FROM xin_steps WHERE id = ?1",
+                params![step_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("Xin step '{step_id}' not found"))?;
+        let running: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM xin_steps
+             WHERE goal_id = ?1 AND sequence >= ?2 AND status IN ('claimed', 'running')",
+            params![goal_id, sequence],
+            |row| row.get(0),
+        )?;
+        if running > 0 {
+            anyhow::bail!("Cannot retry step '{step_id}' while it or a later step is running; cancel the goal first");
+        }
+        let now = authoritative_now(conn)?;
+        conn.execute(
+            "UPDATE xin_steps
+             SET status = 'pending', lease_owner = NULL, lease_expires_at = NULL,
+                 last_heartbeat_at = NULL, checkpoint_json = NULL, completed_at = NULL,
+                 last_output = NULL, updated_at = ?1
+             WHERE goal_id = ?2 AND sequence >= ?3",
+            params![now.to_rfc3339(), goal_id, sequence],
+        )?;
+        let completed: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM xin_steps WHERE goal_id = ?1 AND status = 'completed'",
+            params![goal_id],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "UPDATE xin_goals
+             SET enabled = 1, status = CASE WHEN ?1 = 0 THEN 'pending' ELSE 'running' END,
+                 steps_completed = ?1, completed_at = NULL, final_output = NULL, updated_at = ?2
+             WHERE id = ?3",
+            params![completed, now.to_rfc3339(), goal_id],
+        )?;
+        emit_step_event(conn, config, step_id, "xin.step.retry_requested", Some("pending"), None)?;
+        Ok(())
+    })?;
+    get_step(config, step_id)
 }
 
 /// Return the next claimable step of a goal: the lowest-sequence step that is
@@ -3140,20 +3463,26 @@ mod tests {
     }
 
     #[test]
-    fn remove_completed_only_non_recurring() {
+    fn remove_completed_retains_user_history_and_cleans_one_shot_system_tasks() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
         let one_shot = add_task(&config, &sample_task()).unwrap();
+        let mut system_one_shot = sample_task();
+        system_one_shot.name = "system-one-shot".to_string();
+        system_one_shot.kind = TaskKind::System;
+        let system_one_shot = add_task(&config, &system_one_shot).unwrap();
         let recurring = add_task(&config, &recurring_task()).unwrap();
 
         mark_completed(&config, &one_shot.id, "done").unwrap();
+        mark_completed(&config, &system_one_shot.id, "done").unwrap();
         mark_completed(&config, &recurring.id, "done").unwrap();
 
         let removed = remove_completed(&config).unwrap();
-        assert_eq!(removed, 1); // only one-shot removed
+        assert_eq!(removed, 1); // only the one-shot system task is housekeeping
+        assert!(get_task(&config, &one_shot.id).is_ok());
+        assert!(get_task(&config, &system_one_shot.id).is_err());
 
-        assert!(get_task(&config, &one_shot.id).is_err());
         assert!(get_task(&config, &recurring.id).is_ok());
     }
 
@@ -3325,6 +3654,53 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         assert!(get_task(&config, "no-such-id").is_err());
+    }
+
+    #[test]
+    fn task_control_and_manual_claim_are_durable() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let task = add_task(&config, &sample_task()).unwrap();
+
+        let paused = pause_task(&config, &task.id).unwrap();
+        assert!(!paused.enabled);
+        let lease = claim_task_for_manual_run(&config, &task.id, "manual-worker", 60)
+            .unwrap()
+            .expect("manual run may claim a paused task");
+        assert_eq!(lease.worker_id, "manual-worker");
+
+        let cancelled = cancel_task(&config, &task.id).unwrap();
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        assert!(!cancelled.enabled);
+        assert!(!task_lease_is_current(&config, &task.id, &lease, Utc::now()).unwrap());
+
+        let resumed = resume_task(&config, &task.id).unwrap();
+        assert_eq!(resumed.status, TaskStatus::Pending);
+        assert!(resumed.enabled);
+        let event_types = list_task_events(&config, &task.id)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert!(event_types.contains(&"xin.task.paused".to_string()));
+        assert!(event_types.contains(&"xin.task.cancelled".to_string()));
+        assert!(event_types.contains(&"xin.task.resumed".to_string()));
+    }
+
+    #[test]
+    fn list_runs_returns_newest_first_and_honors_limit() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let task = add_task(&config, &sample_task()).unwrap();
+        let first = Utc::now();
+        let second = first + chrono::Duration::seconds(1);
+        record_run(&config, &task.id, first, first, "ok", Some("first"), 10).unwrap();
+        record_run(&config, &task.id, second, second, "error", Some("second"), 20).unwrap();
+
+        let runs = list_runs(&config, &task.id, 1).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "error");
+        assert_eq!(runs[0].output.as_deref(), Some("second"));
     }
 
     // ── Goal / Step (FIX-P2-16) ───────────────────────────────────────────
@@ -3974,5 +4350,29 @@ mod tests {
         let goals = list_goals(&config).unwrap();
         assert_eq!(goals.len(), 2);
         assert_eq!(goals[0].priority, TaskPriority::High);
+    }
+
+    #[test]
+    fn goal_cancel_revokes_step_lease_and_resume_requeues_it() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let goal = add_goal(&config, &sample_goal(vec![sample_step(1)])).unwrap();
+        let step = list_steps(&config, &goal.id).unwrap().remove(0);
+        let lease = claim_step_with_lease(&config, &step.id, "goal-worker", 60)
+            .unwrap()
+            .expect("claim");
+        assert!(mark_step_running_with_lease(&config, &step.id, &lease).unwrap());
+
+        let cancelled = cancel_goal(&config, &goal.id).unwrap();
+        assert_eq!(cancelled.status, GoalStatus::Cancelled);
+        assert!(!cancelled.enabled);
+        assert!(!step_lease_is_current(&config, &step.id, &lease, Utc::now()).unwrap());
+        assert_eq!(get_step(&config, &step.id).unwrap().status, StepStatus::Stale);
+
+        let resumed = resume_goal(&config, &goal.id).unwrap();
+        assert_eq!(resumed.status, GoalStatus::Pending);
+        assert!(resumed.enabled);
+        let retried = retry_step(&config, &step.id).unwrap();
+        assert_eq!(retried.status, StepStatus::Pending);
     }
 }
