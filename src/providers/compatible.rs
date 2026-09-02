@@ -76,8 +76,11 @@ impl OpenAiCompatibleProvider {
     }
 
     fn http_client_builder(&self) -> reqwest::ClientBuilder {
+        // A buffered response can legitimately take longer than two minutes,
+        // especially when a single-slot local server queues concurrent turns.
+        // The agent's progress-aware idle guard owns hang recovery; a client
+        // deadline here would turn slow-but-healthy work into a transport error.
         self.base_http_client_builder()
-            .timeout(std::time::Duration::from_mins(2))
     }
 
     /// Streaming responses may legitimately run for many minutes. A reqwest
@@ -1580,34 +1583,11 @@ impl OpenAiCompatibleProvider {
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &effective_messages, model)
-                        .await
-                        .map(|text| {
-                            let mut accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
-                            accumulator.record_estimated_completion_chars(text.chars().count());
-                            (
-                                ProviderChatResponse {
-                                    text: Some(text),
-                                    tool_calls: vec![],
-                                    reasoning_content: None,
-                                },
-                                accumulator.finish(),
-                            )
-                        })
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} native chat transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
-
-                return Err(chat_error.into());
-            }
+            // A transport failure is not endpoint discovery. The upstream may
+            // already have processed the request, so replaying it through the
+            // Responses API risks duplicate model work and tool side effects.
+            // Only an explicit HTTP 404 below is safe evidence for fallback.
+            Err(chat_error) => return Err(chat_error.into()),
         };
 
         if !response.status().is_success() {
@@ -1846,22 +1826,7 @@ impl Provider for OpenAiCompatibleProvider {
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &fallback_messages, model)
-                        .await
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
-
-                return Err(chat_error.into());
-            }
+            Err(chat_error) => return Err(chat_error.into()),
         };
 
         if !response.status().is_success() {
@@ -1949,22 +1914,7 @@ impl Provider for OpenAiCompatibleProvider {
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &effective_messages, model)
-                        .await
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
-
-                return Err(chat_error.into());
-            }
+            Err(chat_error) => return Err(chat_error.into()),
         };
 
         if !response.status().is_success() {
@@ -2470,6 +2420,32 @@ mod tests {
         let result = p.chat_with_system(None, "hello", "llama-3.3-70b", 0.7).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Venice API key not set"));
+    }
+
+    #[tokio::test]
+    async fn transport_failure_is_not_replayed_through_responses_api() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test: bind");
+        let addr = listener.local_addr().expect("test: addr");
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("test: accept chat request");
+            // Drop before sending HTTP headers. The provider cannot know
+            // whether the upstream processed the request, so this ambiguous
+            // failure must not cause a second request through another API.
+            drop(socket);
+            drop(listener);
+        });
+
+        let provider = make_provider("custom", &format!("http://{addr}"), Some("test-key"));
+        let error = provider
+            .chat_with_system(None, "hello", "test-model", 0.0)
+            .await
+            .expect_err("test: closed connection must fail");
+        server.await.expect("test: join server");
+
+        let message = error.to_string();
+        assert!(!message.contains("responses fallback"), "got: {message}");
     }
 
     #[test]

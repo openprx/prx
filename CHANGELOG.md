@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.70] - 2026-09-02
+
+### Fixed
+
+- Removed the OpenAI-compatible buffered-response two-minute deadline and
+  stopped replaying ambiguous transport failures through the Responses API.
+- Added WhatsApp typing and paused presence updates to long-running wacli turns.
+
 ## [0.8.69] - 2026-08-31
 
 ### Added

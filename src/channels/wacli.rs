@@ -903,6 +903,37 @@ impl WacliChannel {
         self.config.cli_path.as_deref().unwrap_or("wacli")
     }
 
+    /// Publish a transient WhatsApp presence state through the official CLI.
+    async fn set_presence(&self, recipient: &str, state: &str) -> Result<()> {
+        if recipient.trim().is_empty() {
+            anyhow::bail!("wacli presence: empty recipient");
+        }
+
+        let mut cmd = tokio::process::Command::new(self.cli_binary());
+        cmd.arg("presence").arg(state).arg("--to").arg(recipient);
+        if let Some(store) = self.config.store_dir.as_deref() {
+            if !store.trim().is_empty() {
+                cmd.arg("--store").arg(store);
+            }
+        }
+        cmd.kill_on_drop(true);
+
+        let output = tokio::time::timeout(SEND_TIMEOUT, cmd.output())
+            .await
+            .with_context(|| format!("timeout running '{} presence {state}'", self.cli_binary()))?
+            .with_context(|| format!("failed to spawn '{}'", self.cli_binary()))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "wacli presence {state} failed (status {}): {}",
+                output.status.code().unwrap_or(-1),
+                stderr.trim()
+            );
+        }
+        Ok(())
+    }
+
     /// Send a plain-text message via `wacli send text`.
     ///
     /// Uses an argument array (no shell), enforces a timeout, captures stderr,
@@ -1943,6 +1974,14 @@ impl Channel for WacliChannel {
                 false
             }
         }
+    }
+
+    async fn start_typing(&self, recipient: &str) -> Result<()> {
+        self.set_presence(recipient, "typing").await
+    }
+
+    async fn stop_typing(&self, recipient: &str) -> Result<()> {
+        self.set_presence(recipient, "paused").await
     }
 
     fn capabilities(&self) -> ChannelCapabilities {
@@ -3279,6 +3318,41 @@ mod outbound_media_tests {
         assert!(argv.lines().any(|arg| arg == "--json"), "argv={argv}");
         assert!(argv.lines().any(|arg| arg == "--allow-self-send"), "argv={argv}");
         assert!(channel.self_outbound.is_local_echo("3EB0SELFREPLY").await);
+    }
+
+    #[tokio::test]
+    async fn typing_lifecycle_uses_official_presence_commands() {
+        let cli = FakeCli::new(0);
+        let channel = WacliChannel::new(WacliChannelConfig {
+            cli_path: Some(cli.bin.to_string_lossy().into_owned()),
+            store_dir: Some("/var/lib/wacli".to_string()),
+            ..WacliChannelConfig::default()
+        });
+
+        channel.start_typing("99550001@s.whatsapp.net").await.unwrap();
+        channel.stop_typing("99550001@s.whatsapp.net").await.unwrap();
+
+        assert_eq!(
+            cli.invocations(),
+            vec![
+                expect_argv(&[
+                    "presence",
+                    "typing",
+                    "--to",
+                    "99550001@s.whatsapp.net",
+                    "--store",
+                    "/var/lib/wacli",
+                ]),
+                expect_argv(&[
+                    "presence",
+                    "paused",
+                    "--to",
+                    "99550001@s.whatsapp.net",
+                    "--store",
+                    "/var/lib/wacli",
+                ]),
+            ]
+        );
     }
 
     /// A stand-in `wacli` that appends its `argv` to a log and never talks to

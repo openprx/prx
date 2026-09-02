@@ -1421,7 +1421,7 @@ mod systemd_notify {
     }
 
     #[cfg(not(all(unix, target_os = "linux")))]
-    fn send(_payload: &str) -> std::io::Result<bool> {
+    const fn send(_payload: &str) -> std::io::Result<bool> {
         Ok(false)
     }
 

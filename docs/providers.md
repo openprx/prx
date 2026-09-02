@@ -48,10 +48,13 @@ because that endpoint can silently accept or remap a mistyped model.
 - Bedrock uses Converse/ConverseStream native content and tool blocks.
 - Ollama uses its native chat/tool schema. llama.cpp, vLLM, LiteLLM, Hugging
   Face, and custom endpoints use the OpenAI-compatible adapter.
-- OpenAI-compatible non-streaming calls retain a two-minute request timeout.
-  Streaming calls have a ten-second connection timeout but no whole-response
-  deadline: a healthy SSE generation may run for hours. Runtime
-  `idle_hang_secs` remains the single progress-aware stall guard.
+- OpenAI-compatible calls have a ten-second connection timeout but no
+  whole-response deadline, in both buffered and streaming modes: a queued local
+  request or healthy generation may run for hours. Runtime `idle_hang_secs`
+  remains the single progress-aware stall guard.
+- A transport error fails the current attempt explicitly. Responses API
+  fallback is attempted only after an HTTP 404 proves that Chat Completions is
+  unavailable; an ambiguous disconnect is never replayed through another API.
 - Streaming retries are allowed only before any text, reasoning, or tool-call
   chunk has been emitted. After model output starts, an interruption fails the
   turn explicitly instead of replaying the request and risking duplicated text

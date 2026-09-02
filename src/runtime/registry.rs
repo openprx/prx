@@ -1008,6 +1008,7 @@ fn terminated(slot: &Slot) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessLiveness {
     Running,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Zombie,
     Gone,
 }

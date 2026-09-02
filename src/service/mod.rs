@@ -101,7 +101,7 @@ impl InitSystem {
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub fn resolve(self) -> Result<Self> {
+    pub const fn resolve(self) -> Result<Self> {
         match self {
             Self::Auto => Ok(Self::Systemd),
             concrete => Ok(concrete),
