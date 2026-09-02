@@ -410,11 +410,10 @@ impl Tool for XinTool {
                          Interval:    {} min\n\
                          Tasks:       {} total ({active} active, {paused} paused)\n\
                          By kind:     {system} system, {user} user, {agent} agent\n\
-                         Concurrency: {} max\n\
+                         Concurrency: unbounded\n\
                          Evolution:   integrated",
                         cfg.xin.interval_minutes,
                         tasks.len(),
-                        cfg.xin.max_concurrent,
                     ),
                     error: None,
                 })

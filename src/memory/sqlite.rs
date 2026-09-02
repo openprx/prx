@@ -2259,6 +2259,14 @@ impl SqliteMemory {
 
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
         let body = format!("- [{timestamp}] **{key}**: {}\n", content.trim());
+
+        if matches!(category, MemoryCategory::Core) {
+            if let Err(error) = Self::upsert_core_backup_entry(&path, key, &body) {
+                tracing::warn!("core memory backup update failed ({}): {error}", path.display());
+            }
+            return;
+        }
+
         let payload = match header {
             Some(header) => format!("{header}{body}"),
             None => body,
@@ -2275,6 +2283,66 @@ impl SqliteMemory {
                 tracing::warn!("memory backup open failed ({}): {error}", path.display());
             }
         }
+    }
+
+    /// Keep `MEMORY.md` as a projection of the latest value for each generated
+    /// key. Daily logs remain append-only, but core memory keys are upserts in
+    /// SQLite and must not grow a second, stale copy on every scheduled write.
+    fn upsert_core_backup_entry(path: &Path, key: &str, body: &str) -> anyhow::Result<()> {
+        let lock_path = path.with_extension("md.lock");
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        fs2::FileExt::lock_exclusive(&lock_file)?;
+
+        let existing = std::fs::read_to_string(path).unwrap_or_else(|_| "# Long-Term Memory\n\n".to_string());
+        let mut blocks: Vec<(Option<String>, String)> = Vec::new();
+        for line in existing.split_inclusive('\n') {
+            let entry_key = Self::generated_backup_entry_key(line).map(str::to_string);
+            if entry_key.is_some() || blocks.is_empty() {
+                blocks.push((entry_key, line.to_string()));
+            } else if let Some((_, block)) = blocks.last_mut() {
+                block.push_str(line);
+            }
+        }
+
+        let mut last_by_key = std::collections::HashMap::new();
+        for (index, (block_key, _)) in blocks.iter().enumerate() {
+            if let Some(block_key) = block_key {
+                last_by_key.insert(block_key.as_str(), index);
+            }
+        }
+
+        let mut rewritten = String::with_capacity(existing.len().saturating_add(body.len()));
+        for (index, (block_key, block)) in blocks.iter().enumerate() {
+            match block_key {
+                None => rewritten.push_str(block),
+                Some(block_key) if block_key != key && last_by_key.get(block_key.as_str()) == Some(&index) => {
+                    rewritten.push_str(block);
+                }
+                Some(_) => {}
+            }
+        }
+        if !rewritten.ends_with('\n') {
+            rewritten.push('\n');
+        }
+        rewritten.push_str(body);
+
+        let temp_path = path.with_extension(format!("md.tmp.{}", Uuid::new_v4()));
+        std::fs::write(&temp_path, rewritten)?;
+        std::fs::rename(&temp_path, path)?;
+        fs2::FileExt::unlock(&lock_file)?;
+        Ok(())
+    }
+
+    fn generated_backup_entry_key(line: &str) -> Option<&str> {
+        let rest = line.strip_prefix("- [")?;
+        let (_, rest) = rest.split_once("] **")?;
+        let (key, _) = rest.split_once("**:")?;
+        (!key.is_empty()).then_some(key)
     }
 
     async fn store_internal(
@@ -5963,6 +6031,23 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new(tmp.path()).unwrap();
         (tmp, mem)
+    }
+
+    #[test]
+    fn core_markdown_backup_upserts_and_deduplicates_generated_keys() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("memory").join("brain.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+        SqliteMemory::append_backup_entry(&db_path, "fitness/day-1", "old", &MemoryCategory::Core);
+        SqliteMemory::append_backup_entry(&db_path, "preference", "keep", &MemoryCategory::Core);
+        SqliteMemory::append_backup_entry(&db_path, "fitness/day-1", "new", &MemoryCategory::Core);
+
+        let backup = std::fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap();
+        assert_eq!(backup.matches("**fitness/day-1**:").count(), 1);
+        assert_eq!(backup.matches("**preference**:").count(), 1);
+        assert!(backup.contains("**fitness/day-1**: new"));
+        assert!(!backup.contains("**fitness/day-1**: old"));
     }
 
     #[tokio::test]

@@ -120,7 +120,6 @@ async fn run_loop(config: Config) -> Result<()> {
         target: "xin",
         interval_minutes,
         heartbeat_materialization = true,
-        max_concurrent = config.xin.max_concurrent,
         builtin_tasks = true,
         evolution_integration = true,
         "xin heartbeat engine started"
@@ -238,7 +237,7 @@ fn mark_stale_tasks_for_runtime(config: &Config) -> Result<usize> {
 }
 
 fn due_tasks_for_runtime(config: &Config, now: chrono::DateTime<Utc>) -> Result<Vec<XinTask>> {
-    store::due_tasks(config, now, config.xin.max_concurrent)
+    store::due_tasks(config, now)
 }
 
 fn register_builtin_tasks(config: &Config) -> Result<()> {
@@ -246,6 +245,18 @@ fn register_builtin_tasks(config: &Config) -> Result<()> {
     for def in &definitions {
         if let Err(e) = store::ensure_system_task(config, def) {
             tracing::warn!(target: "xin", name = %def.name, "failed to register builtin task: {e}");
+        }
+    }
+    for task in store::list_tasks(config)? {
+        if crate::xin::builtin::retired_builtin_task_names().contains(&task.name.as_str()) && task.enabled {
+            store::update_task(
+                config,
+                &task.id,
+                &crate::xin::types::XinTaskPatch {
+                    enabled: Some(false),
+                    ..crate::xin::types::XinTaskPatch::default()
+                },
+            )?;
         }
     }
     tracing::info!(
@@ -262,8 +273,8 @@ async fn execute_due_tasks(
     registry: &Arc<BuiltinRegistry>,
     tasks: Vec<XinTask>,
 ) -> XinTickSummary {
-    let max_concurrent = config.xin.max_concurrent.max(1);
     let checked = tasks.len();
+    let concurrency = checked.max(1);
 
     let mut results = stream::iter(tasks.into_iter().map(|task| {
         let config = config.clone();
@@ -271,7 +282,7 @@ async fn execute_due_tasks(
         let registry = Arc::clone(registry);
         async move { execute_single_task(&config, &security, &registry, &task).await }
     }))
-    .buffer_unordered(max_concurrent);
+    .buffer_unordered(concurrency);
 
     let mut summary = XinTickSummary {
         tasks_checked: checked,
@@ -452,7 +463,7 @@ async fn drive_goals(config: &Config, security: &Arc<SecurityPolicy>, registry: 
         return Ok(());
     }
 
-    let max_concurrent = config.xin.max_concurrent.max(1);
+    let concurrency = runnable.len();
     let mut stream = stream::iter(runnable.into_iter().map(|goal| {
         let config = config.clone();
         let security = Arc::clone(security);
@@ -463,7 +474,7 @@ async fn drive_goals(config: &Config, security: &Arc<SecurityPolicy>, registry: 
             }
         }
     }))
-    .buffer_unordered(max_concurrent);
+    .buffer_unordered(concurrency);
 
     while stream.next().await.is_some() {}
     Ok(())
@@ -995,7 +1006,7 @@ mod tests {
         register_builtin_tasks(&config).unwrap();
 
         let tasks = store::list_tasks(&config).unwrap();
-        assert_eq!(tasks.len(), 5);
+        assert_eq!(tasks.len(), 3);
         for task in &tasks {
             assert_eq!(task.kind, TaskKind::System);
             assert!(task.recurring);
@@ -1012,7 +1023,45 @@ mod tests {
         register_builtin_tasks(&config).unwrap();
 
         let tasks = store::list_tasks(&config).unwrap();
-        assert_eq!(tasks.len(), 5); // No duplicates
+        assert_eq!(tasks.len(), 3); // No duplicates
+    }
+
+    #[test]
+    fn register_builtin_tasks_disables_retired_duplicate_schedules() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        for name in crate::xin::builtin::retired_builtin_task_names() {
+            store::add_task(
+                &config,
+                &NewXinTask {
+                    owner_id: None,
+                    topic_id: None,
+                    parent_task_id: None,
+                    source_message_event_id: None,
+                    name: (*name).to_string(),
+                    description: None,
+                    kind: TaskKind::System,
+                    priority: TaskPriority::Low,
+                    execution_mode: ExecutionMode::Internal,
+                    payload: (*name).to_string(),
+                    recurring: true,
+                    interval_secs: 60,
+                    max_failures: 5,
+                    approval_grant_json: None,
+                },
+            )
+            .unwrap();
+        }
+
+        register_builtin_tasks(&config).unwrap();
+
+        let tasks = store::list_tasks(&config).unwrap();
+        for task in tasks
+            .iter()
+            .filter(|task| crate::xin::builtin::retired_builtin_task_names().contains(&task.name.as_str()))
+        {
+            assert!(!task.enabled, "retired duplicate schedule must be disabled");
+        }
     }
 
     #[test]
@@ -1123,10 +1172,9 @@ mod tests {
     }
 
     #[test]
-    fn unified_due_query_respects_priority_across_all_tasks() {
+    fn unified_due_query_returns_all_due_tasks_in_priority_order() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp);
-        config.xin.max_concurrent = 1;
+        let config = test_config(&tmp);
 
         for index in 0..3 {
             store::add_task(
@@ -1172,7 +1220,7 @@ mod tests {
         .unwrap();
 
         let due = due_tasks_for_runtime(&config, Utc::now() + chrono::Duration::seconds(1)).unwrap();
-        assert_eq!(due.len(), 1);
+        assert_eq!(due.len(), 4);
         assert_ne!(due.first().map(|task| task.id.as_str()), Some(heartbeat.id.as_str()));
         assert_eq!(due.first().map(|task| task.priority), Some(TaskPriority::Critical));
     }

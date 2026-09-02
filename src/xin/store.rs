@@ -28,18 +28,6 @@ pub struct XinTaskLease {
 
 /// Insert a new task and return the persisted record.
 pub fn add_task(config: &Config, new: &NewXinTask) -> Result<XinTask> {
-    // Enforce max_tasks capacity
-    let max = config.xin.max_tasks;
-    if max > 0 {
-        let current = with_connection(config, |conn| {
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM xin_tasks", [], |row| row.get(0))?;
-            Ok(count)
-        })?;
-        if current >= max as i64 {
-            anyhow::bail!("Xin task limit reached ({max}). Remove completed/disabled tasks first.");
-        }
-    }
-
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     let next_run = if new.recurring && new.interval_secs > 0 {
@@ -149,9 +137,10 @@ pub fn list_tasks(config: &Config) -> Result<Vec<XinTask>> {
     })
 }
 
-/// Return enabled, pending tasks whose `next_run_at <= now`, sorted by priority DESC.
-pub fn due_tasks(config: &Config, now: DateTime<Utc>, limit: usize) -> Result<Vec<XinTask>> {
-    let lim = i64::try_from(limit.max(1)).context("due_tasks limit overflows i64")?;
+/// Return every enabled, pending task whose `next_run_at <= now`, sorted by
+/// priority descending. The runtime deliberately has no batch-size ceiling:
+/// claiming and leases provide ownership without silently deferring due work.
+pub fn due_tasks(config: &Config, now: DateTime<Utc>) -> Result<Vec<XinTask>> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
@@ -163,10 +152,9 @@ pub fn due_tasks(config: &Config, now: DateTime<Utc>, limit: usize) -> Result<Ve
              WHERE enabled = 1
                AND status IN ('pending', 'stale')
                AND next_run_at <= ?1
-             ORDER BY priority DESC, next_run_at ASC
-             LIMIT ?2",
+             ORDER BY priority DESC, next_run_at ASC",
         )?;
-        let rows = stmt.query_map(params![now.to_rfc3339(), lim], map_task_row)?;
+        let rows = stmt.query_map(params![now.to_rfc3339()], map_task_row)?;
         let mut tasks = Vec::new();
         for row in rows {
             tasks.push(row?);
@@ -3105,11 +3093,11 @@ mod tests {
         add_task(&config, &sample_task()).unwrap();
 
         // Task with next_run_at = now should be due
-        let due = due_tasks(&config, Utc::now() + chrono::Duration::seconds(1), 10).unwrap();
+        let due = due_tasks(&config, Utc::now() + chrono::Duration::seconds(1)).unwrap();
         assert_eq!(due.len(), 1);
 
         // Far in the past — should not be due
-        let due_past = due_tasks(&config, Utc::now() - chrono::Duration::days(1), 10).unwrap();
+        let due_past = due_tasks(&config, Utc::now() - chrono::Duration::days(1)).unwrap();
         assert!(due_past.is_empty());
     }
 

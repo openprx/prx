@@ -84,38 +84,6 @@ pub fn builtin_task_definitions() -> Vec<NewXinTask> {
             topic_id: None,
             parent_task_id: None,
             source_message_event_id: None,
-            name: "xin:memory_evolution".into(),
-            description: Some("Trigger L1/L2/L3 memory evolution cycles".into()),
-            kind: TaskKind::System,
-            priority: TaskPriority::Normal,
-            execution_mode: ExecutionMode::Internal,
-            payload: "xin:memory_evolution".into(),
-            recurring: true,
-            interval_secs: 10800, // 3 hours
-            max_failures: 5,
-            approval_grant_json: None,
-        },
-        NewXinTask {
-            owner_id: None,
-            topic_id: None,
-            parent_task_id: None,
-            source_message_event_id: None,
-            name: "xin:fitness_report".into(),
-            description: Some("Generate daily fitness/adaptation report".into()),
-            kind: TaskKind::System,
-            priority: TaskPriority::Low,
-            execution_mode: ExecutionMode::Internal,
-            payload: "xin:fitness_report".into(),
-            recurring: true,
-            interval_secs: 86400, // 24 hours
-            max_failures: 5,
-            approval_grant_json: None,
-        },
-        NewXinTask {
-            owner_id: None,
-            topic_id: None,
-            parent_task_id: None,
-            source_message_event_id: None,
             name: "xin:memory_hygiene".into(),
             description: Some("Memory compaction, deduplication, pruning".into()),
             kind: TaskKind::System,
@@ -128,6 +96,13 @@ pub fn builtin_task_definitions() -> Vec<NewXinTask> {
             approval_grant_json: None,
         },
     ]
+}
+
+/// Tasks formerly owned by Xin but now driven by the dedicated self-system
+/// workers. Keeping the handler registry compatible lets old persisted goal
+/// steps finish, while startup disables the duplicate recurring schedules.
+pub const fn retired_builtin_task_names() -> &'static [&'static str] {
+    &["xin:memory_evolution", "xin:fitness_report"]
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────

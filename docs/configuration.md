@@ -572,6 +572,8 @@ convenient. Nothing rewrites your config files.
 | `sessions_spawn.max_spawn_depth` | nesting is uncapped; depth is still reported |
 | `sessions_spawn.max_children_per_agent` | per-session fan-out is uncapped |
 | `scheduler.max_concurrent` | due cron jobs all start at once; use `prx tasks` to see and end them |
+| `xin.max_concurrent` | due Xin work is no longer capped by an arbitrary configuration ceiling |
+| `xin.max_tasks` | the persisted Xin task store no longer has an arbitrary task-count ceiling |
 | `autonomy.max_actions_per_hour` | no hourly action budget |
 | `gateway.request_timeout_secs` | no request deadline on gateway handlers |
 | `channels_config.message_timeout_secs` | no wall clock on a channel or chat turn; a stalled turn is ended by `runtime.idle_hang_secs`, a running one by `prx tasks kill` |

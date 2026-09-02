@@ -752,8 +752,9 @@ claim_lease_secs = 90
 interval_minutes = 5
 
 [xin]
-# cycle_interval_secs = 3600
-# max_concurrent_tasks = 2
+interval_minutes = 5
+stale_timeout_minutes = 60
+adopt_legacy_tasks = false
 "#
         .into(),
     }

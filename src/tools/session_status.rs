@@ -120,6 +120,10 @@ impl Tool for SessionStatusTool {
             .into_iter()
             .filter(|run| !active_ids.contains(&run.run_id))
             .collect::<Vec<_>>();
+        let recovered_pending = recovered
+            .iter()
+            .filter(|run| matches!(run.status, RecoveredTaskStatus::Pending))
+            .count();
         let recovered_running = recovered
             .iter()
             .filter(|run| matches!(run.status, RecoveredTaskStatus::Running))
@@ -148,12 +152,13 @@ impl Tool for SessionStatusTool {
              Channels:  {}\n\
              Uptime:    {}\n\
              \n\
-             Sub-agents/tasks: {} total ({} running, {} completed, {} failed; {} memory-backed recovered)",
+             Sub-agents/tasks: {} total ({} pending, {} running, {} completed, {} failed; {} memory-backed recovered)",
             self.model,
             self.provider_name,
             channels_str,
             uptime_str,
             total_count,
+            recovered_pending,
             running_count + recovered_running,
             completed_count + recovered_completed,
             failed_count + recovered_failed,
@@ -298,6 +303,7 @@ mod tests {
         let result = tool.execute(json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("3 total"));
+        assert!(result.output.contains("0 pending"));
         assert!(result.output.contains("1 running"));
         assert!(result.output.contains("1 completed"));
         assert!(result.output.contains("1 failed"));
@@ -376,7 +382,8 @@ mod tests {
         let result = tool.execute(json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("1 total"));
-        assert!(result.output.contains("1 running"));
+        assert!(result.output.contains("1 pending"));
+        assert!(result.output.contains("0 running"));
         assert!(result.output.contains("1 memory-backed recovered"));
     }
 }

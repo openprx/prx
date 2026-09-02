@@ -446,7 +446,7 @@ fn causal_tree_layer(config: &Config) -> ControlLayerTrace {
     }
 }
 
-fn xin_layer(config: &Config) -> ControlLayerTrace {
+fn xin_layer(_config: &Config) -> ControlLayerTrace {
     let enabled = true;
     ControlLayerTrace {
         level: 3,
@@ -462,7 +462,7 @@ fn xin_layer(config: &Config) -> ControlLayerTrace {
             "xin_available": true,
             "builtin_tasks": true,
             "evolution_integration": true,
-            "max_concurrent": config.xin.max_concurrent,
+            "concurrency": "unbounded",
         }),
     }
 }

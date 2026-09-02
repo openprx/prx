@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.76] - 2 September 2026
+
+### Fixed
+
+- Stopped Xin from registering duplicate fitness and memory-evolution schedules;
+  existing persisted duplicates are disabled while their internal handlers stay
+  available for backward-compatible goal recovery.
+- Reported rescheduled Xin and cron work as pending instead of presenting it as
+  a running, unmanageable sub-agent session.
+- Changed generated core-memory Markdown backups to update by key and collapse
+  stale generated duplicates, preventing repeated fitness reports from growing
+  every future system prompt.
+
+### Changed
+
+- Removed the `xin.max_concurrent` and `xin.max_tasks` ceilings. Due work now
+  starts without an arbitrary configuration cap, while leases, heartbeats,
+  checkpoints and explicit cancellation continue to provide crash safety.
+- Reduced the default Xin maintenance set to health checks, stale cleanup and
+  memory hygiene; dedicated self-system workers remain the sole owners of
+  fitness reporting and memory evolution.
+
 ## [0.8.75] - 2 September 2026
 
 ### Changed

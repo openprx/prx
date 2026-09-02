@@ -11806,7 +11806,7 @@ mod tests {
         assert_eq!(count("completed"), 1, "{summary}");
         assert_eq!(count("failed"), 1, "{summary}");
         assert_eq!(count("killed"), 2, "{summary}");
-        assert_eq!(count("no_result"), 3, "{summary}");
+        assert_eq!(count("no_result"), 2, "{summary}");
     }
 
     // ── b4: routing of the summary ───────────────────────────────

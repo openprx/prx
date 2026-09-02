@@ -8,6 +8,7 @@ const MESSAGE_EVENT_SCAN_LIMIT: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecoveredTaskStatus {
+    Pending,
     Running,
     Completed,
     Failed,
@@ -354,7 +355,17 @@ fn is_task_lifecycle_event(event_type: &str) -> bool {
 }
 
 fn status_from_event_type(event_type: &str) -> RecoveredTaskStatus {
-    if event_type == "task.completed"
+    if event_type == "xin.task.created"
+        || event_type == "xin.task.spawned"
+        || event_type == "xin.task.updated"
+        || event_type == "xin.task.rescheduled"
+        || event_type == "xin.task.run_recorded"
+        || event_type == "cron.job.created"
+        || event_type == "cron.job.updated"
+        || event_type == "cron.job.run_recorded"
+    {
+        RecoveredTaskStatus::Pending
+    } else if event_type == "task.completed"
         || event_type == "xin.task.completed"
         || event_type == "cron.job.completed"
         || event_type.ends_with(".task.completed")
@@ -546,5 +557,10 @@ mod tests {
             RecoveredTaskStatus::Completed
         );
         assert_eq!(status_from_event_type("cron.job.failed"), RecoveredTaskStatus::Failed);
+        assert_eq!(
+            status_from_event_type("xin.task.rescheduled"),
+            RecoveredTaskStatus::Pending
+        );
+        assert_eq!(status_from_event_type("cron.job.updated"), RecoveredTaskStatus::Pending);
     }
 }

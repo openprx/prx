@@ -197,6 +197,7 @@ fn format_recovered_history(run_id: &str, history: &RecoveredRunHistory, limit: 
     }
 
     let status = match history.run.status {
+        RecoveredTaskStatus::Pending => "pending",
         RecoveredTaskStatus::Running => "running",
         RecoveredTaskStatus::Completed => "completed",
         RecoveredTaskStatus::Failed => "failed",
