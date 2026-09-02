@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.8.71] - 2026-09-02
+## [0.8.72] - 2 September 2026
+
+### Fixed
+
+- Removed the post-response `Thinking` card from the primary TUI transcript so
+  each turn ends with a single `Worked for` summary and the assistant answer.
+  Reasoning data remains available in the verbose transcript, and hidden
+  reasoning no longer intercepts the tool-card `Tab` shortcut.
+
+## [0.8.71] - 2 September 2026
 
 ### Changed
 
@@ -18,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updated the main TUI composer prompt to `›` while retaining `>` for ASCII
   fallback and explicit labels for attached session targets.
 
-## [0.8.70] - 2026-09-02
+## [0.8.70] - 2 September 2026
 
 ### Fixed
 
@@ -26,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stopped replaying ambiguous transport failures through the Responses API.
 - Added WhatsApp typing and paused presence updates to long-running wacli turns.
 
-## [0.8.69] - 2026-08-31
+## [0.8.69] - 31 August 2026
 
 ### Added
 
@@ -39,14 +48,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   webhook echoes cannot re-enter the agent as new commands, including the race
   where an echo arrives before the send subprocess returns.
 
-## [0.8.68] - 2026-08-31
+## [0.8.68] - 31 August 2026
 
 ### Fixed
 
 - Included configured wacli channels in `prx channel list`, `prx channel doctor`,
   and `prx status`, and documented wacli in the channel command help.
 
-## [0.8.67] - 2026-08-31
+## [0.8.67] - 31 August 2026
 
 ### Fixed
 
@@ -55,7 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Prevented Chat and Agent streaming paths from replaying a request after any
   text, reasoning, or tool-call output has already been emitted.
 
-## [0.8.20] - 2026-07-26
+## [0.8.20] - 26 July 2026
 
 ### Added
 
@@ -81,7 +90,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed the obsolete `[autonomy.sandbox]` schema/templates and Landlock build
   feature so deleting the old switch cannot silently activate isolation.
 
-## [0.8.12] - 2026-07-17
+## [0.8.12] - 17 July 2026
 
 ### Fixed
 
@@ -99,7 +108,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deployment was rolled back after the isolated PostgreSQL legacy-Cron check
   reproduced the Tokio runtime panic. Production returned to healthy 0.8.7.
 
-## [0.8.11] - 2026-07-17
+## [0.8.11] - 17 July 2026
 
 ### Fixed
 
@@ -116,7 +125,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `v0.8.11` was later stopped during Stage 5 and rolled back after its isolated
   PostgreSQL Cron deployment check exposed a Tokio runtime panic.
 
-## [0.8.10] - 2026-07-17
+## [0.8.10] - 17 July 2026
 
 ### Fixed
 
@@ -132,7 +141,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Windows release build later failed, so its incomplete GitHub Release was
   removed without moving its tag. Upgrade directly from 0.8.7 to 0.8.12.
 
-## [0.8.9] - 2026-07-17
+## [0.8.9] - 17 July 2026
 
 ### Fixed
 
@@ -147,7 +156,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `v0.8.8` was stopped before deployment after its production-ledger preflight
   found the checksum regression. Upgrade directly from 0.8.7 to 0.8.9.
 
-## [0.8.8] - 2026-07-16
+## [0.8.8] - 16 July 2026
 
 ### Added
 
@@ -195,7 +204,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   可恢复旧行为；`deny` / `no` / `n` / `0` 与未设置一致拒绝。Codex S5 P0-3 反馈
   "绝不静默 auto-approve"。`autonomy_level=Full` 不走此路径，行为不变。
 
-## [0.3.0] - 2026-03-19
+## [0.3.0] - 19 March 2026
 
 ### Added
 
@@ -270,7 +279,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `enc:` prefix for encrypted secrets — Use `enc2:`
   (ChaCha20-Poly1305) instead
 
-## [0.2.1] - 2026-03-11
+## [0.2.1] - 11 March 2026
 
 ### Added
 
@@ -284,7 +293,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider reachability filtering, lock-safe async outcome persistence,
   and reserved `router/` namespace enforcement.
 
-## [0.1.0] - 2026-02-13
+## [0.1.0] - 13 February 2026
 
 ### Added
 
@@ -319,8 +328,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Command injection blocking
 - Workspace escape prevention
 - Forbidden system path protection (`/etc`, `/root`, `~/.ssh`)
-
-[Unreleased]: https://github.com/openprx/prx/compare/v0.3.0...HEAD
-[0.3.0]: https://github.com/openprx/prx/compare/v0.2.1...v0.3.0
-[0.2.1]: https://github.com/openprx/prx/compare/v0.1.0...v0.2.1
-[0.1.0]: https://github.com/openprx/prx/releases/tag/v0.1.0

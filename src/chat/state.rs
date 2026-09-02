@@ -1246,10 +1246,8 @@ impl ChatState {
             return self.reduce_cancel_requested();
         }
 
-        // Tab → 折叠/展开最近的可折叠卡片（Reasoning 或 ToolResult，取更靠后的）。
-        // BUG-01: 旧实现只切 ToolResult，导致 thinking/Reasoning 卡按 Tab 永不展开
-        // （折叠提示却写着 "press Tab to expand"）。与 tui::toggle_last_foldable_card
-        // 的统一语义对齐。
+        // Tab → 折叠/展开最近的可见 ToolResult 卡片。Reasoning 仅保留在
+        // verbose transcript 中，不应拦截主对话的 Tab 交互。
         if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE && self.ui.input.is_empty() {
             return self.reduce_foldable_card_toggled();
         }
@@ -1470,23 +1468,19 @@ impl ChatState {
         vec![Effect::RequestRedraw]
     }
 
-    /// 处理 Tab — 折叠/展开最近的可折叠卡片（Reasoning 或 ToolResult）。
+    /// 处理 Tab — 折叠/展开最近的可见 ToolResult 卡片。
     ///
-    /// BUG-01: 取 `conversation_lines` 中**最靠后**的 Reasoning 或 ToolResult，
-    /// 翻转其 `folded`。与 `tui::TuiState::toggle_last_foldable_card` 同语义，
-    /// 保证 Pure(reducer/snapshot) 路径下 Tab 能展开 thinking 卡片。
+    /// Reasoning 数据仍保留在 `conversation_lines` 供 verbose transcript
+    /// 使用，但主对话不再渲染它，因此也不参与 Tab 折叠。
     #[cfg(feature = "terminal-tui")]
     fn reduce_foldable_card_toggled(&mut self) -> Vec<Effect> {
         use crate::chat::tui::ConversationLine;
         let mut toggled = false;
         for line in self.ui.conversation_lines.iter_mut().rev() {
-            match line {
-                ConversationLine::Reasoning { folded, .. } | ConversationLine::ToolResult { folded, .. } => {
-                    *folded = !*folded;
-                    toggled = true;
-                    break;
-                }
-                _ => {}
+            if let ConversationLine::ToolResult { folded, .. } = line {
+                *folded = !*folded;
+                toggled = true;
+                break;
             }
         }
         // A fold toggle must still mark the conversation as changed so the
@@ -4837,12 +4831,9 @@ mod tests {
             assert!(has_request_redraw(&effects));
         }
 
-        /// BUG-01: Tab must expand the most recent Reasoning ("thinking") card,
-        /// not only ToolResult cards. Previously Tab ignored Reasoning entirely,
-        /// so thinking cards stayed folded ("▸") forever despite the
-        /// "press Tab to expand" hint.
+        /// Hidden reasoning must not intercept Tab in the primary transcript.
         #[test]
-        fn test_tab_toggles_reasoning_card_fold() {
+        fn test_tab_ignores_hidden_reasoning_card() {
             use crate::chat::tui::ConversationLine;
             use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
             let mut state = s();
@@ -4851,26 +4842,19 @@ mod tests {
                 char_count: 12,
                 folded: true,
             });
-            // Tab → expand.
+            let generation_before = state.ui.conversation_generation;
             let effects = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
             assert!(has_request_redraw(&effects));
             match state.ui.conversation_lines.last() {
                 Some(ConversationLine::Reasoning { folded, .. }) => {
-                    assert!(!folded, "Tab must expand the reasoning card");
+                    assert!(*folded, "Tab must leave hidden reasoning unchanged");
                 }
                 other => panic!("expected Reasoning card, got {other:?}"),
             }
-            // Tab again → collapse.
-            let _ = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
-            match state.ui.conversation_lines.last() {
-                Some(ConversationLine::Reasoning { folded, .. }) => {
-                    assert!(folded, "second Tab must collapse the reasoning card");
-                }
-                other => panic!("expected Reasoning card, got {other:?}"),
-            }
+            assert_eq!(state.ui.conversation_generation, generation_before);
         }
 
-        /// BUG-01: a fold toggle (KeyPressed Tab) must mark the reduce dirty so
+        /// A visible tool fold toggle (KeyPressed Tab) must mark the reduce dirty so
         /// `build_ui_snapshot` rebuilds with the new folded state (the Pure-mode
         /// renderer reads the snapshot, not the live state). Guards against the
         /// stale `cached_lines_arc` regression.
@@ -4879,9 +4863,13 @@ mod tests {
             use crate::chat::tui::ConversationLine;
             use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
             let mut state = s();
-            state.ui.conversation_lines.push(ConversationLine::Reasoning {
-                content: "x".to_string(),
-                char_count: 1,
+            state.ui.conversation_lines.push(ConversationLine::ToolResult {
+                tool_name: "shell".to_string(),
+                args_preview: "{}".to_string(),
+                args_full: "{}".to_string(),
+                result: Some("ok".to_string()),
+                status: crate::chat::tui::ToolStatus::Done,
+                elapsed_ms: Some(1),
                 folded: true,
             });
             // Prime the snapshot cache.
@@ -4892,10 +4880,10 @@ mod tests {
             assert!(dirty, "fold toggle must mark snapshot dirty");
             let snap = state.build_ui_snapshot(2);
             match snap.conversation_lines.last() {
-                Some(ConversationLine::Reasoning { folded, .. }) => {
-                    assert!(!folded, "rebuilt snapshot must reflect the expanded card");
+                Some(ConversationLine::ToolResult { folded, .. }) => {
+                    assert!(!folded, "rebuilt snapshot must reflect the expanded tool card");
                 }
-                other => panic!("expected Reasoning card in snapshot, got {other:?}"),
+                other => panic!("expected ToolResult card in snapshot, got {other:?}"),
             }
         }
 
@@ -4906,6 +4894,15 @@ mod tests {
             use crate::chat::tui::ConversationLine;
             use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
             let mut state = s();
+            state.ui.conversation_lines.push(ConversationLine::ToolResult {
+                tool_name: "shell".to_string(),
+                args_preview: "{}".to_string(),
+                args_full: "{}".to_string(),
+                result: Some("ok".to_string()),
+                status: crate::chat::tui::ToolStatus::Done,
+                elapsed_ms: Some(1),
+                folded: true,
+            });
             state.ui.conversation_lines.push(ConversationLine::Reasoning {
                 content: "thoughts".to_string(),
                 char_count: 8,
@@ -4913,7 +4910,7 @@ mod tests {
             });
             let gen_before = state.ui.conversation_generation;
 
-            // Tab (foldable toggle) must bump the generation so scrollback re-emits.
+            // Tab toggles the visible tool even though hidden reasoning is newer.
             let _ = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
             assert_eq!(
                 state.ui.conversation_generation,
@@ -5266,9 +5263,9 @@ mod tests {
             );
         }
 
-        /// Step3-6b: StreamCompleted with reasoning → 同时 push Reasoning 卡片
+        /// Step3-6b: StreamCompleted with reasoning → 保留 Reasoning 供 verbose transcript
         #[test]
-        fn test_redux_stream_completed_with_reasoning_pushes_card() {
+        fn test_redux_stream_completed_with_reasoning_preserves_transcript_data() {
             let mut state = s();
             let _ = state.reduce(Action::TurnStarted {
                 draft_id: "d1".to_string(),

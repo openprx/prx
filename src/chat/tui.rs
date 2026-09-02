@@ -610,8 +610,7 @@ pub enum InputOutcome {
 /// This is a pure-function projection over the global shortcut table layered
 /// on top of [`TuiState::handle_input_key`]:
 ///
-/// - `Tab` — toggles the most recent foldable card (reasoning OR
-///   tool-result, whichever appears later in the conversation).
+/// - `Tab` — toggles the most recent tool-result card.
 /// - `Ctrl+R` — reverse-searches submitted input history.
 /// - `Ctrl+X Ctrl+E` — opens the current draft in an external editor.
 /// - `Ctrl+C` — interrupt the current turn (caller cancels in-flight work)
@@ -1007,9 +1006,8 @@ pub(crate) fn dispatch_slash_menu_key_with_sources(
 }
 
 /// Identifies which kind of foldable card was toggled by the unified `Tab`
-/// keybinding. Returned alongside the new folded state from
-/// [`TuiState::toggle_last_foldable_card`] so call-sites (or tests) can
-/// observe the dispatch decision without re-scanning `conversation_lines`.
+/// keybinding. Reasoning remains a legacy variant for transcript data, while
+/// the primary TUI only exposes tool cards as foldable rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FoldableKind {
     /// A `ConversationLine::Reasoning` card was flipped.
@@ -1718,9 +1716,9 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
         state.external_editor_prefix_armed = true;
         return KeyDispatch::Consumed;
     }
-    // Tab → toggle the most recent foldable card (reasoning OR tool-result,
-    // whichever appears later in the conversation). When neither exists Tab
-    // is still consumed — per spec it never falls through to the input box.
+    // Tab → toggle the most recent visible tool-result card. Reasoning is
+    // retained for the verbose transcript but intentionally hidden from the
+    // primary conversation, so it must not intercept this shortcut.
     if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE && state.input.is_empty() {
         let _ = state.toggle_last_foldable_card();
         return KeyDispatch::Consumed;
@@ -3469,27 +3467,15 @@ impl TuiState {
         self.conversation_lines.iter().rposition(ConversationLine::is_reasoning)
     }
 
-    /// Toggle the folded flag of the most recent foldable card — either a
-    /// `Reasoning` or a `ToolResult`, whichever appears later in
-    /// `conversation_lines`. Returns the new folded value and a tag
-    /// describing which variant was touched, or `None` if neither exists.
+    /// Toggle the folded flag of the most recent visible `ToolResult` card.
     ///
-    /// This is the keystone behind the unified `Tab` keybinding: the user
-    /// never has to remember whether the most recent card is a tool or a
-    /// thinking block — Tab "does the obvious thing" by flipping whichever
-    /// foldable thing sits closest to the cursor.
+    /// Reasoning records stay in `conversation_lines` for the verbose
+    /// transcript, but the primary TUI does not render or interact with them.
     pub fn toggle_last_foldable_card(&mut self) -> Option<(FoldableKind, bool)> {
         for line in self.conversation_lines.iter_mut().rev() {
-            match line {
-                ConversationLine::Reasoning { folded, .. } => {
-                    *folded = !*folded;
-                    return Some((FoldableKind::Reasoning, *folded));
-                }
-                ConversationLine::ToolResult { folded, .. } => {
-                    *folded = !*folded;
-                    return Some((FoldableKind::ToolResult, *folded));
-                }
-                _ => continue,
+            if let ConversationLine::ToolResult { folded, .. } = line {
+                *folded = !*folded;
+                return Some((FoldableKind::ToolResult, *folded));
             }
         }
         None
@@ -4158,40 +4144,20 @@ pub fn fullscreen_transcript_scroll_available<V: BottomChromeView + ?Sized>(stat
         && !state.focus().is_child_view()
 }
 
-/// Toggle a visible reasoning-card header at a fullscreen mouse coordinate.
+/// Legacy compatibility hook for reasoning-card clicks.
 ///
-/// This mirrors the transcript renderer's viewport math: frame dimensions are
-/// converted into the transcript area, the current scroll state chooses the
-/// top visible row, and only rows occupied by a `Reasoning` header are
-/// actionable. Body rows and other conversation lines are ignored.
-pub fn toggle_reasoning_at_fullscreen_point(
-    state: &mut TuiState,
-    scroll: &FullscreenTranscriptScroll,
-    total_width: u16,
-    total_height: u16,
-    column: u16,
-    row: u16,
+/// Reasoning is no longer rendered in the primary transcript, so no fullscreen
+/// coordinate can target it. The data remains available through the verbose
+/// transcript viewer.
+pub const fn toggle_reasoning_at_fullscreen_point(
+    _state: &mut TuiState,
+    _scroll: &FullscreenTranscriptScroll,
+    _total_width: u16,
+    _total_height: u16,
+    _column: u16,
+    _row: u16,
 ) -> bool {
-    let area = fullscreen_transcript_area(state, total_width, total_height);
-    if area.width == 0
-        || area.height == 0
-        || column < area.x
-        || column >= area.x.saturating_add(area.width)
-        || row < area.y
-        || row >= area.y.saturating_add(area.height)
-    {
-        return false;
-    }
-
-    let top_scroll = fullscreen_transcript_top_scroll(state, scroll, area);
-    let clicked_row = top_scroll.saturating_add(usize::from(row.saturating_sub(area.y)));
-    reasoning_index_at_rendered_row(state, area.width.max(1), clicked_row).is_some_and(|idx| {
-        if let Some(ConversationLine::Reasoning { folded, .. }) = state.conversation_lines.get_mut(idx) {
-            *folded = !*folded;
-            return true;
-        }
-        false
-    })
+    false
 }
 
 fn fullscreen_transcript_top_scroll<V: BottomChromeView + ?Sized>(
@@ -4278,6 +4244,12 @@ pub(crate) fn transcript_plain_rows<V: BottomChromeView + ?Sized>(state: &V, wid
 
 fn push_conversation_transcript_lines<'a, V: BottomChromeView + ?Sized>(lines: &mut Vec<Line<'a>>, state: &'a V) {
     for line in state.conversation_lines() {
+        // Reasoning is diagnostic data, not a second completion summary. Keep
+        // it in the backing conversation for Ctrl+O's verbose transcript, but
+        // omit it from the primary conversation flow.
+        if matches!(line, ConversationLine::Reasoning { .. }) {
+            continue;
+        }
         render_conversation_line(lines, line, state.ascii_fallback());
     }
 }
@@ -4331,26 +4303,6 @@ fn render_turn_activity_line<'a, V: BottomChromeView + ?Sized>(lines: &mut Vec<L
         Span::styled(format!(" ({detail})"), Style::default().fg(Color::DarkGray)),
     ]));
     lines.push(Line::from(""));
-}
-
-fn reasoning_index_at_rendered_row(state: &TuiState, width: u16, rendered_row: usize) -> Option<usize> {
-    let mut cursor = 0usize;
-    for (idx, conv_line) in state.conversation_lines.iter().enumerate() {
-        let mut rendered = Vec::new();
-        render_conversation_line(&mut rendered, conv_line, state.ascii_fallback());
-        let line_rows = usize::from(measure_wrapped_rows(&rendered, width));
-        if let ConversationLine::Reasoning { .. } = conv_line {
-            let header_rows = rendered.first().map_or(1, |header| {
-                let header_lines = vec![header.clone()];
-                usize::from(measure_wrapped_rows(&header_lines, width))
-            });
-            if rendered_row >= cursor && rendered_row < cursor.saturating_add(header_rows) {
-                return Some(idx);
-            }
-        }
-        cursor = cursor.saturating_add(line_rows);
-    }
-    None
 }
 
 fn fullscreen_bottom_chrome_base_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
@@ -9006,31 +8958,46 @@ mod tests {
     }
 
     #[test]
-    fn mouse_click_on_reasoning_header_toggles_fold_state() {
+    fn primary_transcript_hides_reasoning_and_click_cannot_toggle_it() {
         let mut state = TuiState::new("p", "m");
+        state
+            .conversation_lines
+            .push(ConversationLine::TurnSummary { duration_ms: 2_000 });
+        state.conversation_lines.push(ConversationLine::Assistant {
+            content: "final answer".to_string(),
+        });
         assert!(state.push_reasoning("first step\nsecond step"));
         let scroll = FullscreenTranscriptScroll::default();
 
-        assert!(toggle_reasoning_at_fullscreen_point(&mut state, &scroll, 80, 24, 0, 0));
-        match state.conversation_lines.last() {
-            Some(ConversationLine::Reasoning { folded, .. }) => assert!(!*folded, "click expands folded card"),
-            other => panic!("test: expected Reasoning, got {other:?}"),
-        }
-
+        let primary = transcript_plain_rows(&state, 80).join("\n");
         assert!(
-            !toggle_reasoning_at_fullscreen_point(&mut state, &scroll, 80, 24, 0, 1),
-            "clicking expanded body must not toggle"
+            primary.contains("Worked for 2s"),
+            "primary keeps one completion summary: {primary}"
+        );
+        assert!(primary.contains("final answer"), "primary keeps the answer: {primary}");
+        assert!(
+            !primary.contains("Thinking"),
+            "primary transcript hides reasoning: {primary}"
+        );
+        assert!(
+            !primary.contains("first step"),
+            "primary transcript hides reasoning body: {primary}"
+        );
+        assert!(
+            !toggle_reasoning_at_fullscreen_point(&mut state, &scroll, 80, 24, 0, 0),
+            "hidden reasoning has no clickable row"
         );
         match state.conversation_lines.last() {
-            Some(ConversationLine::Reasoning { folded, .. }) => assert!(!*folded, "body click leaves card expanded"),
+            Some(ConversationLine::Reasoning { folded, .. }) => assert!(*folded, "hidden record remains unchanged"),
             other => panic!("test: expected Reasoning, got {other:?}"),
         }
 
-        assert!(toggle_reasoning_at_fullscreen_point(&mut state, &scroll, 80, 24, 0, 0));
-        match state.conversation_lines.last() {
-            Some(ConversationLine::Reasoning { folded, .. }) => assert!(*folded, "second header click collapses"),
-            other => panic!("test: expected Reasoning, got {other:?}"),
-        }
+        let verbose = build_transcript_view("demo", &state.conversation_lines, 0);
+        assert!(
+            verbose.lines.iter().any(|line| line.contains("first step")),
+            "verbose transcript retains reasoning: {:?}",
+            verbose.lines
+        );
     }
 
     #[test]
@@ -10122,29 +10089,24 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_tab_toggles_last_reasoning_card_when_more_recent_than_tool() {
-        // S1-A: Tab now toggles whichever foldable card sits closest to the
-        // end of the conversation. A reasoning card pushed AFTER a tool card
-        // must win the Tab dispatch.
+    fn dispatch_tab_ignores_hidden_reasoning_and_toggles_tool() {
         let mut state = TuiState::new("p", "m");
         state.push_tool_result_started("shell", "{}");
         assert!(state.push_reasoning("step 1\nstep 2"));
 
-        // Defaults: both folded = true. Tab should flip the reasoning card.
         let out = dispatch_global_key(key(KeyCode::Tab), &mut state);
         assert_eq!(out, KeyDispatch::Consumed);
         match state.conversation_lines.last() {
-            Some(ConversationLine::Reasoning { folded, .. }) => assert!(!*folded, "Tab unfolded reasoning"),
+            Some(ConversationLine::Reasoning { folded, .. }) => assert!(*folded, "hidden reasoning stays folded"),
             other => panic!("test: expected Reasoning at end, got {other:?}"),
         }
-        // The tool-result card must NOT have been touched.
         let tool_idx = state
             .conversation_lines
             .iter()
             .position(ConversationLine::is_tool_result)
             .expect("test: tool card exists");
         match state.conversation_lines.get(tool_idx).expect("test: tool idx valid") {
-            ConversationLine::ToolResult { folded, .. } => assert!(*folded, "tool card untouched"),
+            ConversationLine::ToolResult { folded, .. } => assert!(!*folded, "visible tool card toggled"),
             other => panic!("test: expected ToolResult, got {other:?}"),
         }
     }
@@ -10163,7 +10125,7 @@ mod tests {
         assert!(state.push_reasoning("thinking"));
         assert_eq!(
             state.toggle_last_foldable_card(),
-            Some((FoldableKind::Reasoning, false))
+            Some((FoldableKind::ToolResult, true))
         );
     }
 
