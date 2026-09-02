@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.79] - 2 September 2026
+
 ### Added
 
 - Completed Xin task management with editable tasks, immediate execution,
