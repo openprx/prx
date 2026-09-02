@@ -2448,6 +2448,36 @@ mod tests {
         assert!(!message.contains("responses fallback"), "got: {message}");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn buffered_response_survives_past_the_old_two_minute_deadline() {
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        async fn slow_but_healthy() -> Json<serde_json::Value> {
+            tokio::time::sleep(std::time::Duration::from_secs(121)).await;
+            Json(serde_json::json!({
+                "choices": [{"message": {"content": "slow but healthy"}}]
+            }))
+        }
+
+        let app = Router::new().route("/chat/completions", post(slow_but_healthy));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test: bind");
+        let addr = listener.local_addr().expect("test: addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let provider = make_provider("custom", &format!("http://{addr}"), Some("test-key"));
+        let response = provider
+            .chat_with_system(None, "hello", "test-model", 0.0)
+            .await
+            .expect("test: a healthy buffered response has no whole-response deadline");
+
+        assert_eq!(response, "slow but healthy");
+    }
+
     #[test]
     fn request_serializes_correctly() {
         let req = ApiChatRequest {
