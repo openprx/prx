@@ -291,7 +291,7 @@ pub struct UiState {
     pub conversation_generation: u64,
     /// 多行输入 buffer + 历史
     pub input: TuiInput,
-    /// 当前对话回合计数（用于状态栏）
+    /// 当前对话回合计数（用于会话与诊断视图）
     pub turn_count: usize,
     /// In-session chat mode displayed in the status bar.
     pub chat_mode: ChatMode,
@@ -376,7 +376,7 @@ pub struct UiSnapshot {
     pub autonomy_level: AutonomyLevel,
     /// 会话标题（status bar 显示）.
     pub session_title: Arc<str>,
-    /// 对话回合计数（status bar 显示）.
+    /// 对话回合计数（供会话与诊断视图使用）.
     pub turn_count: usize,
     /// ASCII 降级模式标志.
     pub ascii_fallback: bool,
@@ -386,10 +386,12 @@ pub struct UiSnapshot {
     pub conversation_generation: u64,
     /// 当前 in-flight streaming draft（None 表示空闲）.
     pub streaming: Option<StreamingDraft>,
+    /// Wall-clock start of the primary visible turn for live elapsed feedback.
+    pub active_turn_started_at_ms: Option<i64>,
     /// In-flight visible streaming drafts keyed by provider worker sequence.
     pub visible_streaming_drafts: Arc<Vec<VisibleStreamingDraftView>>,
-    /// Duration of the most recently completed main turn, shown in the pinned
-    /// bottom status bar until the next turn starts.
+    /// Duration of the most recently completed main turn. Retained for
+    /// snapshot consumers; the fullscreen transcript owns visible activity.
     pub last_turn_duration_ms: Option<u64>,
     /// 输入 buffer 快照（clone 成本接受，多行场景 < INPUT_MAX_VISIBLE_ROWS）.
     pub input: TuiInput,
@@ -439,6 +441,7 @@ impl UiSnapshot {
             conversation_lines: Arc::new(Vec::new()),
             conversation_generation: 0,
             streaming: None,
+            active_turn_started_at_ms: None,
             visible_streaming_drafts: Arc::new(Vec::new()),
             last_turn_duration_ms: None,
             input: TuiInput::new(),
@@ -482,6 +485,9 @@ pub struct StreamingTurnDraft {
     /// Scheduler sequence; lower sequence renders as the primary/earlier draft.
     pub sequence: u64,
     pub prompt_preview: String,
+    /// Wall-clock start for this provider turn. Kept per draft so concurrent
+    /// turns report their own elapsed time instead of sharing a global timer.
+    pub started_at_ms: i64,
     pub draft: StreamingDraft,
 }
 
@@ -501,7 +507,7 @@ pub struct StreamState {
     pub visible_drafts: Vec<StreamingTurnDraft>,
     /// Wall-clock start of the current primary turn.
     pub started_at_ms: Option<i64>,
-    /// Completed duration retained for the bottom status bar.
+    /// Completed duration retained for snapshot consumers.
     pub last_duration_ms: Option<u64>,
 }
 
@@ -900,6 +906,7 @@ impl ChatState {
             conversation_lines: lines,
             conversation_generation: self.ui.conversation_generation,
             streaming: self.stream.primary_streaming_draft().cloned(),
+            active_turn_started_at_ms: self.stream.primary_draft().map(|draft| draft.started_at_ms),
             visible_streaming_drafts: Arc::new(self.stream.visible_streaming_draft_views()),
             last_turn_duration_ms: self.stream.last_duration_ms,
             input: self.ui.input.clone(),
@@ -1583,6 +1590,7 @@ impl ChatState {
             task_id,
             sequence: Self::visible_draft_sequence(task_id, sequence),
             prompt_preview,
+            started_at_ms: chrono::Utc::now().timestamp_millis(),
             draft: StreamingDraft {
                 draft_id,
                 accumulated: String::new(),
@@ -1802,14 +1810,10 @@ impl ChatState {
         let tool_key = ToolTaskKey::from_task_id(removed_draft.task_id);
         self.control.remove_turn_cancel(tool_key);
         let no_visible_drafts = !self.stream.has_visible_drafts();
+        let duration_ms = crate::chat::tui::turn_elapsed_ms(removed_draft.started_at_ms);
+        self.stream.last_duration_ms = Some(duration_ms);
         if no_visible_drafts {
-            self.stream.last_duration_ms = self.stream.started_at_ms.take().map(|started_at_ms| {
-                let elapsed = chrono::Utc::now()
-                    .timestamp_millis()
-                    .saturating_sub(started_at_ms)
-                    .max(0);
-                u64::try_from(elapsed).unwrap_or(u64::MAX)
-            });
+            self.stream.started_at_ms = None;
         }
         self.remove_pending_tool_cards(tool_key);
         if no_visible_drafts && !self.control.has_task_turn_cancels() {
@@ -1817,6 +1821,9 @@ impl ChatState {
             self.control.generating = false;
         }
         if !final_text.is_empty() {
+            self.ui
+                .conversation_lines
+                .push(ConversationLine::TurnSummary { duration_ms });
             self.ui.conversation_lines.push(ConversationLine::Assistant {
                 content: final_text.clone(),
             });
@@ -5238,9 +5245,13 @@ mod tests {
             assert!(!state.control.generating);
             assert_eq!(
                 state.ui.conversation_lines.len(),
-                prev_lines + 1,
-                "应 push 1 个 Assistant 行"
+                prev_lines + 2,
+                "应 push TurnSummary + Assistant"
             );
+            assert!(matches!(
+                state.ui.conversation_lines.get(prev_lines),
+                Some(crate::chat::tui::ConversationLine::TurnSummary { .. })
+            ));
             // 验证最后一行是 Assistant("final answer")
             if let Some(crate::chat::tui::ConversationLine::Assistant { content }) = state.ui.conversation_lines.last()
             {
@@ -5268,8 +5279,12 @@ mod tests {
                 final_text: "ans".to_string(),
                 reasoning: "thinking step".to_string(),
             });
-            // 应有 Assistant + Reasoning 共 2 行
-            assert_eq!(state.ui.conversation_lines.len(), 2);
+            // 应有 TurnSummary + Assistant + Reasoning 共 3 行
+            assert_eq!(state.ui.conversation_lines.len(), 3);
+            assert!(matches!(
+                state.ui.conversation_lines.first(),
+                Some(crate::chat::tui::ConversationLine::TurnSummary { .. })
+            ));
             assert!(
                 matches!(
                     state.ui.conversation_lines.last(),
@@ -9808,7 +9823,8 @@ mod tests {
             mirror.push_user_message("hello");
             mirror.push_tool_result_started("Bash", "{\"cmd\":\"ls\"}");
             let _ = mirror.mark_last_tool_result_finished("Bash", true, 50, None);
-            mirror.push_assistant_message("done");
+            mirror.start_stream("d-1");
+            mirror.finalize_stream("d-1", "done");
 
             // ── 路径 B: reducer 路径 (S4-A Commit A: UserMessageEchoed 闭合 User echo) ──
             let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
@@ -9843,7 +9859,7 @@ mod tests {
                 reasoning: String::new(),
             });
 
-            // 字节级对账：四类 ConversationLine (System/User/ToolResult/Assistant) 全对齐
+            // 对账五类 ConversationLine（TurnSummary 的毫秒值允许极小执行时差）。
             let mirror_lines: Vec<&ConversationLine> = mirror.conversation_lines.iter().collect();
             let reducer_lines: Vec<&ConversationLine> = state.ui.conversation_lines.iter().collect();
 
@@ -9886,6 +9902,7 @@ mod tests {
                     (ConversationLine::User { content: mc }, ConversationLine::User { content: rc }) => {
                         assert_eq!(mc, rc, "line {i} User content mismatch");
                     }
+                    (ConversationLine::TurnSummary { .. }, ConversationLine::TurnSummary { .. }) => {}
                     _ => panic!("line {i} variant 不匹配: mirror={m_dbg}, reducer={r_dbg}"),
                 }
             }
@@ -9965,7 +9982,7 @@ mod tests {
             );
         }
 
-        /// S4-B 删除清理：mirror push 全删后 reducer 单源接管 4 类 ConversationLine push
+        /// S4-B 删除清理：mirror push 全删后 reducer 单源接管 ConversationLine push
         #[test]
         fn s4_b_reducer_sole_source_for_conversation_lines() {
             let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
@@ -9998,11 +10015,12 @@ mod tests {
                 final_text: "ok".to_string(),
                 reasoning: String::new(),
             });
-            assert_eq!(state.ui.conversation_lines.len(), 4, "reducer 单源应 push 4 行");
+            assert_eq!(state.ui.conversation_lines.len(), 5, "reducer 单源应 push 5 行");
             let mut iter = state.ui.conversation_lines.iter();
             assert!(matches!(iter.next(), Some(ConversationLine::System { .. })));
             assert!(matches!(iter.next(), Some(ConversationLine::User { .. })));
             assert!(matches!(iter.next(), Some(ConversationLine::ToolResult { .. })));
+            assert!(matches!(iter.next(), Some(ConversationLine::TurnSummary { .. })));
             assert!(matches!(iter.next(), Some(ConversationLine::Assistant { .. })));
         }
 

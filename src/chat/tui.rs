@@ -92,6 +92,9 @@ pub struct TuiState {
     /// persisted history. On `finalize_stream` the text is lifted into
     /// `conversation_lines`.
     pub streaming: Option<StreamingDraft>,
+    /// Wall-clock start of the active main turn, used only for live activity
+    /// feedback. Cleared when the draft reaches a terminal state.
+    pub stream_started_at_ms: Option<i64>,
     /// In-flight visible drafts keyed by real provider worker sequence.
     pub visible_streaming_drafts: Arc<Vec<crate::chat::state::VisibleStreamingDraftView>>,
     /// Persistent child-session status line (v1b). Empty when there are
@@ -443,6 +446,9 @@ pub enum ConversationLine {
         /// provider's first delta.
         content: String,
     },
+    /// UI-only completion metadata shown immediately before the assistant
+    /// response. It is not persisted as conversation content.
+    TurnSummary { duration_ms: u64 },
     /// System / status message (dimmed in render).
     System { content: String },
     /// Legacy single-line tool indicator (kept for back-compat with
@@ -1300,6 +1306,9 @@ fn transcript_lines_from_conversation(conversation: &[ConversationLine]) -> (Vec
             ConversationLine::StreamingAssistant { content } => {
                 push_transcript_text(&mut lines, "assistant (streaming)", content);
             }
+            ConversationLine::TurnSummary { duration_ms } => {
+                lines.push(format!("worked: {}", format_turn_duration(*duration_ms)));
+            }
             ConversationLine::System { content } => push_transcript_text(&mut lines, "system", content),
             ConversationLine::Tool { name, success } => {
                 let status = if *success { "done" } else { "error" };
@@ -1386,6 +1395,7 @@ pub fn latest_provider_worker_tool_summary_from_conversation(
             ConversationLine::User { .. }
             | ConversationLine::Assistant { .. }
             | ConversationLine::StreamingAssistant { .. }
+            | ConversationLine::TurnSummary { .. }
             | ConversationLine::System { .. }
             | ConversationLine::Reasoning { .. } => None,
         })
@@ -1462,7 +1472,7 @@ pub fn provider_worker_io_lines_from_conversation(
             ConversationLine::Reasoning { char_count, .. } => {
                 lines.push(format!("thinking: {char_count} chars"));
             }
-            ConversationLine::User { .. } | ConversationLine::System { .. } => {}
+            ConversationLine::User { .. } | ConversationLine::TurnSummary { .. } | ConversationLine::System { .. } => {}
         }
     }
     if let Some(streaming) = streaming
@@ -3119,6 +3129,7 @@ impl TuiState {
             input: TuiInput::new(),
             ascii_fallback: false,
             streaming: None,
+            stream_started_at_ms: None,
             visible_streaming_drafts: Arc::new(Vec::new()),
             sessions_status: String::new(),
             focus: crate::chat::sessions::FocusTarget::Main,
@@ -3188,6 +3199,7 @@ impl TuiState {
     /// Returns the initial version (`0`). Subsequent `update_stream` calls
     /// must supply a strictly greater version or they are rejected.
     pub fn start_stream(&mut self, draft_id: &str) -> u64 {
+        self.stream_started_at_ms = Some(chrono::Utc::now().timestamp_millis());
         self.streaming = Some(StreamingDraft {
             draft_id: draft_id.to_string(),
             accumulated: String::new(),
@@ -3237,7 +3249,12 @@ impl TuiState {
             return;
         }
         self.streaming = None;
+        let duration_ms = self.stream_started_at_ms.take().map(turn_elapsed_ms);
         if !final_text.is_empty() {
+            if let Some(duration_ms) = duration_ms {
+                self.conversation_lines
+                    .push(ConversationLine::TurnSummary { duration_ms });
+            }
             self.conversation_lines.push(ConversationLine::Assistant {
                 content: final_text.to_string(),
             });
@@ -3249,6 +3266,7 @@ impl TuiState {
     pub fn cancel_stream(&mut self, draft_id: &str) {
         if self.streaming.as_ref().is_some_and(|d| d.draft_id == draft_id) {
             self.streaming = None;
+            self.stream_started_at_ms = None;
         }
     }
 
@@ -3660,6 +3678,7 @@ fn estimate_line_height(line: &ConversationLine) -> u16 {
             // No prefix row, just content + trailing blank.
             content.lines().count().max(1) + 1
         }
+        ConversationLine::TurnSummary { .. } => 1,
         ConversationLine::System { content } => content.lines().count().max(1) + 1,
         ConversationLine::Tool { .. } => 1,
         ConversationLine::ToolResult {
@@ -3753,6 +3772,10 @@ pub trait BottomChromeView {
     fn ascii_fallback(&self) -> bool;
     fn conversation_lines(&self) -> &[ConversationLine];
     fn streaming(&self) -> Option<&StreamingDraft>;
+    /// Wall-clock start of the active main turn, when available.
+    fn active_turn_started_at_ms(&self) -> Option<i64> {
+        None
+    }
     /// Duration of the most recently completed main turn, if any.
     fn last_turn_duration_ms(&self) -> Option<u64> {
         None
@@ -3814,6 +3837,9 @@ impl BottomChromeView for TuiState {
     }
     fn streaming(&self) -> Option<&StreamingDraft> {
         self.streaming.as_ref()
+    }
+    fn active_turn_started_at_ms(&self) -> Option<i64> {
+        self.stream_started_at_ms
     }
     fn input(&self) -> &TuiInput {
         &self.input
@@ -3886,6 +3912,9 @@ impl BottomChromeView for crate::chat::state::UiSnapshot {
     }
     fn streaming(&self) -> Option<&StreamingDraft> {
         self.streaming.as_ref()
+    }
+    fn active_turn_started_at_ms(&self) -> Option<i64> {
+        self.active_turn_started_at_ms
     }
     fn last_turn_duration_ms(&self) -> Option<u64> {
         self.last_turn_duration_ms
@@ -4175,12 +4204,7 @@ fn fullscreen_transcript_top_scroll<V: BottomChromeView + ?Sized>(
     }
     let mut lines: Vec<Line<'_>> = Vec::new();
     push_conversation_transcript_lines(&mut lines, state);
-    let streaming_tail = state.streaming().map(|streaming| ConversationLine::StreamingAssistant {
-        content: streaming.accumulated.clone(),
-    });
-    if let Some(streaming_line) = streaming_tail.as_ref() {
-        render_conversation_line(&mut lines, streaming_line, state.ascii_fallback());
-    }
+    push_live_turn_transcript_lines(&mut lines, state);
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
             "(transcript is empty - PageUp/Home view history; /help for copy/export)",
@@ -4236,12 +4260,7 @@ pub(crate) fn transcript_render_row_at_point<V: BottomChromeView + ?Sized>(
 pub(crate) fn transcript_plain_rows<V: BottomChromeView + ?Sized>(state: &V, width: u16) -> Vec<String> {
     let mut lines: Vec<Line<'_>> = Vec::new();
     push_conversation_transcript_lines(&mut lines, state);
-    let streaming_tail = state.streaming().map(|streaming| ConversationLine::StreamingAssistant {
-        content: streaming.accumulated.clone(),
-    });
-    if let Some(streaming_line) = streaming_tail.as_ref() {
-        render_conversation_line(&mut lines, streaming_line, state.ascii_fallback());
-    }
+    push_live_turn_transcript_lines(&mut lines, state);
     if lines.is_empty() {
         lines.push(Line::from("(transcript is empty)"));
     }
@@ -4261,6 +4280,57 @@ fn push_conversation_transcript_lines<'a, V: BottomChromeView + ?Sized>(lines: &
     for line in state.conversation_lines() {
         render_conversation_line(lines, line, state.ascii_fallback());
     }
+}
+
+fn push_live_turn_transcript_lines<'a, V: BottomChromeView + ?Sized>(lines: &mut Vec<Line<'a>>, state: &'a V) {
+    let Some(streaming) = state.streaming() else {
+        return;
+    };
+    if streaming.accumulated.is_empty() {
+        let running_tool = state.conversation_lines().iter().any(|line| {
+            matches!(
+                line,
+                ConversationLine::ToolResult {
+                    status: ToolStatus::Running,
+                    ..
+                }
+            )
+        });
+        if !running_tool {
+            render_turn_activity_line(lines, state);
+        }
+        return;
+    }
+    push_assistant_rendered_lines(
+        lines,
+        render_streaming_assistant_markdown_lines(&streaming.accumulated, state.ascii_fallback()),
+        state.ascii_fallback(),
+    );
+    lines.push(Line::from(""));
+}
+
+fn render_turn_activity_line<'a, V: BottomChromeView + ?Sized>(lines: &mut Vec<Line<'a>>, state: &V) {
+    let spinner = spinner_frame_for_tick(state.ascii_fallback(), current_animation_tick());
+    let separator = if state.ascii_fallback() { " | " } else { " · " };
+    let detail = state.active_turn_started_at_ms().map_or_else(
+        || "Esc to interrupt".to_string(),
+        |started_at_ms| {
+            format!(
+                "{}{}Esc to interrupt",
+                format_turn_duration(turn_elapsed_ms(started_at_ms)),
+                separator
+            )
+        },
+    );
+    lines.push(Line::from(vec![
+        Span::styled(format!("{spinner} "), Style::default().fg(Color::Cyan)),
+        Span::styled(
+            "Working",
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" ({detail})"), Style::default().fg(Color::DarkGray)),
+    ]));
+    lines.push(Line::from(""));
 }
 
 fn reasoning_index_at_rendered_row(state: &TuiState, width: u16, rendered_row: usize) -> Option<usize> {
@@ -4425,12 +4495,7 @@ fn render_fullscreen_transcript<V: BottomChromeView + ?Sized>(
 
     let mut lines: Vec<Line<'_>> = Vec::new();
     push_conversation_transcript_lines(&mut lines, state);
-    let streaming_tail = state.streaming().map(|streaming| ConversationLine::StreamingAssistant {
-        content: streaming.accumulated.clone(),
-    });
-    if let Some(streaming_line) = streaming_tail.as_ref() {
-        render_conversation_line(&mut lines, streaming_line, state.ascii_fallback());
-    }
+    push_live_turn_transcript_lines(&mut lines, state);
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
             "(transcript is empty - PageUp/Home view history; /help for copy/export)",
@@ -5573,92 +5638,41 @@ fn render_status_bar_text<V: BottomChromeView + ?Sized>(state: &V, width: u16) -
     } else {
         usage
     };
-    let activity = render_generation_activity(state);
     let permissions = render_permission_status(state.chat_mode(), state.autonomy_level());
-    let full = activity.as_deref().map_or_else(
-        || {
-            format!(
-                " PRX Chat | {}/{} | {} | {} turns | {permissions} | {usage} ",
-                state.provider(),
-                state.model(),
-                title,
-                state.turn_count(),
-            )
-        },
-        |activity| {
-            format!(
-                " PRX Chat | {}/{} | {} | {} turns | {permissions} | {usage} | {activity} ",
-                state.provider(),
-                state.model(),
-                title,
-                state.turn_count(),
-            )
-        },
+    let full = format!(
+        " PRX Chat | {}/{} | {} | {permissions} | {usage} ",
+        state.provider(),
+        state.model(),
+        title,
     );
     if full.chars().count() <= usize::from(width) {
         return full;
     }
 
-    let compact = activity.as_deref().map_or_else(
-        || {
-            format!(
-                " PRX Chat | {}/{} | {permissions} | {usage} ",
-                state.provider(),
-                state.model()
-            )
-        },
-        |activity| {
-            format!(
-                " PRX Chat | {}/{} | {permissions} | {usage} | {activity} ",
-                state.provider(),
-                state.model()
-            )
-        },
+    let compact = format!(
+        " PRX Chat | {}/{} | {permissions} | {usage} ",
+        state.provider(),
+        state.model()
     );
     if compact.chars().count() <= usize::from(width) {
         return compact;
     }
 
-    let minimal = activity.as_deref().map_or_else(
-        || format!(" PRX | {permissions} | {usage} "),
-        |activity| {
-            if let Some(queue) = queue.as_deref() {
-                format!(" PRX | {permissions} | {queue} | {activity} ")
-            } else if let Some(workers) = workers.as_deref() {
-                let detailed = format!(" PRX | {permissions} | {workers} | {activity} ");
-                if detailed.chars().count() <= usize::from(width) {
-                    detailed
-                } else if let Some(workers) = workers_compact.as_deref() {
-                    format!(" PRX | {permissions} | {workers} | {activity} ")
-                } else {
-                    detailed
-                }
-            } else {
-                format!(" PRX | {permissions} | {activity} ")
-            }
-        },
-    );
-    truncate_chars_with_ellipsis(&minimal, width, state.ascii_fallback())
-}
-
-fn render_generation_activity<V: BottomChromeView + ?Sized>(state: &V) -> Option<String> {
-    if execution_activity_active_for_view(state) {
-        let frame = spinner_frame_for_tick(state.ascii_fallback(), current_animation_tick());
-        return Some(format!("{frame} generating (esc to interrupt)"));
-    }
-    state.last_turn_duration_ms().map(|duration_ms| {
-        let elapsed = if duration_ms < 1_000 {
-            format!("{duration_ms}ms")
+    let minimal = if let Some(queue) = queue.as_deref() {
+        format!(" PRX | {permissions} | {queue} ")
+    } else if let Some(workers) = workers.as_deref() {
+        let detailed = format!(" PRX | {permissions} | {workers} ");
+        if detailed.chars().count() <= usize::from(width) {
+            detailed
+        } else if let Some(workers) = workers_compact.as_deref() {
+            format!(" PRX | {permissions} | {workers} ")
         } else {
-            let seconds = duration_ms / 1_000;
-            if seconds < 60 {
-                format!("{seconds}s")
-            } else {
-                format!("{}m{:02}s", seconds / 60, seconds % 60)
-            }
-        };
-        format!("Worked {elapsed}")
-    })
+            detailed
+        }
+    } else {
+        format!(" PRX | {permissions} | {usage} ")
+    };
+    truncate_chars_with_ellipsis(&minimal, width, state.ascii_fallback())
 }
 
 fn render_main_queue_status(status: MainQueueStatus) -> Option<String> {
@@ -5774,10 +5788,28 @@ fn render_provider_worker_row(row: &ProviderWorkerStatusRow) -> String {
 }
 
 fn provider_worker_elapsed_label(started_at_ms: i64) -> String {
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let elapsed_ms = now_ms.saturating_sub(started_at_ms).max(0);
-    let elapsed_secs = u64::try_from(elapsed_ms / 1000).unwrap_or_default();
+    let elapsed_secs = turn_elapsed_ms(started_at_ms) / 1_000;
     crate::chat::sessions::model::format_elapsed_compact(elapsed_secs)
+}
+
+pub(crate) fn turn_elapsed_ms(started_at_ms: i64) -> u64 {
+    let elapsed_ms = chrono::Utc::now()
+        .timestamp_millis()
+        .saturating_sub(started_at_ms)
+        .max(0);
+    u64::try_from(elapsed_ms).unwrap_or(u64::MAX)
+}
+
+fn format_turn_duration(duration_ms: u64) -> String {
+    if duration_ms < 1_000 {
+        return format!("{duration_ms}ms");
+    }
+    let seconds = duration_ms / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    }
 }
 
 fn format_worker_tokens_compact(tokens: u64) -> String {
@@ -5960,6 +5992,13 @@ fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line: &'a Conver
             // `Assistant` and the cursor disappears.
             push_assistant_rendered_lines(lines, render_streaming_assistant_markdown_lines(content, ascii), ascii);
             lines.push(Line::from(""));
+        }
+        ConversationLine::TurnSummary { duration_ms } => {
+            let marker = if ascii { "*" } else { "•" };
+            lines.push(Line::from(Span::styled(
+                format!("{marker} Worked for {}", format_turn_duration(*duration_ms)),
+                Style::default().fg(Color::DarkGray),
+            )));
         }
         ConversationLine::System { content } => {
             // Claude Code style: dim gray italic, no prefix or indent.
@@ -6225,7 +6264,7 @@ const fn ansi_basic_color(code: u16, bright: bool) -> Color {
 ///   ⎿ output ✓ 234ms · 12 lines · 1.4kB
 /// ```
 /// Expanded layout shows readable input plus bounded output/error rows. While
-/// `Running` no follow-on row is shown — just the header `● run shell(...)`.
+/// While `Running`, no follow-on row is shown — just the animated tool header.
 #[allow(clippy::too_many_arguments)]
 fn render_tool_result<'a>(
     lines: &mut Vec<Line<'a>>,
@@ -6239,7 +6278,11 @@ fn render_tool_result<'a>(
     ascii: bool,
 ) {
     let (_, hook) = tool_card_glyphs(ascii);
-    let (status_glyph, status_color) = tool_status_marker(status, ascii);
+    let (status_glyph, status_color) = if matches!(status, ToolStatus::Running) {
+        (spinner_frame_for_tick(ascii, current_animation_tick()), Color::Cyan)
+    } else {
+        tool_status_marker(status, ascii)
+    };
     let preview_ellipsis = if ascii {
         ARGS_PREVIEW_ELLIPSIS_ASCII
     } else {
@@ -6271,9 +6314,8 @@ fn render_tool_result<'a>(
         Span::raw(header),
     ]));
 
-    // No follow-on row while still running — just the header is shown so the
-    // user sees an in-flight indicator. (The status bar / footer carry the
-    // spinner; the card itself reveals timing once we have it.)
+    // No follow-on row while still running — the animated header owns the
+    // in-flight state. The card reveals timing once a terminal result arrives.
     if matches!(status, ToolStatus::Running) {
         return;
     }
@@ -6880,11 +6922,10 @@ const fn reasoning_card_glyphs(ascii: bool) -> (&'static str, &'static str) {
     }
 }
 
-/// Pick the running bullet (`●` / `*`) and hook glyph (`⎿` / `L`) used by tool cards.
+/// Pick the legacy bullet (`●` / `*`) and hook glyph (`⎿` / `L`) used by tool cards.
 ///
-/// Claude Code uses a single status-colored bullet for the header and a dim
-/// hook for the follow-on summary / body — far less visually noisy than the
-/// previous `[name] running...` header.
+/// Completed cards use the hook for the follow-on summary/body. Running rich
+/// cards replace the legacy bullet with the shared spinner at render time.
 const fn tool_card_glyphs(ascii: bool) -> (&'static str, &'static str) {
     if ascii { ("*", "L") } else { ("\u{25CF}", "\u{23BF}") }
 }
@@ -7050,7 +7091,7 @@ fn subagent_identity_tag(meta: &SubagentMeta) -> String {
 ///
 /// The target is dual-encoded with **colour AND text/glyph** so it is never
 /// colour-only (colour-blind / no-color terminals still read the target):
-/// - [`FocusTarget::Main`] → dim cyan `> ` (unchanged from the original prompt).
+/// - [`FocusTarget::Main`] → dim cyan `› ` (`> ` in ASCII fallback).
 /// - [`FocusTarget::Session`] → blue bold `<kind> #N ▸ ` (or `<kind> #N > `
 ///   under ASCII fallback). The literal kind + sequence text carries the meaning
 ///   even with styling stripped.
@@ -7064,8 +7105,8 @@ fn prompt_indicator(
 ) -> (Span<'static>, usize) {
     match focus {
         crate::chat::sessions::FocusTarget::Main => {
-            // Calmer dim cyan `> ` (matches the long-standing Claude Code prompt).
-            let span = Span::styled("> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM));
+            let marker = if ascii { "> " } else { "› " };
+            let span = Span::styled(marker, Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM));
             (span, 2)
         }
         crate::chat::sessions::FocusTarget::Session { seq } => {
@@ -7899,7 +7940,15 @@ mod tests {
         let len_before = state.conversation_lines.len();
         state.finalize_stream("d1", "answer body");
         assert!(state.streaming.is_none(), "streaming slot cleared after finalize");
-        assert_eq!(state.conversation_lines.len(), len_before + 1, "Assistant line pushed");
+        assert_eq!(
+            state.conversation_lines.len(),
+            len_before + 2,
+            "turn summary and assistant lines pushed"
+        );
+        assert!(matches!(
+            state.conversation_lines.get(len_before),
+            Some(ConversationLine::TurnSummary { .. })
+        ));
         let last = state
             .conversation_lines
             .last()
@@ -8203,8 +8252,8 @@ mod tests {
             folded: true,
         };
         render_conversation_line(&mut lines, &card, false);
-        // Claude-Code style: while running we render just the run header
-        // (`● run shell(ls)`) with no follow-on summary row yet.
+        // While running we render one animated run header with no follow-on
+        // summary row yet.
         assert_eq!(lines.len(), 1, "running folded card renders to 1 line");
         let rendered: String = lines
             .first()
@@ -8213,13 +8262,16 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(rendered.contains("\u{25CF}"), "uses ● bullet: {rendered}");
+        assert!(
+            UNICODE_SPINNER_FRAMES.iter().any(|frame| rendered.contains(frame)),
+            "uses animated spinner: {rendered}"
+        );
         assert!(rendered.contains("run "), "shows run marker: {rendered}");
         assert!(
             rendered.contains(r#"shell(command="ls")"#),
             "shows Tool(args) preview: {rendered}"
         );
-        assert_eq!(span_fg(&lines, 0, 0), Some(Color::White));
+        assert_eq!(span_fg(&lines, 0, 0), Some(Color::Cyan));
     }
 
     #[test]
@@ -8484,7 +8536,12 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(rendered.starts_with("* "), "ASCII bullet header: {rendered}");
+        assert!(
+            ASCII_SPINNER_FRAMES
+                .iter()
+                .any(|frame| rendered.starts_with(&format!("{frame} "))),
+            "ASCII spinner header: {rendered}"
+        );
 
         let mut done_lines: Vec<Line<'_>> = Vec::new();
         let done_card = ConversationLine::ToolResult {
@@ -12127,8 +12184,10 @@ mod tests {
     #[test]
     fn prompt_indicator_main_vs_session() {
         let (main_span, main_w) = prompt_indicator(crate::chat::sessions::FocusTarget::Main, false, None);
-        assert_eq!(main_span.content.as_ref(), "> ");
+        assert_eq!(main_span.content.as_ref(), "› ");
         assert_eq!(main_w, 2);
+        let (main_ascii_span, _) = prompt_indicator(crate::chat::sessions::FocusTarget::Main, true, None);
+        assert_eq!(main_ascii_span.content.as_ref(), "> ");
         let (sess_span, sess_w) = prompt_indicator(crate::chat::sessions::FocusTarget::Session { seq: 4 }, false, None);
         assert!(sess_span.content.contains("agent #4"), "carries the target as text");
         assert!(sess_span.content.contains('\u{25B8}'), "uses the ▸ glyph");
@@ -12907,6 +12966,30 @@ mod tests {
             rows.iter().any(|row| row.contains("streaming tail")),
             "streaming tail rendered: {rows:?}"
         );
+        assert!(
+            !rows.iter().any(|row| row.contains("Working")),
+            "first token replaces the waiting activity: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn fullscreen_waiting_activity_is_clear_at_compact_and_wide_widths() {
+        for width in [40, 80, 120] {
+            let mut state = TuiState::new("provider", "model");
+            state.push_user_message("check service status");
+            state.start_stream("draft-waiting");
+            state.stream_started_at_ms = Some(chrono::Utc::now().timestamp_millis().saturating_sub(2_000));
+            let mut scroll = FullscreenTranscriptScroll::default();
+
+            let rows = fullscreen_rows(&state, width, 16, &mut scroll);
+            let rendered = rows.join("\n");
+
+            assert!(rendered.contains("Working"), "width {width}: {rows:?}");
+            assert!(rendered.contains("Esc to interrupt"), "width {width}: {rows:?}");
+            assert!(!rendered.contains("○ ▌"), "width {width}: {rows:?}");
+            assert!(!rendered.contains("turns"), "width {width}: {rows:?}");
+            assert!(rendered.contains("› "), "width {width}: main input prompt: {rows:?}");
+        }
     }
 
     #[test]
@@ -13325,7 +13408,7 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_keeps_queue_status_when_generating_and_compact() {
+    fn status_bar_keeps_queue_status_without_duplicate_generation_activity() {
         let mut state = TuiState::new("provider-with-long-name", "model-with-long-name");
         state.session_title = "long running orchestration title".to_string();
         state.main_queue_status = MainQueueStatus { queued: 5, priority: 0 };
@@ -13337,14 +13420,11 @@ mod tests {
             line.contains("queue:5"),
             "compact active status should retain queue: {line}"
         );
-        assert!(
-            line.contains("generating"),
-            "compact active status should retain activity: {line}"
-        );
+        assert!(!line.contains("generating"), "activity belongs in transcript: {line}");
     }
 
     #[test]
-    fn status_bar_keeps_provider_worker_status_when_generating_and_compact() {
+    fn status_bar_keeps_provider_worker_status_without_duplicate_activity() {
         let mut state = TuiState::new("provider-with-long-name", "model-with-long-name");
         state.session_title = "long running orchestration title".to_string();
         state.provider_worker_status = ProviderWorkerStatus {
@@ -13373,10 +13453,7 @@ mod tests {
             line.contains("workers:1"),
             "compact active status should retain worker status: {line}"
         );
-        assert!(
-            line.contains("generating"),
-            "compact active status should retain activity: {line}"
-        );
+        assert!(!line.contains("generating"), "activity belongs in transcript: {line}");
     }
 
     #[test]
@@ -13469,51 +13546,58 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_shows_generation_interrupt_hint() {
+    fn waiting_stream_renders_working_activity_in_transcript() {
+        let mut state = TuiState::new("provider", "model");
+        state.stream_started_at_ms = Some(chrono::Utc::now().timestamp_millis().saturating_sub(3_000));
+        state.start_stream("draft-1");
+        state.stream_started_at_ms = Some(chrono::Utc::now().timestamp_millis().saturating_sub(3_000));
+
+        let rows = transcript_plain_rows(&state, 120);
+        let rendered = rows.join("\n");
+
+        assert!(
+            rendered.contains("Working (3s · Esc to interrupt)"),
+            "waiting state is explicit and timed: {rendered}"
+        );
+        assert!(
+            !rendered.contains("○ ▌"),
+            "empty assistant placeholder must not look stuck: {rendered}"
+        );
+    }
+
+    #[test]
+    fn running_tool_owns_activity_without_duplicate_working_line() {
         let mut state = TuiState::new("provider", "model");
         state.start_stream("draft-1");
-
-        let line = render_status_bar_text(&state, 120);
-
-        assert!(line.contains("generating"), "status shows generation activity: {line}");
-        assert!(
-            !line.contains("generating 0s"),
-            "status must not fake elapsed time: {line}"
-        );
-        assert!(
-            line.contains("(esc to interrupt)"),
-            "status exposes esc interrupt affordance: {line}"
-        );
-    }
-
-    #[test]
-    fn status_bar_shows_generation_activity_for_running_tool_without_streaming() {
-        let mut state = TuiState::new("provider", "model");
         state.push_tool_result_started("shell", "{}");
 
-        let line = render_status_bar_text(&state, 120);
+        let rows = transcript_plain_rows(&state, 120);
+        let rendered = rows.join("\n");
 
         assert!(
-            line.contains("generating") && line.contains("(esc to interrupt)"),
-            "running tool keeps generation activity visible: {line}"
+            ASCII_SPINNER_FRAMES
+                .iter()
+                .chain(UNICODE_SPINNER_FRAMES.iter())
+                .any(|frame| rendered.contains(frame)),
+            "running tool renders an animated marker: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Working"),
+            "tool card is the sole activity owner: {rendered}"
         );
     }
 
     #[test]
-    fn status_bar_shows_last_turn_worked_duration_when_idle() {
+    fn status_bar_omits_turn_count_generation_and_completion_activity() {
         let mut snapshot = crate::chat::state::UiSnapshot::initial(Arc::from("provider"), Arc::from("model"));
+        snapshot.turn_count = 4;
         snapshot.last_turn_duration_ms = Some(3_200);
 
         let line = render_status_bar_text(&snapshot, 120);
 
-        assert!(
-            line.contains("Worked 3s"),
-            "completed turn keeps worked duration: {line}"
-        );
-        assert!(
-            !line.contains("generating"),
-            "idle completed turn is not marked generating: {line}"
-        );
+        assert!(!line.contains("turns"), "turn count is not persistent chrome: {line}");
+        assert!(!line.contains("Worked"), "completion belongs in transcript: {line}");
+        assert!(!line.contains("generating"), "generation belongs in transcript: {line}");
     }
 
     #[test]

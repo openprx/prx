@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.71] - 2026-09-02
+
+### Changed
+
+- Replaced the empty assistant waiting cursor with transcript-native, animated
+  turn activity and elapsed time; running tools now own their spinner, completed
+  turns retain a compact duration summary, and the pinned status bar no longer
+  duplicates generation or turn-count state.
+- Updated the main TUI composer prompt to `›` while retaining `>` for ASCII
+  fallback and explicit labels for attached session targets.
+
 ## [0.8.70] - 2026-09-02
 
 ### Fixed
