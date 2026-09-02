@@ -989,6 +989,47 @@ pub fn commit_task_execution(
     })
 }
 
+/// Persist an execution that was interrupted by an explicit task cancellation.
+///
+/// `cancel_task` revokes the active lease before the runner can commit through
+/// `commit_task_execution`, so the cancelled attempt needs its own fenced
+/// terminal write. Only a task that is still cancelled can accept this record;
+/// lease expiry, task removal, and a subsequent resume remain authority loss.
+pub fn commit_task_cancellation(
+    config: &Config,
+    task_id: &str,
+    started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+    output: &str,
+) -> Result<bool> {
+    let bounded = truncate_output(output);
+    let duration_ms = (finished_at - started_at).num_milliseconds();
+    with_immediate_connection(config, |conn| {
+        let changed = conn.execute(
+            "UPDATE xin_tasks
+             SET last_run_at = ?1, last_status = 'cancelled', last_output = ?2,
+                 run_count = run_count + 1, updated_at = ?1
+             WHERE id = ?3 AND status = 'cancelled'",
+            params![finished_at.to_rfc3339(), bounded, task_id],
+        )?;
+        if changed == 0 {
+            return Ok(false);
+        }
+
+        insert_run_record(
+            conn,
+            config,
+            task_id,
+            started_at,
+            finished_at,
+            "cancelled",
+            Some(&bounded),
+            duration_ms,
+        )?;
+        Ok(true)
+    })
+}
+
 fn insert_run_record(
     conn: &Connection,
     config: &Config,

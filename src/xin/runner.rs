@@ -445,7 +445,16 @@ async fn execute_single_task(
         }
     };
     let Some((success, output)) = result else {
-        return (false, task_id, "task cancelled after lease revocation".to_string());
+        let finished_at = Utc::now();
+        let output = "task cancelled after lease revocation".to_string();
+        match store::commit_task_cancellation(config, &task_id, started_at, finished_at, &output) {
+            Ok(true) => return (false, task_id, output),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(target: "xin", task_id = %task_id, "failed to persist cancelled task run: {error}");
+            }
+        }
+        return (false, task_id, "task lost execution authority".to_string());
     };
     if authority_lost {
         return (false, task_id, "task lost execution authority".to_string());

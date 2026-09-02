@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   execution results and run history remain inspectable.
 - Active Xin task and Goal/Step leases now observe operator cancellation within
   one second and stop through the existing cooperative cancellation path.
+- Cancelled active Xin tasks now retain a `cancelled` run-history record for
+  post-run inspection.
 
 ## [0.8.78] - 2 September 2026
 
