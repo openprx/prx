@@ -813,7 +813,7 @@ fn step_as_task(step: &XinStep, goal: &XinGoal) -> XinTask {
         last_output: step.last_output.clone(),
         run_count: u64::from(step.retry_count),
         fail_count: u64::from(step.retry_count),
-        max_failures: step.max_retries,
+        max_failures: 0,
         enabled: true,
         approval_grant_json: step.approval_grant_json.clone(),
     }

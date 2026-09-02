@@ -1,7 +1,8 @@
 //! Built-in system task definitions and handler registry for xin (心).
 //!
 //! Each built-in task maps to an async handler that invokes existing PRX
-//! infrastructure (health checks, stale cleanup, evolution, fitness).
+//! infrastructure (health checks, stale cleanup, and memory hygiene). Retired
+//! evolution and fitness handlers remain registered only for persisted steps.
 
 use crate::config::Config;
 use crate::xin::types::{ExecutionMode, NewXinTask, TaskKind, TaskPriority};
@@ -60,7 +61,7 @@ pub fn builtin_task_definitions() -> Vec<NewXinTask> {
             payload: "xin:health_check".into(),
             recurring: true,
             interval_secs: 300, // 5 minutes
-            max_failures: 10,
+            max_failures: 0,
             approval_grant_json: None,
         },
         NewXinTask {
@@ -76,7 +77,7 @@ pub fn builtin_task_definitions() -> Vec<NewXinTask> {
             payload: "xin:stale_cleanup".into(),
             recurring: true,
             interval_secs: 1800, // 30 minutes
-            max_failures: 10,
+            max_failures: 0,
             approval_grant_json: None,
         },
         NewXinTask {
@@ -92,7 +93,7 @@ pub fn builtin_task_definitions() -> Vec<NewXinTask> {
             payload: "xin:memory_hygiene".into(),
             recurring: true,
             interval_secs: 43200, // 12 hours
-            max_failures: 5,
+            max_failures: 0,
             approval_grant_json: None,
         },
     ]
@@ -144,8 +145,15 @@ async fn handle_fitness_report(config: Config) -> Result<String> {
 
 #[allow(clippy::unused_async)]
 async fn handle_memory_hygiene(config: Config) -> Result<String> {
-    crate::memory::hygiene::run_if_due(&config.memory, &config.workspace_dir)?;
-    Ok("memory hygiene completed: deterministic hygiene tick".into())
+    match crate::memory::hygiene::run_if_due(&config.memory, &config.workspace_dir)? {
+        crate::memory::hygiene::HygieneRunOutcome::Skipped => {
+            Ok("memory hygiene skipped: cadence window has not elapsed".into())
+        }
+        crate::memory::hygiene::HygieneRunOutcome::Completed(report) => Ok(format!(
+            "memory hygiene completed: {} action(s)",
+            report.total_actions()
+        )),
+    }
 }
 
 #[cfg(test)]

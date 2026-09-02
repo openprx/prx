@@ -163,34 +163,6 @@ pub fn due_tasks(config: &Config, now: DateTime<Utc>) -> Result<Vec<XinTask>> {
     })
 }
 
-/// Return due enabled system tasks inside one reserved name namespace.
-#[allow(dead_code)]
-pub(crate) fn due_system_tasks_in_namespace(
-    config: &Config,
-    now: DateTime<Utc>,
-    limit: usize,
-    namespace_prefix: &str,
-) -> Result<Vec<XinTask>> {
-    let lim = i64::try_from(limit.max(1)).context("due namespace limit overflows i64")?;
-    let pattern = format!("{namespace_prefix}%");
-    with_connection(config, |conn| {
-        let mut stmt = conn.prepare(
-            "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
-                    name, description, kind, status, priority, execution_mode,
-                    payload, recurring, interval_secs, created_at, updated_at,
-                    last_run_at, next_run_at, last_status, last_output,
-                    run_count, fail_count, max_failures, enabled, approval_grant_json
-             FROM xin_tasks
-             WHERE enabled = 1 AND kind = 'system' AND name LIKE ?1
-               AND status IN ('pending', 'stale') AND next_run_at <= ?2
-             ORDER BY priority DESC, next_run_at ASC
-             LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![pattern, now.to_rfc3339(), lim], map_task_row)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
-    })
-}
-
 /// Apply a partial update to an existing task.
 pub fn update_task(config: &Config, task_id: &str, patch: &XinTaskPatch) -> Result<XinTask> {
     let mut task = get_task(config, task_id)?;
@@ -441,7 +413,7 @@ pub fn mark_completed(config: &Config, task_id: &str, output: &str) -> Result<()
     })
 }
 
-/// Mark a task as failed. If `fail_count >= max_failures` (and max_failures > 0), disables it.
+/// Mark a task as failed while preserving its operator-controlled enabled state.
 #[cfg(test)]
 pub fn mark_failed(config: &Config, task_id: &str, output: &str) -> Result<()> {
     let now = Utc::now();
@@ -471,15 +443,6 @@ pub fn mark_failed(config: &Config, task_id: &str, output: &str) -> Result<()> {
                 Some(serde_json::json!({ "output": bounded }).to_string()).as_deref(),
             )?;
         }
-
-        // Auto-disable if max_failures exceeded
-        conn.execute(
-            "UPDATE xin_tasks
-             SET enabled = 0
-             WHERE id = ?1 AND max_failures > 0 AND fail_count >= max_failures",
-            params![task_id],
-        )
-        .context("Failed to auto-disable xin task")?;
 
         Ok(())
     })
@@ -760,7 +723,7 @@ pub(crate) fn disable_system_tasks_except(
 
 /// Commit one legacy Xin task execution as a single local transaction.
 ///
-/// Result state, run history, failure disabling, recurring reschedule, local
+/// Result state, run history, recurring reschedule, local
 /// lifecycle events, and their outbox rows either commit together or roll back
 /// together. Cross-database delivery is recovered from the committed outbox.
 pub fn commit_task_execution(
@@ -849,15 +812,6 @@ pub fn commit_task_execution(
                     .to_string(),
                 )
                 .as_deref(),
-            )?;
-        }
-
-        if !success {
-            conn.execute(
-                "UPDATE xin_tasks
-                 SET enabled = 0
-                 WHERE id = ?1 AND max_failures > 0 AND fail_count >= max_failures",
-                params![task_id],
             )?;
         }
 
@@ -1514,14 +1468,19 @@ pub(crate) fn complete_step_with_lease(
     })
 }
 
-/// Fail/retry only the exact lease generation that performed the work.
+/// Retry only the exact lease generation that performed the work.
+///
+/// Xin goals are durable intents: an execution failure records the error and
+/// releases the lease, but does not impose a hidden retry ceiling or terminally
+/// fail the goal. Operators can explicitly cancel a goal when retrying is no
+/// longer desired.
 pub(crate) fn fail_step_with_lease(config: &Config, step_id: &str, lease: &XinStepLease, output: &str) -> Result<bool> {
     let bounded = truncate_output(output);
     with_immediate_connection(config, |conn| {
         let now = authoritative_now(conn)?;
-        let row: Option<(String, i64, i64)> = conn
+        let exists = conn
             .query_row(
-                "SELECT goal_id, retry_count, max_retries FROM xin_steps
+                "SELECT 1 FROM xin_steps
                  WHERE id = ?1 AND lease_owner = ?2 AND lease_epoch = ?3
                    AND lease_expires_at >= ?4 AND status IN ('claimed', 'running')",
                 params![
@@ -1530,47 +1489,27 @@ pub(crate) fn fail_step_with_lease(config: &Config, step_id: &str, lease: &XinSt
                     i64::try_from(lease.epoch).unwrap_or(i64::MAX),
                     now.to_rfc3339()
                 ],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |_| Ok(()),
             )
-            .ok();
-        let Some((goal_id, retry_count, max_retries)) = row else {
+            .optional()?
+            .is_some();
+        if !exists {
             return Ok(false);
-        };
-        if retry_count < max_retries {
-            conn.execute(
-                "UPDATE xin_steps
-                 SET status = 'pending', retry_count = retry_count + 1, last_output = ?1,
-                     lease_owner = NULL, lease_expires_at = NULL, updated_at = ?2
-                 WHERE id = ?3 AND lease_owner = ?4 AND lease_epoch = ?5",
-                params![
-                    bounded,
-                    now.to_rfc3339(),
-                    step_id,
-                    lease.worker_id,
-                    i64::try_from(lease.epoch).unwrap_or(i64::MAX)
-                ],
-            )?;
-            emit_step_event(conn, config, step_id, "xin.step.retry", Some("pending"), Some(lease))?;
-        } else {
-            conn.execute(
-                "UPDATE xin_steps
-                 SET status = 'failed', retry_count = retry_count + 1, last_output = ?1,
-                     completed_at = ?2, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?2
-                 WHERE id = ?3 AND lease_owner = ?4 AND lease_epoch = ?5",
-                params![
-                    bounded,
-                    now.to_rfc3339(),
-                    step_id,
-                    lease.worker_id,
-                    i64::try_from(lease.epoch).unwrap_or(i64::MAX)
-                ],
-            )?;
-            emit_step_event(conn, config, step_id, "xin.step.failed", Some("failed"), Some(lease))?;
-            conn.execute(
-                "UPDATE xin_goals SET status = 'failed', updated_at = ?1 WHERE id = ?2",
-                params![now.to_rfc3339(), goal_id],
-            )?;
         }
+        conn.execute(
+            "UPDATE xin_steps
+             SET status = 'pending', retry_count = retry_count + 1, last_output = ?1,
+                 lease_owner = NULL, lease_expires_at = NULL, updated_at = ?2
+             WHERE id = ?3 AND lease_owner = ?4 AND lease_epoch = ?5",
+            params![
+                bounded,
+                now.to_rfc3339(),
+                step_id,
+                lease.worker_id,
+                i64::try_from(lease.epoch).unwrap_or(i64::MAX)
+            ],
+        )?;
+        emit_step_event(conn, config, step_id, "xin.step.retry", Some("pending"), Some(lease))?;
         Ok(true)
     })
 }
@@ -1608,53 +1547,29 @@ pub fn complete_step(config: &Config, step_id: &str, output: &str) -> Result<()>
     })
 }
 
-/// Mark a step failed. If retries remain the step is reset to `pending` (lease
-/// released) for re-execution; otherwise it is terminally `failed` and the goal
-/// rolls up to `failed`.
+/// Record a failed attempt and reset the step to `pending` for re-execution.
 #[cfg(test)]
 pub fn fail_step(config: &Config, step_id: &str, output: &str) -> Result<()> {
     let now = Utc::now();
     let bounded = truncate_output(output);
     with_connection(config, |conn| {
-        let row: Option<(String, i64, i64)> = conn
-            .query_row(
-                "SELECT goal_id, retry_count, max_retries FROM xin_steps WHERE id = ?1",
-                params![step_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .ok();
-        let Some((goal_id, retry_count, max_retries)) = row else {
+        let exists = conn
+            .query_row("SELECT 1 FROM xin_steps WHERE id = ?1", params![step_id], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
             tracing::warn!(step_id = %step_id, "fail_step: step not found");
             return Ok(());
-        };
-
-        let retries_left = retry_count < max_retries;
-        if retries_left {
-            conn.execute(
-                "UPDATE xin_steps
-                 SET status = 'pending', retry_count = retry_count + 1, last_output = ?1,
-                     lease_owner = NULL, lease_expires_at = NULL, updated_at = ?2
-                 WHERE id = ?3",
-                params![bounded, now.to_rfc3339(), step_id],
-            )
-            .context("Failed to reset xin step for retry")?;
-            emit_step_event(conn, config, step_id, "xin.step.retry", Some("pending"), None)?;
-        } else {
-            conn.execute(
-                "UPDATE xin_steps
-                 SET status = 'failed', retry_count = retry_count + 1, last_output = ?1,
-                     completed_at = ?2, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?2
-                 WHERE id = ?3",
-                params![bounded, now.to_rfc3339(), step_id],
-            )
-            .context("Failed to fail xin step")?;
-            emit_step_event(conn, config, step_id, "xin.step.failed", Some("failed"), None)?;
-            conn.execute(
-                "UPDATE xin_goals SET status = 'failed', updated_at = ?1 WHERE id = ?2",
-                params![now.to_rfc3339(), goal_id],
-            )
-            .context("Failed to mark goal failed")?;
         }
+        conn.execute(
+            "UPDATE xin_steps
+             SET status = 'pending', retry_count = retry_count + 1, last_output = ?1,
+                 lease_owner = NULL, lease_expires_at = NULL, updated_at = ?2
+             WHERE id = ?3",
+            params![bounded, now.to_rfc3339(), step_id],
+        )
+        .context("Failed to reset xin step for retry")?;
+        emit_step_event(conn, config, step_id, "xin.step.retry", Some("pending"), None)?;
         Ok(())
     })
 }
@@ -1747,7 +1662,7 @@ pub(crate) fn adopt_legacy_task(config: &Config, task_id: &str) -> Result<Option
             description: task.description.clone(),
             execution_mode: task.execution_mode.clone(),
             payload: task.payload.clone(),
-            max_retries: task.max_failures,
+            max_retries: 0,
             approval_grant_json: task.approval_grant_json.clone(),
             lease_ttl_secs: 0,
         };
@@ -1834,7 +1749,7 @@ pub fn migrate_task_to_goal(config: &Config, task_id: &str) -> Result<XinGoal> {
         description: task.description.clone(),
         execution_mode: task.execution_mode,
         payload: task.payload,
-        max_retries: task.max_failures,
+        max_retries: 0,
         approval_grant_json: task.approval_grant_json,
         lease_ttl_secs: 0,
     };
@@ -2885,6 +2800,44 @@ mod tests {
     }
 
     #[test]
+    fn recurring_failures_beyond_legacy_cap_remain_enabled_and_scheduled() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mut new = recurring_task();
+        new.max_failures = 1;
+        let task = add_task(&config, &new).unwrap();
+
+        for attempt in 1..=2 {
+            let lease = claim_task_with_lease(&config, &task.id, "test-worker", 60)
+                .unwrap()
+                .expect("claimed");
+            let started_at = Utc::now();
+            let finished_at = started_at + chrono::Duration::milliseconds(1);
+            assert!(
+                commit_task_execution(
+                    &config,
+                    &task.id,
+                    &lease,
+                    false,
+                    "retryable error",
+                    started_at,
+                    finished_at,
+                    1,
+                )
+                .unwrap()
+            );
+
+            let current = get_task(&config, &task.id).unwrap();
+            assert!(current.enabled);
+            assert_eq!(current.status, TaskStatus::Pending);
+            assert_eq!(current.fail_count, attempt);
+        }
+
+        let current = get_task(&config, &task.id).unwrap();
+        assert!(current.fail_count > u64::from(current.max_failures));
+    }
+
+    #[test]
     fn recurring_execution_rolls_back_when_event_outbox_enqueue_fails() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
@@ -3139,7 +3092,7 @@ mod tests {
     }
 
     #[test]
-    fn mark_failed_auto_disables_after_max_failures() {
+    fn mark_failed_never_auto_disables() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
@@ -3149,11 +3102,11 @@ mod tests {
 
         mark_failed(&config, &task.id, "err 1").unwrap();
         let t1 = get_task(&config, &task.id).unwrap();
-        assert!(t1.enabled); // still enabled, 1 failure < 2 max
+        assert!(t1.enabled);
 
         mark_failed(&config, &task.id, "err 2").unwrap();
         let t2 = get_task(&config, &task.id).unwrap();
-        assert!(!t2.enabled); // auto-disabled: 2 failures >= 2 max
+        assert!(t2.enabled);
         assert_eq!(t2.fail_count, 2);
     }
 
@@ -3822,10 +3775,9 @@ mod tests {
     }
 
     #[test]
-    fn fail_step_retries_then_fails_goal() {
+    fn fail_step_retries_without_a_terminal_ceiling() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
-        // max_retries = 2 → first two failures retry, third is terminal.
         let goal = add_goal(&config, &sample_goal(vec![sample_step(1)])).unwrap();
         let step = list_steps(&config, &goal.id).unwrap().remove(0);
 
@@ -3834,8 +3786,10 @@ mod tests {
         fail_step(&config, &step.id, "boom-2").unwrap();
         assert_eq!(get_step(&config, &step.id).unwrap().status, StepStatus::Pending);
         fail_step(&config, &step.id, "boom-3").unwrap();
-        assert_eq!(get_step(&config, &step.id).unwrap().status, StepStatus::Failed);
-        assert_eq!(get_goal(&config, &goal.id).unwrap().status, GoalStatus::Failed);
+        let retried = get_step(&config, &step.id).unwrap();
+        assert_eq!(retried.status, StepStatus::Pending);
+        assert_eq!(retried.retry_count, 3);
+        assert_ne!(get_goal(&config, &goal.id).unwrap().status, GoalStatus::Failed);
     }
 
     #[test]
@@ -3865,7 +3819,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_prior_step_blocks_all_later_steps() {
+    fn retrying_prior_step_blocks_all_later_steps() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let mut first = sample_step(1);
@@ -3873,9 +3827,9 @@ mod tests {
         let goal = add_goal(&config, &sample_goal(vec![first, sample_step(2)])).unwrap();
         let steps = list_steps(&config, &goal.id).unwrap();
 
-        fail_step(&config, &steps[0].id, "terminal failure").unwrap();
-        assert_eq!(get_step(&config, &steps[0].id).unwrap().status, StepStatus::Failed);
-        assert!(next_runnable_step(&config, &goal.id).unwrap().is_none());
+        fail_step(&config, &steps[0].id, "retryable failure").unwrap();
+        assert_eq!(get_step(&config, &steps[0].id).unwrap().status, StepStatus::Pending);
+        assert_eq!(next_runnable_step(&config, &goal.id).unwrap().unwrap().id, steps[0].id);
         assert!(!claim_step(&config, &steps[1].id, "prx:1:bypass", 60).unwrap());
     }
 

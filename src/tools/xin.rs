@@ -14,7 +14,9 @@ use crate::config::{Config, SharedConfig};
 use crate::security::SecurityPolicy;
 use crate::security::policy::{ApprovalGrant, PERSISTED_APPROVAL_GRANT_TTL_SECS};
 use crate::xin::store;
-use crate::xin::types::{ExecutionMode, NewXinTask, TaskKind, TaskPriority, XinTask, XinTaskEvent, XinTaskPatch};
+use crate::xin::types::{
+    ExecutionMode, GoalStatus, NewXinTask, StepStatus, TaskKind, TaskPriority, XinTask, XinTaskEvent, XinTaskPatch,
+};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -93,7 +95,7 @@ fn format_task_detail(task: &XinTask) -> String {
     lines.push(format!("Enabled:     {}", task.enabled));
     lines.push(format!("Runs:        {}", task.run_count));
     lines.push(format!("Failures:    {}", task.fail_count));
-    lines.push(format!("Max Fails:   {}", task.max_failures));
+    lines.push("Failure Cap: none (legacy value ignored)".to_string());
     lines.push(format!("Next Run:    {}", task.next_run_at.to_rfc3339()));
     if let Some(last) = &task.last_run_at {
         lines.push(format!("Last Run:    {}", last.to_rfc3339()));
@@ -401,6 +403,50 @@ impl Tool for XinTool {
                 let system = tasks.iter().filter(|t| t.kind == TaskKind::System).count();
                 let user = tasks.iter().filter(|t| t.kind == TaskKind::User).count();
                 let agent = tasks.iter().filter(|t| t.kind == TaskKind::Agent).count();
+                let goals = match store::list_goals(&cfg) {
+                    Ok(goals) => goals,
+                    Err(e) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("Failed to query xin goals: {e}")),
+                        });
+                    }
+                };
+                let goals_active = goals
+                    .iter()
+                    .filter(|goal| goal.enabled && matches!(goal.status, GoalStatus::Pending | GoalStatus::Running))
+                    .count();
+                let goals_completed = goals.iter().filter(|goal| goal.status == GoalStatus::Completed).count();
+                let goals_failed = goals.iter().filter(|goal| goal.status == GoalStatus::Failed).count();
+                let goals_cancelled = goals.iter().filter(|goal| goal.status == GoalStatus::Cancelled).count();
+                let goals_paused = goals.iter().filter(|goal| !goal.enabled).count();
+                let mut steps_total = 0_usize;
+                let mut steps_waiting = 0_usize;
+                let mut steps_running = 0_usize;
+                let mut steps_completed = 0_usize;
+                let mut steps_failed = 0_usize;
+                for goal in &goals {
+                    let steps = match store::list_steps(&cfg, &goal.id) {
+                        Ok(steps) => steps,
+                        Err(e) => {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!("Failed to query steps for xin goal {}: {e}", goal.id)),
+                            });
+                        }
+                    };
+                    steps_total += steps.len();
+                    for step in steps {
+                        match step.status {
+                            StepStatus::Pending | StepStatus::Stale => steps_waiting += 1,
+                            StepStatus::Claimed | StepStatus::Running => steps_running += 1,
+                            StepStatus::Completed => steps_completed += 1,
+                            StepStatus::Failed => steps_failed += 1,
+                        }
+                    }
+                }
 
                 Ok(ToolResult {
                     success: true,
@@ -410,10 +456,13 @@ impl Tool for XinTool {
                          Interval:    {} min\n\
                          Tasks:       {} total ({active} active, {paused} paused)\n\
                          By kind:     {system} system, {user} user, {agent} agent\n\
+                         Goals:       {} total ({goals_active} active, {goals_completed} completed, {goals_failed} legacy-failed, {goals_cancelled} cancelled, {goals_paused} paused)\n\
+                         Steps:       {steps_total} total ({steps_waiting} waiting, {steps_running} running, {steps_completed} completed, {steps_failed} legacy-failed)\n\
                          Concurrency: unbounded\n\
                          Evolution:   integrated",
                         cfg.xin.interval_minutes,
                         tasks.len(),
+                        goals.len(),
                     ),
                     error: None,
                 })
@@ -494,7 +543,7 @@ impl Tool for XinTool {
                     payload,
                     recurring,
                     interval_secs,
-                    max_failures: 3,
+                    max_failures: 0,
                     approval_grant_json,
                 };
 
@@ -625,6 +674,7 @@ impl Tool for XinTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::new_shared;
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Config {
@@ -676,5 +726,22 @@ mod tests {
 
         assert!(scope.owner_id.is_none());
         assert!(scope.topic_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn status_reports_tasks_goals_and_steps_separately() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
+        let tool = XinTool::new(new_shared(config), security);
+
+        let result = tool.execute(json!({"action": "status"})).await.unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("Tasks:       0 total"));
+        assert!(result.output.contains("Goals:       0 total"));
+        assert!(result.output.contains("Steps:       0 total"));
+        assert!(result.output.contains("Concurrency: unbounded"));
     }
 }

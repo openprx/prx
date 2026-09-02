@@ -11,8 +11,8 @@ const HYGIENE_INTERVAL_HOURS: i64 = 12;
 const STATE_FILE: &str = "memory_hygiene_state.json";
 const USEFUL_COUNT_RETENTION_THRESHOLD: u32 = 3;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct HygieneReport {
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HygieneReport {
     archived_memory_files: u64,
     archived_session_files: u64,
     purged_memory_archives: u64,
@@ -23,7 +23,7 @@ struct HygieneReport {
 }
 
 impl HygieneReport {
-    const fn total_actions(&self) -> u64 {
+    pub const fn total_actions(&self) -> u64 {
         self.archived_memory_files
             + self.archived_session_files
             + self.purged_memory_archives
@@ -32,6 +32,14 @@ impl HygieneReport {
             + self.pruned_daily_rows
             + self.closed_stale_topics
     }
+}
+
+/// Whether a hygiene invocation performed a cadence tick or intentionally did
+/// nothing because the previous successful tick is still fresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HygieneRunOutcome {
+    Skipped,
+    Completed(HygieneReport),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -43,9 +51,9 @@ struct HygieneState {
 /// Run memory/session hygiene if the cadence window has elapsed.
 ///
 /// This function is intentionally best-effort: callers should log and continue on failure.
-pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
+pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<HygieneRunOutcome> {
     if !should_run_now(workspace_dir)? {
-        return Ok(());
+        return Ok(HygieneRunOutcome::Skipped);
     }
 
     let report = HygieneReport {
@@ -73,7 +81,7 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
         );
     }
 
-    Ok(())
+    Ok(HygieneRunOutcome::Completed(report))
 }
 
 fn should_run_now(workspace_dir: &Path) -> Result<bool> {
@@ -436,7 +444,8 @@ mod tests {
         fs::write(&old_file, "old note").unwrap();
         fs::write(&today_file, "fresh note").unwrap();
 
-        run_if_due(&default_cfg(), workspace).unwrap();
+        let first = run_if_due(&default_cfg(), workspace).unwrap();
+        assert!(matches!(first, HygieneRunOutcome::Completed(_)));
 
         assert!(!old_file.exists(), "old daily file should be archived");
         assert!(
@@ -463,7 +472,8 @@ mod tests {
         let old_file = workspace.join("sessions").join(&old_name);
         fs::write(&old_file, "old session").unwrap();
 
-        run_if_due(&default_cfg(), workspace).unwrap();
+        let outcome = run_if_due(&default_cfg(), workspace).unwrap();
+        assert!(matches!(outcome, HygieneRunOutcome::Completed(_)));
 
         assert!(!old_file.exists(), "old session file should be archived");
         assert!(
@@ -484,7 +494,8 @@ mod tests {
         let file_a = workspace.join("memory").join(format!("{old_a}.md"));
         fs::write(&file_a, "first").unwrap();
 
-        run_if_due(&default_cfg(), workspace).unwrap();
+        let first = run_if_due(&default_cfg(), workspace).unwrap();
+        assert!(matches!(first, HygieneRunOutcome::Completed(_)));
         assert!(!file_a.exists(), "first old file should be archived");
 
         let old_b = (Local::now().date_naive() - Duration::days(9))
@@ -494,7 +505,8 @@ mod tests {
         fs::write(&file_b, "second").unwrap();
 
         // Should skip because cadence gate prevents a second immediate run.
-        run_if_due(&default_cfg(), workspace).unwrap();
+        let second = run_if_due(&default_cfg(), workspace).unwrap();
+        assert_eq!(second, HygieneRunOutcome::Skipped);
         assert!(file_b.exists(), "second file should remain because run is throttled");
     }
 

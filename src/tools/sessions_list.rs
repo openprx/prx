@@ -269,7 +269,6 @@ fn recovered_matches_filter(run: &RecoveredTaskRun, status_filter: &str) -> bool
 
 fn format_recovered_run(run: &RecoveredTaskRun) -> String {
     let status = match run.status {
-        RecoveredTaskStatus::Pending => format!("⏸ pending (memory: {})", run.last_event_type),
         RecoveredTaskStatus::Running => format!("🔄 running (memory: {})", run.last_event_type),
         RecoveredTaskStatus::Completed => {
             let detail = run.status_detail.as_deref().unwrap_or("completed");

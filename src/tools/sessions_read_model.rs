@@ -8,7 +8,6 @@ const MESSAGE_EVENT_SCAN_LIMIT: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecoveredTaskStatus {
-    Pending,
     Running,
     Completed,
     Failed,
@@ -325,28 +324,14 @@ fn merge_message_backfill(current: &mut RecoveredTaskRun, next: &RecoveredTaskRu
 }
 
 fn is_task_lifecycle_event(event_type: &str) -> bool {
+    if event_type.starts_with("xin.task.") || event_type.starts_with("cron.job.") {
+        return false;
+    }
     event_type == "task.spawned"
         || event_type == "task.steered"
         || event_type == "task.completed"
         || event_type == "task.failed"
         || event_type == "task.killed"
-        || event_type == "xin.task.created"
-        || event_type == "xin.task.spawned"
-        || event_type == "xin.task.updated"
-        || event_type == "xin.task.claimed"
-        || event_type == "xin.task.completed"
-        || event_type == "xin.task.failed"
-        || event_type == "xin.task.stale"
-        || event_type == "xin.task.rescheduled"
-        || event_type == "xin.task.removed"
-        || event_type == "xin.task.run_recorded"
-        || event_type == "cron.job.created"
-        || event_type == "cron.job.updated"
-        || event_type == "cron.job.claimed"
-        || event_type == "cron.job.completed"
-        || event_type == "cron.job.failed"
-        || event_type == "cron.job.removed"
-        || event_type == "cron.job.run_recorded"
         || event_type.ends_with(".task.started")
         || event_type.ends_with(".task.completed")
         || event_type.ends_with(".task.failed")
@@ -355,28 +340,10 @@ fn is_task_lifecycle_event(event_type: &str) -> bool {
 }
 
 fn status_from_event_type(event_type: &str) -> RecoveredTaskStatus {
-    if event_type == "xin.task.created"
-        || event_type == "xin.task.spawned"
-        || event_type == "xin.task.updated"
-        || event_type == "xin.task.rescheduled"
-        || event_type == "xin.task.run_recorded"
-        || event_type == "cron.job.created"
-        || event_type == "cron.job.updated"
-        || event_type == "cron.job.run_recorded"
-    {
-        RecoveredTaskStatus::Pending
-    } else if event_type == "task.completed"
-        || event_type == "xin.task.completed"
-        || event_type == "cron.job.completed"
-        || event_type.ends_with(".task.completed")
-    {
+    if event_type == "task.completed" || event_type.ends_with(".task.completed") {
         RecoveredTaskStatus::Completed
     } else if event_type == "task.failed"
         || event_type == "task.killed"
-        || event_type == "xin.task.failed"
-        || event_type == "xin.task.removed"
-        || event_type == "cron.job.failed"
-        || event_type == "cron.job.removed"
         || event_type.ends_with(".task.failed")
         || event_type.ends_with(".task.timeout")
     {
@@ -547,20 +514,12 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_xin_and_cron_lifecycle_events() {
-        assert!(is_task_lifecycle_event("xin.task.spawned"));
-        assert!(is_task_lifecycle_event("xin.task.completed"));
-        assert!(is_task_lifecycle_event("cron.job.created"));
-        assert!(is_task_lifecycle_event("cron.job.failed"));
-        assert_eq!(
-            status_from_event_type("xin.task.completed"),
-            RecoveredTaskStatus::Completed
-        );
-        assert_eq!(status_from_event_type("cron.job.failed"), RecoveredTaskStatus::Failed);
-        assert_eq!(
-            status_from_event_type("xin.task.rescheduled"),
-            RecoveredTaskStatus::Pending
-        );
-        assert_eq!(status_from_event_type("cron.job.updated"), RecoveredTaskStatus::Pending);
+    fn excludes_scheduled_work_from_subagent_sessions() {
+        assert!(!is_task_lifecycle_event("xin.task.spawned"));
+        assert!(!is_task_lifecycle_event("xin.task.completed"));
+        assert!(!is_task_lifecycle_event("cron.job.created"));
+        assert!(!is_task_lifecycle_event("cron.job.failed"));
+        assert!(is_task_lifecycle_event("task.spawned"));
+        assert!(is_task_lifecycle_event("delegate.task.completed"));
     }
 }

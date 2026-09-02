@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.77] - 2 September 2026
+
+### Fixed
+
+- Kept failed Xin tasks enabled and recurring work scheduled instead of
+  silently disabling it after a persisted failure-count threshold.
+- Made failed Goal/Step attempts return to the pending queue without a hidden
+  retry ceiling; retry counters remain available for observability.
+- Excluded Xin and cron lifecycle records from sub-agent session recovery, so
+  scheduled work no longer appears as a process-like session.
+- Reported whether memory hygiene actually ran or was skipped by its cadence
+  gate instead of claiming completion for both outcomes.
+
+### Changed
+
+- Added Goal and Step state counts to `xin status`, separate from recurring
+  task/loop counts.
+- Removed the unused namespace due-task query that still accepted a batch
+  limit, and retained legacy failure-cap database fields as ignored
+  compatibility data.
+
 ## [0.8.76] - 2 September 2026
 
 ### Fixed

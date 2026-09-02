@@ -158,7 +158,8 @@ pub struct XinTask {
     pub last_output: Option<String>,
     pub run_count: u64,
     pub fail_count: u64,
-    /// Max consecutive failures before auto-disabling (0 = no limit).
+    /// Legacy persisted failure-cap field. Xin no longer auto-disables tasks;
+    /// this remains readable for database compatibility.
     pub max_failures: u32,
     pub enabled: bool,
     /// Runtime-created approval grant for delayed shell execution.
@@ -227,7 +228,7 @@ pub enum GoalStatus {
     Running,
     /// All steps completed successfully.
     Completed,
-    /// A step exhausted its retries.
+    /// Legacy terminal failure state retained for persisted-data compatibility.
     Failed,
     /// The goal was cancelled by an operator/owner.
     Cancelled,
@@ -257,9 +258,10 @@ impl GoalStatus {
 
 /// Step-level status: the execution-engine-visible atomic state.
 ///
-/// A step moves Pending → Claimed → Running → Completed | Failed. When a lease
-/// expires while the step is Claimed/Running it is reset to `Stale` and may be
-/// re-claimed by any worker.
+/// A step moves Pending → Claimed → Running → Completed. Failed attempts return
+/// to Pending without a hidden retry ceiling. The `Failed` state remains for
+/// persisted-data compatibility. When a lease expires while a step is
+/// Claimed/Running it is reset to `Stale` and may be re-claimed by any worker.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum StepStatus {
@@ -358,6 +360,8 @@ pub struct XinStep {
     /// Per-step lease TTL override in seconds (0 = per-mode default).
     pub lease_ttl_secs: u64,
     pub retry_count: u32,
+    /// Legacy persisted retry-cap field. Attempts are no longer terminated at
+    /// this value; cancellation is explicit at goal level.
     pub max_retries: u32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
