@@ -602,7 +602,7 @@ impl Provider for MockEnvProvider {
         // is_final 混搭。flavor 仅记日志（实际协议适配由 driver 与各 provider impl 负责）。
         //
         // 关键：第一次调用按脚本 emit，**第二次及以后**只输出 final（避免 tool_call 无限重放
-        // 导致 driver max_tool_iterations 触发）。脚本含 tool_call 时尤其重要：driver
+        // 导致 driver 重复请求）。脚本含 tool_call 时尤其重要：driver
         // 执行 tool → 喂回 tool_result → 再次调 stream_chat_with_history，本次不该再发 tool_call.
         if let Some(script) = self.script.as_ref() {
             if let Some(flavor) = &self.flavor {

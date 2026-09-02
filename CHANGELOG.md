@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.75] - 2 September 2026
+
+### Changed
+
+- Removed the main-agent, chat, delegated-agent and spawned-session tool-round
+  ceilings. Progressing work now continues until completion, explicit failure
+  or user cancellation; the TUI reports `Step N` without a false denominator.
+- Retired `agent.max_tool_iterations`, per-agent `max_iterations`, and the
+  `sessions_spawn` `max_iterations` argument. Existing configuration keys are
+  ignored with a migration warning instead of stopping startup.
+- Removed wall-clock deadlines from delegated model calls, task-mode
+  sub-agents, process-isolated session workers, and shell subprocesses. The
+  `sessions_spawn.timeout_seconds` argument and the 24-hour
+  `runtime.idle_hang_max_total_secs` ceiling are retired; active work now ends
+  only through completion, a real error, no-progress hang detection, or an
+  explicit cancellation such as `prx tasks kill`.
+
 ## [0.8.74] - 2 September 2026
 
 ### Fixed

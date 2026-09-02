@@ -354,7 +354,6 @@ async fn run_console_runtime_turn(
         None,
         "console",
         &config_snapshot.multimodal,
-        config_snapshot.agent.max_tool_iterations,
         config_snapshot.agent.read_only_tool_concurrency_window,
         config_snapshot.agent.priority_scheduling_enabled,
         config_snapshot.agent.low_priority_tools.clone(),

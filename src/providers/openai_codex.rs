@@ -123,7 +123,6 @@ impl OpenAiCodexProvider {
             auth,
             auth_profile_override: options.auth_profile_override.clone(),
             client: Client::builder()
-                .timeout(std::time::Duration::from_mins(2))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| Client::new()),

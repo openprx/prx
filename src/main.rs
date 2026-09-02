@@ -823,9 +823,6 @@ Examples:
         /// Optional allowed tools JSON array override (normally provided in stdin manifest)
         #[arg(long)]
         tools: Option<String>,
-        /// Optional timeout override in seconds (normally provided in stdin manifest)
-        #[arg(long)]
-        timeout: Option<u64>,
     },
 
     /// Generate shell completion script to stdout
@@ -1137,7 +1134,6 @@ async fn async_main() -> Result<()> {
         workspace,
         memory_db,
         tools,
-        timeout,
     } = &cli.command
     {
         return session_worker::runner::run_from_stdin(
@@ -1145,7 +1141,6 @@ async fn async_main() -> Result<()> {
             workspace.clone(),
             memory_db.clone(),
             tools.clone(),
-            *timeout,
             cli.config_dir.clone(),
         )
         .await;

@@ -38,11 +38,6 @@ use tokio::sync::{RwLock, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-/// Default timeout for sub-agent runs (10 minutes).
-///
-/// A value of `0` means "no timeout" (run until natural completion), matching
-/// the session-worker semantics in `session_worker/runner.rs`.
-const DEFAULT_SUB_AGENT_TIMEOUT_SECS: u64 = 600;
 const PROCESS_OUTPUT_DRAIN_TIMEOUT_SECS: u64 = 1;
 const PROCESS_REAP_TIMEOUT_SECS: u64 = 5;
 const PROCESS_TERMINATION_REQUEST_TIMEOUT_SECS: u64 = 5;
@@ -1252,7 +1247,6 @@ async fn record_spawn_request_event(
     mode: &str,
     provider_name: &str,
     model: &str,
-    max_iterations: usize,
     lineage: &SpawnLineage,
 ) {
     let Some(fabric) = fabric else {
@@ -1273,7 +1267,6 @@ async fn record_spawn_request_event(
                     "mode": mode,
                     "provider": provider_name,
                     "model": model,
-                    "max_iterations": max_iterations,
                     "owner_id": lineage.owner_id,
                     "topic_id": lineage.topic_id,
                     "parent_task_id": lineage.parent_task_id,
@@ -1297,7 +1290,6 @@ async fn record_spawn_request_event(
                     "mode": mode,
                     "provider": provider_name,
                     "model": model,
-                    "max_iterations": max_iterations,
                     "owner_id": lineage.owner_id,
                     "topic_id": lineage.topic_id,
                     "parent_task_id": lineage.parent_task_id,
@@ -1631,9 +1623,6 @@ pub(crate) const PANICKED_BEFORE_RESULT_SUFFIX: &str = "panicked before it could
 /// while holding the OS child.
 pub(crate) const PROCESS_OWNER_PANICKED_PREFIX: &str = "process owner panicked";
 
-/// Reason recorded when a run was cut off by its manifest `timeout_seconds`.
-pub(crate) const SUB_AGENT_TIMED_OUT_REASON: &str = "timeout";
-
 /// Marker the runtime writes in front of a failure reason that came out of the
 /// sub-agent itself.
 ///
@@ -1800,7 +1789,6 @@ fn failure_gave_no_conclusion(reason: &str) -> bool {
     reason.starts_with(EXITED_WITHOUT_RESULT_PREFIX)
         || reason.ends_with(PANICKED_BEFORE_RESULT_SUFFIX)
         || reason.starts_with(PROCESS_OWNER_PANICKED_PREFIX)
-        || reason == SUB_AGENT_TIMED_OUT_REASON
         || crate::agent::idle::message_describes_hang_termination(reason)
 }
 
@@ -1951,9 +1939,8 @@ fn settled_verdict(status: &SubAgentStatus) -> Option<JoinedVerdict> {
 /// it would end a fan-out because it took long, and duration is not a fault in
 /// this runtime. What actually bounds the wait is that *every member is bounded
 /// on its own terms* — a task-mode member runs under
-/// [`crate::agent::idle::run_guarded`], a process-mode member's worker installs
-/// the same thresholds in its own process and may additionally carry the
-/// manifest's `timeout_seconds` — and every one of those endings now commits a
+/// [`crate::agent::idle::run_guarded`], and a process-mode member's worker
+/// installs the same thresholds in its own process. Every ending commits a
 /// terminal status on the member's row rather than leaving it `Running`. When
 /// the last member ends, this returns; there is no third outcome to time out
 /// on.
@@ -2063,7 +2050,7 @@ fn batch_vouches_for_the_waiter(
 ///   would kill the parents of perfectly healthy fan-outs. It vouches on its
 ///   non-terminal status — the one place this function still trusts an absence.
 ///   That blind spot is bounded by the worker's own in-process watchdog and by
-///   `idle_hang_max_total_secs`, and closing it properly needs a liveness frame
+///   its in-process idle watchdog, and closing it properly needs a liveness frame
 ///   the worker's one-line stdout protocol does not carry today.
 ///
 /// MUTATION GUARD: return `true` unconditionally and
@@ -2198,7 +2185,7 @@ impl Tool for SessionsSpawnTool {
                 "tasks": {
                     "type": "array",
                     "minItems": 1,
-                    "description": "Required for action='spawn_batch' (and used by no other action): the tasks to launch, all at once. Each entry is either a task string or an object {task, agent?, model?, provider?, mode?, recipient?, timeout_seconds?, max_iterations?} — those eight keys and no others; any other key is rejected rather than ignored. Any top-level parameter of this call acts as the default for every entry, and an entry key overrides that default for that member alone. There is no limit on how many may be launched. Members do not announce their own results — call 'join' with the returned batch_id and report the outcome yourself in a single message.",
+                    "description": "Required for action='spawn_batch' (and used by no other action): the tasks to launch, all at once. Each entry is either a task string or an object {task, agent?, model?, provider?, mode?, recipient?} — those six keys and no others; any other key is rejected rather than ignored. Any top-level parameter of this call acts as the default for every entry, and an entry key overrides that default for that member alone. There is no limit on how many may be launched. Members do not announce their own results — call 'join' with the returned batch_id and report the outcome yourself in a single message.",
                     "items": {
                         "anyOf": [
                             {"type": "string", "minLength": 1},
@@ -2246,16 +2233,6 @@ impl Tool for SessionsSpawnTool {
                             available_agents.join(", ")
                         }
                     )
-                },
-                "timeout_seconds": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Maximum runtime in seconds, for actions 'spawn' and 'spawn_batch' (ignored by every other action). Omitted = the 600s default deadline; pass 0 explicitly for no timeout (sub-agent runs until completion); any other value enforces that deadline."
-                },
-                "max_iterations": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Maximum tool call iterations for the sub-agent, for actions 'spawn' and 'spawn_batch' (ignored by every other action). Can only lower the agent/global config ceiling — a larger value is clamped down to it. Omit to use the configured value."
                 },
                 "mode": {
                     "type": "string",
@@ -2421,8 +2398,6 @@ impl SessionsSpawnTool {
                 "provider": {"type": "string"},
                 "mode": {"type": "string", "enum": ["task", "process"]},
                 "recipient": {"type": "string"},
-                "timeout_seconds": {"type": "integer", "minimum": 0},
-                "max_iterations": {"type": "integer", "minimum": 1}
             },
             "required": ["task"]
         })
@@ -2896,10 +2871,6 @@ impl SessionsSpawnTool {
             return Ok(SpawnOutcome::rejected("'task' parameter must not be empty".into()));
         }
 
-        let timeout_secs = args
-            .get("timeout_seconds")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_SUB_AGENT_TIMEOUT_SECS);
         let mode = args
             .get("mode")
             .and_then(|v| v.as_str())
@@ -3114,15 +3085,6 @@ impl SessionsSpawnTool {
                     .map(str::to_string)
             })
             .or_else(|| self.fallback_api_key.clone());
-        let configured_max = selected_agent
-            .as_ref()
-            .map(|(_, cfg)| cfg.max_iterations.max(1))
-            .unwrap_or(SUB_AGENT_MAX_ITERATIONS);
-        let resolved_max_iterations = args
-            .get("max_iterations")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-            .map_or(configured_max, |dynamic_max| dynamic_max.max(1).min(configured_max));
         let memory_fabric = self.memory.as_ref().map(|memory| {
             MemoryFabric::new(memory.clone(), self.workspace_dir.to_string_lossy())
                 .with_event_recording(self.event_recording)
@@ -3148,7 +3110,6 @@ impl SessionsSpawnTool {
             &mode,
             &resolved_provider_name,
             &resolved_model,
-            resolved_max_iterations,
             &run_lineage,
         )
         .await;
@@ -3194,7 +3155,6 @@ impl SessionsSpawnTool {
             let model = resolved_model;
             let provider_name = resolved_provider_name;
             let api_key = resolved_api_key;
-            let max_iterations = resolved_max_iterations;
             let workspace_root = self.workspace_dir.clone();
             let worker_workspace_root = self
                 .spawn_config
@@ -3307,8 +3267,6 @@ impl SessionsSpawnTool {
                                 &model,
                                 api_key.as_deref(),
                                 temperature,
-                                timeout_secs,
-                                max_iterations,
                                 &workspace_root,
                                 &worker_workspace_root,
                                 identity_dir.as_deref(),
@@ -3522,7 +3480,6 @@ impl SessionsSpawnTool {
         let provider_name = resolved_provider_name;
         let model = resolved_model;
         let temperature = resolved_temperature;
-        let max_iterations = resolved_max_iterations;
         // Rebuild the provider object whenever the resolved provider differs
         // from the gateway provider. This covers a named agent provider AND an
         // inline `provider` override (BUG-12) even without a named agent.
@@ -3725,7 +3682,6 @@ impl SessionsSpawnTool {
                 security,
                 &multimodal_config,
                 &compaction_config,
-                max_iterations,
                 steer_rx,
                 history_arc,
                 task_scope,
@@ -3737,20 +3693,11 @@ impl SessionsSpawnTool {
                 restore_run_id,
                 Arc::clone(&task_progress),
             );
-            // `timeout_secs == 0` means "no timeout" — run until natural
-            // completion. This matches the session-worker semantics in
-            // `session_worker/runner.rs`. A non-zero value wraps the run in a
-            // `tokio::time::timeout`. `Ok(_)` => ran to completion (no timeout
-            // or finished in time), `Err(_)` => elapsed.
-            let result = if timeout_secs == 0 {
-                Ok(run_future.await)
-            } else {
-                tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), run_future).await
-            };
+            let result = run_future.await;
             tracing::info!(run_id = %rid, success = result.is_ok(), "Sub-agent task finished");
 
             let (status, result_text, provider_outcome, terminal_status, history_projection) = match result {
-                Ok(Ok(task_result)) => {
+                Ok(task_result) => {
                     let provider_outcome = crate::agent::terminal::provider_outcome_from_trace(
                         &route_decision,
                         provider_started_at,
@@ -3767,7 +3714,7 @@ impl SessionsSpawnTool {
                         }),
                     )
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     let msg = format!("Sub-agent error: {e}");
                     (
                         SubAgentStatus::Failed(task_failure_reason(&e)),
@@ -3776,21 +3723,6 @@ impl SessionsSpawnTool {
                             &route_decision,
                             provider_started_at,
                             &e,
-                        ),
-                        crate::agent::terminal::TurnTerminalStatus::Failed,
-                        None,
-                    )
-                }
-                Err(_) => {
-                    let msg = format!("Sub-agent timed out after {timeout_secs}s");
-                    let error = anyhow::anyhow!(msg.clone());
-                    (
-                        SubAgentStatus::Failed(SUB_AGENT_TIMED_OUT_REASON.into()),
-                        msg,
-                        crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
-                            &route_decision,
-                            provider_started_at,
-                            &error,
                         ),
                         crate::agent::terminal::TurnTerminalStatus::Failed,
                         None,
@@ -4550,9 +4482,6 @@ pub(crate) fn steering_instruction(message: &str) -> String {
     format!("[Steering instruction from operator] {message}")
 }
 
-/// Maximum tool-call iterations for a sub-agent run (per steering segment).
-const SUB_AGENT_MAX_ITERATIONS: usize = 200;
-
 /// Environment variable carrying the sealed session-worker capability to the
 /// child process.
 const SESSION_WORKER_CAP_ENV: &str = "OPENPRX_SESSION_WORKER_CAPABILITY";
@@ -4782,7 +4711,6 @@ async fn run_sub_agent_task(
     security: Arc<SecurityPolicy>,
     multimodal_config: &MultimodalConfig,
     compaction_config: &AgentCompactionConfig,
-    max_iterations: usize,
     mut steer_rx: tokio::sync::mpsc::Receiver<String>,
     history_out: Arc<RwLock<Vec<HistoryEntry>>>,
     scope: Option<SpawnScope>,
@@ -4968,7 +4896,6 @@ async fn run_sub_agent_task(
                 approval_manager.map(Arc::new),
                 "sessions_spawn",
                 &multimodal_config_owned,
-                max_iterations,
                 2,
                 false,
                 vec!["sessions_spawn".to_string(), "delegate".to_string(), "cron".to_string()],
@@ -5104,8 +5031,6 @@ fn build_session_worker_cli_args(manifest: &WorkerManifest) -> anyhow::Result<Ve
         manifest.memory_db_path.display().to_string(),
         "--tools".to_string(),
         tools_json,
-        "--timeout".to_string(),
-        manifest.timeout_seconds.to_string(),
     ])
 }
 
@@ -5148,8 +5073,6 @@ fn build_session_worker_manifest(
     agent_id: Option<&str>,
     event_recording: MemoryEventRecording,
     allowed_tools: &[String],
-    timeout_secs: u64,
-    max_iterations: usize,
     identity_dir: Option<String>,
     scope: Option<&SpawnScope>,
     lineage: &SpawnLineage,
@@ -5181,8 +5104,6 @@ fn build_session_worker_manifest(
         persona_id: None,
         memory_event_recording: event_recording,
         allowed_tools: allowed_tools.to_vec(),
-        timeout_seconds: timeout_secs,
-        max_iterations,
         system_prompt: None,
         identity_dir,
         scope_sender: scope.map(|ctx| ctx.sender.clone()),
@@ -5323,7 +5244,6 @@ async fn terminate_owned_child(
 async fn wait_for_owned_process(
     child: &mut tokio::process::Child,
     process_group: &mut OwnedProcessGroup,
-    parent_timeout: std::time::Duration,
     process_control: &ProcessRunControl,
     #[cfg(test)] inject_wait_error: bool,
 ) -> anyhow::Result<OwnedChildExit> {
@@ -5346,13 +5266,6 @@ async fn wait_for_owned_process(
                 Ok(_) => Ok(OwnedChildExit::Terminated(reason)),
                 Err(error) => Ok(OwnedChildExit::TerminationFailed(error.to_string())),
             }
-        }
-        () = tokio::time::sleep(parent_timeout) => {
-            terminate_owned_child(child, process_group).await?;
-            anyhow::bail!(
-                "session-worker exceeded parent timeout of {}s and was killed",
-                parent_timeout.as_secs()
-            )
         }
     }
 }
@@ -5559,13 +5472,11 @@ async fn run_owned_child_phase(
     process_group: &mut OwnedProcessGroup,
     stdout_task: tokio::task::JoinHandle<anyhow::Result<Vec<u8>>>,
     stderr_task: tokio::task::JoinHandle<anyhow::Result<Vec<u8>>>,
-    parent_timeout: std::time::Duration,
     process_control: &ProcessRunControl,
 ) -> anyhow::Result<OwnedProcessPhase> {
     let process_exit = match wait_for_owned_process(
         child,
         process_group,
-        parent_timeout,
         process_control,
         #[cfg(test)]
         false,
@@ -5721,7 +5632,6 @@ async fn run_spawned_child_lifecycle(
     child: &mut tokio::process::Child,
     process_group: &mut OwnedProcessGroup,
     payload: &str,
-    parent_timeout: std::time::Duration,
     process_control: &ProcessRunControl,
     steer: Option<WorkerSteerPipe>,
     progress: Option<Arc<crate::agent::idle::ProgressBeat>>,
@@ -5770,15 +5680,7 @@ async fn run_spawned_child_lifecycle(
     #[cfg(test)]
     assert!(!panic_before_wait, "injected owned-child lifecycle panic");
 
-    run_owned_child_phase(
-        child,
-        process_group,
-        stdout_task,
-        stderr_task,
-        parent_timeout,
-        process_control,
-    )
-    .await
+    run_owned_child_phase(child, process_group, stdout_task, stderr_task, process_control).await
 }
 
 async fn cleanup_owned_child_after_panic(
@@ -5826,8 +5728,6 @@ async fn run_sub_agent_process(
     model: &str,
     api_key: Option<&str>,
     temperature: f64,
-    timeout_secs: u64,
-    max_iterations: usize,
     workspace_root: &std::path::Path,
     worker_workspace_root: &std::path::Path,
     agent_identity_dir: Option<&str>,
@@ -5913,8 +5813,6 @@ async fn run_sub_agent_process(
         agent_id,
         event_recording,
         allowed_tools,
-        timeout_secs,
-        max_iterations,
         identity_dir,
         scope,
         lineage,
@@ -5966,22 +5864,10 @@ async fn run_sub_agent_process(
             return Err(error);
         }
     };
-    // `timeout_secs == 0` means "no timeout" — the child (see
-    // `session_worker/runner.rs`) runs until natural completion, so the parent
-    // must not kill it prematurely. We use a far-future cap (30 days) as an
-    // effectively-unbounded parent timeout, which keeps the existing
-    // `tokio::time::timeout` wrapping intact while avoiding timer overflow.
-    const NO_TIMEOUT_PARENT_CAP_SECS: u64 = 30 * 24 * 60 * 60;
-    let parent_timeout = if timeout_secs == 0 {
-        std::time::Duration::from_secs(NO_TIMEOUT_PARENT_CAP_SECS)
-    } else {
-        std::time::Duration::from_secs(timeout_secs)
-    };
     let owned_phase = std::panic::AssertUnwindSafe(run_spawned_child_lifecycle(
         &mut child,
         &mut process_group,
         &payload,
-        parent_timeout,
         process_control,
         Some(WorkerSteerPipe {
             steer_rx,
@@ -6627,7 +6513,6 @@ mod tests {
             max_depth: 3,
             agentic: false,
             allowed_tools: Vec::new(),
-            max_iterations: 10,
             identity_dir,
             memory_scope: None,
             spawn_enabled: None,
@@ -6763,8 +6648,6 @@ mod tests {
             None,
             MemoryEventRecording::default(),
             &[],
-            30,
-            4,
             None,
             Some(&scope),
             &lineage,
@@ -6839,36 +6722,13 @@ mod tests {
         assert!(tool.description().contains("steer"));
     }
 
-    #[test]
-    fn default_sub_agent_timeout_is_ten_minutes() {
-        // Regression: the constant was 0 (instant timeout in task mode) while
-        // its doc claimed "10 minutes". It must now be 600s.
-        assert_eq!(DEFAULT_SUB_AGENT_TIMEOUT_SECS, 600);
-    }
-
     #[tokio::test]
-    async fn task_mode_zero_timeout_does_not_elapse_immediately() {
-        // Mirrors the task-mode timeout-wrapping logic at the spawn site:
-        // `timeout_secs == 0` must run the future to completion (no timeout),
-        // rather than wrapping it in `tokio::time::timeout(ZERO, ..)` which
-        // would elapse on the first poll. Use a future with a real (small)
-        // delay so a ZERO-duration timeout would observably fail.
-        async fn wrap_like_task_mode(timeout_secs: u64) -> Result<&'static str, tokio::time::error::Elapsed> {
-            let run_future = async {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                "done"
-            };
-            if timeout_secs == 0 {
-                Ok(run_future.await)
-            } else {
-                tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), run_future).await
-            }
-        }
-
-        // 0 => no timeout => runs to completion.
-        assert_eq!(wrap_like_task_mode(0).await, Ok("done"));
-        // Non-zero generous timeout also completes.
-        assert_eq!(wrap_like_task_mode(60).await, Ok("done"));
+    async fn task_mode_has_no_wall_clock_deadline() {
+        let run_future = async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            "done"
+        };
+        assert_eq!(run_future.await, "done");
     }
 
     #[tokio::test]
@@ -6888,7 +6748,6 @@ mod tests {
             test_security(),
             &MultimodalConfig::default(),
             &AgentCompactionConfig::default(),
-            1,
             steer_rx,
             Arc::clone(&history_out),
             None,
@@ -6929,7 +6788,7 @@ mod tests {
         assert!(schema["properties"]["model"].is_object());
         assert!(schema["properties"]["provider"].is_object());
         assert!(schema["properties"]["agent"].is_object());
-        assert!(schema["properties"]["timeout_seconds"].is_object());
+        assert!(schema["properties"]["timeout_seconds"].is_null());
         assert!(schema["properties"]["mode"].is_object());
         assert!(schema["properties"]["recipient"].is_object());
         // Verify enum includes history and steer
@@ -9176,8 +9035,6 @@ mod tests {
             persona_id: None,
             memory_event_recording: MemoryEventRecording::default(),
             allowed_tools: vec!["shell".to_string()],
-            timeout_seconds: 30,
-            max_iterations: 20,
             system_prompt: None,
             identity_dir: None,
             scope_sender: None,
@@ -9318,9 +9175,9 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn process_mode_parent_timeout_kills_stuck_process() {
+    async fn process_mode_waits_for_natural_completion_without_a_deadline() {
         let mut command = tokio::process::Command::new("sleep");
-        command.arg("5");
+        command.arg("0.1");
         command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -9334,23 +9191,11 @@ mod tests {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         process_group.observe_termination_calls(calls.clone());
 
-        let result = wait_for_owned_process(
-            &mut child,
-            &mut process_group,
-            std::time::Duration::from_millis(50),
-            &control,
-            false,
-        )
-        .await;
-        assert!(result.is_err());
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(!process_group.armed);
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("session-worker exceeded parent timeout")
-        );
+        let result = wait_for_owned_process(&mut child, &mut process_group, &control, false)
+            .await
+            .expect("the worker must be allowed to finish naturally");
+        assert!(matches!(result, OwnedChildExit::Exited(status) if status.success()));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[cfg(unix)]
@@ -9416,7 +9261,6 @@ mod tests {
             &mut child,
             &mut process_group,
             "{}",
-            std::time::Duration::from_secs(30),
             &control,
             None,
             None,
@@ -9462,14 +9306,7 @@ mod tests {
         let monitor = tokio::spawn(async move {
             let mut child = child;
             let mut process_group = OwnedProcessGroup::from_child(&child).unwrap();
-            let result = wait_for_owned_process(
-                &mut child,
-                &mut process_group,
-                std::time::Duration::from_secs(30),
-                owner_control.as_ref(),
-                false,
-            )
-            .await;
+            let result = wait_for_owned_process(&mut child, &mut process_group, owner_control.as_ref(), false).await;
             let finalization = match result {
                 Ok(OwnedChildExit::Terminated(_)) => ProcessFinalization::Terminated,
                 _ => ProcessFinalization::Natural,
@@ -9709,15 +9546,9 @@ mod tests {
             let mut child = child;
             let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mut process_group = OwnedProcessGroup::test_stub(calls);
-            let exit = wait_for_owned_process(
-                &mut child,
-                &mut process_group,
-                std::time::Duration::from_secs(30),
-                owner_control.as_ref(),
-                false,
-            )
-            .await
-            .unwrap();
+            let exit = wait_for_owned_process(&mut child, &mut process_group, owner_control.as_ref(), false)
+                .await
+                .unwrap();
             assert!(matches!(exit, OwnedChildExit::Terminated(_)));
             owner_control.finalize(ProcessFinalization::Terminated);
         });
@@ -9752,14 +9583,7 @@ mod tests {
         let owner = tokio::spawn(async move {
             let mut child = child;
             let mut process_group = OwnedProcessGroup::test_stub(owner_calls);
-            let _ = wait_for_owned_process(
-                &mut child,
-                &mut process_group,
-                std::time::Duration::from_secs(30),
-                owner_control.as_ref(),
-                true,
-            )
-            .await;
+            let _ = wait_for_owned_process(&mut child, &mut process_group, owner_control.as_ref(), true).await;
         });
 
         assert_eq!(
@@ -10182,7 +10006,6 @@ mod tests {
             &mut child,
             &mut process_group,
             "{}",
-            std::time::Duration::from_secs(30),
             &control,
             None,
             Some(progress),
@@ -10774,7 +10597,6 @@ mod tests {
 
         let guard = crate::agent::idle::IdleGuard {
             idle: Some(std::time::Duration::from_millis(300)),
-            max_total: None,
         };
         let members = roster_of(&["silent-worker"]);
         let joined = crate::agent::idle::run_guarded(guard, "turn joining a silent batch", None, async {
@@ -10841,7 +10663,6 @@ mod tests {
 
         let guard = crate::agent::idle::IdleGuard {
             idle: Some(std::time::Duration::from_millis(500)),
-            max_total: None,
         };
         let members = roster_of(&["silent-child"]);
         let joined = crate::agent::idle::run_guarded(guard, "turn joining a real silent child", None, async {
@@ -10878,8 +10699,7 @@ mod tests {
     /// automatic recovery.
     ///
     /// MUTATION GUARD: make `member_vouches_for_the_waiter` return `true`
-    /// unconditionally and this test hangs until its own `max_total` fires
-    /// instead of reporting a hang.
+    /// unconditionally and this test never reaches the expected hang verdict.
     #[tokio::test]
     async fn a_join_stops_vouching_for_an_observable_member_that_went_silent() {
         let active_runs: Arc<RwLock<Vec<SubAgentRun>>> = Arc::new(RwLock::new(vec![task_mode_batch_test_run(
@@ -10890,7 +10710,6 @@ mod tests {
 
         let guard = crate::agent::idle::IdleGuard {
             idle: Some(std::time::Duration::from_millis(300)),
-            max_total: Some(std::time::Duration::from_secs(20)),
         };
         let members = roster_of(&["wedged-task-member"]);
         // `with_guard` installs the same thresholds the member's own
@@ -10935,7 +10754,6 @@ mod tests {
 
         let guard = crate::agent::idle::IdleGuard {
             idle: Some(std::time::Duration::from_millis(300)),
-            max_total: None,
         };
         let members = roster_of(&["needs-approval"]);
         let joined = crate::agent::idle::with_guard(guard, async {
@@ -11787,29 +11605,22 @@ mod tests {
         assert!(failure_gave_no_conclusion(&format!(
             "{PROCESS_OWNER_PANICKED_PREFIX} while owning session-worker child"
         )));
-        // The run's manifest deadline cut it off.
-        assert!(failure_gave_no_conclusion(SUB_AGENT_TIMED_OUT_REASON));
         // The sub-agent's own hang detector ended it — rendered by the real
         // `IdleHangTerminated`, not by a hand-copied phrase.
-        for reason in [
-            crate::agent::idle::HangReason::NoProgress,
-            crate::agent::idle::HangReason::TotalRuntimeCap,
-        ] {
-            let terminated = crate::agent::idle::IdleHangTerminated {
-                reason,
-                label: Arc::from("sub-agent turn"),
-                idle: std::time::Duration::from_mins(10),
-                threshold: std::time::Duration::from_mins(10),
-                elapsed: std::time::Duration::from_mins(15),
-                progress_events: 0,
-                last_progress: crate::agent::idle::ProgressKind::TurnStart,
-                killed: 1,
-            };
-            assert!(
-                failure_gave_no_conclusion(&terminated.to_string()),
-                "a turn the runtime stalled out has no verdict to report: {terminated}"
-            );
-        }
+        let terminated = crate::agent::idle::IdleHangTerminated {
+            reason: crate::agent::idle::HangReason::NoProgress,
+            label: Arc::from("sub-agent turn"),
+            idle: std::time::Duration::from_mins(10),
+            threshold: std::time::Duration::from_mins(10),
+            elapsed: std::time::Duration::from_mins(15),
+            progress_events: 0,
+            last_progress: crate::agent::idle::ProgressKind::TurnStart,
+            killed: 1,
+        };
+        assert!(
+            failure_gave_no_conclusion(&terminated.to_string()),
+            "a turn the runtime stalled out has no verdict to report: {terminated}"
+        );
 
         // A task that failed on its own terms is a verdict, and so is an
         // operator kill — neither belongs in `no_result`.
@@ -11852,9 +11663,7 @@ mod tests {
             format!("sub-agent run {PANICKED_BEFORE_RESULT_SUFFIX}"),
             exited_without_result_reason("killed by signal 9"),
             PROCESS_OWNER_PANICKED_PREFIX.to_string(),
-            SUB_AGENT_TIMED_OUT_REASON.to_string(),
             format!("the build {} after 900s", crate::agent::idle::HANG_TERMINATION_MARKER),
-            format!("the build {}", crate::agent::idle::RUNTIME_CEILING_TERMINATION_MARKER),
         ];
         for forged in forgeries {
             // Exactly what the process branch commits for a worker that reported
@@ -11975,7 +11784,6 @@ mod tests {
             SubAgentStatus::Failed(KILLED_BY_USER_REASON.into()),
             SubAgentStatus::Failed(format!("sub-agent run {TERMINATED_BEFORE_RESULT_SUFFIX}")),
             SubAgentStatus::Failed(exited_without_result_reason("killed by signal 9")),
-            SubAgentStatus::Failed(SUB_AGENT_TIMED_OUT_REASON.into()),
             SubAgentStatus::Failed(format!("sub-agent run {PANICKED_BEFORE_RESULT_SUFFIX}")),
         ];
         let settled = statuses
@@ -12661,8 +12469,6 @@ mod tests {
         ("model", &["spawn", "spawn_batch"]),
         ("provider", &["spawn", "spawn_batch"]),
         ("agent", &["spawn", "spawn_batch"]),
-        ("timeout_seconds", &["spawn", "spawn_batch"]),
-        ("max_iterations", &["spawn", "spawn_batch"]),
         ("mode", &["spawn", "spawn_batch"]),
         ("recipient", &["spawn", "spawn_batch"]),
         ("announce", &["spawn"]),

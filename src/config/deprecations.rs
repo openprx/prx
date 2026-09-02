@@ -58,6 +58,9 @@ const REASON_UNCAPPED: &str =
 const REASON_NO_TIMEOUT: &str =
     "prx no longer imposes timeouts on agent work; slow work is waited on and reported, not cancelled";
 
+/// Agentic loops now converge through completion, explicit failure, or cancellation.
+const REASON_NO_ITERATION_LIMIT: &str = "prx no longer stops a progressing agent after an arbitrary number of tool rounds; use cancellation or `prx tasks kill` to end it";
+
 /// The key described an enforcement that never existed.
 const REASON_NEVER_ENFORCED: &str = "this limit was never enforced by any code path and has been removed rather than \
                                      left as a false assurance";
@@ -73,6 +76,16 @@ const REASON_ROLLOUT_RETIRED: &str = "read-only tool scheduling is no longer sta
 /// key back into a hard "unknown configuration path" error, which is the right
 /// end state once no deployment can still be carrying it.
 pub(crate) const DEPRECATED_CONFIG_KEYS: &[DeprecatedKey] = &[
+    DeprecatedKey {
+        path: &["agent", "max_tool_iterations"],
+        shape: DeprecatedShape::Field,
+        reason: REASON_NO_ITERATION_LIMIT,
+    },
+    DeprecatedKey {
+        path: &["runtime", "idle_hang_max_total_secs"],
+        shape: DeprecatedShape::Field,
+        reason: REASON_NO_TIMEOUT,
+    },
     // ── [agent]: tool concurrency governance ──────────────────────────────
     DeprecatedKey {
         path: &["agent", "parallel_tools"],
@@ -218,6 +231,33 @@ pub(crate) fn strip_deprecated_keys(root: &mut toml::Value, config_path: Option<
                 "Ignoring removed configuration key; it no longer does anything and the line is safe to delete"
             ),
         }
+        stripped.push(dotted);
+    }
+    // Delegate agents are a user-named map, so their retired field cannot be
+    // represented by the static exact-path table above. Strip every
+    // `[agents.<name>].max_iterations` entry explicitly.
+    let retired_agent_limits = root
+        .get_mut("agents")
+        .and_then(toml::Value::as_table_mut)
+        .map(|agents| {
+            agents
+                .iter_mut()
+                .filter_map(|(name, value)| {
+                    value
+                        .as_table_mut()
+                        .and_then(|agent| agent.remove("max_iterations"))
+                        .map(|_| format!("agents.{name}.max_iterations"))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for dotted in retired_agent_limits {
+        tracing::warn!(
+            key = %dotted,
+            reason = REASON_NO_ITERATION_LIMIT,
+            config = config_path.map(|path| path.display().to_string()),
+            "Ignoring removed configuration key; it no longer does anything and the line is safe to delete"
+        );
         stripped.push(dotted);
     }
     stripped

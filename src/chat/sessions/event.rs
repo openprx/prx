@@ -447,10 +447,7 @@ mod tests {
             duration_ms: 12,
         };
         assert_eq!(summarize_tool_call(&finished), Some("✓ read [ok 12ms]".to_string()));
-        let progress = ToolCallNotification::Progress {
-            iteration: 1,
-            max_iterations: 5,
-        };
+        let progress = ToolCallNotification::Progress { iteration: 1 };
         assert_eq!(summarize_tool_call(&progress), None);
     }
 

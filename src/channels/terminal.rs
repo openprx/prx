@@ -151,7 +151,6 @@ enum UiEvent {
     },
     ToolProgress {
         iteration: usize,
-        max_iterations: usize,
     },
 
     // === Complete message (non-streaming fallback) ===
@@ -553,21 +552,16 @@ impl UiActor {
                 }
             }
 
-            UiEvent::ToolProgress {
-                iteration,
-                max_iterations,
-            } => {
+            UiEvent::ToolProgress { iteration } => {
                 if !self.plain_mode {
                     let _ = execute!(
                         io::stdout(),
                         style::SetForegroundColor(style::Color::Cyan),
-                        style::Print(format!(
-                            "  \u{25B6} Step {iteration}/{max_iterations} \u{2014} continuing...\n"
-                        )),
+                        style::Print(format!("  \u{25B6} Step {iteration} \u{2014} continuing...\n")),
                         style::ResetColor
                     );
                 } else {
-                    println!("  [step {iteration}/{max_iterations}] continuing...");
+                    println!("  [step {iteration}] continuing...");
                 }
             }
 
@@ -729,11 +723,8 @@ impl UiActor {
                 self.notify_redraw();
             }
 
-            UiEvent::ToolProgress {
-                iteration,
-                max_iterations,
-            } => {
-                let msg = format!("step {iteration}/{max_iterations}");
+            UiEvent::ToolProgress { iteration } => {
+                let msg = format!("step {iteration}");
                 bridge.sink.push_system(&msg);
                 self.notify_redraw();
             }
@@ -964,14 +955,8 @@ impl TerminalChannel {
     }
 
     /// Send a tool-loop progress notification to the UI Actor.
-    pub async fn notify_progress(&self, iteration: usize, max_iterations: usize) {
-        let _ = self
-            .ui_tx
-            .send(UiEvent::ToolProgress {
-                iteration,
-                max_iterations,
-            })
-            .await;
+    pub async fn notify_progress(&self, iteration: usize) {
+        let _ = self.ui_tx.send(UiEvent::ToolProgress { iteration }).await;
     }
 }
 

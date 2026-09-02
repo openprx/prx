@@ -20,7 +20,6 @@ use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
 
 const MIN_POLL_SECONDS: u64 = 5;
-const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 
 tokio::task_local! {
@@ -560,16 +559,6 @@ async fn run_agent_job(
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
 
-    // Cap tool iterations for cron jobs to prevent runaway context growth.
-    // Behavior-limits Phase 1: raised 30 -> 100.
-    // 0-semantics note: on this CRON path `0` (or >cap) clamps to this value, NOT
-    // to the main-agent `0 -> default` fallback in `agent/loop_.rs`.
-    const CRON_MAX_TOOL_ITERATIONS: usize = 100;
-    let mut cron_config = config.clone();
-    if cron_config.agent.max_tool_iterations == 0 || cron_config.agent.max_tool_iterations > CRON_MAX_TOOL_ITERATIONS {
-        cron_config.agent.max_tool_iterations = CRON_MAX_TOOL_ITERATIONS;
-    }
-
     let runtime_envelope = claim.map(|claim| {
         let guard_config = config.clone();
         let guard_job_id = job.id.clone();
@@ -603,7 +592,7 @@ async fn run_agent_job(
             // Background cron job: no cooperative shutdown signal of its own;
             // the scheduler drops/aborts the task. See never_cancelled_shutdown.
             crate::agent::run_with_runtime_envelope(
-                cron_config,
+                config.clone(),
                 Some(prefixed_prompt),
                 None,
                 model_override,
@@ -964,7 +953,11 @@ async fn deliver_if_configured(
 }
 
 async fn run_job_command(config: &Config, job: &CronJob) -> (bool, String) {
-    run_job_command_with_timeout_authorization(config, job, Duration::from_secs(SHELL_JOB_TIMEOUT_SECS)).await
+    let process = match ShellProcessAdapter::from_config(config) {
+        Ok(process) => process,
+        Err(error) => return (false, format!("runtime error: {error}")),
+    };
+    run_job_command_with_adapter(config, job, None, &process).await
 }
 
 #[allow(dead_code)]
@@ -977,7 +970,7 @@ async fn run_job_command_with_timeout_authorization(
         Ok(process) => process,
         Err(error) => return (false, format!("runtime error: {error}")),
     };
-    run_job_command_with_timeout_and_adapter(config, job, timeout, &process).await
+    run_job_command_with_adapter(config, job, Some(timeout), &process).await
 }
 
 #[allow(dead_code)]
@@ -985,10 +978,10 @@ async fn run_job_command_with_timeout(config: &Config, job: &CronJob, timeout: D
     run_job_command_with_timeout_authorization(config, job, timeout).await
 }
 
-async fn run_job_command_with_timeout_and_adapter(
+async fn run_job_command_with_adapter(
     config: &Config,
     job: &CronJob,
-    timeout: Duration,
+    timeout: Option<Duration>,
     process: &ShellProcessAdapter,
 ) -> (bool, String) {
     match process
@@ -1009,7 +1002,7 @@ async fn run_job_command_with_timeout_and_adapter(
             );
             (output.status.success(), combined)
         }
-        Err(ShellProcessError::Timeout(_)) => (false, format!("job timed out after {}s", timeout.as_secs_f64())),
+        Err(ShellProcessError::Timeout(timeout)) => (false, format!("job timed out after {}s", timeout.as_secs_f64())),
         Err(error) => (false, format!("spawn error: {error}")),
     }
 }
@@ -1524,7 +1517,7 @@ mod tests {
         }));
 
         let (success, output) =
-            run_job_command_with_timeout_and_adapter(&config, &job, Duration::from_secs(5), &process).await;
+            run_job_command_with_adapter(&config, &job, Some(Duration::from_secs(5)), &process).await;
 
         assert!(success, "{output}");
         assert!(output.contains("cron-runtime-spy"));
@@ -1543,7 +1536,7 @@ mod tests {
         let process = ShellProcessAdapter::new(Arc::new(NativeRuntime::new()));
 
         let (success, output) =
-            run_job_command_with_timeout_and_adapter(&config, &job, Duration::from_secs(5), &process).await;
+            run_job_command_with_adapter(&config, &job, Some(Duration::from_secs(5)), &process).await;
 
         assert!(success, "{output}");
         assert!(config.workspace_dir.join("cron-sandbox-marker").exists());

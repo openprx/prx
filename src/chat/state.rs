@@ -1117,7 +1117,7 @@ impl ChatState {
                 duration_ms,
                 result,
             } => self.reduce_tool_finished(task_id, sequence, tool_call_id, name, success, duration_ms, result),
-            Action::ToolProgress { iteration, max } => self.reduce_tool_progress(iteration, max),
+            Action::ToolProgress { iteration } => self.reduce_tool_progress(iteration),
             Action::ToolApprovalRequested {
                 task_id,
                 tool_id,
@@ -2253,12 +2253,12 @@ impl ChatState {
     /// 当前 UI 未单独显示 progress 字段；保留 Action 是为了未来扩展 + 钩子触发.
     /// 不 mutate UI 状态（签名仍接受 `&self` 但 reducer 入口统一传 `&mut`，
     /// 此处用 `&self` 让 clippy::needless-pass-by-ref-mut 静音）.
-    fn reduce_tool_progress(&mut self, iteration: usize, max: usize) -> Vec<Effect> {
+    fn reduce_tool_progress(&mut self, iteration: usize) -> Vec<Effect> {
         self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
         vec![
             Effect::LogTrace {
                 level: tracing::Level::DEBUG,
-                msg: format!("tool_progress {iteration}/{max}"),
+                msg: format!("tool_progress {iteration}"),
             },
             Effect::RequestRedraw,
         ]
@@ -5736,7 +5736,7 @@ mod tests {
         fn test_redux_tool_progress_returns_log_redraw_and_visible_generation() {
             let mut state = s();
             let before = state.ui.conversation_generation;
-            let effects = state.reduce(Action::ToolProgress { iteration: 3, max: 10 });
+            let effects = state.reduce(Action::ToolProgress { iteration: 3 });
             assert!(has_request_redraw(&effects));
             assert!(has_log_trace(&effects));
             assert!(state.ui.conversation_lines.is_empty());
@@ -9754,7 +9754,7 @@ mod tests {
         #[test]
         fn s4_a_1_tool_progress_dirty_but_retry_trace_only_is_clean() {
             let mut state = make_state();
-            let (_e, d) = state.reduce_tracked(Action::ToolProgress { iteration: 1, max: 3 });
+            let (_e, d) = state.reduce_tracked(Action::ToolProgress { iteration: 1 });
             assert!(d, "ToolProgress must dirty Pure snapshots so progress is visible");
             let (_e, d2) = state.reduce_tracked(Action::StreamRetryAttempt {
                 attempt: 1,

@@ -24,12 +24,6 @@ use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
 
 const XIN_COMPONENT: &str = "xin";
-const SHELL_TIMEOUT_SECS: u64 = 120;
-// Sub-agent (xin runner) tool-iteration hard clamp. Behavior-limits Phase 1:
-// raised 20 -> 100 to align with `sub_agent.max_iterations` default.
-// 0-semantics note: on this path `0` (or >cap) clamps to this value, NOT to the
-// main-agent fallback in `agent/loop_.rs:DEFAULT_MAX_TOOL_ITERATIONS`.
-const AGENT_MAX_TOOL_ITERATIONS: usize = 100;
 /// Floor for the heartbeat interval so very short leases still renew sanely.
 const MIN_HEARTBEAT_SECS: u64 = 5;
 
@@ -835,16 +829,10 @@ async fn run_agent(
 
     let prompt = format!("[xin:task:{}] {}", task.id, task.payload);
 
-    let mut agent_config = config.clone();
-    if agent_config.agent.max_tool_iterations == 0 || agent_config.agent.max_tool_iterations > AGENT_MAX_TOOL_ITERATIONS
-    {
-        agent_config.agent.max_tool_iterations = AGENT_MAX_TOOL_ITERATIONS;
-    }
-
     // Background xin runner: no cooperative shutdown signal of its own; the
     // runner drives this synchronously. See never_cancelled_shutdown docs.
     match crate::agent::run_with_runtime_envelope(
-        agent_config,
+        config.clone(),
         Some(prompt),
         None,
         config.default_model.clone(),
@@ -929,7 +917,7 @@ async fn run_shell_with_adapter(
         .execute(ShellProcessRequest {
             command: &task.payload,
             workspace_dir: &config.workspace_dir,
-            timeout: Duration::from_secs(SHELL_TIMEOUT_SECS),
+            timeout: None,
             cancellation,
         })
         .await
@@ -943,7 +931,7 @@ async fn run_shell_with_adapter(
             );
             (output.status.success(), combined)
         }
-        Err(ShellProcessError::Timeout(_)) => (false, format!("task timed out after {SHELL_TIMEOUT_SECS}s")),
+        Err(ShellProcessError::Timeout(timeout)) => (false, format!("task timed out after {timeout:?}")),
         Err(ShellProcessError::Cancelled) => (false, "task cancelled after lease loss".into()),
         Err(error) => (false, format!("spawn error: {error}")),
     }

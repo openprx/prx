@@ -6,11 +6,7 @@ use crate::runtime::shell_process::{
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-
-/// Maximum shell command execution time before kill.
-const SHELL_TIMEOUT_SECS: u64 = 60;
 
 /// Direct host shell command execution tool.
 ///
@@ -41,9 +37,7 @@ impl ShellTool {
     fn legacy_process_error_message(error: ShellProcessError) -> String {
         match error {
             ShellProcessError::Cancelled => TOOL_EXECUTION_CANCELLED.to_string(),
-            ShellProcessError::Timeout(_) => {
-                format!("Command timed out after {SHELL_TIMEOUT_SECS}s and was killed")
-            }
+            ShellProcessError::Timeout(timeout) => format!("Command timed out after {timeout:?} and was killed"),
             ShellProcessError::Runtime(error) => format!("Failed to build runtime command: {error}"),
             ShellProcessError::Spawn(error) | ShellProcessError::Wait(error) | ShellProcessError::Output(error) => {
                 format!("Failed to execute command: {error}")
@@ -65,7 +59,7 @@ impl ShellTool {
             .execute(ShellProcessRequest {
                 command,
                 workspace_dir: &self.workspace_dir,
-                timeout: Duration::from_secs(SHELL_TIMEOUT_SECS),
+                timeout: None,
                 cancellation,
             })
             .await

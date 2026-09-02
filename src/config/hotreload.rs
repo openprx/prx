@@ -177,12 +177,6 @@ fn log_diff(old: &Config, fresh: &Config) {
             old.default_temperature, fresh.default_temperature
         ));
     }
-    if old.agent.max_tool_iterations != fresh.agent.max_tool_iterations {
-        changes.push(format!(
-            "agent.max_tool_iterations: {} → {}",
-            old.agent.max_tool_iterations, fresh.agent.max_tool_iterations
-        ));
-    }
     if old.agent.max_history_messages != fresh.agent.max_history_messages {
         changes.push(format!(
             "agent.max_history_messages: {} → {}",

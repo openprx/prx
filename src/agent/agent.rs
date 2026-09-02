@@ -794,14 +794,6 @@ impl Agent {
         };
         #[cfg(feature = "llm-router")]
         let mut cost_event = RouterCostEvent::new(&effective_model);
-        let max_tool_iterations = match classify_result.intent {
-            // Simple: cap at configured limit but allow up to 5 — not a hard 3.
-            // The previous hard-cap of 3 silently ignored higher configured values.
-            super::classifier::TaskIntent::Simple => self.config.max_tool_iterations.clamp(1, 5),
-            super::classifier::TaskIntent::Stream => self.config.max_tool_iterations.max(1),
-            super::classifier::TaskIntent::Delegate => self.config.max_tool_iterations.max(1),
-        };
-
         // NOTE: CTE branch consumption removed from this legacy path; CTE now runs
         // in `loop_::run` (see the note above where the prediction block was).
 
@@ -811,7 +803,6 @@ impl Agent {
             serde_json::json!({
                 "effective_model": effective_model.clone(),
                 "intent": format!("{:?}", classify_result.intent),
-                "max_tool_iterations": max_tool_iterations,
             }),
         );
         // FIX-P1-14: routing may have resolved a model different from the one the
@@ -867,7 +858,7 @@ impl Agent {
         // below). Shared across loop iterations so a runaway model cannot spin
         // forever on repeated overflows.
         let mut turn_overflow_retries = 0usize;
-        for _ in 0..max_tool_iterations {
+        loop {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
             for tool in &self.tools {
                 let _ = tool.refresh().await;
@@ -1145,20 +1136,6 @@ impl Agent {
             self.history.push(formatted);
             self.trim_history();
         }
-
-        #[cfg(feature = "llm-router")]
-        if let Some(router) = &self.router {
-            let success = false;
-            let latency = turn_start.elapsed().as_millis() as u64;
-            if let Err(err) = router
-                .record_outcome(user_message, &effective_model, success, latency)
-                .await
-            {
-                tracing::warn!("Router record_outcome failed: {err}");
-            }
-            self.append_router_cost_event(&cost_event).await;
-        }
-        anyhow::bail!("Agent exceeded maximum tool iterations ({})", max_tool_iterations)
     }
 
     pub async fn run_single(&mut self, message: &str) -> Result<String> {

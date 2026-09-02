@@ -30,9 +30,7 @@
 //!    `long_running_turn_survives_while_it_keeps_making_progress` exists to go
 //!    red the moment anyone does it.
 //! 2. **Reinterpret [`IdleGuard::idle`] as a total budget.** It is not a
-//!    ceiling on turn length and no default may ever be chosen as if it were.
-//!    The only total ceiling is [`IdleGuard::max_total`], which is deliberately
-//!    set a full day out — see its documentation.
+//!    ceiling on turn length and no total-runtime ceiling exists here.
 //!
 //! # Relationship to `[runtime] long_task_warn_secs`
 //!
@@ -66,10 +64,8 @@
 //! * It does not attempt to distinguish *useful* progress from *futile*
 //!   progress. A model that calls the same failing tool forever is emitting
 //!   genuine events, so the runtime is not hung and this detector will not (and
-//!   should not) fire. Non-convergence is a different fault with a different,
-//!   already-present bound: `agent.max_tool_iterations`. Conflating the two
-//!   would mean killing a healthy turn because we disliked its content, which
-//!   is the wall-clock mistake wearing a different hat.
+//!   should not) fire. Users can still cancel the turn explicitly; imposing an
+//!   arbitrary iteration ceiling would also kill healthy long-running work.
 //! * It does not let one turn's activity keep another turn alive. The beat
 //!   lives in a task-local ([`CURRENT_BEAT`]), so concurrent turns cannot
 //!   refresh each other. The one deliberate exception is a *child* run linking
@@ -112,32 +108,11 @@ pub const DEFAULT_IDLE_HANG_SECS: u64 = 1800;
 /// shorter is a foot-gun, not a tuning choice.
 pub const MIN_IDLE_HANG_SECS: u64 = 30;
 
-/// Default absolute ceiling on one turn when `[runtime] idle_hang_max_total_secs`
-/// is unset: 24 hours.
-///
-/// This is the backstop for the one case the idle window cannot see: a turn that
-/// keeps emitting faint, real events forever and so never goes silent. It is
-/// **not** a turn-duration policy and must never be tuned as one. The value is
-/// picked to be unreachable by legitimate work — the longest healthy agent turn
-/// documented anywhere in the ecosystem survey this mechanism came from was
-/// ~41 minutes, so a day leaves roughly 35x of headroom — and exists only so a
-/// daemon that runs for months cannot accumulate immortal turns.
-///
-/// Set `0` to disable it entirely. Lowering it toward the idle window turns it
-/// back into the wall-clock turn timeout this runtime does not have.
-pub const DEFAULT_IDLE_HANG_MAX_TOTAL_SECS: u64 = 86_400;
-
-/// Smallest enabled total ceiling: one hour.
-///
-/// Guards against the ceiling being quietly repurposed as a short turn budget.
-pub const MIN_IDLE_HANG_MAX_TOTAL_SECS: u64 = 3_600;
-
 /// Sentinel for "no configuration installed yet", so the built-in defaults
 /// apply to code paths that run before (or without) `install`.
 const NOT_INSTALLED: u64 = u64::MAX;
 
 static INSTALLED_IDLE_SECS: AtomicU64 = AtomicU64::new(NOT_INSTALLED);
-static INSTALLED_MAX_TOTAL_SECS: AtomicU64 = AtomicU64::new(NOT_INSTALLED);
 
 /// Publish the configured thresholds process-wide.
 ///
@@ -146,9 +121,8 @@ static INSTALLED_MAX_TOTAL_SECS: AtomicU64 = AtomicU64::new(NOT_INSTALLED);
 /// mirrors how `[runtime] long_task_warn_secs` is installed
 /// ([`crate::runtime::registry::start_long_task_warner`]). Call it once during
 /// dispatch; paths that never call it get the documented defaults.
-pub fn install(idle_secs: Option<u64>, max_total_secs: Option<u64>) {
+pub fn install(idle_secs: Option<u64>) {
     INSTALLED_IDLE_SECS.store(idle_secs.unwrap_or(NOT_INSTALLED), Ordering::Relaxed);
-    INSTALLED_MAX_TOTAL_SECS.store(max_total_secs.unwrap_or(NOT_INSTALLED), Ordering::Relaxed);
 }
 
 /// Thresholds a guarded turn runs under.
@@ -159,27 +133,18 @@ pub struct IdleGuard {
     ///
     /// Reset by every progress event — this is not a budget for the turn.
     pub idle: Option<Duration>,
-    /// Absolute ceiling on the turn regardless of progress. `None` disables it.
-    ///
-    /// See [`DEFAULT_IDLE_HANG_MAX_TOTAL_SECS`] before touching this.
-    pub max_total: Option<Duration>,
 }
 
 impl IdleGuard {
     /// Build from raw configuration values, applying defaults for `None` and
     /// treating `Some(0)` as "disabled".
     #[must_use]
-    pub const fn resolve(idle_secs: Option<u64>, max_total_secs: Option<u64>) -> Self {
+    pub const fn resolve(idle_secs: Option<u64>) -> Self {
         Self {
             idle: match idle_secs {
                 Some(0) => None,
                 Some(secs) => Some(Duration::from_secs(secs)),
                 None => Some(Duration::from_secs(DEFAULT_IDLE_HANG_SECS)),
-            },
-            max_total: match max_total_secs {
-                Some(0) => None,
-                Some(secs) => Some(Duration::from_secs(secs)),
-                None => Some(Duration::from_secs(DEFAULT_IDLE_HANG_MAX_TOTAL_SECS)),
             },
         }
     }
@@ -187,7 +152,7 @@ impl IdleGuard {
     /// Both checks off — the guard degenerates to running the future directly.
     #[must_use]
     pub const fn is_disabled(self) -> bool {
-        self.idle.is_none() && self.max_total.is_none()
+        self.idle.is_none()
     }
 }
 
@@ -220,7 +185,7 @@ pub fn configured() -> IdleGuard {
         NOT_INSTALLED => None,
         value => Some(value),
     };
-    IdleGuard::resolve(read(&INSTALLED_IDLE_SECS), read(&INSTALLED_MAX_TOTAL_SECS))
+    IdleGuard::resolve(read(&INSTALLED_IDLE_SECS))
 }
 
 /// Kind of event that reset the idle window, recorded so the termination report
@@ -283,8 +248,7 @@ pub enum ProgressKind {
     ///   non-terminal status alone. That is a known blind spot rather than a
     ///   design: closing it needs a liveness frame on the worker's stdout
     ///   protocol, which today carries exactly one line. Until then such a
-    ///   member is bounded only by the worker's own in-process watchdog and by
-    ///   [`IdleGuard::max_total`].
+    ///   member is bounded by the worker's own in-process watchdog.
     ///
     /// The rule as code is `crate::tools::sessions_spawn::member_vouches_for_the_waiter`.
     SubtaskAlive,
@@ -480,8 +444,6 @@ where
 pub enum HangReason {
     /// No observable progress for the whole idle window.
     NoProgress,
-    /// Still making progress, but past the absolute ceiling.
-    TotalRuntimeCap,
 }
 
 impl HangReason {
@@ -490,7 +452,6 @@ impl HangReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NoProgress => "idle_no_progress",
-            Self::TotalRuntimeCap => "total_runtime_cap",
         }
     }
 }
@@ -505,23 +466,17 @@ impl HangReason {
 /// drifting apart silently.
 pub const HANG_TERMINATION_MARKER: &str = "was terminated as hung";
 
-/// Wording every absolute-ceiling termination message carries.
-///
-/// Same contract as [`HANG_TERMINATION_MARKER`], for the other threshold: a
-/// turn stopped at the ceiling also never reached a conclusion of its own.
-pub const RUNTIME_CEILING_TERMINATION_MARKER: &str = "was terminated at the absolute runtime ceiling";
-
 /// Whether a rendered error message describes a turn ended by this detector.
 ///
 /// Text matching is not a shortcut here — it is the only channel available.
 /// A sub-agent's outcome crosses into the run registry as
 /// `SubAgentStatus::Failed(error.to_string())`, so the typed
 /// [`IdleHangTerminated`] is already gone by the time anything downstream can
-/// ask. The two markers are the constants the message is built from, so writer
-/// and reader cannot disagree.
+/// ask. The marker is the constant the message is built from, so writer and
+/// reader cannot disagree.
 #[must_use]
 pub fn message_describes_hang_termination(message: &str) -> bool {
-    message.contains(HANG_TERMINATION_MARKER) || message.contains(RUNTIME_CEILING_TERMINATION_MARKER)
+    message.contains(HANG_TERMINATION_MARKER)
 }
 
 /// Error returned when a turn is terminated by this detector.
@@ -571,19 +526,6 @@ impl std::fmt::Display for IdleHangTerminated {
                 self.elapsed.as_secs(),
                 self.killed,
             ),
-            HangReason::TotalRuntimeCap => write!(
-                f,
-                "agent turn '{}' {RUNTIME_CEILING_TERMINATION_MARKER} of {}s \
-                 (`[runtime] idle_hang_max_total_secs`) after {}s and {} progress event(s); \
-                 {} runtime work item(s) signalled. The turn was still emitting events, so \
-                 this is a backstop against a run that never converges, not a turn-duration \
-                 policy.",
-                self.label,
-                self.threshold.as_secs(),
-                self.elapsed.as_secs(),
-                self.progress_events,
-                self.killed,
-            ),
         }
     }
 }
@@ -605,7 +547,7 @@ const WATCHDOG_MIN_STEP: Duration = Duration::from_millis(5);
 ///
 /// Returns `fut`'s own result untouched whenever it completes — success,
 /// failure, or cancellation. Only when the turn goes silent past
-/// [`IdleGuard::idle`] (or runs past [`IdleGuard::max_total`]) does this replace
+/// [`IdleGuard::idle`] does this replace
 /// the outcome with an [`IdleHangTerminated`] error.
 ///
 /// The watchdog runs inline in the caller's task rather than in a spawned one,
@@ -643,7 +585,7 @@ where
     tokio::pin!(guarded);
 
     loop {
-        let step = next_check_delay(guard, &beat, started);
+        let step = next_check_delay(guard, &beat);
         tokio::select! {
             // Progress first: if the turn is ready, it wins the race outright,
             // even on a tick where the deadline has also come due.
@@ -662,7 +604,7 @@ where
             beat.record(ProgressKind::RuntimeSubtree);
         }
 
-        let Some((reason, threshold)) = verdict(guard, &beat, started) else {
+        let Some((reason, threshold)) = verdict(guard, &beat) else {
             continue;
         };
         return Err(terminate(reason, threshold, label, cancel, &beat, started).await);
@@ -670,21 +612,16 @@ where
 }
 
 /// How long the watchdog may sleep before the earliest threshold could be due.
-fn next_check_delay(guard: IdleGuard, beat: &ProgressBeat, started: Instant) -> Duration {
+fn next_check_delay(guard: IdleGuard, beat: &ProgressBeat) -> Duration {
     let until_idle = guard.idle.map(|window| window.saturating_sub(beat.idle_for()));
-    let until_total = guard.max_total.map(|cap| cap.saturating_sub(started.elapsed()));
-    let step = match (until_idle, until_total) {
-        (Some(idle), Some(total)) => idle.min(total),
-        (Some(only), None) | (None, Some(only)) => only,
-        // `is_disabled` already returned; this arm is unreachable in practice
-        // and resolves to a harmless long nap rather than a busy loop.
-        (None, None) => Duration::from_secs(DEFAULT_IDLE_HANG_SECS),
-    };
+    // `is_disabled` already returned; the fallback is unreachable in practice
+    // and resolves to a harmless long nap rather than a busy loop.
+    let step = until_idle.unwrap_or(Duration::from_secs(DEFAULT_IDLE_HANG_SECS));
     step.max(WATCHDOG_MIN_STEP)
 }
 
 /// Whether a threshold is actually due right now, and which one.
-fn verdict(guard: IdleGuard, beat: &ProgressBeat, started: Instant) -> Option<(HangReason, Duration)> {
+fn verdict(guard: IdleGuard, beat: &ProgressBeat) -> Option<(HangReason, Duration)> {
     // The idle check reads `beat.idle_for()`, never `started.elapsed()`.
     //
     // MUTATION GUARD: swapping it for `started.elapsed()` turns this detector
@@ -694,11 +631,6 @@ fn verdict(guard: IdleGuard, beat: &ProgressBeat, started: Instant) -> Option<(H
         && beat.idle_for() >= window
     {
         return Some((HangReason::NoProgress, window));
-    }
-    if let Some(cap) = guard.max_total
-        && started.elapsed() >= cap
-    {
-        return Some((HangReason::TotalRuntimeCap, cap));
     }
     None
 }
@@ -820,10 +752,9 @@ fn subtree_fingerprint(root: Option<WorkId>) -> Option<u64> {
 mod tests {
     use super::*;
 
-    fn guard_ms(idle_ms: u64, total_ms: Option<u64>) -> IdleGuard {
+    fn guard_ms(idle_ms: u64) -> IdleGuard {
         IdleGuard {
             idle: Some(Duration::from_millis(idle_ms)),
-            max_total: total_ms.map(Duration::from_millis),
         }
     }
 
@@ -849,7 +780,7 @@ mod tests {
 
         let tool_token = turn_token.child_token();
         let result: anyhow::Result<()> = registry::scoped(turn, async move {
-            run_guarded(guard_ms(200, None), "hung-turn", Some(&token_for_turn), async move {
+            run_guarded(guard_ms(200), "hung-turn", Some(&token_for_turn), async move {
                 let tool = registry::register_tool_call("hang_tool", None, Some(tool_token));
                 let tool_id = tool.id();
                 registry::scope_current(tool_id, async move {
@@ -960,14 +891,8 @@ mod tests {
         let idle = Duration::from_millis(300);
         // 15 beats one third of the window apart => ~1.5s of run time, five
         // times the idle window, and never more than 100ms of silence.
-        let outcome: anyhow::Result<u32> = run_guarded(
-            IdleGuard {
-                idle: Some(idle),
-                max_total: None,
-            },
-            "long-progressing-turn",
-            None,
-            async {
+        let outcome: anyhow::Result<u32> =
+            run_guarded(IdleGuard { idle: Some(idle) }, "long-progressing-turn", None, async {
                 let mut ticks = 0_u32;
                 for _ in 0..15 {
                     tokio::time::sleep(idle / 3).await;
@@ -975,9 +900,8 @@ mod tests {
                     ticks += 1;
                 }
                 Ok(ticks)
-            },
-        )
-        .await;
+            })
+            .await;
 
         let ticks = outcome.expect("a turn that keeps making progress must never be terminated");
         assert_eq!(ticks, 15, "the turn must run to its natural end");
@@ -989,21 +913,14 @@ mod tests {
     #[tokio::test]
     async fn the_same_duration_without_progress_is_terminated() {
         let idle = Duration::from_millis(300);
-        let outcome: anyhow::Result<u32> = run_guarded(
-            IdleGuard {
-                idle: Some(idle),
-                max_total: None,
-            },
-            "long-silent-turn",
-            None,
-            async {
+        let outcome: anyhow::Result<u32> =
+            run_guarded(IdleGuard { idle: Some(idle) }, "long-silent-turn", None, async {
                 for _ in 0..15 {
                     tokio::time::sleep(idle / 3).await;
                 }
                 Ok(15)
-            },
-        )
-        .await;
+            })
+            .await;
 
         let error = outcome.expect_err("silence for the whole window is a hang");
         assert!(is_hang_termination(&error), "got: {error}");
@@ -1035,16 +952,15 @@ mod tests {
         );
 
         // And a guarded turn is unaffected by the warning sweeper.
-        let outcome: anyhow::Result<()> =
-            run_guarded(guard_ms(400, None), "warned-but-progressing", Some(&token), async {
-                for _ in 0..6 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    registry::warn_long_running(Duration::ZERO);
-                    beat(ProgressKind::ToolEnd);
-                }
-                Ok(())
-            })
-            .await;
+        let outcome: anyhow::Result<()> = run_guarded(guard_ms(400), "warned-but-progressing", Some(&token), async {
+            for _ in 0..6 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                registry::warn_long_running(Duration::ZERO);
+                beat(ProgressKind::ToolEnd);
+            }
+            Ok(())
+        })
+        .await;
         assert!(
             outcome.is_ok(),
             "the long-task warning must not push a progressing turn into a hang verdict"
@@ -1053,32 +969,11 @@ mod tests {
         drop(work);
     }
 
-    /// The absolute ceiling fires even while progress keeps arriving, and says
-    /// so — it is a different verdict from a stall.
-    #[tokio::test]
-    async fn total_ceiling_stops_a_turn_that_never_converges() {
-        let outcome: anyhow::Result<()> = run_guarded(guard_ms(10_000, Some(300)), "never-converges", None, async {
-            loop {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                beat(ProgressKind::ProviderStream);
-            }
-        })
-        .await;
-
-        let error = outcome.expect_err("the ceiling must stop a run that never ends");
-        let detail = error
-            .downcast_ref::<IdleHangTerminated>()
-            .expect("the ceiling produces a hang termination error");
-        assert_eq!(detail.reason, HangReason::TotalRuntimeCap);
-        assert!(detail.progress_events > 0, "the turn was progressing the whole time");
-        assert!(error.to_string().contains("absolute runtime ceiling"), "{error}");
-    }
-
     /// A turn that fails or is cancelled keeps its own error: the guard never
     /// relabels an ordinary outcome as a hang.
     #[tokio::test]
     async fn ordinary_outcomes_are_passed_through_untouched() {
-        let failed: anyhow::Result<()> = run_guarded(guard_ms(5_000, None), "failing-turn", None, async {
+        let failed: anyhow::Result<()> = run_guarded(guard_ms(5_000), "failing-turn", None, async {
             Err(anyhow::anyhow!("tool exploded"))
         })
         .await;
@@ -1086,7 +981,7 @@ mod tests {
         assert!(!is_hang_termination(&error), "a task failure is not a hang");
         assert_eq!(error.to_string(), "tool exploded");
 
-        let ok: anyhow::Result<u8> = run_guarded(guard_ms(5_000, None), "fast-turn", None, async { Ok(7) }).await;
+        let ok: anyhow::Result<u8> = run_guarded(guard_ms(5_000), "fast-turn", None, async { Ok(7) }).await;
         assert_eq!(ok.expect("a fast turn is untouched"), 7);
     }
 
@@ -1106,8 +1001,8 @@ mod tests {
         };
 
         let (noisy, silent): (anyhow::Result<()>, anyhow::Result<()>) = tokio::join!(
-            run_guarded(guard_ms(300, None), "noisy", None, noisy),
-            run_guarded(guard_ms(300, None), "silent", None, silent),
+            run_guarded(guard_ms(300), "noisy", None, noisy),
+            run_guarded(guard_ms(300), "silent", None, silent),
         );
         assert!(noisy.is_ok(), "the progressing turn survives");
         let error = silent.expect_err("the silent turn is terminated regardless of its neighbour");
@@ -1118,7 +1013,7 @@ mod tests {
     /// working sub-agent is not judged silent.
     #[tokio::test]
     async fn child_run_progress_keeps_its_spawner_alive() {
-        let outcome: anyhow::Result<()> = run_guarded(guard_ms(300, None), "parent-turn", None, async {
+        let outcome: anyhow::Result<()> = run_guarded(guard_ms(300), "parent-turn", None, async {
             let inherited = current_beat();
             let child = tokio::spawn(scope_beat(inherited, async {
                 for _ in 0..15 {
@@ -1151,7 +1046,7 @@ mod tests {
 
         let outcome: anyhow::Result<()> = scope_beat(
             Some(Arc::clone(&handed)),
-            run_guarded(guard_ms(10_000, None), "child-turn", None, async {
+            run_guarded(guard_ms(10_000), "child-turn", None, async {
                 beat(ProgressKind::ToolStart);
                 tokio::time::sleep(Duration::from_millis(30)).await;
                 beat(ProgressKind::ToolEnd);
@@ -1179,25 +1074,12 @@ mod tests {
 
     #[test]
     fn thresholds_resolve_defaults_and_honour_the_disable_switch() {
-        let defaults = IdleGuard::resolve(None, None);
+        let defaults = IdleGuard::resolve(None);
         assert_eq!(defaults.idle, Some(Duration::from_secs(DEFAULT_IDLE_HANG_SECS)));
-        assert_eq!(
-            defaults.max_total,
-            Some(Duration::from_secs(DEFAULT_IDLE_HANG_MAX_TOTAL_SECS))
-        );
 
-        assert_eq!(
-            IdleGuard::resolve(Some(0), Some(0)),
-            IdleGuard {
-                idle: None,
-                max_total: None
-            }
-        );
-        assert!(IdleGuard::resolve(Some(0), Some(0)).is_disabled());
-        assert_eq!(
-            IdleGuard::resolve(Some(90), Some(7_200)).idle,
-            Some(Duration::from_secs(90))
-        );
+        assert_eq!(IdleGuard::resolve(Some(0)), IdleGuard { idle: None });
+        assert!(IdleGuard::resolve(Some(0)).is_disabled());
+        assert_eq!(IdleGuard::resolve(Some(90)).idle, Some(Duration::from_secs(90)));
 
         // The idle default must stay clear of the long-task warning default, so
         // an operator always gets a warning well before anything is terminated.
@@ -1209,18 +1091,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_disabled_guard_runs_the_future_directly() {
-        let outcome: anyhow::Result<u8> = run_guarded(
-            IdleGuard {
-                idle: None,
-                max_total: None,
-            },
-            "unguarded",
-            None,
-            async {
-                tokio::time::sleep(Duration::from_millis(30)).await;
-                Ok(3)
-            },
-        )
+        let outcome: anyhow::Result<u8> = run_guarded(IdleGuard { idle: None }, "unguarded", None, async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Ok(3)
+        })
         .await;
         assert_eq!(outcome.expect("a disabled guard never terminates"), 3);
     }

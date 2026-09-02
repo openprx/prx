@@ -47,8 +47,6 @@ pub struct WorkerManifest {
     #[serde(default)]
     pub memory_event_recording: crate::memory::MemoryEventRecording,
     pub allowed_tools: Vec<String>,
-    pub timeout_seconds: u64,
-    pub max_iterations: usize,
     pub system_prompt: Option<String>,
     pub identity_dir: Option<String>,
     pub scope_sender: Option<String>,
@@ -172,8 +170,6 @@ mod tests {
                 record_tool_events: true,
             },
             allowed_tools: vec!["shell".into(), "file_read".into()],
-            timeout_seconds: 0,
-            max_iterations: 24,
             system_prompt: None,
             identity_dir: Some("identity/worker".into()),
             scope_sender: Some("openprx_user".into()),

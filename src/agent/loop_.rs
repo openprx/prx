@@ -112,7 +112,7 @@ pub enum ToolCallNotification {
         duration_ms: u64,
     },
     /// Progress indication for multi-iteration tool loops.
-    Progress { iteration: usize, max_iterations: usize },
+    Progress { iteration: usize },
 }
 
 /// A neutral, crate-library-level sink that provisions the per-run event
@@ -399,17 +399,6 @@ impl DocumentIngestRuntime {
     }
 }
 
-/// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
-/// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero
-/// (MAIN-AGENT path: this `0 -> default` fallback is distinct from the sub-agent
-/// runner and cron paths, where `0` clamps to their own per-path caps — see
-/// `xin/runner.rs:AGENT_MAX_TOOL_ITERATIONS` and `cron/scheduler.rs:CRON_MAX_TOOL_ITERATIONS`).
-/// Behavior-limits Phase 1: aligned 10 -> 200 with `default_agent_max_tool_iterations`.
-///
-/// `pub` so the Redux/TUI driver (`chat::dispatcher::drive_start_turn_stream`) can
-/// reuse the exact same default instead of maintaining a divergent local constant.
-pub const DEFAULT_MAX_TOOL_ITERATIONS: usize = 200;
-
 const TOOL_PARSE_LOG_PREVIEW_CHARS: usize = 200;
 
 /// Maximum inline characters allowed for a single tool result before it is
@@ -427,15 +416,6 @@ pub(crate) const COMPACTION_TIMEOUT_SECS: u64 = 300;
 
 /// Maximum number of times to retry an LLM call after a context overflow error.
 const MAX_OVERFLOW_RETRIES: usize = 3;
-
-/// Hard cap on `max_tool_iterations` to prevent unbounded tool-call loops
-/// even when the user passes an unreasonably large config value.
-/// 🔴 Anti-runaway safeguard (NOT removed). Behavior-limits Phase 1 raises the
-/// ceiling 1000 -> 2000. On hit the loop returns `Err` (bail!), never panics.
-///
-/// `pub` so the Redux/TUI driver (`chat::dispatcher::drive_start_turn_stream`) can
-/// reuse the exact same finite cap instead of maintaining a divergent local constant.
-pub const MAX_TOOL_ITERATIONS_CAP: usize = 2000;
 
 /// Fraction of `max_context_tokens` above which a pre-turn memory flush is triggered.
 pub(crate) const PRE_TURN_FLUSH_THRESHOLD: f64 = 0.85;
@@ -3628,7 +3608,6 @@ pub(crate) async fn agent_turn(
     temperature: f64,
     silent: bool,
     multimodal_config: &crate::config::MultimodalConfig,
-    max_tool_iterations: usize,
     read_only_tool_concurrency_window: usize,
     priority_scheduling_enabled: bool,
     low_priority_tool_names: Vec<String>,
@@ -3647,7 +3626,6 @@ pub(crate) async fn agent_turn(
         None,
         "channel",
         multimodal_config,
-        max_tool_iterations,
         read_only_tool_concurrency_window,
         priority_scheduling_enabled,
         low_priority_tool_names,
@@ -4585,7 +4563,6 @@ async fn execute_tools_with_policy(
 // full conversation so far (system prompt + user messages + prior tool
 // results). The loop exits when:
 //   • the LLM returns no tool calls (final answer), or
-//   • max_iterations is reached (runaway safety), or
 //   • the cancellation token fires (external abort).
 
 /// Provider-attribution trace for a completed (or returning) tool-call loop.
@@ -5646,7 +5623,6 @@ pub(crate) async fn run_tool_call_loop(
     approval: Option<Arc<ApprovalManager>>,
     channel_name: &str,
     multimodal_config: &crate::config::MultimodalConfig,
-    max_tool_iterations: usize,
     read_only_tool_concurrency_window: usize,
     priority_scheduling_enabled: bool,
     low_priority_tool_names: Vec<String>,
@@ -5672,7 +5648,6 @@ pub(crate) async fn run_tool_call_loop(
         approval,
         channel_name,
         multimodal_config,
-        max_tool_iterations,
         read_only_tool_concurrency_window,
         priority_scheduling_enabled,
         low_priority_tool_names,
@@ -5722,7 +5697,6 @@ pub(crate) async fn run_tool_call_loop_traced(
     approval: Option<Arc<ApprovalManager>>,
     channel_name: &str,
     multimodal_config: &crate::config::MultimodalConfig,
-    max_tool_iterations: usize,
     read_only_tool_concurrency_window: usize,
     priority_scheduling_enabled: bool,
     low_priority_tool_names: Vec<String>,
@@ -5748,7 +5722,6 @@ pub(crate) async fn run_tool_call_loop_traced(
         approval,
         channel_name,
         multimodal_config,
-        max_tool_iterations,
         read_only_tool_concurrency_window,
         priority_scheduling_enabled,
         low_priority_tool_names,
@@ -5809,7 +5782,6 @@ pub(crate) async fn run_tool_call_loop_outcome(
     approval: Option<Arc<ApprovalManager>>,
     channel_name: &str,
     multimodal_config: &crate::config::MultimodalConfig,
-    max_tool_iterations: usize,
     read_only_tool_concurrency_window: usize,
     priority_scheduling_enabled: bool,
     low_priority_tool_names: Vec<String>,
@@ -5844,7 +5816,6 @@ pub(crate) async fn run_tool_call_loop_outcome(
         approval,
         channel_name,
         multimodal_config,
-        max_tool_iterations,
         read_only_tool_concurrency_window,
         priority_scheduling_enabled,
         low_priority_tool_names,
@@ -5887,7 +5858,6 @@ async fn run_tool_call_loop_outcome_unguarded(
     approval: Option<Arc<ApprovalManager>>,
     channel_name: &str,
     multimodal_config: &crate::config::MultimodalConfig,
-    max_tool_iterations: usize,
     read_only_tool_concurrency_window: usize,
     priority_scheduling_enabled: bool,
     low_priority_tool_names: Vec<String>,
@@ -5903,11 +5873,6 @@ async fn run_tool_call_loop_outcome_unguarded(
     expose_stay_silent: bool,
     runtime_adapter: Option<ToolLoopRuntimeAdapter>,
 ) -> Result<(ToolLoopOutcome, ToolLoopTrace)> {
-    let max_iterations = if max_tool_iterations == 0 {
-        DEFAULT_MAX_TOOL_ITERATIONS
-    } else {
-        max_tool_iterations.min(MAX_TOOL_ITERATIONS_CAP)
-    };
     let ToolLoopMemory {
         ledger,
         ingest: document_ingest,
@@ -6061,17 +6026,16 @@ async fn run_tool_call_loop_outcome_unguarded(
     let mut tool_summary_retry_attempted = false;
     let mut inject_tool_summary_retry_instruction = false;
 
-    for iteration in 0..max_iterations {
+    let mut iteration = 0usize;
+    loop {
+        iteration = iteration.saturating_add(1);
         // Reaching a new iteration means the previous one produced a complete
         // model response and its tool results: unambiguous progress.
         crate::agent::idle::beat(crate::agent::idle::ProgressKind::ProviderResponse);
         // Notify progress for multi-iteration tool loops (skip the first iteration).
-        if iteration > 0 {
+        if iteration > 1 {
             if let Some(ref tx) = on_tool_call {
-                let _ = tx.try_send(ToolCallNotification::Progress {
-                    iteration: iteration + 1,
-                    max_iterations,
-                });
+                let _ = tx.try_send(ToolCallNotification::Progress { iteration });
             }
         }
 
@@ -6744,8 +6708,6 @@ async fn run_tool_call_loop_outcome_unguarded(
             );
         }
     }
-
-    anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
 }
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -7331,7 +7293,6 @@ pub(crate) async fn run_with_runtime_envelope(
                         Some(Arc::clone(&approval_manager)),
                         "cli",
                         &config.multimodal,
-                        config.agent.max_tool_iterations,
                         config.agent.read_only_tool_concurrency_window,
                         config.agent.priority_scheduling_enabled,
                         config.agent.low_priority_tools.clone(),
@@ -7742,7 +7703,6 @@ pub(crate) async fn run_with_runtime_envelope(
                         Some(Arc::clone(&approval_manager)),
                         "cli",
                         &config.multimodal,
-                        config.agent.max_tool_iterations,
                         config.agent.read_only_tool_concurrency_window,
                         config.agent.priority_scheduling_enabled,
                         config.agent.low_priority_tools.clone(),
@@ -8077,7 +8037,6 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         config.default_temperature,
         true,
         &config.multimodal,
-        config.agent.max_tool_iterations,
         config.agent.read_only_tool_concurrency_window,
         config.agent.priority_scheduling_enabled,
         config.agent.low_priority_tools.clone(),
@@ -8980,7 +8939,6 @@ mod tests {
             None,
             "cli",
             &crate::config::MultimodalConfig::default(),
-            4,
             2,
             false,
             Vec::new(),
@@ -9188,7 +9146,6 @@ mod tests {
             None,
             "cli",
             &crate::config::MultimodalConfig::default(),
-            4,
             2,
             false,
             Vec::new(),
@@ -9315,7 +9272,6 @@ mod tests {
             None,
             "cli",
             &crate::config::MultimodalConfig::default(),
-            3,
             2,
             false,
             Vec::new(),
@@ -9370,7 +9326,6 @@ mod tests {
             None,
             "cli",
             &multimodal,
-            3,
             2,
             false,
             Vec::new(),
@@ -9417,7 +9372,6 @@ mod tests {
             None,
             "cli",
             &crate::config::MultimodalConfig::default(),
-            3,
             2,
             false,
             Vec::new(),
@@ -9472,7 +9426,6 @@ mod tests {
             None,
             "cli",
             &crate::config::MultimodalConfig::default(),
-            3,
             2,
             false,
             Vec::new(),
@@ -9668,7 +9621,6 @@ mod tests {
             None,
             "cli",
             &crate::config::MultimodalConfig::default(),
-            3,
             2,
             false,
             Vec::new(),
@@ -9819,7 +9771,6 @@ mod tests {
             Some(Arc::new(approval_mgr)),
             "telegram",
             &crate::config::MultimodalConfig::default(),
-            4,
             2,
             false,
             Vec::new(),
@@ -9901,7 +9852,6 @@ mod tests {
             None,
             "cli",
             &crate::config::MultimodalConfig::default(),
-            4,
             2,
             false,
             Vec::new(),
@@ -9990,7 +9940,6 @@ mod tests {
             Some(Arc::new(approval_mgr)),
             "telegram",
             &crate::config::MultimodalConfig::default(),
-            4,
             2,
             false,
             Vec::new(),
@@ -10093,7 +10042,6 @@ mod tests {
 
         let guard = crate::agent::idle::IdleGuard {
             idle: Some(Duration::from_millis(300)),
-            max_total: None,
         };
         let error = crate::agent::idle::with_guard(
             guard,
@@ -10110,7 +10058,6 @@ mod tests {
                 None,
                 "telegram",
                 &crate::config::MultimodalConfig::default(),
-                4,
                 2,
                 false,
                 Vec::new(),
@@ -10175,7 +10122,6 @@ mod tests {
 
         let guard = crate::agent::idle::IdleGuard {
             idle: Some(idle_window),
-            max_total: None,
         };
         let started = std::time::Instant::now();
         let result = crate::agent::idle::with_guard(
@@ -10193,7 +10139,6 @@ mod tests {
                 Some(Arc::new(ApprovalManager::new())),
                 "telegram",
                 &crate::config::MultimodalConfig::default(),
-                ROUNDS + 2,
                 2,
                 false,
                 Vec::new(),
@@ -10222,112 +10167,6 @@ mod tests {
             executions.load(Ordering::SeqCst),
             ROUNDS,
             "every scripted round must have done real work"
-        );
-    }
-
-    /// A provider that never stops asking for the same tool, so the turn can
-    /// only end at the iteration budget.
-    struct LoopingToolProvider;
-
-    #[async_trait]
-    impl Provider for LoopingToolProvider {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<String> {
-            anyhow::bail!("chat_with_system is not used by this test provider")
-        }
-
-        async fn chat(
-            &self,
-            _request: ChatRequest<'_>,
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<ChatResponse> {
-            Ok(ChatResponse {
-                text: Some(
-                    "<tool_call>\n{\"name\":\"delay_progress\",\"arguments\":{\"value\":\"again\"}}\n</tool_call>"
-                        .to_string(),
-                ),
-                tool_calls: Vec::new(),
-                reasoning_content: None,
-            })
-        }
-    }
-
-    /// The deliberate limit of this mechanism, pinned so nobody "fixes" it into
-    /// something worse.
-    ///
-    /// A model stuck calling the same tool forever is emitting real events, so
-    /// the runtime is not hung and the idle detector must not fire: it cannot
-    /// and must not judge whether progress is *useful*, only whether there is
-    /// any. Non-convergence is a different fault with its own existing bound,
-    /// `agent.max_tool_iterations`, and that is what ends this turn.
-    #[tokio::test]
-    async fn a_futile_but_active_loop_is_bounded_by_iterations_not_by_hang_detection() {
-        const BUDGET: usize = 6;
-        let provider = LoopingToolProvider;
-        let executions = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(SteadyTool {
-            delay: Duration::from_millis(60),
-            executions: Arc::clone(&executions),
-        })];
-        let ledger_dir = TempDir::new().unwrap();
-        let ledger_memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(ledger_dir.path()).unwrap());
-        let ledger_envelope = RuntimeEnvelope::agent(ledger_dir.path().to_string_lossy().to_string(), "futile-loop");
-        let document_ingest = DocumentIngestRuntime::from_envelope(ledger_memory, &ledger_envelope);
-
-        let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user("spin forever")];
-        let observer = NoopObserver;
-
-        let guard = crate::agent::idle::IdleGuard {
-            idle: Some(Duration::from_millis(200)),
-            max_total: None,
-        };
-        let outcome = crate::agent::idle::with_guard(
-            guard,
-            run_tool_call_loop(
-                &provider,
-                &mut history,
-                Arc::new(tools_registry),
-                &observer,
-                &crate::hooks::HookManager::new(std::env::temp_dir()),
-                "mock-provider",
-                "mock-model",
-                0.0,
-                true,
-                Some(Arc::new(ApprovalManager::new())),
-                "telegram",
-                &crate::config::MultimodalConfig::default(),
-                BUDGET,
-                2,
-                false,
-                Vec::new(),
-                None,
-                None,
-                None,
-                None, // no scope context
-                None,
-                None, // no tool tiering
-                ToolLoopMemory::from_ingest_for_test(document_ingest),
-                ChatMode::default(),
-            ),
-        )
-        .await;
-
-        if let Err(error) = &outcome {
-            assert!(
-                !crate::agent::idle::is_hang_termination(error),
-                "a busy-but-futile loop is not a hang: {error}"
-            );
-        }
-        assert_eq!(
-            executions.load(Ordering::SeqCst),
-            BUDGET,
-            "the iteration budget, not the idle detector, is what bounds this turn"
         );
     }
 
@@ -10770,7 +10609,6 @@ mod tests {
         let result = crate::agent::idle::with_guard(
             crate::agent::idle::IdleGuard {
                 idle: Some(Duration::from_millis(200)),
-                max_total: None,
             },
             run_tool_call_loop_outcome(
                 &provider,
@@ -10785,7 +10623,6 @@ mod tests {
                 None,
                 "cli",
                 &crate::config::MultimodalConfig::default(),
-                4,
                 2,
                 false,
                 Vec::new(),
@@ -13048,10 +12885,6 @@ Done."#;
     // ═══════════════════════════════════════════════════════════════════════
 
     const _: () = {
-        assert!(DEFAULT_MAX_TOOL_ITERATIONS > 0);
-        // Behavior-limits Phase 1: default raised to 200; keep a sane ceiling and
-        // ensure it never exceeds the anti-runaway hard cap.
-        assert!(DEFAULT_MAX_TOOL_ITERATIONS <= MAX_TOOL_ITERATIONS_CAP);
         assert!(DEFAULT_MAX_HISTORY_MESSAGES > 0);
         assert!(DEFAULT_MAX_HISTORY_MESSAGES <= 1000);
     };
@@ -13535,7 +13368,6 @@ Let me check the result."#;
             None,
             "cli",
             &crate::config::MultimodalConfig::default(),
-            4,
             2,
             false,
             Vec::new(),
@@ -13599,7 +13431,6 @@ Let me check the result."#;
             None,
             "cli",
             &crate::config::MultimodalConfig::default(),
-            2,
             2,
             false,
             Vec::new(),
@@ -13673,7 +13504,6 @@ Let me check the result."#;
             None,
             "cli",
             &crate::config::MultimodalConfig::default(),
-            4,
             2,
             false,
             Vec::new(),
@@ -14365,7 +14195,6 @@ Let me check the result."#;
                 None,
                 "terminal",
                 &crate::config::MultimodalConfig::default(),
-                4,
                 2,
                 false,
                 Vec::new(),
@@ -14465,7 +14294,6 @@ Let me check the result."#;
                 None,
                 "telegram",
                 &crate::config::MultimodalConfig::default(),
-                4,
                 2,
                 false,
                 Vec::new(),
@@ -14541,7 +14369,6 @@ Let me check the result."#;
                 None,
                 "telegram",
                 &crate::config::MultimodalConfig::default(),
-                4,
                 2,
                 false,
                 Vec::new(),

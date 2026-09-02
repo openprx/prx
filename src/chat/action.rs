@@ -399,8 +399,8 @@ pub enum Action {
         duration_ms: u64,
         result: Option<String>,
     },
-    /// 工具调用进度（iteration/max）
-    ToolProgress { iteration: usize, max: usize },
+    /// 工具调用进度
+    ToolProgress { iteration: usize },
     /// **S3 T3-1**: driver 请求 UI 对某工具调用做 approval（supervised autonomy 模式下触发）.
     ///
     /// reducer 仅产生 `Effect::RequestApproval`，driver 自身通过 oneshot rx 等响应。

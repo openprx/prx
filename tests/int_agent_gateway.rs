@@ -17,7 +17,7 @@
 //! P0 integration tests for agent + gateway.
 //!
 //! These tests validate:
-//! - Agent tool dispatch, malformed tool calls, timeouts, and iteration limits
+//! - Agent tool dispatch, malformed tool calls, and timeout handling
 //! - Gateway auth (bearer token rejection), body size limits, HMAC verification, rate limiting
 //!
 //! Each test uses mock providers and isolated state; no real LLM or network calls.
@@ -33,7 +33,7 @@ use axum::{Json, Router};
 use openprx::HookManager;
 use openprx::agent::agent::Agent;
 use openprx::agent::dispatcher::NativeToolDispatcher;
-use openprx::config::{AgentConfig, Config, MemoryConfig, new_shared};
+use openprx::config::{Config, MemoryConfig, new_shared};
 use openprx::gateway::{AppState, GatewayRateLimiter, IdempotencyStore, MAX_BODY_SIZE};
 use openprx::memory::{self, Memory, MemoryCategory, MemoryEntry};
 use openprx::observability::{NoopObserver, Observer};
@@ -309,19 +309,6 @@ fn build_agent(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Agent 
         .workspace_dir(std::env::temp_dir())
         .build()
         .expect("test: build agent")
-}
-
-fn build_agent_with_config(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>, config: AgentConfig) -> Agent {
-    Agent::builder()
-        .provider(provider)
-        .tools(tools)
-        .memory(make_memory())
-        .observer(make_observer())
-        .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::env::temp_dir())
-        .config(config)
-        .build()
-        .expect("test: build agent with config")
 }
 
 /// Build a minimal `AppState` for gateway integration tests.
@@ -636,43 +623,6 @@ async fn int_agent_gateway_ap03_provider_timeout_during_tool_loop() {
             // would need a configured timeout to handle this in production.
         }
     }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// INT-AP-06: Max tool iterations prevents runaway loops
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Validates that when the provider always returns tool calls, the agent stops
-/// after `max_tool_iterations` iterations and returns an error.
-#[tokio::test]
-async fn int_agent_gateway_ap06_max_tool_iterations_prevents_runaway() {
-    let max_iters = 3;
-
-    // Create way more tool call responses than the limit allows.
-    let mut responses = Vec::new();
-    for i in 0..max_iters + 10 {
-        responses.push(tool_response(vec![ToolCall {
-            id: format!("tc{i}"),
-            name: "echo".into(),
-            arguments: r#"{"message": "loop forever"}"#.into(),
-        }]));
-    }
-
-    let provider = Box::new(MockProvider::new(responses));
-    let config = AgentConfig {
-        max_tool_iterations: max_iters,
-        ..AgentConfig::default()
-    };
-
-    let mut agent = build_agent_with_config(provider, vec![Box::new(EchoTool)], config);
-
-    let result = agent.turn("infinite loop").await;
-    assert!(result.is_err(), "Expected error when max tool iterations exceeded");
-    let err = result.expect_err("test: expected max iterations error").to_string();
-    assert!(
-        err.contains("maximum tool iterations"),
-        "Error should mention max iterations limit, got: {err}"
-    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

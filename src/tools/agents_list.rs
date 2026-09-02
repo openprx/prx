@@ -113,7 +113,6 @@ mod tests {
             max_depth: 3,
             agentic: false,
             allowed_tools: Vec::new(),
-            max_iterations: 10,
             identity_dir: None,
             memory_scope: None,
             spawn_enabled: None,

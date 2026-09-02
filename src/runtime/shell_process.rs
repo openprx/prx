@@ -37,7 +37,9 @@ const OUTPUT_DRAIN_KILL_GRACE: Duration = Duration::from_secs(1);
 pub struct ShellProcessRequest<'a> {
     pub command: &'a str,
     pub workspace_dir: &'a Path,
-    pub timeout: Duration,
+    /// Optional operation deadline. Normal PRX work passes `None`; tests and
+    /// explicitly bounded internal probes may opt into a deadline.
+    pub timeout: Option<Duration>,
     pub cancellation: Option<CancellationToken>,
 }
 
@@ -127,7 +129,7 @@ impl ShellProcessAdapter {
         );
         let mut drains = tokio::spawn(OutputDrainTasks::new(stdout_task, stderr_task).join());
         let mut drain_guard = DrainAbortGuard::new(drains.abort_handle());
-        let deadline = tokio::time::sleep(request.timeout);
+        let deadline = wait_for_timeout(request.timeout);
         tokio::pin!(deadline);
         let cancellation = wait_for_cancellation(request.cancellation.as_ref());
         tokio::pin!(cancellation);
@@ -143,14 +145,14 @@ impl ShellProcessAdapter {
                 }
                 return Err(ShellProcessError::Cancelled);
             }
-            () = &mut deadline => {
+            timeout = &mut deadline => {
                 let reaped = process.terminate_and_reap().await;
                 finish_drains_after_kill(&mut drains).await;
                 drain_guard.disarm();
                 if reaped {
                     process.mark_complete();
                 }
-                return Err(ShellProcessError::Timeout(request.timeout));
+                return Err(ShellProcessError::Timeout(timeout));
             }
             status = process.wait() => status.map_err(ShellProcessError::Wait)?,
         };
@@ -158,12 +160,12 @@ impl ShellProcessAdapter {
         enum DrainResult {
             Complete(Result<io::Result<(CapturedOutput, CapturedOutput)>, tokio::task::JoinError>),
             Cancelled,
-            TimedOut,
+            TimedOut(Duration),
         }
         let drain_result = tokio::select! {
             biased;
             () = &mut cancellation => DrainResult::Cancelled,
-            () = &mut deadline => DrainResult::TimedOut,
+            timeout = &mut deadline => DrainResult::TimedOut(timeout),
             output = &mut drains => DrainResult::Complete(output),
         };
         let (stdout, stderr) = match drain_result {
@@ -181,14 +183,14 @@ impl ShellProcessAdapter {
                 }
                 return Err(ShellProcessError::Cancelled);
             }
-            DrainResult::TimedOut => {
+            DrainResult::TimedOut(timeout) => {
                 let reaped = process.terminate_and_reap().await;
                 finish_drains_after_kill(&mut drains).await;
                 drain_guard.disarm();
                 if reaped {
                     process.mark_complete();
                 }
-                return Err(ShellProcessError::Timeout(request.timeout));
+                return Err(ShellProcessError::Timeout(timeout));
             }
         };
         process.mark_complete();
@@ -213,6 +215,16 @@ impl ShellProcessAdapter {
 async fn wait_for_cancellation(cancellation: Option<&CancellationToken>) {
     match cancellation {
         Some(token) => token.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn wait_for_timeout(timeout: Option<Duration>) -> Duration {
+    match timeout {
+        Some(timeout) => {
+            tokio::time::sleep(timeout).await;
+            timeout
+        }
         None => std::future::pending().await,
     }
 }
@@ -595,6 +607,23 @@ mod tests {
         ShellProcessAdapter::new(Arc::new(NativeRuntime::new()))
     }
 
+    #[tokio::test]
+    async fn request_without_deadline_runs_to_natural_completion() {
+        let temp = TempDir::new().expect("temp dir");
+        let outcome = adapter()
+            .execute(ShellProcessRequest {
+                command: "sleep 0.05; printf done",
+                workspace_dir: temp.path(),
+                timeout: None,
+                cancellation: None,
+            })
+            .await
+            .expect("unbounded shell execution");
+
+        assert!(outcome.status.success());
+        assert_eq!(outcome.stdout, "done");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn adapter_inherits_complete_parent_environment() {
         let _secret = EnvGuard::secret("must-not-leak");
@@ -603,7 +632,7 @@ mod tests {
             .execute(ShellProcessRequest {
                 command: "printf '%s' \"$PRX_TEST_SECRET\"",
                 workspace_dir: temp.path(),
-                timeout: Duration::from_secs(5),
+                timeout: Some(Duration::from_secs(5)),
                 cancellation: None,
             })
             .await
@@ -620,7 +649,7 @@ mod tests {
             .execute(ShellProcessRequest {
                 command: "yes x | head -c 1100000; yes y | head -c 1100000 >&2",
                 workspace_dir: temp.path(),
-                timeout: Duration::from_secs(10),
+                timeout: Some(Duration::from_secs(10)),
                 cancellation: None,
             })
             .await
@@ -642,7 +671,7 @@ mod tests {
             .execute(ShellProcessRequest {
                 command: "touch pre-cancelled-marker",
                 workspace_dir: temp.path(),
-                timeout: Duration::from_secs(5),
+                timeout: Some(Duration::from_secs(5)),
                 cancellation: Some(cancellation),
             })
             .await;
@@ -659,7 +688,7 @@ mod tests {
             .execute(ShellProcessRequest {
                 command: "sleep 30 >&2 & exit 0",
                 workspace_dir: temp.path(),
-                timeout: Duration::from_millis(100),
+                timeout: Some(Duration::from_millis(100)),
                 cancellation: None,
             })
             .await;
@@ -677,7 +706,7 @@ mod tests {
             .execute(ShellProcessRequest {
                 command: "setsid sh -c 'echo $$ > setsid.pid; exec sleep 30' >&2 & while [ ! -s setsid.pid ]; do :; done; exit 0",
                 workspace_dir: temp.path(),
-                timeout: Duration::from_millis(100),
+                timeout: Some(Duration::from_millis(100)),
                 cancellation: None,
             })
             .await;
@@ -752,7 +781,7 @@ mod tests {
             .execute(ShellProcessRequest {
                 command: &command,
                 workspace_dir: temp.path(),
-                timeout: Duration::from_secs(10),
+                timeout: Some(Duration::from_secs(10)),
                 cancellation: Some(cancellation),
             })
             .await;
@@ -781,7 +810,7 @@ mod tests {
             .execute(ShellProcessRequest {
                 command,
                 workspace_dir: temp.path(),
-                timeout: Duration::from_secs(10),
+                timeout: Some(Duration::from_secs(10)),
                 cancellation: Some(cancellation),
             })
             .await;
@@ -858,7 +887,7 @@ mod tests {
                 .execute(ShellProcessRequest {
                     command: &command,
                     workspace_dir: &workspace,
-                    timeout: Duration::from_mins(1),
+                    timeout: Some(Duration::from_mins(1)),
                     cancellation: None,
                 })
                 .await

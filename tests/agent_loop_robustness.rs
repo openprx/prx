@@ -21,7 +21,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use openprx::agent::agent::Agent;
 use openprx::agent::dispatcher::NativeToolDispatcher;
-use openprx::config::{AgentConfig, MemoryConfig};
+use openprx::config::MemoryConfig;
 use openprx::memory;
 use openprx::memory::Memory;
 use openprx::observability::{NoopObserver, Observer};
@@ -307,16 +307,15 @@ async fn agent_handles_mixed_tool_success_and_failure() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// TG4.3: Iteration limit enforcement (#777)
+// TG4.3: Long tool sequence completion (#777)
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Agent should not exceed `max_tool_iterations` (default=50) even with
-/// a provider that keeps returning tool calls
+/// Agent should allow a long, progressing tool sequence to finish naturally.
 #[tokio::test]
-async fn agent_respects_max_tool_iterations() {
+async fn agent_allows_long_tool_sequence_to_finish() {
     let (counting_tool, count) = CountingTool::new();
 
-    // Create 20 tool call responses, which stays below the default limit of 50
+    // Create 20 tool call responses followed by a final answer.
     let mut responses: Vec<ChatResponse> = (0..20)
         .map(|i| {
             tool_response(vec![ToolCall {
@@ -326,23 +325,17 @@ async fn agent_respects_max_tool_iterations() {
             }])
         })
         .collect();
-    // Add a final text response that would be used if limit is reached
     responses.push(text_response("Final response after iterations"));
 
     let provider = Box::new(MockProvider::new(responses));
     let mut agent = build_agent(provider, vec![Box::new(counting_tool)]);
 
-    // Agent should complete (either by hitting iteration limit or running out of responses)
-    let result = agent.turn("keep calling tools").await;
-    // The agent should complete without hanging
-    assert!(result.is_ok() || result.is_err());
-
-    let invocations = *count.lock().unwrap();
-    let max_tool_iterations = AgentConfig::default().max_tool_iterations;
-    assert!(
-        invocations <= max_tool_iterations,
-        "tool invocations ({invocations}) should not exceed default max_tool_iterations ({max_tool_iterations})"
-    );
+    let result = agent
+        .turn("keep calling tools")
+        .await
+        .expect("long sequence should finish");
+    assert_eq!(result, "Final response after iterations");
+    assert_eq!(*count.lock().unwrap(), 20);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

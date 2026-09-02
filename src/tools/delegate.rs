@@ -13,12 +13,6 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
-
-/// Default timeout for sub-agent provider calls.
-const DELEGATE_TIMEOUT_SECS: u64 = 120;
-/// Default timeout for agentic sub-agent runs.
-const DELEGATE_AGENTIC_TIMEOUT_SECS: u64 = 300;
 
 struct DelegateAgenticExecution {
     result: ToolResult,
@@ -634,72 +628,20 @@ impl Tool for DelegateTool {
                     agent_config.agentic,
                     scope.as_ref(),
                     &result,
-                    false,
                 )
                 .await;
             }
             return Ok(tool_result);
         }
 
-        // Wrap the provider call in a timeout to prevent indefinite blocking
-        let result = tokio::time::timeout(
-            Duration::from_secs(DELEGATE_TIMEOUT_SECS),
-            provider.chat_with_system(
+        let result = provider
+            .chat_with_system(
                 agent_config.system_prompt.as_deref(),
                 &full_prompt,
                 &effective_model,
                 temperature,
-            ),
-        )
-        .await;
-
-        let result = match result {
-            Ok(inner) => inner,
-            Err(_elapsed) => {
-                let tool_result = ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Agent '{agent_name}' timed out after {DELEGATE_TIMEOUT_SECS}s")),
-                };
-                if let Some(fabric) = memory_fabric.as_ref() {
-                    let timeout_error = anyhow::anyhow!(
-                        tool_result
-                            .error
-                            .clone()
-                            .unwrap_or_else(|| "delegate timeout".to_string())
-                    );
-                    let provider_outcome = crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
-                        &route_decision,
-                        provider_started_at,
-                        &timeout_error,
-                    );
-                    finalize_delegate_turn(
-                        fabric,
-                        &self.security.workspace_dir,
-                        event_scope.clone(),
-                        &delegate_run_id,
-                        provider_outcome,
-                        &tool_result,
-                        0,
-                    )
-                    .await;
-                    record_delegate_result_event(fabric, event_scope.clone(), &Ok(tool_result.clone())).await;
-                    record_delegate_terminal_task_event(
-                        fabric,
-                        event_scope,
-                        agent_name,
-                        &effective_provider,
-                        &effective_model,
-                        agent_config.agentic,
-                        scope.as_ref(),
-                        &Ok(tool_result.clone()),
-                        true,
-                    )
-                    .await;
-                }
-                return Ok(tool_result);
-            }
-        };
+            )
+            .await;
 
         match result {
             Ok(response) => {
@@ -742,7 +684,6 @@ impl Tool for DelegateTool {
                         agent_config.agentic,
                         scope.as_ref(),
                         &Ok(tool_result.clone()),
-                        false,
                     )
                     .await;
                 }
@@ -780,7 +721,6 @@ impl Tool for DelegateTool {
                         agent_config.agentic,
                         scope.as_ref(),
                         &Ok(tool_result.clone()),
-                        false,
                     )
                     .await;
                 }
@@ -903,7 +843,6 @@ async fn record_delegate_terminal_task_event(
     agentic: bool,
     delegate_scope: Option<&DelegateScope>,
     result: &anyhow::Result<ToolResult>,
-    timeout: bool,
 ) {
     let (success, error, output_preview) = match result {
         Ok(result) => (
@@ -913,9 +852,7 @@ async fn record_delegate_terminal_task_event(
         ),
         Err(error) => (false, Some(error.to_string()), String::new()),
     };
-    let event_type = if timeout {
-        "delegate.task.timeout"
-    } else if success {
+    let event_type = if success {
         "delegate.task.completed"
     } else {
         "delegate.task.failed"
@@ -1067,52 +1004,48 @@ impl DelegateTool {
             "delegate resolved child compaction window"
         );
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(DELEGATE_AGENTIC_TIMEOUT_SECS),
-            crate::agent::loop_::run_tool_call_loop_traced(
-                provider,
-                &mut history,
-                Arc::new(sub_tools),
-                &noop_observer,
-                &hooks,
-                effective_provider,
-                effective_model,
-                temperature,
-                true,
-                None,
-                "delegate",
-                &self.multimodal_config,
-                agent_config.max_iterations,
-                2,
-                false,
-                vec!["sessions_spawn".to_string(), "delegate".to_string(), "cron".to_string()],
-                Some(&resolved_compaction.config),
-                None,
-                None,
-                scope_ctx.as_ref(),
-                None,
-                None, // delegate sub-agents do not use tool tiering
-                // The ledger is keyed off the shared memory alone: a delegated
-                // sub-agent without an ingest scope must still run write tools.
-                self.memory.as_ref().map_or_else(
-                    || crate::agent::loop_::ToolLoopMemory::ledger_only(&self.security.workspace_dir),
-                    |memory| {
-                        crate::agent::loop_::ToolLoopMemory::new(
-                            memory,
-                            &self.security.workspace_dir,
-                            scope_ctx
-                                .as_ref()
-                                .map(|ctx| DocumentIngestRuntime::from_scope(memory.clone(), ctx)),
-                        )
-                    },
-                ),
-                crate::agent::loop_::ChatMode::default(),
+        let result = crate::agent::loop_::run_tool_call_loop_traced(
+            provider,
+            &mut history,
+            Arc::new(sub_tools),
+            &noop_observer,
+            &hooks,
+            effective_provider,
+            effective_model,
+            temperature,
+            true,
+            None,
+            "delegate",
+            &self.multimodal_config,
+            2,
+            false,
+            vec!["sessions_spawn".to_string(), "delegate".to_string(), "cron".to_string()],
+            Some(&resolved_compaction.config),
+            None,
+            None,
+            scope_ctx.as_ref(),
+            None,
+            None, // delegate sub-agents do not use tool tiering
+            // The ledger is keyed off the shared memory alone: a delegated
+            // sub-agent without an ingest scope must still run write tools.
+            self.memory.as_ref().map_or_else(
+                || crate::agent::loop_::ToolLoopMemory::ledger_only(&self.security.workspace_dir),
+                |memory| {
+                    crate::agent::loop_::ToolLoopMemory::new(
+                        memory,
+                        &self.security.workspace_dir,
+                        scope_ctx
+                            .as_ref()
+                            .map(|ctx| DocumentIngestRuntime::from_scope(memory.clone(), ctx)),
+                    )
+                },
             ),
+            crate::agent::loop_::ChatMode::default(),
         )
         .await;
 
         match result {
-            Ok(Ok((response, trace))) => {
+            Ok((response, trace)) => {
                 let rendered = if response.trim().is_empty() {
                     "[Empty response]".to_string()
                 } else {
@@ -1133,22 +1066,11 @@ impl DelegateTool {
                     history_commit_len: history.len(),
                 })
             }
-            Ok(Err(e)) => Ok(DelegateAgenticExecution {
+            Err(e) => Ok(DelegateAgenticExecution {
                 result: ToolResult {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Agent '{agent_name}' failed: {e}")),
-                },
-                trace: None,
-                history_commit_len: history.len(),
-            }),
-            Err(_) => Ok(DelegateAgenticExecution {
-                result: ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "Agent '{agent_name}' timed out after {DELEGATE_AGENTIC_TIMEOUT_SECS}s"
-                    )),
                 },
                 trace: None,
                 history_commit_len: history.len(),
@@ -1250,7 +1172,6 @@ mod tests {
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
                 identity_dir: None,
                 memory_scope: None,
                 spawn_enabled: None,
@@ -1267,7 +1188,6 @@ mod tests {
                 max_depth: 2,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
                 identity_dir: None,
                 memory_scope: None,
                 spawn_enabled: None,
@@ -1360,38 +1280,6 @@ mod tests {
         }
     }
 
-    struct InfiniteToolCallProvider;
-
-    #[async_trait]
-    impl Provider for InfiniteToolCallProvider {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<String> {
-            Ok("unused".to_string())
-        }
-
-        async fn chat(
-            &self,
-            _request: ChatRequest<'_>,
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<ChatResponse> {
-            Ok(ChatResponse {
-                text: None,
-                tool_calls: vec![ToolCall {
-                    id: "loop".to_string(),
-                    name: "echo_tool".to_string(),
-                    arguments: "{\"value\":\"x\"}".to_string(),
-                }],
-                reasoning_content: None,
-            })
-        }
-    }
-
     struct FailingProvider;
 
     #[async_trait]
@@ -1416,7 +1304,7 @@ mod tests {
         }
     }
 
-    fn agentic_config(allowed_tools: Vec<String>, max_iterations: usize) -> DelegateAgentConfig {
+    fn agentic_config(allowed_tools: Vec<String>) -> DelegateAgentConfig {
         DelegateAgentConfig {
             provider: "openrouter".to_string(),
             identity_dir: None,
@@ -1429,7 +1317,6 @@ mod tests {
             max_depth: 3,
             agentic: true,
             allowed_tools,
-            max_iterations,
         }
     }
 
@@ -1551,7 +1438,6 @@ mod tests {
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
                 identity_dir: None,
                 memory_scope: None,
                 spawn_enabled: None,
@@ -1627,7 +1513,6 @@ mod tests {
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
                 identity_dir: None,
                 memory_scope: None,
                 spawn_enabled: None,
@@ -1669,7 +1554,6 @@ mod tests {
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
                 identity_dir: None,
                 memory_scope: None,
                 spawn_enabled: None,
@@ -1852,7 +1736,6 @@ mod tests {
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
                 identity_dir: None,
                 memory_scope: None,
                 spawn_enabled: None,
@@ -1895,7 +1778,7 @@ mod tests {
     #[tokio::test]
     async fn agentic_mode_rejects_empty_allowed_tools() {
         let mut agents = HashMap::new();
-        agents.insert("agentic".to_string(), agentic_config(Vec::new(), 10));
+        agents.insert("agentic".to_string(), agentic_config(Vec::new()));
 
         let tool = DelegateTool::new(agents, None, test_security());
         let result = tool
@@ -1910,10 +1793,7 @@ mod tests {
     #[tokio::test]
     async fn agentic_mode_rejects_unmatched_allowed_tools() {
         let mut agents = HashMap::new();
-        agents.insert(
-            "agentic".to_string(),
-            agentic_config(vec!["missing_tool".to_string()], 10),
-        );
+        agents.insert("agentic".to_string(), agentic_config(vec!["missing_tool".to_string()]));
 
         let tool = DelegateTool::new(agents, None, test_security())
             .with_parent_tools(Arc::new(vec![Arc::new(EchoTool::default())]));
@@ -1934,7 +1814,7 @@ mod tests {
 
     #[tokio::test]
     async fn agentic_mode_inherits_parent_tools_only_with_explicit_wildcard() {
-        let config = agentic_config(vec!["*".to_string()], 10);
+        let config = agentic_config(vec!["*".to_string()]);
         // The mock provider answers "done" as soon as any tool message is in the
         // history, and a refusal is appended as a tool message too. Count the
         // executions so the assertion cannot be satisfied by a refused call.
@@ -1971,7 +1851,7 @@ mod tests {
 
     #[tokio::test]
     async fn agentic_mode_rejects_wildcard_mixed_with_named_tools() {
-        let config = agentic_config(vec!["*".to_string(), "echo_tool".to_string()], 10);
+        let config = agentic_config(vec!["*".to_string(), "echo_tool".to_string()]);
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
             .with_parent_tools(Arc::new(vec![Arc::new(EchoTool::default())]));
         let provider = OneToolThenFinalProvider;
@@ -2003,7 +1883,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_agentic_runs_tool_call_loop_with_filtered_tools() {
-        let config = agentic_config(vec!["echo_tool".to_string()], 10);
+        let config = agentic_config(vec!["echo_tool".to_string()]);
         // Same trap as above: "done" proves only that some tool message exists.
         let executions = Arc::new(AtomicUsize::new(0));
         let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(Arc::new(vec![
@@ -2059,7 +1939,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_agentic_rejects_delegate_as_ineligible() {
-        let config = agentic_config(vec!["delegate".to_string()], 10);
+        let config = agentic_config(vec!["delegate".to_string()]);
         let tool =
             DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(Arc::new(vec![Arc::new(
                 DelegateTool::new(HashMap::new(), None, test_security()),
@@ -2092,40 +1972,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_agentic_respects_max_iterations() {
-        let config = agentic_config(vec!["echo_tool".to_string()], 2);
-        let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool::default())]));
-
-        let provider = InfiniteToolCallProvider;
-        let result = tool
-            .execute_agentic(
-                "agentic",
-                &config,
-                "openrouter",
-                "model-test",
-                &provider,
-                "run",
-                0.2,
-                None,
-            )
-            .await
-            .unwrap();
-
-        assert!(!result.result.success);
-        assert!(
-            result
-                .result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("maximum tool iterations (2)")
-        );
-    }
-
-    #[tokio::test]
     async fn execute_agentic_propagates_provider_errors() {
-        let config = agentic_config(vec!["echo_tool".to_string()], 10);
+        let config = agentic_config(vec!["echo_tool".to_string()]);
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
             .with_parent_tools(Arc::new(vec![Arc::new(EchoTool::default())]));
 
@@ -2161,7 +2009,6 @@ mod tests {
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
                 identity_dir: None,
                 memory_scope: None,
                 spawn_enabled: None,

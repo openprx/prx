@@ -643,7 +643,7 @@ async fn int_tr_05_direct_shell_process_has_no_sandbox_selection() {
         .execute(ShellProcessRequest {
             command: "printf ok >/dev/null; printf direct",
             workspace_dir: workspace.path(),
-            timeout: Duration::from_secs(5),
+            timeout: Some(Duration::from_secs(5)),
             cancellation: None,
         })
         .await

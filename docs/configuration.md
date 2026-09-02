@@ -169,20 +169,6 @@ max_history = 200
 # call could be mistaken for a hang.
 # idle_hang_secs = 1800
 
-# Absolute ceiling in seconds on one agent turn, regardless of progress.
-#
-# Backstop for the single case `idle_hang_secs` cannot see: a run that keeps
-# emitting faint but real events, so never goes silent, yet never converges
-# either. The default of 86400s (24 hours) is chosen to be unreachable by
-# legitimate work — the longest healthy agent turn on record in the practice
-# survey behind this feature was about 41 minutes.
-#
-# Do NOT tune this down toward `idle_hang_secs`: doing so turns it into the
-# wall-clock turn timeout this runtime deliberately does not have. Set 0 to
-# disable it. Enabled values must be at least 3600 seconds and must not be
-# below `idle_hang_secs`.
-# idle_hang_max_total_secs = 86400
-
 [memory]
 backend = "sqlite"
 # Compatibility gate for semantic promotion. Message events are controlled below.
@@ -229,6 +215,8 @@ interval_minutes = 30
 active_hours = [8, 23]
 
 [agent]
+# Agent tool rounds have no numeric ceiling. A progressing turn continues until
+# it completes, fails explicitly, or is cancelled with Esc / `prx tasks kill`.
 # Read-only tool calls in one model iteration always run in parallel; there is
 # no switch that turns that off. Tool execution is never time-bounded either —
 # a long-running tool is normal agent business. Use `prx tasks list|kill` to see
@@ -256,7 +244,6 @@ provider = "anthropic"
 model = "claude-sonnet-4-6"
 agentic = true
 allowed_tools = ["web_search", "file_read"]
-max_iterations = 200
 
 # Model fallbacks
 [reliability.model_fallbacks]
@@ -570,6 +557,7 @@ convenient. Nothing rewrites your config files.
 
 | Removed key | Why |
 |---|---|
+| `agent.max_tool_iterations` | progressing agent work has no arbitrary tool-round ceiling |
 | `agent.parallel_tools` | no concurrency ceiling to switch |
 | `agent.read_only_tool_timeout_secs` | no timeouts on agent work |
 | `agent.concurrency_kill_switch_force_serial` | staged rollout retired |
@@ -587,8 +575,14 @@ convenient. Nothing rewrites your config files.
 | `autonomy.max_actions_per_hour` | no hourly action budget |
 | `gateway.request_timeout_secs` | no request deadline on gateway handlers |
 | `channels_config.message_timeout_secs` | no wall clock on a channel or chat turn; a stalled turn is ended by `runtime.idle_hang_secs`, a running one by `prx tasks kill` |
+| `runtime.idle_hang_max_total_secs` | no absolute wall-clock ceiling on a progressing turn |
+| `agents.<name>.max_iterations` | delegated agents have no arbitrary tool-round ceiling |
 | `[security.resources]` (whole table) | never enforced by any code path |
 | `memory.events.retention_days` | never read by the hygiene pass |
+
+The `sessions_spawn` tool also no longer accepts `max_iterations` or
+`timeout_seconds`; task-mode and process-mode sub-agents share the same
+unbounded execution contract.
 
 A key that is merely **misspelled** is still a hard error. Only the exact paths
 above are absorbed, so `max_actions_per_hourr` still stops the load with

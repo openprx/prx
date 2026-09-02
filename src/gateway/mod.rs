@@ -2009,7 +2009,6 @@ async fn run_gateway_chat_with_multimodal(
     // Build system prompt with native_tools flag so the prompt instructs the
     // LLM to use tools rather than emit XML tags.
     let multimodal_config = config_snapshot.multimodal.clone();
-    let max_tool_iterations = config_snapshot.agent.max_tool_iterations;
     let native_tools = mode_capabilities.native_tool_calling;
     let skill_embedder =
         crate::memory::create_embedder_from_config(&config_snapshot, config_snapshot.api_key.as_deref());
@@ -2119,7 +2118,6 @@ async fn run_gateway_chat_with_multimodal(
             None, // no approval manager
             "webhook",
             &multimodal_config,
-            max_tool_iterations,
             config_snapshot.agent.read_only_tool_concurrency_window,
             config_snapshot.agent.priority_scheduling_enabled,
             config_snapshot.agent.low_priority_tools.clone(),

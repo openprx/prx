@@ -259,7 +259,7 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
     // that goes completely silent is hung, not long, and is terminated. Reset by
     // any progress, so it never bounds how long a working turn may run. See
     // `crate::agent::idle` for why these two must stay separate.
-    crate::agent::idle::install(config.runtime.idle_hang_secs, config.runtime.idle_hang_max_total_secs);
+    crate::agent::idle::install(config.runtime.idle_hang_secs);
     if should_bind_signal(&command) {
         spawn_signal_task(root_shutdown.clone());
     }

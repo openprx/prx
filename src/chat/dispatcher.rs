@@ -927,8 +927,6 @@ pub struct EffectDeps {
     /// 表示当前 turn 不允许 tool 调用（driver 收到 tool_call 时发 StreamFailed）。
     /// 用 `Arc<Vec<Box<dyn Tool>>>` 而非 slice：跨 spawn 边界共享所有权，clone 仅 Arc bump。
     pub tools_registry: Option<Arc<Vec<Box<dyn crate::tools::Tool>>>>,
-    /// **5a-6**: max tool iterations — 防 LLM 死循环。0 走默认 (16)，上限受 driver 内部保护。
-    pub max_tool_iterations: usize,
     /// **S3 T3-1**: approval 请求-应答路由器 (driver↔dispatcher 桥接 oneshot).
     ///
     /// driver 在执行需 approval 的 tool 前注册 oneshot tx；dispatcher_task 在
@@ -1154,9 +1152,8 @@ impl EffectExecutor {
                 // 后续 turn 自动用新 model（同 provider 换 model）。
                 let model = deps.model.current().to_string();
                 let temperature = deps.temperature;
-                // 5a-6: 透传 tool registry + max iterations (None / 0 → driver 退化为纯文本流式).
+                // 5a-6: 透传 tool registry（None → driver 退化为纯文本流式）.
                 let tools_registry = deps.tools_registry.as_ref().map(Arc::clone);
-                let max_tool_iterations = deps.max_tool_iterations;
                 let tool_security_policy = Arc::clone(&deps.tool_security_policy);
                 let tool_execution_context = chat_tool_execution_context(
                     tool_security_policy.as_ref(),
@@ -1231,7 +1228,6 @@ impl EffectExecutor {
                         tools_registry,
                         tool_execution_service,
                         tool_execution_context,
-                        max_tool_iterations,
                         chat_mode,
                         observer,
                         hooks,
@@ -1826,22 +1822,6 @@ fn build_dispatcher_tool_specs(
     specs
 }
 
-/// Resolve the effective max-tool-iterations for the Redux/TUI driver.
-///
-/// Directly reuses `agent::loop_`'s public constants so the driver and the main
-/// agent loop share one source of truth (Phase 1 behavior-limits: 200 default /
-/// 2000 finite cap) and can never silently drift apart again. A finite cap is
-/// always preserved (never 0 / never `usize::MAX`): a configured `0` falls back
-/// to the shared default, and any larger value is clamped to the shared cap.
-fn resolve_driver_max_iterations(max_tool_iterations: usize) -> usize {
-    use crate::agent::loop_::{DEFAULT_MAX_TOOL_ITERATIONS, MAX_TOOL_ITERATIONS_CAP};
-    if max_tool_iterations == 0 {
-        DEFAULT_MAX_TOOL_ITERATIONS
-    } else {
-        max_tool_iterations.min(MAX_TOOL_ITERATIONS_CAP)
-    }
-}
-
 async fn apply_redux_summary_compaction(
     provider: &dyn Provider,
     history: &mut Vec<crate::providers::traits::ChatMessage>,
@@ -2241,7 +2221,6 @@ async fn drive_start_turn_stream(
     tools_registry: Option<Arc<Vec<Box<dyn crate::tools::Tool>>>>,
     tool_execution_service: Option<Arc<ToolExecutionService>>,
     tool_execution_context: ToolExecutionContext,
-    max_tool_iterations: usize,
     chat_mode: crate::agent::loop_::ChatMode,
     observer: Arc<dyn Observer>,
     hooks: Arc<HookManager>,
@@ -2356,7 +2335,6 @@ async fn drive_start_turn_stream(
         None,
         "terminal",
         &crate::config::MultimodalConfig::default(),
-        max_tool_iterations,
         1,
         false,
         Vec::new(),
@@ -2474,16 +2452,12 @@ async fn drive_start_turn_stream_legacy(
     tools_registry: Option<Arc<Vec<Box<dyn crate::tools::Tool>>>>,
     tool_execution_service: Option<Arc<ToolExecutionService>>,
     tool_execution_context: ToolExecutionContext,
-    max_tool_iterations: usize,
     chat_mode: crate::agent::loop_::ChatMode,
 ) {
-    let max_iterations = resolve_driver_max_iterations(max_tool_iterations);
-
     let mut version: u64 = 0;
     let mut accumulated = String::new();
     let mut reasoning_buf = String::new();
     let mut usage_accumulator = ProviderUsageAccumulator::new();
-    let mut iteration: usize = 0;
     let mut overflow_retries: u8 = 0;
     let mut last_compaction_feedback: Option<String> = None;
     let mut last_injection_overbudget_feedback: Option<String> = None;
@@ -2492,24 +2466,11 @@ async fn drive_start_turn_stream_legacy(
     // BUG-03: count how many times each unrecoverable tool-failure signature has
     // been seen this turn. When the model re-issues the *same* permanently-blocked
     // call (permission denied / not allowed / rejected …) the count climbs; once it
-    // recurs we stop the turn early instead of spinning to `max_tool_iterations`.
+    // recurs we stop the turn early instead of retrying indefinitely.
     let mut unrecoverable_seen: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     let stream_tool_specs: Vec<crate::tools::ToolSpec> = build_dispatcher_tool_specs(tools_registry.as_deref());
 
     'outer: loop {
-        iteration = iteration.saturating_add(1);
-        if iteration > max_iterations {
-            let action = Action::StreamFailed {
-                draft_id: draft_id.clone(),
-                err: format!("redux driver: max tool iterations exceeded ({max_iterations})"),
-                retryable: false,
-            };
-            if let Err(e) = action_tx.send(action).await {
-                tracing::debug!(error = %e, "StartTurn: action_tx closed on max-iter exceeded");
-            }
-            return;
-        }
-
         if let Some(config) = compaction_config.as_ref() {
             let budget = crate::agent::loop_::plan_context_budget(
                 &history,
@@ -2727,8 +2688,6 @@ async fn drive_start_turn_stream_legacy(
                         return;
                     }
                 }
-                // 同一次 outer iteration 不消耗配额 — decrement 让重试不计入 max_iterations.
-                iteration = iteration.saturating_sub(1);
                 continue 'outer;
             }
             StreamPassOutcome::TransientNetworkError { err } => {
@@ -2861,7 +2820,7 @@ async fn drive_start_turn_stream_legacy(
                 }
                 // BUG-03: if a permanently-blocked call was retried, fail the turn
                 // now with an actionable message rather than letting the LLM spin
-                // until `max_tool_iterations`. history already carries every tool
+                // indefinitely. history already carries every tool
                 // result so the failure context is intact for any follow-up turn.
                 if let Some(tool_name) = repeated_unrecoverable {
                     let action = Action::StreamFailed {
@@ -2952,7 +2911,7 @@ enum ToolExecOutcome {
     /// not allowed / path not allowed — the model retrying the identical call
     /// can never succeed), `unrecoverable` carries a stable signature so the
     /// driver loop can detect a repeated blocked action and stop the turn early
-    /// instead of burning all `max_tool_iterations` on a futile retry spin.
+    /// instead of retrying a futile operation indefinitely.
     Done { unrecoverable: Option<String> },
     /// 用户 cancel — 调用方应立即从 driver 返回.
     Cancelled,
@@ -2963,8 +2922,8 @@ enum ToolExecOutcome {
 /// BUG-03: classify whether a tool error is **unrecoverable** — i.e. retrying
 /// the identical call can never succeed because a security policy or
 /// OS permission permanently blocks it. The Redux driver uses this to short-
-/// circuit the "LLM keeps re-issuing the same blocked tool call until
-/// max-iterations" spin observed in chat-demo (BUG-03).
+/// circuit the "LLM keeps re-issuing the same blocked tool call" spin observed
+/// in chat-demo (BUG-03).
 ///
 /// Matching is case-insensitive substring against the human-readable error /
 /// output. Transient failures (timeouts, network, "file not found", parse
@@ -3970,38 +3929,6 @@ mod tests {
     use crate::chat::action::Action;
     use crate::providers::router::MockEnvProvider;
 
-    /// P1-1 regression: the Redux/TUI driver must NOT clamp the configured
-    /// `max_tool_iterations` down to the old 64 ceiling. `AgentConfig::default()`
-    /// (Phase 1: 200) must survive the driver clamp with its full effective value.
-    #[test]
-    fn redux_driver_does_not_clamp_default_max_iterations_to_64() {
-        use crate::agent::loop_::{DEFAULT_MAX_TOOL_ITERATIONS, MAX_TOOL_ITERATIONS_CAP};
-
-        let cfg_default = crate::config::AgentConfig::default().max_tool_iterations;
-        assert_eq!(
-            cfg_default, DEFAULT_MAX_TOOL_ITERATIONS,
-            "AgentConfig default must match loop_ shared default (Phase 1: 200)"
-        );
-
-        let effective = resolve_driver_max_iterations(cfg_default);
-        // The whole point of P1-1: the new default is not silently dropped to 64.
-        assert!(
-            effective >= 200,
-            "driver clamped default {cfg_default} down to {effective} (regression: old 64 ceiling)"
-        );
-        assert_eq!(
-            effective, cfg_default,
-            "default value (<= cap) must pass through the driver unchanged"
-        );
-
-        // 0 falls back to the shared default (finite, never 0).
-        assert_eq!(resolve_driver_max_iterations(0), DEFAULT_MAX_TOOL_ITERATIONS);
-        // Oversized values are clamped to the shared finite cap (never usize::MAX).
-        assert_eq!(resolve_driver_max_iterations(usize::MAX), MAX_TOOL_ITERATIONS_CAP);
-        // A value already under the cap passes through verbatim.
-        assert_eq!(resolve_driver_max_iterations(500), 500);
-    }
-
     #[test]
     fn dispatcher_tool_specs_never_include_stay_silent() {
         use crate::security::SecurityPolicy;
@@ -4534,7 +4461,6 @@ mod tests {
             None,
             None,
             tool_context,
-            0,
             crate::agent::loop_::ChatMode::Edit,
             Arc::new(crate::observability::noop::NoopObserver),
             Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),
@@ -5217,7 +5143,6 @@ mod real_mode_tests {
             model: ModelSlot::from("test-model"),
             temperature: 0.0,
             tools_registry: None,
-            max_tool_iterations: 0,
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
         };
@@ -5664,7 +5589,6 @@ mod real_mode_tests {
                 model: ModelSlot::from("test-model"),
                 temperature: 0.0,
                 tools_registry: None,
-                max_tool_iterations: 0,
                 approval_router: Arc::new(ApprovalRouter::new()),
                 tool_security_policy: full_tool_security_policy(),
             };
@@ -5733,7 +5657,6 @@ mod real_mode_tests {
             model: ModelSlot::from("test-model"),
             temperature: 0.0,
             tools_registry: None,
-            max_tool_iterations: 0,
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
         };
@@ -6702,7 +6625,6 @@ mod real_mode_tests {
             model: ModelSlot::from("test-model"),
             temperature: 0.0,
             tools_registry: None,
-            max_tool_iterations: 0,
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
         };
@@ -6852,7 +6774,6 @@ mod real_mode_tests {
             model: ModelSlot::from("test-model"),
             temperature: 0.0,
             tools_registry: None,
-            max_tool_iterations: 0,
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
         };
@@ -7006,7 +6927,6 @@ mod real_mode_tests {
             model: ModelSlot::from("test-model"),
             temperature: 0.0,
             tools_registry: None,
-            max_tool_iterations: 0,
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
         };
@@ -7530,7 +7450,6 @@ mod real_mode_tests {
             captured_tool_counts: Arc::clone(&captured_tool_counts),
         });
         deps.tools_registry = Some(Arc::new(vec![Box::new(EchoTool) as Box<dyn crate::tools::Tool>]));
-        deps.max_tool_iterations = 4;
         let executor = EffectExecutor::new_with_deps(deps);
 
         let cancel = CancellationToken::new();
@@ -7729,7 +7648,6 @@ mod real_mode_tests {
             executed: Arc::clone(&executed),
             seen_run_id: Arc::clone(&seen_run_id),
         }) as Box<dyn crate::tools::Tool>]));
-        deps.max_tool_iterations = 4;
         let executor = EffectExecutor::new_with_deps(deps);
 
         let turn_run_id = "turn-run-id-xyz".to_string();
@@ -7777,134 +7695,16 @@ mod real_mode_tests {
         );
     }
 
-    /// **5a-6 limit case**：max_tool_iterations 超过即触发 StreamFailed.
-    ///
-    /// 模拟 provider 每次都发 tool_call (不停止) — driver 达到 iter 上限后必须 fail.
-    #[tokio::test]
-    async fn driver_max_tool_iterations_emits_stream_failed() {
-        use crate::providers::traits::{
-            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
-            StreamResult, ToolCallChunk,
-        };
-        use async_trait::async_trait;
-        use futures::stream::{self, BoxStream, StreamExt};
-
-        struct NoopTool;
-        #[async_trait]
-        impl crate::tools::Tool for NoopTool {
-            fn name(&self) -> &str {
-                "noop"
-            }
-            fn description(&self) -> &str {
-                "no-op"
-            }
-            fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({"type": "object"})
-            }
-            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
-                Ok(crate::tools::ToolResult {
-                    success: true,
-                    output: "ok".to_string(),
-                    error: None,
-                })
-            }
-        }
-
-        struct AlwaysToolCallProvider;
-        #[async_trait]
-        impl Provider for AlwaysToolCallProvider {
-            fn capabilities(&self) -> ProviderCapabilities {
-                ProviderCapabilities::default()
-            }
-            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
-                Ok(String::new())
-            }
-            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
-                Ok(ChatResponse {
-                    text: None,
-                    tool_calls: Vec::new(),
-                    reasoning_content: None,
-                })
-            }
-            fn supports_streaming(&self) -> bool {
-                true
-            }
-            fn stream_chat_with_history(
-                &self,
-                _: &[PMsg],
-                _: &str,
-                _: f64,
-                _: StreamOptions,
-            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
-                let calls = vec![ToolCallChunk::new("loop", "noop", "{}", 0)];
-                stream::iter(vec![
-                    Ok(StreamChunk::tool_call_chunk(calls)),
-                    Ok(StreamChunk::final_chunk()),
-                ])
-                .boxed()
-            }
-            async fn warmup(&self) -> anyhow::Result<()> {
-                Ok(())
-            }
-        }
-
-        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
-        let shutdown = CancellationToken::new();
-        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
-        deps.provider = Arc::new(AlwaysToolCallProvider);
-        deps.tools_registry = Some(Arc::new(vec![Box::new(NoopTool) as Box<dyn crate::tools::Tool>]));
-        deps.max_tool_iterations = 2; // 故意低
-        let executor = EffectExecutor::new_with_deps(deps);
-
-        let cancel = CancellationToken::new();
-        executor
-            .execute(Effect::StartTurn {
-                provider_turn_task_id: None,
-                draft_id: "draft-max-iter".to_string(),
-                history: Vec::new(),
-                compaction_guard_history: None,
-                compaction_config: None,
-                cancel,
-                chat_mode: crate::agent::loop_::ChatMode::Edit,
-                turn_spawn_ctx: None,
-                turn_message_send_ctx: None,
-            })
-            .await;
-
-        let mut got_failed = false;
-        for _ in 0..32 {
-            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
-                .await
-                .expect("driver should respond per action within 2s")
-                .expect("action must arrive");
-            if let Action::StreamFailed { err, retryable, .. } = &action {
-                assert!(!retryable, "max-iter exceeded is permanent");
-                assert!(
-                    err.contains("max tool iterations")
-                        || err.contains("maximum tool iterations")
-                        || err.contains("max_tool"),
-                    "err must mention max iterations (got: {err})"
-                );
-                got_failed = true;
-                break;
-            }
-        }
-        assert!(
-            got_failed,
-            "driver must emit StreamFailed when max_tool_iterations exceeded"
-        );
-    }
-
     /// BUG-03 round-2: when a tool fails *unrecoverably* (permission denied) and
     /// the model re-issues the identical blocked call, the driver must STOP early
-    /// instead of spinning all `max_tool_iterations` (the chat-demo defect where
-    /// a blocked shell command burned 9 LLM round-trips before erroring out).
+    /// instead of retrying indefinitely (the chat-demo defect where a blocked
+    /// shell command burned repeated LLM round-trips before erroring out).
     ///
     /// Provider always emits the same `noop` tool call; the tool always returns
-    /// "permission denied". With `max_tool_iterations = 10`, the fix must emit
+    /// "permission denied". The fix must emit
     /// `StreamFailed` with the *unrecoverable* message after the signature recurs
     /// (≈ iteration 2) and crucially must NOT count the noop tool more than a
-    /// couple of times — proving it did not spin to the iteration ceiling.
+    /// couple of times — proving it did not retry indefinitely.
     #[tokio::test]
     async fn driver_stops_early_on_repeated_unrecoverable_tool_failure() {
         use crate::providers::traits::{
@@ -8000,8 +7800,6 @@ mod real_mode_tests {
         deps.tools_registry = Some(Arc::new(vec![Box::new(DeniedTool {
             exec_count: Arc::clone(&exec_count),
         }) as Box<dyn crate::tools::Tool>]));
-        // Generous ceiling: if the early-stop is broken this would spin to 10.
-        deps.max_tool_iterations = 10;
         let executor = EffectExecutor::new_with_deps(deps);
 
         let cancel = CancellationToken::new();
@@ -8039,19 +7837,14 @@ mod real_mode_tests {
         );
         assert!(
             failed_err.contains("unrecoverable") && failed_err.contains("shell"),
-            "must stop with the unrecoverable message naming the blocked tool, not max-iter (got: {failed_err})"
-        );
-        assert!(
-            !failed_err.contains("max tool iterations"),
-            "must NOT have spun to max_tool_iterations (got: {failed_err})"
+            "must stop with the unrecoverable message naming the blocked tool (got: {failed_err})"
         );
         // The blocked tool must have run only a small number of times (the first
-        // failure plus the one retry that trips the early-stop) — definitely far
-        // below the iteration ceiling of 10.
+        // failure plus the one retry that trips the early-stop).
         let runs = exec_count.load(AtomicOrdering::SeqCst);
         assert!(
             (1..=3).contains(&runs),
-            "blocked tool should run ~twice before early-stop, not spin to the ceiling (ran {runs} times)"
+            "blocked tool should run ~twice before early-stop, not retry indefinitely (ran {runs} times)"
         );
     }
 
@@ -8506,7 +8299,6 @@ mod real_mode_tests {
             counter: Arc::new(AtomicUsize::new(0)),
         });
         deps.tools_registry = Some(Arc::new(vec![Box::new(PingTool) as Box<dyn crate::tools::Tool>]));
-        deps.max_tool_iterations = 4;
         let executor = EffectExecutor::new_with_deps(deps);
 
         executor
@@ -8648,7 +8440,6 @@ mod real_mode_tests {
             second_history: Arc::clone(&second_history),
         });
         deps.tools_registry = Some(Arc::new(vec![Box::new(PingTool) as Box<dyn crate::tools::Tool>]));
-        deps.max_tool_iterations = 4;
         let executor = EffectExecutor::new_with_deps(deps);
 
         executor
@@ -10650,7 +10441,6 @@ mod real_mode_tests {
         deps.tools_registry = Some(Arc::new(vec![Box::new(ShellTool {
             arguments: Arc::clone(&approved_arguments),
         }) as Box<dyn crate::tools::Tool>]));
-        deps.max_tool_iterations = 4;
         deps.tool_security_policy = tool_security_policy(crate::security::AutonomyLevel::Supervised);
         // 测试拦截器：当看到 `Action::ToolApprovalRequested` 时主动 router.resolve(true)
         // 模拟 dispatcher_task + EffectExecutor stub 的端到端 auto-approve 行为。
@@ -10846,7 +10636,6 @@ mod real_mode_tests {
         deps.tools_registry = Some(Arc::new(vec![Box::new(RejectableTool {
             executed: Arc::clone(&exec_counter),
         }) as Box<dyn crate::tools::Tool>]));
-        deps.max_tool_iterations = 4;
         deps.tool_security_policy = tool_security_policy(crate::security::AutonomyLevel::Supervised);
         let router_for_resolve = Arc::clone(&deps.approval_router);
         let executor = EffectExecutor::new_with_deps(deps);
@@ -11718,7 +11507,6 @@ mod real_mode_tests {
             model: ModelSlot::from("test-model"),
             temperature: 0.0,
             tools_registry: None,
-            max_tool_iterations: 0,
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
         };

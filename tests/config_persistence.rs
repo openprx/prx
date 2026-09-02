@@ -46,16 +46,6 @@ fn config_default_temperature_positive() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn agent_config_default_max_tool_iterations() {
-    let agent = AgentConfig::default();
-    // Behavior-limits Phase 1: default raised 50 -> 200.
-    assert_eq!(
-        agent.max_tool_iterations, 200,
-        "default max_tool_iterations should be 200"
-    );
-}
-
-#[test]
 fn agent_config_default_max_history_messages() {
     let agent = AgentConfig::default();
     // Behavior-limits Phase 1: default raised 50 -> 300.
@@ -132,7 +122,6 @@ fn config_toml_roundtrip_preserves_provider() {
 #[test]
 fn config_toml_roundtrip_preserves_agent_config() {
     let mut config = Config::default();
-    config.agent.max_tool_iterations = 5;
     config.agent.max_history_messages = 25;
     config.agent.compact_context = true;
     config.agent.read_only_tool_concurrency_window = 8;
@@ -140,7 +129,6 @@ fn config_toml_roundtrip_preserves_agent_config() {
     let toml_str = toml::to_string(&config).expect("config should serialize to TOML");
     let parsed: Config = toml::from_str(&toml_str).expect("TOML should deserialize back");
 
-    assert_eq!(parsed.agent.max_tool_iterations, 5);
     assert_eq!(parsed.agent.max_history_messages, 25);
     assert!(parsed.agent.compact_context);
     assert_eq!(parsed.agent.read_only_tool_concurrency_window, 8);
@@ -175,7 +163,6 @@ fn config_file_write_read_roundtrip() {
     let mut config = Config::default();
     config.default_provider = Some("mistral".into());
     config.default_model = Some("mistral-large".into());
-    config.agent.max_tool_iterations = 15;
 
     let toml_str = toml::to_string(&config).expect("config should serialize");
     fs::write(&config_path, &toml_str).expect("config file write should succeed");
@@ -185,7 +172,6 @@ fn config_file_write_read_roundtrip() {
 
     assert_eq!(parsed.default_provider.as_deref(), Some("mistral"));
     assert_eq!(parsed.default_model.as_deref(), Some("mistral-large"));
-    assert_eq!(parsed.agent.max_tool_iterations, 15);
 }
 
 #[test]
@@ -197,10 +183,6 @@ default_temperature = 0.7
     let parsed: Config = toml::from_str(minimal_toml).expect("minimal TOML should parse");
 
     // Agent config should use defaults
-    assert_eq!(
-        parsed.agent.max_tool_iterations,
-        AgentConfig::default().max_tool_iterations
-    );
     // Behavior-limits Phase 1: default raised to 300.
     assert_eq!(parsed.agent.max_history_messages, 300);
     assert!(!parsed.agent.compact_context);
@@ -212,12 +194,10 @@ fn config_file_with_custom_agent_section() {
 default_temperature = 0.7
 
 [agent]
-max_tool_iterations = 3
 compact_context = true
 ";
     let parsed: Config = toml::from_str(toml_with_agent).expect("TOML with agent section should parse");
 
-    assert_eq!(parsed.agent.max_tool_iterations, 3);
     assert!(parsed.agent.compact_context);
     // max_history_messages should still use default (Phase 1: 300)
     assert_eq!(parsed.agent.max_history_messages, 300);

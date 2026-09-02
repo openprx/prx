@@ -521,9 +521,6 @@ pub struct DelegateAgentConfig {
     /// Allowlist of tool names available to the sub-agent in agentic mode.
     #[serde(default)]
     pub allowed_tools: Vec<String>,
-    /// Maximum tool-call iterations in agentic mode.
-    #[serde(default = "default_max_tool_iterations")]
-    pub max_iterations: usize,
     /// Optional identity files directory relative to workspace root.
     #[serde(default)]
     pub identity_dir: Option<String>,
@@ -540,13 +537,6 @@ const fn default_max_depth() -> u32 {
     // allowed; worst case is slower/costlier, not a crash (each level is a
     // synchronous call, not a fork). Fork-bomb safety lives in `sessions_spawn`.
     8
-}
-
-const fn default_max_tool_iterations() -> usize {
-    // Sub-agent agentic loop cap (`sub_agent.max_iterations`).
-    // Behavior-limits Phase 1: raised 50 -> 100. Paired hard clamp lives in
-    // `xin/runner.rs:AGENT_MAX_TOOL_ITERATIONS` (also raised to 100).
-    100
 }
 
 const fn default_router_alpha() -> f32 {
@@ -933,11 +923,6 @@ pub struct AgentConfig {
     /// When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models.
     #[serde(default)]
     pub compact_context: bool,
-    /// Maximum tool-call loop turns per user message. Default: `200`.
-    /// Setting to `0` falls back to the safe default (`DEFAULT_MAX_TOOL_ITERATIONS`
-    /// in `agent/loop_.rs`). Hard-capped by `MAX_TOOL_ITERATIONS_CAP`.
-    #[serde(default = "default_agent_max_tool_iterations")]
-    pub max_tool_iterations: usize,
     /// Maximum conversation history messages retained per session. Default: `300`.
     #[serde(default = "default_agent_max_history_messages")]
     pub max_history_messages: usize,
@@ -1185,14 +1170,6 @@ impl Default for SelfSystemConfig {
     }
 }
 
-const fn default_agent_max_tool_iterations() -> usize {
-    // Main-agent tool loop cap (`agent.max_tool_iterations`).
-    // Behavior-limits Phase 1: raised 50 -> 200 so the agent can finish long
-    // tasks. Still bounded by the anti-runaway `MAX_TOOL_ITERATIONS_CAP` in
-    // `agent/loop_.rs` (high-position safeguard, not removed).
-    200
-}
-
 const fn default_agent_max_history_messages() -> usize {
     // Behavior-limits Phase 1: raised 50 -> 300 so the agent retains more
     // context. For truly long sessions the recommended path is os_paging
@@ -1236,7 +1213,6 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             compact_context: false,
-            max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
             tool_dispatcher: default_agent_tool_dispatcher(),
             read_only_tool_concurrency_window: default_read_only_tool_concurrency_window(),
@@ -3662,21 +3638,6 @@ pub struct RuntimeConfig {
     /// entirely. Enabled values must be at least 30 seconds.
     #[serde(default)]
     pub idle_hang_secs: Option<u64>,
-
-    /// Absolute ceiling in seconds on a single agent turn, regardless of
-    /// progress.
-    ///
-    /// A backstop for the one case [`RuntimeConfig::idle_hang_secs`] cannot
-    /// see: a run that keeps emitting faint but real events and so never goes
-    /// silent, yet never converges either. The default (86400s = 24h) is chosen
-    /// to be unreachable by legitimate work, and lowering it toward the idle
-    /// window turns it into the wall-clock turn timeout this runtime
-    /// deliberately does not have.
-    ///
-    /// Leave unset for the 86400s default; set `0` to disable it. Enabled
-    /// values must be at least 3600 seconds.
-    #[serde(default)]
-    pub idle_hang_max_total_secs: Option<u64>,
 }
 
 /// Docker runtime configuration (`[runtime.docker]` section).
@@ -3756,7 +3717,6 @@ impl Default for RuntimeConfig {
             max_blocking_threads: None,
             long_task_warn_secs: None,
             idle_hang_secs: None,
-            idle_hang_max_total_secs: None,
         }
     }
 }
@@ -6315,28 +6275,6 @@ impl Config {
                 );
             }
         }
-        // The total ceiling is a backstop, not a turn budget: it has to stay
-        // far above the idle window, or it silently becomes the wall-clock turn
-        // timeout the runtime does not have.
-        if let Some(max_total_secs) = self.runtime.idle_hang_max_total_secs {
-            if max_total_secs > 0 && max_total_secs < crate::agent::idle::MIN_IDLE_HANG_MAX_TOTAL_SECS {
-                anyhow::bail!(
-                    "runtime.idle_hang_max_total_secs must be 0 (disabled) or at least {} seconds",
-                    crate::agent::idle::MIN_IDLE_HANG_MAX_TOTAL_SECS
-                );
-            }
-            let idle_secs = self
-                .runtime
-                .idle_hang_secs
-                .unwrap_or(crate::agent::idle::DEFAULT_IDLE_HANG_SECS);
-            if max_total_secs > 0 && idle_secs > 0 && max_total_secs < idle_secs {
-                anyhow::bail!(
-                    "runtime.idle_hang_max_total_secs ({max_total_secs}) must not be below \
-                     runtime.idle_hang_secs ({idle_secs}); the total ceiling is a backstop for \
-                     runs that never converge, not a shorter turn timeout"
-                );
-            }
-        }
 
         // Scheduler
         if self.scheduler.max_tasks == 0 {
@@ -6678,7 +6616,6 @@ mod tests {
             max_depth: 3,
             agentic: true,
             allowed_tools,
-            max_iterations: 10,
             identity_dir: None,
             memory_scope: None,
             spawn_enabled: None,
@@ -7239,8 +7176,7 @@ reasoning_enabled = false
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(!cfg.compact_context);
-        // Behavior-limits Phase 1: raised defaults (200 / 300).
-        assert_eq!(cfg.max_tool_iterations, 200);
+        // Behavior-limits Phase 1: raised history default to 300.
         assert_eq!(cfg.max_history_messages, 300);
         assert_eq!(cfg.tool_dispatcher, "auto");
         assert_eq!(cfg.read_only_tool_concurrency_window, 2);
@@ -7326,7 +7262,6 @@ provider = "openrouter"
 default_temperature = 0.7
 [agent]
 compact_context = true
-max_tool_iterations = 20
 max_history_messages = 80
 tool_dispatcher = "xml"
 read_only_tool_concurrency_window = 4
@@ -7335,7 +7270,6 @@ low_priority_tools = ["sessions_spawn", "delegate"]
 "#;
         let parsed: Config = toml::from_str(raw).unwrap();
         assert!(parsed.agent.compact_context);
-        assert_eq!(parsed.agent.max_tool_iterations, 20);
         assert_eq!(parsed.agent.max_history_messages, 80);
         assert_eq!(parsed.agent.tool_dispatcher, "xml");
         assert_eq!(parsed.agent.read_only_tool_concurrency_window, 4);
@@ -7522,6 +7456,9 @@ default_model = "single-file"
 default_temperature = 0.7
 default_model = "kept"
 
+[runtime]
+idle_hang_max_total_secs = 86400
+
 [agent]
 max_tool_iterations = 150
 parallel_tools = true
@@ -7529,6 +7466,11 @@ read_only_tool_timeout_secs = 30
 concurrency_rollout_stage = "stage_a"
 concurrency_rollout_channels = ["telegram"]
 concurrency_rollback_timeout_rate_threshold = 0.2
+
+[agents.researcher]
+provider = "openrouter"
+model = "kept-agent-model"
+max_iterations = 25
 
 [sessions_spawn]
 max_concurrent = 64
@@ -7572,7 +7514,7 @@ max_size_mb = 42
 
         // Neighbouring keys in every touched table survived the strip.
         assert_eq!(loaded.default_model.as_deref(), Some("kept"));
-        assert_eq!(loaded.agent.max_tool_iterations, 150);
+        assert_eq!(loaded.agents["researcher"].model, "kept-agent-model");
         assert_eq!(loaded.sessions_spawn.process_memory_strategy, "isolated_private");
         assert_eq!(loaded.autonomy.max_cost_per_day_cents, 4_294_967_295);
         assert_eq!(loaded.gateway.port, 3120);
@@ -7803,7 +7745,6 @@ model = "override-beta"
                 max_depth: 4,
                 agentic: true,
                 allowed_tools: vec!["shell".into()],
-                max_iterations: 7,
                 identity_dir: None,
                 memory_scope: None,
                 spawn_enabled: Some(true),
@@ -7889,7 +7830,6 @@ model = "override-beta"
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
                 identity_dir: None,
                 memory_scope: None,
                 spawn_enabled: None,
@@ -9445,13 +9385,11 @@ allowed_from = ["*"]
     async fn idle_hang_thresholds_validate_and_stay_distinct_from_the_long_task_warning() {
         let defaults = Config::default();
         assert_eq!(defaults.runtime.idle_hang_secs, None, "unset means the 1800s default");
-        assert_eq!(defaults.runtime.idle_hang_max_total_secs, None);
         defaults.validate().expect("defaults must validate");
 
-        // 0 disables either check.
+        // 0 disables idle detection.
         let mut disabled = Config::default();
         disabled.runtime.idle_hang_secs = Some(0);
-        disabled.runtime.idle_hang_max_total_secs = Some(0);
         disabled.validate().expect("0 is the documented disable switch");
 
         // Too short to tell a wedged turn from a quiet tool call.
@@ -9461,25 +9399,6 @@ allowed_from = ["*"]
             .validate()
             .expect_err("an idle window this short would kill healthy work");
         assert!(error.to_string().contains("runtime.idle_hang_secs"), "{error}");
-
-        // The total ceiling is a backstop, never a shorter turn budget.
-        let mut short_ceiling = Config::default();
-        short_ceiling.runtime.idle_hang_max_total_secs = Some(600);
-        let error = short_ceiling
-            .validate()
-            .expect_err("a 10-minute ceiling is a wall-clock turn timeout in disguise");
-        assert!(
-            error.to_string().contains("runtime.idle_hang_max_total_secs"),
-            "{error}"
-        );
-
-        let mut inverted = Config::default();
-        inverted.runtime.idle_hang_secs = Some(7_200);
-        inverted.runtime.idle_hang_max_total_secs = Some(3_600);
-        let error = inverted
-            .validate()
-            .expect_err("the ceiling must never sit below the idle window");
-        assert!(error.to_string().contains("must not be below"), "{error}");
 
         // The two mechanisms are configured independently, and the shipped
         // defaults keep the warning strictly ahead of the termination.

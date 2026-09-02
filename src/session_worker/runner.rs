@@ -532,7 +532,6 @@ fn validate_worker_cli_overrides(
     workspace: Option<&str>,
     memory_db: Option<&str>,
     tools: Option<&[String]>,
-    timeout: Option<u64>,
     config_dir: Option<&str>,
 ) -> Result<()> {
     if let Some(task) = task {
@@ -553,11 +552,6 @@ fn validate_worker_cli_overrides(
     if let Some(tools) = tools {
         if tools != manifest.allowed_tools.as_slice() {
             anyhow::bail!("session-worker CLI tools override must match sealed manifest");
-        }
-    }
-    if let Some(timeout) = timeout {
-        if timeout != manifest.timeout_seconds {
-            anyhow::bail!("session-worker CLI timeout override must match sealed manifest");
         }
     }
     let config_dir = config_dir
@@ -605,7 +599,7 @@ async fn run_validated_manifest(
     // The worker is a separate process and never reaches `runtime::mode::dispatch`,
     // so it installs the hang-detection thresholds itself. Without this it would
     // silently run on the built-in defaults instead of the operator's config.
-    crate::agent::idle::install(config.runtime.idle_hang_secs, config.runtime.idle_hang_max_total_secs);
+    crate::agent::idle::install(config.runtime.idle_hang_secs);
     let generation_after = config_source_generation(&manifest.config_dir)?;
     if generation_after != manifest.config_generation {
         anyhow::bail!(
@@ -789,7 +783,6 @@ async fn run_validated_manifest(
         let tool_tiering_ref = &config.tool_tiering;
         let low_priority_tools_ref: &[String] = &config.agent.low_priority_tools;
         let temperature = manifest.temperature;
-        let max_iterations = manifest.max_iterations.max(1);
         let read_only_window = config.agent.read_only_tool_concurrency_window;
         let priority_scheduling_enabled = config.agent.priority_scheduling_enabled;
         let tools_registry = Arc::new(tools_registry);
@@ -812,7 +805,6 @@ async fn run_validated_manifest(
                         None,
                         "session-worker",
                         multimodal_ref,
-                        max_iterations,
                         read_only_window,
                         priority_scheduling_enabled,
                         low_priority_tools_ref.to_vec(),
@@ -843,21 +835,7 @@ async fn run_validated_manifest(
 
     let run_future = with_manifest_spawn_context(&manifest, run_future);
 
-    let result = if manifest.timeout_seconds == 0 {
-        // No timeout — run until natural completion (rely on callback)
-        run_future.await
-    } else {
-        match tokio::time::timeout(std::time::Duration::from_secs(manifest.timeout_seconds), run_future).await {
-            Ok(r) => r,
-            Err(_) => (
-                Err(anyhow::anyhow!(
-                    "Sub-agent timed out after {}s",
-                    manifest.timeout_seconds
-                )),
-                0,
-            ),
-        }
-    };
+    let result = run_future.await;
 
     let (loop_result, history_commit_len) = result;
     let (worker_result, provider_outcome, terminal_status) = match loop_result {
@@ -1296,7 +1274,6 @@ pub async fn run_from_stdin(
     workspace: Option<String>,
     memory_db: Option<String>,
     tools: Option<String>,
-    timeout: Option<u64>,
     explicit_config_dir: Option<String>,
 ) -> Result<()> {
     let mut raw = String::new();
@@ -1329,7 +1306,6 @@ pub async fn run_from_stdin(
         workspace.as_deref(),
         memory_db.as_deref(),
         parsed_tools.as_deref(),
-        timeout,
         explicit_config_dir.as_deref(),
     ) {
         let result = WorkerResult {
@@ -1383,8 +1359,6 @@ mod tests {
             persona_id: None,
             memory_event_recording: crate::memory::MemoryEventRecording::default(),
             allowed_tools: vec!["file_read".to_string()],
-            timeout_seconds: 30,
-            max_iterations: 1,
             system_prompt: None,
             identity_dir: Some("identity/worker".to_string()),
             scope_sender: None,
@@ -1768,7 +1742,6 @@ mod tests {
             Some(&manifest.workspace_dir.to_string_lossy()),
             Some(&manifest.memory_db_path.to_string_lossy()),
             Some(&manifest.allowed_tools),
-            Some(manifest.timeout_seconds),
             Some(&manifest.config_dir.to_string_lossy()),
         )
         .unwrap_err();
@@ -1786,7 +1759,6 @@ mod tests {
             Some(&manifest.workspace_dir.to_string_lossy()),
             Some(&manifest.memory_db_path.to_string_lossy()),
             Some(&manifest.allowed_tools),
-            Some(manifest.timeout_seconds),
             Some("/different/config"),
         )
         .unwrap_err();
@@ -1930,8 +1902,6 @@ mod tests {
             persona_id: None,
             memory_event_recording: crate::memory::MemoryEventRecording::default(),
             allowed_tools: Vec::new(),
-            timeout_seconds: 30,
-            max_iterations: 1,
             system_prompt: None,
             identity_dir: None,
             scope_sender: Some("alice".to_string()),
@@ -2003,8 +1973,6 @@ mod tests {
             persona_id: Some("persona-a".to_string()),
             memory_event_recording: crate::memory::MemoryEventRecording::default(),
             allowed_tools: Vec::new(),
-            timeout_seconds: 30,
-            max_iterations: 1,
             system_prompt: None,
             identity_dir: None,
             scope_sender: Some("alice".to_string()),
@@ -2135,8 +2103,6 @@ mod tests {
             persona_id: None,
             memory_event_recording: crate::memory::MemoryEventRecording::default(),
             allowed_tools: Vec::new(),
-            timeout_seconds: 30,
-            max_iterations: 1,
             system_prompt: None,
             identity_dir: None,
             scope_sender: Some("alice".to_string()),
@@ -2213,8 +2179,6 @@ mod tests {
             persona_id: Some("persona-a".to_string()),
             memory_event_recording: crate::memory::MemoryEventRecording::default(),
             allowed_tools: Vec::new(),
-            timeout_seconds: 30,
-            max_iterations: 1,
             system_prompt: None,
             identity_dir: None,
             scope_sender: None,
@@ -2284,8 +2248,6 @@ mod tests {
             persona_id: Some("persona-a".to_string()),
             memory_event_recording: crate::memory::MemoryEventRecording::default(),
             allowed_tools: Vec::new(),
-            timeout_seconds: 30,
-            max_iterations: 1,
             system_prompt: None,
             identity_dir: None,
             scope_sender: Some("alice".to_string()),

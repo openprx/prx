@@ -4393,7 +4393,6 @@ pub async fn run(
             model: dispatcher::ModelSlot::new(Arc::from(model_name)),
             temperature,
             tools_registry: Some(Arc::clone(&tools_registry)),
-            max_tool_iterations: config.agent.max_tool_iterations,
             approval_router: Arc::new(dispatcher::ApprovalRouter::new()),
             tool_security_policy: Arc::clone(&security),
         };
@@ -7315,11 +7314,8 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             .notify_tool_finished(&name, success, duration_ms)
                             .await;
                     }
-                    ToolCallNotification::Progress {
-                        iteration,
-                        max_iterations,
-                    } => {
-                        terminal_for_tools.notify_progress(iteration, max_iterations).await;
+                    ToolCallNotification::Progress { iteration } => {
+                        terminal_for_tools.notify_progress(iteration).await;
                     }
                 }
             }
@@ -8171,7 +8167,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             Some(Arc::clone(&approval_manager)),
                             "terminal",
                             &config.multimodal,
-                            config.agent.max_tool_iterations,
                             config.agent.read_only_tool_concurrency_window,
                             config.agent.priority_scheduling_enabled,
                             config.agent.low_priority_tools.clone(),

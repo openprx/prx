@@ -191,7 +191,6 @@ struct ChannelRuntimeDefaults {
 #[derive(Clone)]
 struct ChannelMessageRuntimeSnapshot {
     multimodal: crate::config::MultimodalConfig,
-    max_tool_iterations: usize,
     read_only_tool_concurrency_window: usize,
     priority_scheduling_enabled: bool,
     low_priority_tools: Vec<String>,
@@ -232,8 +231,6 @@ struct ChannelRuntimeContext {
     temperature: f64,
     auto_save_memory: bool,
     memory_event_recording: MemoryEventRecording,
-    #[cfg(test)]
-    max_tool_iterations: usize,
     #[cfg(test)]
     read_only_tool_concurrency_window: usize,
     #[cfg(test)]
@@ -1131,7 +1128,6 @@ fn message_runtime_snapshot(
     if !Arc::ptr_eq(&ctx.config.pin(), &ctx.config_generation) {
         return ChannelMessageRuntimeSnapshot {
             multimodal: ctx.multimodal.clone(),
-            max_tool_iterations: ctx.max_tool_iterations,
             read_only_tool_concurrency_window: ctx.read_only_tool_concurrency_window,
             priority_scheduling_enabled: ctx.priority_scheduling_enabled,
             low_priority_tools: ctx.low_priority_tools.clone(),
@@ -1146,7 +1142,6 @@ fn message_runtime_snapshot(
     let config = generation.effective.as_ref();
     ChannelMessageRuntimeSnapshot {
         multimodal: config.multimodal.clone(),
-        max_tool_iterations: config.agent.max_tool_iterations,
         read_only_tool_concurrency_window: config.agent.read_only_tool_concurrency_window,
         priority_scheduling_enabled: config.agent.priority_scheduling_enabled,
         low_priority_tools: config.agent.low_priority_tools.clone(),
@@ -1737,8 +1732,6 @@ pub(crate) enum TurnFailureKind {
     ServiceUnavailable,
     /// The model service could not be reached at all.
     Network,
-    /// The agent hit its tool-iteration ceiling before producing an answer.
-    ToolLoopExhausted,
     /// Nothing matched. Deliberately says as little as possible.
     Unclassified,
 }
@@ -1755,7 +1748,6 @@ impl TurnFailureKind {
             Self::ServiceCredentials => "service_credentials",
             Self::ServiceUnavailable => "service_unavailable",
             Self::Network => "network",
-            Self::ToolLoopExhausted => "tool_loop_exhausted",
             Self::Unclassified => "unclassified",
         }
     }
@@ -1786,9 +1778,6 @@ impl TurnFailureKind {
                 "⚠️ The AI service is having trouble at the moment. Please try again in a few minutes."
             }
             Self::Network => "⚠️ I could not reach the AI service — the connection failed. Please try again.",
-            Self::ToolLoopExhausted => {
-                "⚠️ I worked on that for a while and had to stop before finishing. Please try rephrasing it, or splitting it into smaller steps."
-            }
             Self::Unclassified => "⚠️ Something went wrong. Please try again later.",
         }
     }
@@ -1826,8 +1815,6 @@ pub(crate) fn classify_turn_failure(err: &anyhow::Error) -> TurnFailureKind {
 /// wording it arrives with. Anything matching nothing stays `Unclassified` —
 /// saying too little is recoverable, telling a user the wrong thing is not.
 fn classify_turn_failure_text(lower: &str) -> TurnFailureKind {
-    /// Emitted only by the agent's own iteration ceiling.
-    const TOOL_LOOP_HINTS: [&str; 1] = ["exceeded maximum tool iterations"];
     /// Emitted only by the multimodal / media-artifact preparation stage. The
     /// production incident this classifier exists for lands on the first entry.
     const ATTACHMENT_HINTS: [&str; 8] = [
@@ -1931,9 +1918,7 @@ fn classify_turn_failure_text(lower: &str) -> TurnFailureKind {
 
     let hit = |hints: &[&str]| hints.iter().any(|hint| lower.contains(hint));
 
-    if hit(&TOOL_LOOP_HINTS) {
-        TurnFailureKind::ToolLoopExhausted
-    } else if hit(&ATTACHMENT_HINTS) {
+    if hit(&ATTACHMENT_HINTS) {
         TurnFailureKind::Attachment
     } else if hit(&CONTEXT_WINDOW_OVERFLOW_HINTS) || hit(&CONTEXT_EXTRA_HINTS) {
         TurnFailureKind::ContextTooLong
@@ -3674,15 +3659,11 @@ async fn run_channel_turn(
                         "Tool call finished"
                     );
                 }
-                crate::agent::loop_::ToolCallNotification::Progress {
-                    iteration,
-                    max_iterations,
-                } => {
+                crate::agent::loop_::ToolCallNotification::Progress { iteration } => {
                     tracing::info!(
                         channel = %tool_event_channel_name,
                         sender = %tool_event_sender_name,
                         iteration,
-                        max_iterations,
                         "Tool loop progress"
                     );
                 }
@@ -3773,7 +3754,6 @@ async fn run_channel_turn(
                     None,
                     msg.channel.as_str(),
                     &message_runtime.multimodal,
-                    message_runtime.max_tool_iterations,
                     message_runtime.read_only_tool_concurrency_window,
                     message_runtime.priority_scheduling_enabled,
                     message_runtime.low_priority_tools.clone(),
@@ -6151,8 +6131,6 @@ pub async fn start_channels_with_config(
         auto_save_memory: config.memory.auto_save && config.memory.semantic.auto_promote_user_messages,
         memory_event_recording: config.memory.event_recording_config(),
         #[cfg(test)]
-        max_tool_iterations: config.agent.max_tool_iterations,
-        #[cfg(test)]
         read_only_tool_concurrency_window: config.agent.read_only_tool_concurrency_window,
         #[cfg(test)]
         priority_scheduling_enabled: config.agent.priority_scheduling_enabled,
@@ -6835,7 +6813,6 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -6906,7 +6883,6 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -6950,7 +6926,6 @@ mod tests {
 
         let mut desired = (*initial_generation.effective).clone();
         desired.default_temperature = 0.42;
-        desired.agent.max_tool_iterations = 17;
         desired.agent.read_only_tool_concurrency_window = 7;
         manager
             .apply_runtime_config(desired, crate::config::ConfigReloadTrigger::Test)
@@ -6964,11 +6939,10 @@ mod tests {
 
         assert_ne!(current_generation.id, initial_generation.id);
         assert_eq!(current_defaults.temperature, 0.42);
-        assert_eq!(current_message.max_tool_iterations, 17);
         assert_eq!(current_message.read_only_tool_concurrency_window, 7);
         assert_ne!(
-            current_message.max_tool_iterations,
-            pinned_before_reload.max_tool_iterations
+            current_message.read_only_tool_concurrency_window,
+            pinned_before_reload.read_only_tool_concurrency_window
         );
     }
 
@@ -7313,7 +7287,6 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -8105,7 +8078,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -8313,7 +8285,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -8508,7 +8479,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -8697,7 +8667,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -8884,7 +8853,6 @@ BTC is currently around $65,000 based on latest tool output."#
         crate::agent::idle::with_guard(
             crate::agent::idle::IdleGuard {
                 idle: Some(Duration::from_millis(200)),
-                max_total: None,
             },
             process_channel_message(
                 ctx,
@@ -9263,7 +9231,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -9357,7 +9324,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -9453,7 +9419,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -9542,7 +9507,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -9636,7 +9600,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -9757,7 +9720,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -9851,7 +9813,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -9946,7 +9907,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -10012,7 +9972,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn process_channel_message_respects_configured_max_tool_iterations_above_default() {
+    async fn process_channel_message_allows_long_tool_sequence_to_finish() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -10036,7 +9996,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 12,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -10098,108 +10057,6 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(response.starts_with("chat-iter-success:"));
         assert!(response.contains("Completed after 11 tool iterations."));
         assert!(!response.contains("⚠️ Error:"));
-    }
-
-    #[tokio::test]
-    async fn process_channel_message_reports_configured_max_tool_iterations_limit() {
-        let channel_impl = Arc::new(RecordingChannel::default());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-
-        let mut channels_by_name = HashMap::new();
-        channels_by_name.insert(channel.name().to_string(), channel);
-
-        let runtime_ctx = Arc::new(ChannelRuntimeContext {
-            config: crate::config::new_shared(Config::default()),
-            config_generation: crate::config::new_shared(Config::default()).pin(),
-            channels_by_name: Arc::new(channels_by_name),
-            provider: Arc::new(IterativeToolProvider {
-                required_tool_iterations: 20,
-            }),
-            default_provider: Arc::new("test-provider".to_string()),
-            memory: Arc::new(NoopMemory),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool::default())]),
-            observer: Arc::new(NoopObserver),
-            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
-            model: Arc::new("test-model".to_string()),
-            temperature: 0.0,
-            auto_save_memory: false,
-            memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 3,
-            read_only_tool_concurrency_window: 2,
-            priority_scheduling_enabled: false,
-            low_priority_tools: Vec::new(),
-            min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
-            route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
-            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
-            agent_compaction: crate::config::AgentCompactionConfig::default(),
-            tool_tiering: crate::config::ToolTieringConfig::default(),
-            signal_inbound_policy: None,
-            whatsapp_inbound_policy: None,
-            bot_names: vec!["prx".to_string()],
-            bot_uuids: vec![],
-            mention_only_by_channel: HashMap::new(),
-            group_reply_mode_by_channel: HashMap::new(),
-            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
-            interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
-                security: Arc::new(crate::security::SecurityPolicy::default()),
-            })),
-            native_tools: false,
-            skill_rag_ctx: None,
-            test_inbound_authorizer: None,
-        });
-
-        process_channel_message(
-            runtime_ctx,
-            traits::ChannelMessage {
-                id: "msg-iter-fail".to_string(),
-                sender: "bob".to_string(),
-                reply_target: "chat-iter-fail".to_string(),
-                content: "Loop forever".to_string(),
-                channel: "test-channel".to_string(),
-                timestamp: 2,
-                thread_ts: None,
-                chat_kind: crate::channels::traits::ChatKind::Dm,
-                chat_title: None,
-                sender_display: None,
-                mentioned_uuids: vec![],
-                mentioned: false,
-                is_group_hint: false,
-                sender_is_bot: false,
-            },
-            CancellationToken::new(),
-        )
-        .await;
-
-        let sent_messages = channel_impl.sent_messages.lock().await;
-        let responses = response_messages(&sent_messages);
-        assert_eq!(responses.len(), 1);
-        let response = responses.first().unwrap();
-        assert!(response.starts_with("chat-iter-fail:"));
-        // Hitting the iteration ceiling is a recognised failure class now, so the
-        // reader is told what actually happened and what to do instead of the
-        // catch-all sentence.
-        assert!(
-            response.contains(TurnFailureKind::ToolLoopExhausted.advice()),
-            "iteration-ceiling turns must carry the tool-loop advice, got: {response}"
-        );
-        assert!(
-            response.contains("(Error ID: "),
-            "every failure notice must carry a quotable error id, got: {response}"
-        );
-        assert!(
-            !response.contains("⚠️ Something went wrong. Please try again later."),
-            "a classified failure must not fall back to the generic sentence"
-        );
     }
 
     // --- User-facing failure classification -------------------------------
@@ -10344,14 +10201,6 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn turn_failure_maps_tool_iteration_ceiling() {
-        let err = failure_of("Agent exceeded maximum tool iterations (200)");
-        assert_eq!(classify_turn_failure(&err), TurnFailureKind::ToolLoopExhausted);
-        let notice = turn_failure_notice(TurnFailureKind::ToolLoopExhausted, "0badc0de");
-        assert!(notice.contains("rephrasing") && notice.contains("smaller steps"));
-    }
-
-    #[test]
     fn turn_failure_classification_walks_the_whole_cause_chain() {
         // Real failures reach this branch wrapped in generic context lines;
         // reading only the outermost message would classify them as unknown.
@@ -10408,7 +10257,6 @@ BTC is currently around $65,000 based on latest tool output."#
             TurnFailureKind::ServiceCredentials,
             TurnFailureKind::ServiceUnavailable,
             TurnFailureKind::Network,
-            TurnFailureKind::ToolLoopExhausted,
             TurnFailureKind::Unclassified,
         ] {
             let text = turn_failure_notice(kind, "0badc0de");
@@ -10520,7 +10368,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 3,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -10791,7 +10638,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: opts.auto_save_memory,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -11170,7 +11016,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -11562,7 +11407,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -11676,7 +11520,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -11805,7 +11648,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -11916,7 +11758,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -12576,7 +12417,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -12692,7 +12532,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -12798,7 +12637,6 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),
@@ -13563,7 +13401,6 @@ After"#;
             temperature: 0.0,
             auto_save_memory: false,
             memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
             priority_scheduling_enabled: false,
             low_priority_tools: Vec::new(),

@@ -765,7 +765,6 @@ fn agent_template(spec: Spec) -> String {
 # Behavior-limits Phase 1: opened defaults (long-task iterations + history).
 
 [agent]
-max_tool_iterations = 200
 max_history_messages = 300
 
 # OS-paging (non-destructive history eviction + semantic recall) on by default so
@@ -782,7 +781,6 @@ max_recalled_pages = 10
 # Behavior-limits Phase 1: opened defaults.
 
 [agent]
-max_tool_iterations = 200
 max_history_messages = 300
 
 [agent.compaction]
@@ -804,7 +802,6 @@ max_recalled_pages = 10
 # Behavior-limits Phase 1: opened defaults.
 
 [agent]
-max_tool_iterations = 200
 max_history_messages = 300
 
 # Context compaction to manage long conversations.
@@ -836,7 +833,6 @@ enabled = false
 # model = "claude-sonnet-4-6"
 # system_prompt = "You are a research assistant."
 # agentic = true
-# max_iterations = 100
 # allowed_tools = ["web_search", "read_file"]
 # allowed_tools = ["*"]                # explicit inheritance of eligible parent tools
 "#
