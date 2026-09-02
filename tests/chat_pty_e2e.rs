@@ -576,6 +576,37 @@ fn test_chat_exit_command_clean() {
     }
 }
 
+/// Chat tracing must move to `chat.log` before configuration is loaded. If it
+/// stays on stderr until the TUI starts, those startup lines sit behind the
+/// alternate screen and are revealed as stale terminal output on exit.
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_redirects_startup_tracing_before_tui() {
+    let guard = new_harness_guard().expect("build chat harness");
+    let cmd = build_chat_command_in(&guard, &[], &[("PRX_TUI", "1"), ("RUST_LOG", "info")]);
+    let mut sg = SessionGuard::new(spawn_chat_command(cmd));
+    let session = sg.session();
+
+    let captured = read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    assert!(
+        !captured.contains("Config loaded") && !captured.contains("openprx::config::schema"),
+        "startup tracing must not be written to the chat terminal:\n{captured}"
+    );
+
+    session.send("\x04").expect("send Ctrl-D");
+    assert!(
+        wait_for_exit(session, EXIT_TIMEOUT),
+        "full-screen chat did not exit after Ctrl-D"
+    );
+
+    let log_path = guard.home_dir.join(".openprx/chat.log");
+    let log = std::fs::read_to_string(&log_path).expect("read redirected chat.log");
+    assert!(
+        log.contains("Config loaded"),
+        "startup tracing should be retained in chat.log, got:\n{log}"
+    );
+}
+
 /// 4. Double Ctrl-C exits the session — *both* the user-visible
 /// `Exiting...` banner AND a fully-terminated process within the agreed
 /// timeout. No fallback escalation (Ctrl-D / SIGHUP) is allowed; this

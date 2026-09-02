@@ -105,7 +105,7 @@ use anyhow::Result;
 use std::collections::VecDeque;
 use std::io::{IsTerminal as _, Write as _};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 #[cfg(feature = "terminal-tui")]
 use std::time::Instant;
@@ -3782,6 +3782,12 @@ fn install_chat_panic_hook() {
 
 // ── P3-1: Redirect tracing to ~/.openprx/chat.log during chat ────────────
 
+/// `main` redirects chat tracing before loading configuration so startup
+/// diagnostics are not left behind the alternate screen and revealed on exit.
+/// `chat::run` also calls `ensure_chat_tracing_to_file` for embedders that do
+/// not enter through the binary bootstrap; this flag prevents a nested reload.
+static CHAT_TRACING_TO_FILE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// RAII guard owning the `tracing_appender` non-blocking worker. When dropped
 /// it:
 ///   1. swaps the global tracing writer back to stderr (best-effort), so
@@ -3790,7 +3796,7 @@ fn install_chat_panic_hook() {
 ///
 /// Held for the lifetime of `chat::run`. If construction fails we keep the
 /// existing stderr writer — no panics, no silent data loss.
-pub(crate) struct TracingChatGuard {
+pub struct TracingChatGuard {
     _worker_guard: tracing_appender::non_blocking::WorkerGuard,
 }
 
@@ -3803,6 +3809,7 @@ impl Drop for TracingChatGuard {
                 eprintln!("warning: failed to restore stderr tracing writer: {e}");
             }
         }
+        CHAT_TRACING_TO_FILE_ACTIVE.store(false, Ordering::Release);
         // _worker_guard drops next → tracing-appender flushes pending lines.
     }
 }
@@ -3825,7 +3832,7 @@ fn resolve_chat_log_dir() -> Result<std::path::PathBuf> {
 /// On any failure (no HOME, dir not creatable, file not openable, no global
 /// reload handle) returns `Err` without panicking — callers fall back to the
 /// existing stderr writer.
-pub(crate) fn setup_chat_tracing_to_file() -> Result<TracingChatGuard> {
+pub fn setup_chat_tracing_to_file() -> Result<TracingChatGuard> {
     setup_chat_tracing_to_file_in(&resolve_chat_log_dir()?)
 }
 
@@ -3857,9 +3864,19 @@ pub(crate) fn setup_chat_tracing_to_file_in(dir: &std::path::Path) -> Result<Tra
         .reload(layer)
         .map_err(|e| anyhow::anyhow!("failed to redirect tracing to chat.log: {e}"))?;
 
+    CHAT_TRACING_TO_FILE_ACTIVE.store(true, Ordering::Release);
+
     Ok(TracingChatGuard {
         _worker_guard: worker_guard,
     })
+}
+
+/// Redirect tracing unless the binary bootstrap already owns the redirect.
+fn ensure_chat_tracing_to_file() -> Result<Option<TracingChatGuard>> {
+    if CHAT_TRACING_TO_FILE_ACTIVE.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    setup_chat_tracing_to_file().map(Some)
 }
 
 /// Run the interactive chat session with rich terminal UI.
@@ -3878,8 +3895,8 @@ pub async fn run(
     // Held for the rest of this function. On failure (no HOME, log dir
     // unwritable, etc.) we fall back to the stderr writer that `main` set up
     // and emit a warning. Never panics.
-    let _tracing_guard: Option<TracingChatGuard> = match setup_chat_tracing_to_file() {
-        Ok(g) => Some(g),
+    let _tracing_guard: Option<TracingChatGuard> = match ensure_chat_tracing_to_file() {
+        Ok(g) => g,
         Err(e) => {
             tracing::warn!(error = %e, "P3-1: keeping tracing on stderr (chat.log unavailable)");
             None

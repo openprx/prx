@@ -1172,10 +1172,10 @@ async fn async_main() -> Result<()> {
     }
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO.
-    // For `chat` subcommand, we build a reloadable subscriber so that the
-    // chat handler can redirect tracing to ~/.openprx/chat.log once the TUI
-    // takes over the terminal. Until then logs still go to stderr so startup
-    // diagnostics (config errors, etc.) remain visible to the user.
+    // For `chat` subcommand, we build a reloadable subscriber so tracing can
+    // move to ~/.openprx/chat.log before configuration is loaded. Otherwise
+    // startup INFO/WARN lines written behind the alternate screen reappear as
+    // a wall of stale output when the user exits the TUI.
     let use_stderr = matches!(
         cli.command,
         Commands::Chat { .. }
@@ -1210,6 +1210,21 @@ async fn async_main() -> Result<()> {
             eprintln!("failed to set default tracing subscriber: {e}");
         }
     }
+
+    // Acquire this before Config::load_* and hold it through command dispatch.
+    // Fatal startup errors are still returned through anyhow and printed by
+    // main after this guard restores stderr; routine tracing stays in chat.log.
+    let _chat_tracing_guard = if matches!(&cli.command, Commands::Chat { .. }) {
+        match chat::setup_chat_tracing_to_file() {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                tracing::warn!(%error, "keeping chat tracing on stderr because chat.log is unavailable");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Onboard runs quick setup by default, or the interactive wizard with --interactive.
     // The onboard wizard uses reqwest::blocking internally, which creates its own

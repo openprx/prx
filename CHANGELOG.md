@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.73] - 2 September 2026
+
+### Fixed
+
+- Redirected chat tracing before configuration loads so routine startup logs
+  remain in `~/.openprx/chat.log` instead of reappearing in the terminal when
+  the full-screen TUI exits.
+
 ## [0.8.72] - 2 September 2026
 
 ### Fixed
