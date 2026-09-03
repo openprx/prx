@@ -1170,7 +1170,9 @@ impl Tool for McpStatusTool {
     }
 
     fn availability(&self) -> crate::capability::CapabilityAvailability {
-        self.mcp.availability()
+        crate::capability::CapabilityAvailability::ready(
+            "local MCP diagnostics are executable even when no remote server is configured",
+        )
     }
 }
 
@@ -1506,6 +1508,21 @@ mod tests {
         let result = tool.execute(json!({"action": "status"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("\"servers\""));
+    }
+
+    #[test]
+    fn status_capability_remains_visible_without_configured_servers() {
+        let mcp = Arc::new(McpTool::new(
+            Arc::new(SecurityPolicy::default()),
+            McpConfig::default(),
+            std::env::temp_dir(),
+        ));
+        let status = McpStatusTool::new(mcp);
+
+        assert_eq!(
+            status.availability().level,
+            crate::capability::CapabilityAvailabilityLevel::Ready
+        );
     }
 
     #[test]
