@@ -9,7 +9,7 @@ health, MCP discovery, and the active WASM generation.
 | **Shell & Files** | `shell`, `file_read`, `file_write`, `file_edit`, `git_operations` |
 | **Web** | `web_search_tool`, `web_fetch`, `http_request` |
 | **Memory & Documents** | `memory_store`, `memory_recall`, `memory_search`, `memory_get`, `memory_forget`, `memory_reindex`, `document_search`, `document_get_chunk`, `document_ingest`, `document_sync` |
-| **Skills** | `skills_list`, `skill_read` |
+| **Skills** | `skills_list`, `skill_read`, `skills_manage`, `skill_execute`, plus up to 32 declared skill-tool aliases |
 | **Messaging** | `message_send` |
 | **Sessions** | `sessions_spawn`, `sessions_send`, `sessions_list`, `sessions_history`, `session_status`, `subagents`, `delegate` |
 | **Scheduling** | `cron` (calendar/time scheduling), `xin` (autonomous task and durable Goal/Step workflows) |
@@ -20,11 +20,27 @@ health, MCP discovery, and the active WASM generation.
 | **Infrastructure** | `gateway`, `config_reload`, `proxy_config`, `agents_list` |
 | **Integrations** | `composio` (1000+ OAuth apps), `pushover` (notifications) |
 
-`skills_list` reports whether a skill is workspace-trusted or community/lazy,
-and marks `SKILL.toml` tool declarations as `declared_not_executable` until a
-real adapter exists. `skill_read` resolves a skill by catalog name, then reads
-its instruction file or a relative resource under that skill's own canonical
-root. It never turns an arbitrary absolute path into a file-read bypass.
+`skills_list` reports active and disabled skills, their origin/loading mode,
+and whether each supported `SKILL.toml` tool is executable through the skill
+adapter. `skill_read` resolves a skill by catalog name, then reads its
+instruction file or a relative resource under that skill's own canonical root.
+It never turns an arbitrary absolute path into a file-read bypass.
+
+`skills_manage` is the approval-gated agent control plane for `create`,
+`install`, `update`, `enable`, `disable`, `validate`, `sync`, and `remove`.
+The CLI exposes `list`, `sync`, `install`, `update`, `enable`, `disable`, and
+`remove`. Disabled workspace skills remain installed but are removed from
+prompt selection and executable alias discovery.
+
+`skill_execute` is the root execution fallback for enabled skill tools. It also
+exports up to 32 deterministic `skill__<skill>__<tool>` aliases and is recorded
+as the `skill` adapter by the canonical tool catalog. Supported manifest kinds
+are `shell`, `script`, and `http`; shell/script scalar arguments are supplied
+as `PRX_SKILL_ARG_*` environment variables, scripts are confined to their
+canonical skill root, and HTTP tools reuse the public-network and domain
+allowlist enforcement of `http_request`. Skill tool calls use the same policy,
+approval, cancellation, idempotency, and audit execution service as native,
+MCP, and WASM tools.
 
 `document_ingest` accepts UTF-8 inline content or a workspace-relative file.
 `document_sync` requires a workspace-relative file and derives a stable document

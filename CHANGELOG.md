@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.81] - 3 September 2026
+
+### Added
+
+- Added approval-gated `skills_manage` lifecycle actions for creating,
+  installing, updating, enabling, disabling, validating, synchronizing, and
+  removing skills, with matching CLI update/enable/disable commands.
+- Added executable `skill_execute` support and bounded dynamic aliases for
+  declared shell, script, and HTTP skill tools.
+
+### Changed
+
+- Added a first-class `skill` tool adapter so declared skill tools use the same
+  provider catalog and execution service as native, MCP, and WASM tools.
+- Persist disabled workspace skills without deleting them and keep them visible
+  to control-plane inventory while excluding them from prompts and execution.
+
 ## [0.8.80] - 3 September 2026
 
 ### Added

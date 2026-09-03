@@ -39,6 +39,7 @@ pub enum ToolAdapterKind {
     Native,
     McpAlias,
     WasmPlugin,
+    Skill,
 }
 
 /// Small raw execution port consumed by the application service.
@@ -114,6 +115,8 @@ impl ToolBackend for SharedRegistryToolAdapter {
             ToolAdapterKind::McpAlias
         } else if self.root_name == "wasm_plugin_call" {
             ToolAdapterKind::WasmPlugin
+        } else if self.root_name == "skill_execute" {
+            ToolAdapterKind::Skill
         } else {
             ToolAdapterKind::Native
         }
@@ -174,6 +177,8 @@ impl ToolBackend for LegacyToolAdapter {
             ToolAdapterKind::McpAlias
         } else if self.tool.name() == "wasm_plugin_call" {
             ToolAdapterKind::WasmPlugin
+        } else if self.tool.name() == "skill_execute" {
+            ToolAdapterKind::Skill
         } else {
             ToolAdapterKind::Native
         }
@@ -709,6 +714,8 @@ impl ToolCatalog {
                                 ToolAdapterKind::McpAlias
                             } else if root_name == "wasm_plugin_call" {
                                 ToolAdapterKind::WasmPlugin
+                            } else if root_name == "skill_execute" {
+                                ToolAdapterKind::Skill
                             } else {
                                 ToolAdapterKind::Native
                             }
@@ -786,6 +793,7 @@ fn tool_descriptor(
         ToolAdapterKind::Native => "native",
         ToolAdapterKind::McpAlias => "MCP alias",
         ToolAdapterKind::WasmPlugin => "WASM plugin",
+        ToolAdapterKind::Skill => "skill",
     };
     ToolDescriptor {
         public_name: spec.name,

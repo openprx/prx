@@ -220,6 +220,21 @@ pub enum SkillCommands {
         /// Git URL (HTTPS/SSH) or local path
         source: String,
     },
+    /// Update an installed remote skill, or revalidate a linked local skill
+    Update {
+        /// Skill name
+        name: String,
+    },
+    /// Enable an installed workspace skill
+    Enable {
+        /// Skill name
+        name: String,
+    },
+    /// Disable an installed workspace skill without deleting it
+    Disable {
+        /// Skill name
+        name: String,
+    },
     /// Remove an installed skill
     Remove {
         /// Skill name

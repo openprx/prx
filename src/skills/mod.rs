@@ -27,6 +27,7 @@ const MAX_SKILLS_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_EMBEDDING_CACHE_ENTRIES: usize = 2048;
 const MAX_HYDRATION_LOCKS: usize = 64;
 const UNTRUSTED_ORIGIN_MARKER: &str = ".openprx-untrusted-origin.json";
+const DISABLED_SKILL_MARKER: &str = ".openprx-disabled";
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CatalogKey {
@@ -387,12 +388,17 @@ fn load_skills_with_open_skills_config(
 
     // Highest precedence: workspace skills. Later inserts replace matching names,
     // and workspace entries receive admission priority when the catalog is full.
+    let disabled_workspace_skills = disabled_workspace_skill_names(workspace_dir);
     let workspace_skills = load_workspace_skills(workspace_dir);
     let workspace_names = workspace_skills
         .iter()
         .map(|skill| skill.name.trim().to_ascii_lowercase())
+        .filter(|name| !disabled_workspace_skills.contains(name))
         .collect::<BTreeSet<_>>();
     merge_skills(&mut skills, workspace_skills);
+    for name in &disabled_workspace_skills {
+        skills.remove(name);
+    }
 
     let mut admitted = workspace_names.into_iter().take(MAX_SKILLS).collect::<BTreeSet<_>>();
     for name in skills.keys() {
@@ -418,6 +424,69 @@ fn load_workspace_skills(workspace_dir: &Path) -> Vec<Skill> {
     load_skills_from_directory(&skills_dir)
 }
 
+/// Load workspace-owned skills without applying enabled-state filtering.
+/// Control-plane inventory surfaces use this to keep disabled skills visible.
+pub fn load_installed_workspace_skills(workspace_dir: &Path) -> Vec<Skill> {
+    load_workspace_skills(workspace_dir)
+}
+
+fn disabled_workspace_skill_names(workspace_dir: &Path) -> BTreeSet<String> {
+    let state_dir = workspace_dir.join("skills").join(DISABLED_SKILL_MARKER);
+    let Ok(entries) = sorted_directory_entries(&state_dir) else {
+        return BTreeSet::new();
+    };
+    entries
+        .into_iter()
+        .filter(|entry| entry.path().is_file())
+        .filter_map(|entry| {
+            let directory_name = entry.file_name();
+            let skill_dir = skills_dir(workspace_dir).join(&directory_name);
+            load_skill_from_entry_dir(&skill_dir)
+                .map(|skill| skill.name.trim().to_ascii_lowercase())
+                .or_else(|| directory_name.to_str().map(|name| name.trim().to_ascii_lowercase()))
+        })
+        .collect()
+}
+
+fn disabled_skill_marker(workspace_dir: &Path, name: &str) -> PathBuf {
+    skills_dir(workspace_dir).join(DISABLED_SKILL_MARKER).join(name)
+}
+
+fn load_skill_from_entry_dir(path: &Path) -> Option<Skill> {
+    let toml_path = path.join("SKILL.toml");
+    let md_path = path.join("SKILL.md");
+    if toml_path.is_file() {
+        load_skill_toml(&toml_path).ok()
+    } else if md_path.is_file() {
+        load_skill_md(&md_path, path).ok()
+    } else {
+        None
+    }
+}
+
+fn resolve_installed_skill_path(workspace_dir: &Path, name: &str) -> Result<PathBuf> {
+    validate_skill_name(name)?;
+    let root = skills_dir(workspace_dir);
+    let direct = root.join(name);
+    if load_skill_from_entry_dir(&direct).is_some() {
+        return Ok(direct);
+    }
+    for entry in sorted_directory_entries(&root).unwrap_or_default() {
+        let path = entry.path();
+        if load_skill_from_entry_dir(&path).is_some_and(|skill| skill.name.eq_ignore_ascii_case(name)) {
+            return Ok(path);
+        }
+    }
+    bail!("Skill not found: {name}")
+}
+
+fn installed_directory_name(path: &Path) -> Result<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(ToString::to_string)
+        .ok_or_else(|| anyhow::anyhow!("Installed skill path has no valid directory name: {}", path.display()))
+}
+
 fn load_skills_from_directory(skills_dir: &Path) -> Vec<Skill> {
     if !skills_dir.exists() {
         return Vec::new();
@@ -431,6 +500,9 @@ fn load_skills_from_directory(skills_dir: &Path) -> Vec<Skill> {
 
     for entry in entries {
         let path = entry.path();
+        if entry.file_name().to_str().is_some_and(|name| name.starts_with('.')) {
+            continue;
+        }
         if !path.is_dir() {
             continue;
         }
@@ -1241,6 +1313,241 @@ pub(crate) fn cleanup_staged_skill(staging: &Path) {
     let _ = remove_skill_path(staging);
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct InstalledSkillState {
+    pub name: String,
+    pub path: PathBuf,
+    pub enabled: bool,
+}
+
+/// Return workspace-owned skill entries, including disabled entries that are
+/// intentionally absent from the active runtime catalog.
+pub fn installed_skill_states(workspace_dir: &Path) -> Result<Vec<InstalledSkillState>> {
+    let root = skills_dir(workspace_dir);
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut states = Vec::new();
+    for entry in sorted_directory_entries(&root)? {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(directory_name) = entry.file_name().to_str().map(ToString::to_string) else {
+            continue;
+        };
+        if directory_name.starts_with('.') || validate_skill_name(&directory_name).is_err() {
+            continue;
+        }
+        let Some(skill) = load_skill_from_entry_dir(&path) else {
+            continue;
+        };
+        let name = skill.name;
+        let enabled = !disabled_skill_marker(workspace_dir, &directory_name).is_file();
+        states.push(InstalledSkillState { name, path, enabled });
+    }
+    Ok(states)
+}
+
+/// Install a workspace skill from a Git remote or an explicit local directory.
+/// The active target is published only after the staged skill validates.
+pub async fn install_skill_from_source(workspace_dir: &Path, source: &str) -> Result<PathBuf> {
+    let skills_path = skills_dir(workspace_dir);
+    let name = if is_git_source(source) {
+        skill_name_from_source(source)?
+    } else {
+        let src = PathBuf::from(source);
+        let name = src
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ToString::to_string)
+            .ok_or_else(|| anyhow::anyhow!("Source path has no valid skill name: {source}"))?;
+        validate_skill_name(&name)?;
+        name
+    };
+    let (staging, target) = skill_staging_paths(&skills_path, &name)?;
+
+    let staging_result: Result<()> = async {
+        if is_git_source(source) {
+            let mut cmd = Command::new("git");
+            cmd.args(["clone", "--depth", "1", source]).arg(&staging);
+            let output = crate::runtime::shell_process::run_managed_output(cmd).await?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                bail!("Git clone failed: {stderr}");
+            }
+            mark_staged_skill_untrusted(&staging, source)?;
+            return Ok(());
+        }
+
+        let src = PathBuf::from(source)
+            .canonicalize()
+            .with_context(|| format!("Source path does not exist: {source}"))?;
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&src, &staging)?;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::symlink_dir;
+            if symlink_dir(&src, &staging).is_err() {
+                let mut junction_cmd = Command::new("cmd");
+                junction_cmd
+                    .args(["/C", "mklink", "/J"])
+                    .arg(&staging)
+                    .arg(&src)
+                    .kill_on_drop(true);
+                let junction_result = junction_cmd.output().await;
+                if !junction_result.as_ref().is_ok_and(|output| output.status.success()) {
+                    copy_dir_recursive(&src, &staging)?;
+                }
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            copy_dir_recursive(&src, &staging)?;
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Err(error) = staging_result {
+        cleanup_staged_skill(&staging);
+        return Err(error);
+    }
+    if let Some(staged_skill) = load_skill_from_entry_dir(&staging) {
+        let duplicate = installed_skill_states(workspace_dir)?
+            .into_iter()
+            .any(|installed| installed.name.eq_ignore_ascii_case(&staged_skill.name));
+        if duplicate {
+            cleanup_staged_skill(&staging);
+            bail!("Skill already installed with manifest name: {}", staged_skill.name);
+        }
+    }
+    if let Err(error) = activate_staged_skill(&staging, &target, workspace_dir) {
+        cleanup_staged_skill(&staging);
+        return Err(error);
+    }
+    Ok(target)
+}
+
+/// Create a new instruction skill through the same staged activation boundary
+/// used by remote and local installs.
+pub fn create_instruction_skill(
+    workspace_dir: &Path,
+    name: &str,
+    description: &str,
+    instructions: &str,
+) -> Result<PathBuf> {
+    validate_skill_name(name)?;
+    if instructions.trim().is_empty() {
+        bail!("Skill instructions cannot be empty");
+    }
+    let (staging, target) = skill_staging_paths(&skills_dir(workspace_dir), name)?;
+    let staged = (|| -> Result<()> {
+        std::fs::create_dir(&staging)?;
+        let description = bounded_text(description.trim(), MAX_DESCRIPTION_BYTES);
+        let body = format!("# {name}\n\n{description}\n\n{}\n", instructions.trim());
+        std::fs::write(staging.join("SKILL.md"), body)?;
+        activate_staged_skill(&staging, &target, workspace_dir)?;
+        Ok(())
+    })();
+    if let Err(error) = staged {
+        cleanup_staged_skill(&staging);
+        return Err(error);
+    }
+    Ok(target)
+}
+
+pub fn set_installed_skill_enabled(workspace_dir: &Path, name: &str, enabled: bool) -> Result<PathBuf> {
+    let path = resolve_installed_skill_path(workspace_dir, name)?;
+    let directory_name = installed_directory_name(&path)?;
+    let marker = disabled_skill_marker(workspace_dir, &directory_name);
+    if enabled {
+        if marker.exists() {
+            std::fs::remove_file(&marker)?;
+        }
+    } else {
+        let parent = marker
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Invalid disabled skill marker path"))?;
+        std::fs::create_dir_all(parent)?;
+        std::fs::write(&marker, b"disabled")?;
+    }
+    invalidate_skill_catalog(workspace_dir);
+    Ok(path)
+}
+
+pub fn validate_installed_skill(workspace_dir: &Path, name: &str) -> Result<PathBuf> {
+    let path = resolve_installed_skill_path(workspace_dir, name)?;
+    validate_staged_skill(&path)?;
+    Ok(path)
+}
+
+pub fn remove_installed_skill(workspace_dir: &Path, name: &str) -> Result<()> {
+    let path = resolve_installed_skill_path(workspace_dir, name)?;
+    let directory_name = installed_directory_name(&path)?;
+    remove_skill_path(&path)?;
+    let marker = disabled_skill_marker(workspace_dir, &directory_name);
+    if marker.exists() {
+        std::fs::remove_file(marker)?;
+    }
+    invalidate_skill_catalog(workspace_dir);
+    Ok(())
+}
+
+/// Update an installed Git skill by fetching its recorded source into a fresh
+/// staging directory and atomically swapping it into place. Local linked skills
+/// already track their source and are therefore only revalidated.
+pub async fn update_installed_skill(workspace_dir: &Path, name: &str) -> Result<PathBuf> {
+    let root = skills_dir(workspace_dir);
+    let target = resolve_installed_skill_path(workspace_dir, name)?;
+    let directory_name = installed_directory_name(&target)?;
+    let metadata = std::fs::symlink_metadata(&target)?;
+    if metadata.file_type().is_symlink() {
+        validate_staged_skill(&target)?;
+        invalidate_skill_catalog(workspace_dir);
+        return Ok(target);
+    }
+
+    let marker_path = target.join(UNTRUSTED_ORIGIN_MARKER);
+    let marker: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&marker_path)
+            .with_context(|| format!("Skill '{name}' has no recorded remote source and cannot be updated"))?,
+    )?;
+    let source = marker
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .filter(|source| is_git_source(source))
+        .ok_or_else(|| anyhow::anyhow!("Skill '{name}' has no valid recorded Git source"))?;
+    let staging = root.join(format!(".{directory_name}.staging-{}", uuid::Uuid::new_v4()));
+    let backup = root.join(format!(".{directory_name}.backup-{}", uuid::Uuid::new_v4()));
+    let updated = async {
+        let mut cmd = Command::new("git");
+        cmd.args(["clone", "--depth", "1", source]).arg(&staging);
+        let output = crate::runtime::shell_process::run_managed_output(cmd).await?;
+        if !output.status.success() {
+            bail!("Git clone failed: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        mark_staged_skill_untrusted(&staging, source)?;
+        validate_staged_skill(&staging)?;
+        std::fs::rename(&target, &backup)?;
+        if let Err(error) = std::fs::rename(&staging, &target) {
+            let _ = std::fs::rename(&backup, &target);
+            return Err(error.into());
+        }
+        cleanup_staged_skill(&backup);
+        invalidate_skill_catalog(workspace_dir);
+        Ok::<_, anyhow::Error>(target.clone())
+    }
+    .await;
+    if updated.is_err() {
+        cleanup_staged_skill(&staging);
+    }
+    updated
+}
+
 fn remove_skill_path(path: &Path) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || metadata.is_file() {
@@ -1275,15 +1582,20 @@ pub async fn handle_command(command: crate::SkillCommands, config: &crate::confi
     match command {
         crate::SkillCommands::List => {
             let skills = load_skills_with_config(workspace_dir, config);
-            if skills.is_empty() {
-                println!("No skills installed.");
+            let disabled = installed_skill_states(workspace_dir)?
+                .into_iter()
+                .filter(|skill| !skill.enabled)
+                .collect::<Vec<_>>();
+            if skills.is_empty() && disabled.is_empty() {
+                println!("No workspace skills installed.");
+                println!("Native skill management is available to the agent through skills_manage.");
                 println!();
                 println!("  Create one: mkdir -p ~/.openprx/workspace/skills/my-skill");
                 println!("              echo '# My Skill' > ~/.openprx/workspace/skills/my-skill/SKILL.md");
                 println!();
                 println!("  Or install: prx skills install <source>");
             } else {
-                println!("Installed skills ({}):", skills.len());
+                println!("Skills ({} active, {} disabled):", skills.len(), disabled.len());
                 println!();
                 for skill in &skills {
                     println!(
@@ -1307,6 +1619,14 @@ pub async fn handle_command(command: crate::SkillCommands, config: &crate::confi
                         println!("    Tags:  {}", skill.tags.join(", "));
                     }
                 }
+                for skill in &disabled {
+                    println!(
+                        "  {} {} — {}",
+                        console::style(&skill.name).white().bold(),
+                        console::style("disabled").yellow(),
+                        skill.path.display()
+                    );
+                }
             }
             println!();
             Ok(())
@@ -1321,72 +1641,7 @@ pub async fn handle_command(command: crate::SkillCommands, config: &crate::confi
         }
         crate::SkillCommands::Install { source } => {
             println!("Installing skill from: {source}");
-
-            let skills_path = skills_dir(workspace_dir);
-            let name = if is_git_source(&source) {
-                skill_name_from_source(&source)?
-            } else {
-                let src = PathBuf::from(&source);
-                src.file_name()
-                    .and_then(|name| name.to_str())
-                    .map(ToString::to_string)
-                    .ok_or_else(|| anyhow::anyhow!("Source path has no valid skill name: {source}"))?
-            };
-            let (staging, target) = skill_staging_paths(&skills_path, &name)?;
-
-            let staging_result: Result<()> = async {
-                if is_git_source(&source) {
-                    let mut cmd = Command::new("git");
-                    cmd.args(["clone", "--depth", "1", &source]).arg(&staging);
-                    let output = crate::runtime::shell_process::run_managed_output(cmd).await?;
-                    if !output.status.success() {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        bail!("Git clone failed: {stderr}");
-                    }
-                    mark_staged_skill_untrusted(&staging, &source)?;
-                    return Ok(());
-                }
-
-                let src = PathBuf::from(&source)
-                    .canonicalize()
-                    .with_context(|| format!("Source path does not exist: {source}"))?;
-
-                #[cfg(unix)]
-                {
-                    std::os::unix::fs::symlink(&src, &staging)?;
-                }
-                #[cfg(windows)]
-                {
-                    use std::os::windows::fs::symlink_dir;
-                    if symlink_dir(&src, &staging).is_err() {
-                        let mut junction_cmd = Command::new("cmd");
-                        junction_cmd
-                            .args(["/C", "mklink", "/J"])
-                            .arg(&staging)
-                            .arg(&src)
-                            .kill_on_drop(true);
-                        let junction_result = junction_cmd.output().await;
-                        if !junction_result.as_ref().is_ok_and(|output| output.status.success()) {
-                            copy_dir_recursive(&src, &staging)?;
-                        }
-                    }
-                }
-                #[cfg(not(any(unix, windows)))]
-                {
-                    copy_dir_recursive(&src, &staging)?;
-                }
-                Ok(())
-            }
-            .await;
-
-            if let Err(error) = staging_result {
-                cleanup_staged_skill(&staging);
-                return Err(error);
-            }
-            if let Err(error) = activate_staged_skill(&staging, &target, workspace_dir) {
-                cleanup_staged_skill(&staging);
-                return Err(error);
-            }
+            let target = install_skill_from_source(workspace_dir, &source).await?;
             println!(
                 "  {} Skill installed atomically at {}.",
                 console::style("✓").green().bold(),
@@ -1395,16 +1650,28 @@ pub async fn handle_command(command: crate::SkillCommands, config: &crate::confi
             Ok(())
         }
         crate::SkillCommands::Remove { name } => {
-            validate_skill_name(&name)?;
-
-            let skill_path = skills_dir(workspace_dir).join(&name);
-            if std::fs::symlink_metadata(&skill_path).is_err() {
-                anyhow::bail!("Skill not found: {name}");
-            }
-
-            remove_skill_path(&skill_path)?;
-            invalidate_skill_catalog(workspace_dir);
+            remove_installed_skill(workspace_dir, &name)?;
             println!("  {} Skill '{}' removed.", console::style("✓").green().bold(), name);
+            Ok(())
+        }
+        crate::SkillCommands::Update { name } => {
+            let target = update_installed_skill(workspace_dir, &name).await?;
+            println!(
+                "  {} Skill '{}' updated at {}.",
+                console::style("✓").green().bold(),
+                name,
+                target.display()
+            );
+            Ok(())
+        }
+        crate::SkillCommands::Enable { name } => {
+            set_installed_skill_enabled(workspace_dir, &name, true)?;
+            println!("  {} Skill '{}' enabled.", console::style("✓").green().bold(), name);
+            Ok(())
+        }
+        crate::SkillCommands::Disable { name } => {
+            set_installed_skill_enabled(workspace_dir, &name, false)?;
+            println!("  {} Skill '{}' disabled.", console::style("✓").green().bold(), name);
             Ok(())
         }
     }

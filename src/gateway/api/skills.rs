@@ -25,8 +25,9 @@ pub(super) struct SkillsResponse {
 pub async fn get_skills(State(state): State<AppState>) -> Json<SkillsResponse> {
     let config = state.config.load_full();
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+    let states = crate::skills::installed_skill_states(&config.workspace_dir).unwrap_or_default();
 
-    let items: Vec<SkillInfo> = skills
+    let mut items: Vec<SkillInfo> = skills
         .into_iter()
         .map(|s| SkillInfo {
             name: s.name,
@@ -35,19 +36,64 @@ pub async fn get_skills(State(state): State<AppState>) -> Json<SkillsResponse> {
             enabled: true,
         })
         .collect();
+    let installed = crate::skills::load_installed_workspace_skills(&config.workspace_dir);
+    for state in states.into_iter().filter(|state| !state.enabled) {
+        let description = installed
+            .iter()
+            .find(|skill| skill.name.eq_ignore_ascii_case(&state.name))
+            .map(|skill| skill.description.clone())
+            .unwrap_or_default();
+        items.push(SkillInfo {
+            name: state.name,
+            description,
+            location: state.path.display().to_string(),
+            enabled: false,
+        });
+    }
+    items.sort_by(|left, right| left.name.cmp(&right.name));
 
     Json(SkillsResponse { skills: items })
 }
 
 /// PATCH /api/skills/{id}/toggle
 pub async fn toggle_skill(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if let Err(error) = crate::skills::validate_skill_name(&id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": error.to_string()})),
+        ));
+    }
+    super::authorize_resource_mutation(&state, "gateway_api:skills:toggle", ResourceRiskLevel::Low)?;
+    let config = state.config.load_full();
+    let current = crate::skills::installed_skill_states(&config.workspace_dir)
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+        })?
+        .into_iter()
+        .find(|skill| skill.name.eq_ignore_ascii_case(&id))
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Skill not found"})),
+            )
+        })?;
+    let enabled = !current.enabled;
+    crate::skills::set_installed_skill_enabled(&config.workspace_dir, &id, enabled).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+    })?;
     Ok(Json(serde_json::json!({
-        "status": "toggled",
+        "status": "ok",
         "id": id,
-        "note": "Skill toggle is not yet persisted. Restart will reset state."
+        "enabled": enabled
     })))
 }
 

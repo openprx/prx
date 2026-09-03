@@ -105,7 +105,7 @@ pub use sessions_list::SessionsListTool;
 pub use sessions_send::SessionsSendTool;
 pub use sessions_spawn::SessionsSpawnTool;
 pub use shell::ShellTool;
-pub use skills::{SkillReadTool, SkillsListTool};
+pub use skills::{SkillExecuteTool, SkillReadTool, SkillsListTool, SkillsManageTool};
 pub use stay_silent::{STAY_SILENT_TOOL_NAME, StaySilentTool};
 pub use subagents::SubagentsTool;
 pub use traits::Tool;
@@ -353,7 +353,7 @@ pub fn all_tools_with_runtime_ext(
 ) -> ToolsRegistryResult {
     // Core tools — always registered regardless of module flags.
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::new(runtime, workspace_dir.to_path_buf())),
+        Arc::new(ShellTool::new(runtime.clone(), workspace_dir.to_path_buf())),
         Arc::new(FileReadTool::new(security.clone(), config.memory.acl_enabled)),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
@@ -362,6 +362,19 @@ pub fn all_tools_with_runtime_ext(
         Arc::new(PushoverTool::new(security.clone(), workspace_dir.to_path_buf())),
         Arc::new(SkillsListTool::new(workspace_dir.to_path_buf(), root_config.clone())),
         Arc::new(SkillReadTool::new(workspace_dir.to_path_buf(), root_config.clone())),
+        Arc::new(SkillsManageTool::new(
+            workspace_dir.to_path_buf(),
+            root_config.clone(),
+            security.clone(),
+        )),
+        Arc::new(SkillExecuteTool::new(
+            workspace_dir.to_path_buf(),
+            root_config.clone(),
+            runtime,
+            security.clone(),
+            browser_config,
+            http_config,
+        )),
         // stay_silent lets the model decline to reply in smart group-reply mode.
         // Always registered so the loop can resolve the call; its spec is only
         // advertised to the model on smart group turns (loop-side `expose_stay_silent`
@@ -681,6 +694,8 @@ mod tests {
         for added in [
             "skills_list",
             "skill_read",
+            "skills_manage",
+            "skill_execute",
             "document_ingest",
             "document_sync",
             "mcp_status",

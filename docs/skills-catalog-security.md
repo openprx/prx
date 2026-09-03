@@ -31,6 +31,11 @@ install, uninstall, explicit synchronization, or SkillForge integration.
 Manual filesystem edits require a process restart or an explicit catalog
 invalidation by the embedding application.
 
+Workspace enablement is persisted under `skills/.openprx-disabled/`. A disabled
+workspace entry suppresses a same-named community fallback, remains visible to
+control-plane inventory, and is excluded from prompt selection and executable
+skill-tool aliases.
+
 ## Prompt trust and limits
 
 Community repositories are always lazy: PRX loads bounded name, description,
@@ -66,3 +71,19 @@ an existing active skill is never replaced.
 
 Local CLI paths are explicit operator input and remain trusted. They are staged
 as a link/copy, validated, and atomically activated through the same lifecycle.
+
+Remote updates clone the recorded source into a fresh staging directory,
+validate it, and swap it into place while retaining a rollback copy until the
+new directory is active. Local linked skills already track their source and are
+revalidated by update. Agent-initiated lifecycle changes use `skills_manage`
+and pass through the common side-effect approval and audit boundary.
+
+## Execution lifecycle
+
+Enabled `SKILL.toml` declarations with kind `shell`, `script`, or `http` are
+exported through `skill_execute` and deterministic skill aliases. Script paths
+must be relative and remain inside the selected skill's canonical root. Shell
+and script output uses the shared bounded, cancellation-aware process adapter;
+HTTP declarations reuse `http_request` network restrictions. Unsupported kinds
+remain visible in `skills_list` as unsupported and are never exported as
+provider-callable ToolSpecs.
