@@ -91,6 +91,9 @@ pub struct AppContext {
     /// attached — built once here so no path can forget `with_audit_config`
     /// (collapses the 17 hand-wired sites, survey §1 / dev-plan §2.1).
     pub security: Arc<SecurityPolicy>,
+    /// Process-local lifecycle hook generation shared by the loop and its
+    /// control tool, so diagnostics and mutations observe the executing state.
+    pub hooks: Arc<crate::hooks::HookManager>,
     /// Workspace root as `Arc<Path>` (iron rule 7: no `PathBuf` clone, no
     /// intermediate `String`).
     // Not yet consumed by a wired mode (chat reads `config.workspace_dir`);
@@ -127,6 +130,9 @@ pub struct AppContext {
     /// `.await`). `None` for every other profile (they use the shared `tools`
     /// `Arc`); after chat's `take`, the inner `Option` is `None` (no dead state).
     pub base_tools: Option<parking_lot::Mutex<Option<Vec<Box<dyn Tool>>>>>,
+    /// Sole WASM plugin generation owner for this process/workspace.
+    #[cfg(feature = "wasm-plugins")]
+    pub plugin_runtime: Option<Arc<crate::plugins::PluginRuntime>>,
     /// Heuristic LLM router. Only built for profiles that need it and only when
     /// the `llm-router` feature is enabled; always constructed after memory
     /// (`agent/agent.rs:446` invariant).
@@ -273,6 +279,7 @@ impl RuntimeBootstrap {
         // 2. security (with audit) — single source of truth; always carries the
         //    configured `security.audit` block (dev-plan §2.1, collapses 17 sites).
         let security = build_security_policy(&config);
+        let hooks = Arc::new(crate::hooks::HookManager::new(config.workspace_dir.clone()));
 
         // workspace_dir as Arc<Path>: borrow the config path, no String detour.
         let workspace_dir: Arc<Path> = Arc::from(config.workspace_dir.as_path());
@@ -304,6 +311,17 @@ impl RuntimeBootstrap {
         } else {
             None
         };
+
+        #[cfg(feature = "wasm-plugins")]
+        let plugin_runtime = if profile.needs_tools() {
+            crate::plugins::init_plugin_runtime(&config.workspace_dir, memory.clone()).await
+        } else {
+            None
+        };
+        #[cfg(feature = "wasm-plugins")]
+        if let Some(plugin_runtime) = &plugin_runtime {
+            hooks.set_plugin_runtime(Arc::clone(plugin_runtime)).await;
+        }
 
         // 5. router — strictly after memory (agent/agent.rs:446 invariant), only
         //    when the feature is on and the profile needs it.
@@ -379,7 +397,7 @@ impl RuntimeBootstrap {
             } else {
                 (None, None)
             };
-            let registry = tools::all_tools_with_runtime(
+            let mut registry = tools::all_tools_with_runtime(
                 Arc::clone(&config),
                 Arc::clone(&config_manager),
                 &security,
@@ -394,6 +412,15 @@ impl RuntimeBootstrap {
                 config.api_key.as_deref(),
                 &config,
             );
+            registry.push(hooks.status_tool());
+            registry.push(hooks.manage_tool(Arc::clone(&security)));
+            #[cfg(feature = "wasm-plugins")]
+            if let Some(plugin_runtime) = &plugin_runtime {
+                registry.push(plugin_runtime.tool_router());
+                registry.push(plugin_runtime.status_tool());
+                registry.push(plugin_runtime.reload_tool(Arc::clone(&security)));
+                registry.push(plugin_runtime.manage_tool(Arc::clone(&security)));
+            }
             if matches!(profile, BootstrapProfile::Interactive) {
                 base_tools = Some(parking_lot::Mutex::new(Some(registry)));
             } else {
@@ -407,10 +434,13 @@ impl RuntimeBootstrap {
             config,
             observer,
             security,
+            hooks,
             workspace_dir,
             memory,
             tools,
             base_tools,
+            #[cfg(feature = "wasm-plugins")]
+            plugin_runtime,
             #[cfg(feature = "llm-router")]
             router,
             #[cfg(feature = "llm-router")]
@@ -489,6 +519,16 @@ mod tests {
             .expect("test: Interactive must build base_tools");
         let taken = base.lock().take().expect("test: base_tools present once");
         assert!(!taken.is_empty(), "tool registry should be non-empty");
+        let names = taken.iter().map(|tool| tool.name()).collect::<Vec<_>>();
+        assert!(names.contains(&"hooks_status"));
+        assert!(names.contains(&"hooks_manage"));
+        #[cfg(feature = "wasm-plugins")]
+        {
+            assert!(names.contains(&"wasm_plugin_call"));
+            assert!(names.contains(&"wasm_plugins_status"));
+            assert!(names.contains(&"wasm_plugin_reload"));
+            assert!(names.contains(&"wasm_plugins_manage"));
+        }
         // The owned Vec is a one-shot take; the inner Option is now None.
         assert!(base.lock().is_none(), "base_tools take is one-shot");
         // Interactive does not enable the router.

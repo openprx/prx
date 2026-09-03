@@ -389,6 +389,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "skills_list",
     "skill_read",
     "wasm_plugins_status",
+    "hooks_status",
     "mcp_status",
     // Web reads.
     "web_fetch",

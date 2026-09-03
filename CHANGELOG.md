@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.87] - 3 September 2026
+
+### Added
+
+- Add model-visible Hooks status and lifecycle management for validation,
+  atomic replacement, refresh, recoverable removal, and synthetic event tests.
+- Add model-visible WASM plugin install, update, enable, disable, refresh,
+  inspection, and recoverable removal across chat, agent, gateway, and channel
+  entrypoints.
+
+### Fixed
+
+- Register the shared WASM plugin runtime in `prx chat` and the runtime
+  bootstrap instead of exposing plugin tools only in daemon/channel paths.
+- Match the versioned WIT logging ABI's enum parameter so real plugin
+  components instantiate and execute instead of appearing loaded but unusable.
+- Surface isolated WASM adapter construction failures in plugin status and
+  reject or roll back lifecycle changes that do not produce an operational
+  adapter.
+- Reuse the executing HookManager in chat and agent loops so control-plane
+  diagnostics and changes address the same live hook generation.
+
 ## [0.8.86] - 3 September 2026
 
 ### Changed

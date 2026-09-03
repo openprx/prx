@@ -186,8 +186,46 @@ impl PluginManifest {
         if self.plugin.name.is_empty() {
             return Err(PluginError::Manifest("plugin name cannot be empty".to_string()));
         }
+        if self.plugin.name.len() > 128
+            || !self
+                .plugin
+                .name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        {
+            return Err(PluginError::Manifest(
+                "plugin name must be 1-128 ASCII letters, digits, '-' or '_'".to_string(),
+            ));
+        }
         if self.plugin.version.is_empty() {
             return Err(PluginError::Manifest("plugin version cannot be empty".to_string()));
+        }
+        for capability in &self.capabilities {
+            if capability.name.trim().is_empty() {
+                return Err(PluginError::Manifest(
+                    "plugin capability name cannot be empty".to_string(),
+                ));
+            }
+            if !matches!(
+                capability.capability_type.as_str(),
+                "tool" | "hook" | "middleware" | "cron" | "provider" | "storage"
+            ) {
+                return Err(PluginError::Manifest(format!(
+                    "unsupported plugin capability type '{}'",
+                    capability.capability_type
+                )));
+            }
+            if capability.capability_type == "cron"
+                && capability
+                    .schedule
+                    .as_deref()
+                    .is_none_or(|schedule| schedule.trim().is_empty())
+            {
+                return Err(PluginError::Manifest(format!(
+                    "cron capability '{}' requires a schedule",
+                    capability.name
+                )));
+            }
         }
         Ok(())
     }

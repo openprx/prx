@@ -6848,8 +6848,7 @@ pub(crate) async fn run_with_runtime_envelope(
     let config = Arc::clone(&ctx.config);
 
     let observer = Arc::clone(&ctx.observer);
-    // hooks are not part of AppContext — keep the local construction unchanged.
-    let hooks = HookManager::new(config.workspace_dir.clone());
+    let hooks = Arc::clone(&ctx.hooks);
     // security is consumed only by tool construction, which now happens inside the
     // bootstrap; it is not re-bound here on purpose (no downstream use in `run`).
     // The local runtime adapter is likewise built and consumed inside the

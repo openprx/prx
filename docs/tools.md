@@ -15,7 +15,8 @@ health, MCP discovery, and the active WASM generation.
 | **Scheduling** | `cron` (calendar/time scheduling), `xin` (autonomous task and durable Goal/Step workflows) |
 | **Images** | `image`, `image_info` |
 | **MCP** | `mcp_call`, `mcp_status`, plus up to 32 discovered aliases |
-| **WASM Plugins** | `wasm_plugin_call`, `wasm_plugins_status`, `wasm_plugin_reload`, plus up to 32 aliases when compiled with `wasm-plugins` |
+| **WASM Plugins** | `wasm_plugin_call`, `wasm_plugins_status`, `wasm_plugins_manage`, `wasm_plugin_reload`, plus up to 32 aliases when compiled with `wasm-plugins` |
+| **Hooks** | `hooks_status`, `hooks_manage` |
 | **Remote Nodes** | `nodes` (control paired devices — camera, screen, location, run commands) |
 | **Infrastructure** | `gateway`, `config_reload`, `proxy_config`, `agents_list` |
 | **Integrations** | `composio` (1000+ OAuth apps), `pushover` (notifications) |
@@ -66,6 +67,19 @@ parallel. An explicit refresh or workspace MCP configuration change closes the
 cached session before rediscovery. A timeout or transport failure also resets
 the session, but PRX does not replay the failed call because it may have already
 performed an external side effect.
+
+`wasm_plugins_manage` supports `status`, `get`, `refresh`, `install`, `update`,
+`enable`, `disable`, and `remove`. Install/update sources must be directories
+inside the workspace and contain `plugin.toml` plus its declared WASM file.
+PRX stages and compiles the candidate before publication, atomically refreshes
+the shared generation, and rolls back if any declared adapter cannot be built.
+An approved managed install records a `.prx-managed` marker and grants the
+plugin's declared required host interfaces; manually placed plugins retain the
+conservative permission filter.
+Disable keeps the plugin under `.plugins-disabled`; remove moves it under
+`.plugins-trash` and reports the recovery path. Status includes active,
+disabled, and isolated adapter errors. The same runtime and controls are
+registered in chat, agent, gateway, and channel entrypoints.
 
 For prompt-guided models, the textual tool catalog now uses the same per-turn
 intent selection as native function calling. Registered capabilities whose
@@ -208,6 +222,14 @@ Create `hooks.json` in the workspace directory:
 - payloads are capped at 4 MiB and passed through a restrictive temporary file plus optional stdin
 - timeout covers stdin and process execution; timed-out children are killed and reaped, and temporary payload files are removed on every exit path
 - WASM plugins with the `hook` capability also receive these events
+
+`hooks_status` reports the live config path, validity, timeout, event coverage,
+and action count. `hooks_manage` supports `status`, `refresh`, `validate`,
+`replace`, `remove`, and `test`. Replacement is validated and atomically
+published; removal moves the previous file to `.hooks-trash` and reports the
+recovery path. Unknown or duplicate normalized event names are rejected. The
+manager behind these tools is the same instance that emits the current turn's
+events.
 
 ## Webhook Receiver
 
