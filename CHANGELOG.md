@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.98] - 3 September 2026
+
+### Fixed
+
+- Pin capability routing to the exact user-authored turn input before recalled
+  memory, shared events, middleware, or provider-history enrichment. TUI, CLI,
+  Gateway, WhatsApp/other IM channels, and process session workers can no longer
+  inherit stale MCP/WASM intent from contextual text.
+
+### Tests
+
+- Prove that positive MCP intent in recalled context cannot override a current
+  Skill-only request that explicitly excludes MCP and browser tools.
+
 ## [0.8.97] - 3 September 2026
 
 ### Fixed
