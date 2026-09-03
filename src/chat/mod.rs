@@ -5852,6 +5852,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     &skills,
                     native_tools,
                     &tools_registry,
+                    None,
                 );
                 history.push(ChatMessage::system(cleared_system.clone()));
                 // S2-C Step 4 (Codex P0 修正): 用 SetLeadingSystemPrompt 而非
@@ -7108,6 +7109,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
             &selected_skills,
             native_tools,
             &tools_registry,
+            Some(&user_input),
         );
         let persisted_history_for_turn = persisted_history_for_current_turn(&chat_session, &system_prompt, &user_input);
         if history.is_empty() {
@@ -13820,6 +13822,7 @@ fn history_for_session_with_system(
         skills,
         native_tools,
         tools_registry,
+        None,
     ))];
     history.extend(resumed_history);
     history

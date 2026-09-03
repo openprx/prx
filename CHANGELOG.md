@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.80] - 3 September 2026
+
+### Added
+
+- Added catalog-backed `skills_list` and path-confined `skill_read` tools for
+  workspace and lazy community skills.
+- Added approval-gated `document_ingest` and stable-source `document_sync`
+  tools for the durable document store.
+- Added MCP status/error discovery and WASM plugin status/reload/root-call
+  tools, with deterministic bounded alias exposure.
+
+### Changed
+
+- Extended the canonical tool catalog with backend-reported availability and a
+  distinct WASM adapter kind; declared-only capabilities are no longer exposed
+  to providers as executable ToolSpecs.
+- Applied the same per-turn intent selection to native and prompt-guided tool
+  catalogs, and refresh dynamic backends before each catalog snapshot.
+- Rebuilt Document FTS together with Memory FTS during `memory_reindex`.
+- Replaced line-number-based Markdown hydration and line splitting with
+  CommonMark block parsing, nested heading paths, stable content anchors, and
+  atomic list/code/table/frontmatter handling.
+
+### Fixed
+
+- Blocked SSRF/private-network targets and out-of-allowlist domains in
+  `http_request`, including legacy numeric IP spellings, and bounded the body
+  while streaming instead of after unlimited buffering.
+- Retained MCP configuration/discovery failures for diagnostics and retried
+  failed discovery with bounded backoff instead of silently treating a failed
+  first attempt as initialized forever.
+- Canonicalized the workspace root before applying ACL protection to Memory
+  Markdown and SQLite files, closing a symlinked-temporary-directory bypass.
+- Preserved dynamic specs, refresh hooks, cancellation dispatch, recipient
+  routing, and runtime availability through the shared `Arc` tool adapter.
+
 ## [0.8.79] - 2 September 2026
 
 ### Added

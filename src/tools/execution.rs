@@ -38,6 +38,7 @@ pub enum ToolEffect {
 pub enum ToolAdapterKind {
     Native,
     McpAlias,
+    WasmPlugin,
 }
 
 /// Small raw execution port consumed by the application service.
@@ -52,6 +53,9 @@ pub trait ToolBackend: Send + Sync {
     fn tier(&self) -> ToolTier;
     fn categories(&self) -> Vec<ToolCategory>;
     fn adapter_kind(&self, public_name: &str) -> ToolAdapterKind;
+    fn availability(&self) -> CapabilityAvailability {
+        CapabilityAvailability::ready(format!("executable backend '{}' is registered", self.root_name()))
+    }
 
     async fn invoke(
         &self,
@@ -108,9 +112,18 @@ impl ToolBackend for SharedRegistryToolAdapter {
     fn adapter_kind(&self, public_name: &str) -> ToolAdapterKind {
         if self.root_name == "mcp_call" && public_name != self.root_name {
             ToolAdapterKind::McpAlias
+        } else if self.root_name == "wasm_plugin_call" {
+            ToolAdapterKind::WasmPlugin
         } else {
             ToolAdapterKind::Native
         }
+    }
+
+    fn availability(&self) -> CapabilityAvailability {
+        self.tool().map_or_else(
+            || CapabilityAvailability::declared(format!("tool '{}' is no longer registered", self.root_name)),
+            Tool::availability,
+        )
     }
 
     async fn invoke(
@@ -159,9 +172,15 @@ impl ToolBackend for LegacyToolAdapter {
     fn adapter_kind(&self, public_name: &str) -> ToolAdapterKind {
         if self.tool.name() == "mcp_call" && public_name != self.tool.name() {
             ToolAdapterKind::McpAlias
+        } else if self.tool.name() == "wasm_plugin_call" {
+            ToolAdapterKind::WasmPlugin
         } else {
             ToolAdapterKind::Native
         }
+    }
+
+    fn availability(&self) -> CapabilityAvailability {
+        self.tool.availability()
     }
 
     async fn invoke(
@@ -655,6 +674,7 @@ impl ToolCatalog {
                         backend.tier(),
                         backend.categories(),
                         |public_name| backend.adapter_kind(public_name),
+                        backend.availability(),
                     )
                 })
             })
@@ -687,10 +707,13 @@ impl ToolCatalog {
                         |public_name| {
                             if root_name == "mcp_call" && public_name != root_name {
                                 ToolAdapterKind::McpAlias
+                            } else if root_name == "wasm_plugin_call" {
+                                ToolAdapterKind::WasmPlugin
                             } else {
                                 ToolAdapterKind::Native
                             }
                         },
+                        tool.availability(),
                     )
                 })
             })
@@ -726,6 +749,9 @@ impl ToolCatalog {
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
         self.descriptors
             .iter()
+            .filter(|descriptor| {
+                descriptor.availability.level >= crate::capability::CapabilityAvailabilityLevel::Configured
+            })
             .map(|descriptor| ToolSpec {
                 name: descriptor.public_name.clone(),
                 description: descriptor.description.clone(),
@@ -748,6 +774,7 @@ fn tool_descriptor(
     tier: ToolTier,
     categories: Vec<ToolCategory>,
     adapter_kind: impl FnOnce(&str) -> ToolAdapterKind,
+    availability: CapabilityAvailability,
 ) -> ToolDescriptor {
     let adapter = adapter_kind(&spec.name);
     let effect = if crate::security::policy::is_read_only_tool(&spec.name) {
@@ -758,6 +785,7 @@ fn tool_descriptor(
     let adapter_label = match adapter {
         ToolAdapterKind::Native => "native",
         ToolAdapterKind::McpAlias => "MCP alias",
+        ToolAdapterKind::WasmPlugin => "WASM plugin",
     };
     ToolDescriptor {
         public_name: spec.name,
@@ -768,9 +796,13 @@ fn tool_descriptor(
         categories,
         effect,
         adapter,
-        availability: CapabilityAvailability::ready(format!(
-            "executable {adapter_label} backend '{backend_name}' is registered"
-        )),
+        availability: if availability.reason.trim().is_empty() {
+            CapabilityAvailability::ready(format!(
+                "executable {adapter_label} backend '{backend_name}' is registered"
+            ))
+        } else {
+            availability
+        },
     }
 }
 

@@ -23,6 +23,7 @@ pub mod config_reload;
 pub mod cron;
 pub mod delegate;
 pub mod document_get_chunk;
+pub mod document_ingest;
 pub mod document_search;
 pub mod error_hints;
 pub mod execution;
@@ -54,6 +55,7 @@ pub(crate) mod sessions_read_model;
 pub mod sessions_send;
 pub mod sessions_spawn;
 pub mod shell;
+pub mod skills;
 pub mod stay_silent;
 pub mod subagents;
 pub(crate) mod tool_diff;
@@ -69,6 +71,7 @@ pub use config_reload::ConfigReloadTool;
 pub use cron::CronTool;
 pub use delegate::DelegateTool;
 pub use document_get_chunk::DocumentGetChunkTool;
+pub use document_ingest::{DocumentIngestTool, DocumentSyncTool};
 pub use document_search::DocumentSearchTool;
 pub use execution::{
     AdapterOwnedPreparation, ApprovalStrategy, DenyApprovalStrategy, EffectPolicy, LegacyToolAdapter,
@@ -85,7 +88,7 @@ pub use git_operations::GitOperationsTool;
 pub use http_request::HttpRequestTool;
 pub use image::ImageTool;
 pub use image_info::ImageInfoTool;
-pub use mcp::McpTool;
+pub use mcp::{McpStatusTool, McpTool};
 pub use memory_forget::MemoryForgetTool;
 pub use memory_get::MemoryGetTool;
 pub use memory_recall::MemoryRecallTool;
@@ -102,6 +105,7 @@ pub use sessions_list::SessionsListTool;
 pub use sessions_send::SessionsSendTool;
 pub use sessions_spawn::SessionsSpawnTool;
 pub use shell::ShellTool;
+pub use skills::{SkillReadTool, SkillsListTool};
 pub use stay_silent::{STAY_SILENT_TOOL_NAME, StaySilentTool};
 pub use subagents::SubagentsTool;
 pub use traits::Tool;
@@ -181,6 +185,26 @@ impl Tool for ArcDelegatingTool {
         self.inner.execute_with_cancellation(args, cancellation).await
     }
 
+    async fn refresh(&self) -> anyhow::Result<()> {
+        self.inner.refresh().await
+    }
+
+    fn supports_name(&self, name: &str) -> bool {
+        self.inner.supports_name(name)
+    }
+
+    async fn set_active_recipient(&self, recipient: &str) {
+        self.inner.set_active_recipient(recipient).await;
+    }
+
+    async fn set_active_channel(&self, channel: Arc<dyn crate::channels::traits::Channel>) {
+        self.inner.set_active_channel(channel).await;
+    }
+
+    fn specs(&self) -> Vec<ToolSpec> {
+        self.inner.specs()
+    }
+
     async fn execute_named(&self, name: &str, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute_named(name, args).await
     }
@@ -202,6 +226,10 @@ impl Tool for ArcDelegatingTool {
 
     fn categories(&self) -> &'static [ToolCategory] {
         self.inner.categories()
+    }
+
+    fn availability(&self) -> crate::capability::CapabilityAvailability {
+        self.inner.availability()
     }
 }
 
@@ -332,6 +360,8 @@ pub fn all_tools_with_runtime_ext(
         Arc::new(ProxyConfigTool::new(shared_config.clone(), security.clone())),
         Arc::new(GitOperationsTool::new(security.clone(), workspace_dir.to_path_buf())),
         Arc::new(PushoverTool::new(security.clone(), workspace_dir.to_path_buf())),
+        Arc::new(SkillsListTool::new(workspace_dir.to_path_buf(), root_config.clone())),
+        Arc::new(SkillReadTool::new(workspace_dir.to_path_buf(), root_config.clone())),
         // stay_silent lets the model decline to reply in smart group-reply mode.
         // Always registered so the loop can resolve the call; its spec is only
         // advertised to the model on smart group turns (loop-side `expose_stay_silent`
@@ -372,6 +402,16 @@ pub fn all_tools_with_runtime_ext(
             workspace_dir.to_path_buf(),
             memory.clone(),
         )));
+        tool_arcs.push(Arc::new(DocumentIngestTool::new(
+            workspace_dir.to_path_buf(),
+            memory.clone(),
+            security.clone(),
+        )));
+        tool_arcs.push(Arc::new(DocumentSyncTool::new(
+            workspace_dir.to_path_buf(),
+            memory.clone(),
+            security.clone(),
+        )));
         tool_arcs.push(Arc::new(MemoryReindexTool::new(memory.clone(), security.clone())));
 
         if config.memory.acl_enabled {
@@ -395,6 +435,7 @@ pub fn all_tools_with_runtime_ext(
         workspace_dir.to_path_buf(),
     ));
     tool_arcs.push(mcp.clone());
+    tool_arcs.push(Arc::new(McpStatusTool::new(mcp.clone())));
     let mcp_tool_ref = Some(mcp);
 
     if let Some(key) = composio_key {
@@ -403,11 +444,11 @@ pub fn all_tools_with_runtime_ext(
         }
     }
 
-    // Network tool surfaces are always registered. HTTP requests are unrestricted
-    // native functionality; timeout and response-size limits are operational only.
+    // Network tool surfaces are always registered. Both HTTP tools enforce the
+    // configured public-domain boundary and block local/private targets.
     tool_arcs.push(Arc::new(HttpRequestTool::new(
         security.clone(),
-        Vec::new(),
+        browser_config.allowed_domains.clone(),
         http_config.max_response_size,
         http_config.timeout_secs,
     )));
@@ -487,6 +528,54 @@ mod tests {
             description: String::new(),
             parameters: serde_json::json!({}),
         }
+    }
+
+    struct DynamicDeclaredTool;
+
+    #[async_trait]
+    impl Tool for DynamicDeclaredTool {
+        fn name(&self) -> &str {
+            "dynamic_root"
+        }
+
+        fn description(&self) -> &str {
+            "test dynamic adapter"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("not executable".to_string()),
+            })
+        }
+
+        fn specs(&self) -> Vec<ToolSpec> {
+            vec![self.spec(), spec("dynamic_alias")]
+        }
+
+        fn supports_name(&self, name: &str) -> bool {
+            matches!(name, "dynamic_root" | "dynamic_alias")
+        }
+
+        fn availability(&self) -> crate::capability::CapabilityAvailability {
+            crate::capability::CapabilityAvailability::declared("test backend unavailable")
+        }
+    }
+
+    #[test]
+    fn arc_registry_adapter_preserves_dynamic_contract() {
+        let tools = boxed_registry_from_arcs(vec![Arc::new(DynamicDeclaredTool)]);
+        assert_eq!(tools[0].specs().len(), 2);
+        assert!(tools[0].supports_name("dynamic_alias"));
+        assert_eq!(
+            tools[0].availability().level,
+            crate::capability::CapabilityAvailabilityLevel::Declared
+        );
     }
 
     #[test]
@@ -589,6 +678,18 @@ mod tests {
         );
         assert!(names.contains(&"http_request"));
         assert!(names.contains(&"web_search_tool"));
+        for added in [
+            "skills_list",
+            "skill_read",
+            "document_ingest",
+            "document_sync",
+            "mcp_status",
+        ] {
+            assert!(
+                names.contains(&added),
+                "new capability tool `{added}` is not registered"
+            );
+        }
         assert!(
             names.contains(&"web_fetch"),
             "web_fetch registration must not depend on its allowlist"
@@ -677,6 +778,13 @@ mod tests {
         assert!(names.contains(&"document_search"));
         assert!(names.contains(&"document_get_chunk"));
         assert!(names.contains(&"memory_reindex"));
+        let catalog = ToolCatalog::from_boxed_registry(&tools);
+        assert!(catalog.descriptor("document_ingest").is_some());
+        assert!(catalog.descriptor("document_sync").is_some());
+        assert!(
+            catalog.tool_specs().iter().all(|spec| spec.name != "document_ingest"),
+            "declared-only document ingestion must not be advertised for markdown memory"
+        );
     }
 
     #[test]

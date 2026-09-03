@@ -7,6 +7,7 @@ use std::time::Duration;
 /// HTTP request tool for API interactions.
 /// Supports GET, POST, PUT, DELETE methods with configurable security.
 pub struct HttpRequestTool {
+    allowed_domains: Vec<String>,
     max_response_size: usize,
     timeout_secs: u64,
 }
@@ -14,13 +15,14 @@ pub struct HttpRequestTool {
 impl HttpRequestTool {
     pub fn new(
         _security: Arc<crate::security::SecurityPolicy>,
-        _legacy_allowed_domains: Vec<String>,
+        allowed_domains: Vec<String>,
         max_response_size: usize,
         timeout_secs: u64,
     ) -> Self {
         Self {
-            max_response_size,
-            timeout_secs,
+            allowed_domains: super::web_fetch::normalize_allowed_domains(allowed_domains),
+            max_response_size: max_response_size.max(1),
+            timeout_secs: timeout_secs.max(1),
         }
     }
 
@@ -37,6 +39,14 @@ impl HttpRequestTool {
 
         if !url.starts_with("http://") && !url.starts_with("https://") {
             anyhow::bail!("Only http:// and https:// URLs are allowed");
+        }
+
+        let host = extract_host(url)?;
+        if is_private_or_local_host(&host) {
+            anyhow::bail!("Blocked local/private host: {host}");
+        }
+        if !self.allowed_domains.is_empty() && !super::web_fetch::host_matches_allowlist(&host, &self.allowed_domains) {
+            anyhow::bail!("Host '{host}' is not in browser.allowed_domains");
         }
 
         Ok(url.to_string())
@@ -117,14 +127,35 @@ impl HttpRequestTool {
         Ok(request.send().await?)
     }
 
-    fn truncate_response(&self, text: &str) -> String {
-        if text.len() > self.max_response_size {
-            let mut truncated = text.chars().take(self.max_response_size).collect::<String>();
-            truncated.push_str("\n\n... [Response truncated due to size limit] ...");
-            truncated
-        } else {
-            text.to_string()
+    async fn read_bounded_response(&self, mut response: reqwest::Response) -> anyhow::Result<String> {
+        let mut bytes = Vec::with_capacity(self.max_response_size.min(64 * 1024));
+        let mut truncated = false;
+
+        while let Some(chunk) = response.chunk().await? {
+            let remaining = self.max_response_size.saturating_sub(bytes.len());
+            if chunk.len() > remaining {
+                if let Some(prefix) = chunk.get(..remaining) {
+                    bytes.extend_from_slice(prefix);
+                }
+                truncated = true;
+                break;
+            }
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() == self.max_response_size {
+                truncated = true;
+                break;
+            }
         }
+
+        Ok(Self::format_response_bytes(&bytes, truncated))
+    }
+
+    fn format_response_bytes(bytes: &[u8], truncated: bool) -> String {
+        let mut text = String::from_utf8_lossy(bytes).into_owned();
+        if truncated {
+            text.push_str("\n\n... [Response truncated due to size limit] ...");
+        }
+        text
     }
 }
 
@@ -226,8 +257,8 @@ impl Tool for HttpRequestTool {
                     .join(", ");
 
                 // Get response body with size limit
-                let response_text = match response.text().await {
-                    Ok(text) => self.truncate_response(&text),
+                let response_text = match self.read_bounded_response(response).await {
+                    Ok(text) => text,
                     Err(e) => format!("[Failed to read response body: {e}]"),
                 };
 
@@ -322,6 +353,9 @@ pub(crate) fn is_private_or_local_host(host: &str) -> bool {
             std::net::IpAddr::V6(v6) => is_non_global_v6(v6),
         };
     }
+    if let Some(ip) = parse_legacy_ipv4(bare) {
+        return is_non_global_v4(ip);
+    }
 
     // DNS rebinding defense: resolve the hostname and check if any resolved
     // IP is private/local. This catches hostnames that pass string checks
@@ -349,6 +383,35 @@ pub(crate) fn is_private_or_local_host(host: &str) -> bool {
     }
 
     false
+}
+
+/// Parse the historical IPv4 forms accepted by libc and many HTTP stacks
+/// (octal, hexadecimal, integer, and shortened dotted notation). Rust's
+/// `IpAddr` deliberately rejects them, so checking them explicitly prevents a
+/// validator/client interpretation gap.
+fn parse_legacy_ipv4(host: &str) -> Option<std::net::Ipv4Addr> {
+    fn component(value: &str) -> Option<u32> {
+        if value.is_empty() {
+            return None;
+        }
+        if let Some(hex) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+            return u32::from_str_radix(hex, 16).ok();
+        }
+        if value.len() > 1 && value.starts_with('0') {
+            return u32::from_str_radix(&value[1..], 8).ok();
+        }
+        value.parse::<u32>().ok()
+    }
+
+    let parts = host.split('.').map(component).collect::<Option<Vec<_>>>()?;
+    let raw = match parts.as_slice() {
+        [value] => *value,
+        [a, b] if *a <= 0xff && *b <= 0x00ff_ffff => (*a << 24) | *b,
+        [a, b, c] if *a <= 0xff && *b <= 0xff && *c <= 0xffff => (*a << 24) | (*b << 16) | *c,
+        [a, b, c, d] if [a, b, c, d].iter().all(|value| **value <= 0xff) => (*a << 24) | (*b << 16) | (*c << 8) | *d,
+        _ => return None,
+    };
+    Some(std::net::Ipv4Addr::from(raw))
 }
 
 /// Returns true if the IPv4 address is not globally routable.
@@ -413,6 +476,33 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("whitespace"));
+    }
+
+    #[test]
+    fn validate_blocks_local_and_private_hosts() {
+        let tool = test_tool(Vec::new());
+        for url in [
+            "http://localhost:8080/secret",
+            "http://127.0.0.1/secret",
+            "http://10.0.0.1/secret",
+            "http://169.254.169.254/latest/meta-data",
+        ] {
+            let error = tool.validate_url(url).expect_err("private target must be blocked");
+            assert!(
+                error.to_string().contains("Blocked local/private host"),
+                "{url}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_enforces_configured_domain_allowlist() {
+        let tool = test_tool(vec!["example.com"]);
+        assert!(tool.validate_url("https://api.example.com/v1").is_ok());
+        let error = tool
+            .validate_url("https://example.org/v1")
+            .expect_err("host outside allowlist must be blocked");
+        assert!(error.to_string().contains("browser.allowed_domains"));
     }
 
     #[test]
@@ -518,17 +608,16 @@ mod tests {
     }
 
     #[test]
-    fn truncate_response_within_limit() {
-        let tool = test_tool(vec!["example.com"]);
-        let text = "hello world";
-        assert_eq!(tool.truncate_response(text), "hello world");
+    fn bounded_response_within_limit() {
+        assert_eq!(
+            HttpRequestTool::format_response_bytes(b"hello world", false),
+            "hello world"
+        );
     }
 
     #[test]
-    fn truncate_response_over_limit() {
-        let tool = HttpRequestTool::new(Arc::new(SecurityPolicy::default()), vec!["example.com".into()], 10, 30);
-        let text = "hello world this is long";
-        let truncated = tool.truncate_response(text);
+    fn bounded_response_marks_truncation() {
+        let truncated = HttpRequestTool::format_response_bytes(b"hello worl", true);
         assert!(truncated.len() <= 10 + 60); // limit + message
         assert!(truncated.contains("[Response truncated"));
     }

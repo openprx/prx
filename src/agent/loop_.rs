@@ -2599,6 +2599,7 @@ pub(crate) fn build_runtime_system_prompt(
     skills: &[crate::skills::Skill],
     native_tools: bool,
     tools_registry: &[Box<dyn Tool>],
+    user_query: Option<&str>,
 ) -> String {
     let bootstrap_max_chars = if config.agent.compact_context { Some(6000) } else { None };
     let mut system_prompt = crate::channels::build_system_prompt_with_mode(
@@ -2614,7 +2615,12 @@ pub(crate) fn build_runtime_system_prompt(
     if !native_tools {
         // These callers (chat REPL, gateway sessions, loop one-shots) are never
         // smart group-reply turns, so `stay_silent` is never advertised here.
-        system_prompt.push_str(&build_tool_instructions(tools_registry, false));
+        system_prompt.push_str(&build_tool_instructions_for_intent(
+            tools_registry,
+            user_query.unwrap_or_default(),
+            &config.tool_tiering,
+            false,
+        ));
     }
 
     system_prompt
@@ -5777,37 +5783,6 @@ async fn run_tool_call_loop_outcome_unguarded(
     // user turn, not just its final iteration.
     let mut any_turn_had_fallback = false;
 
-    let tool_specs: Vec<crate::tools::ToolSpec> = tool_tiering.map_or_else(
-        || crate::tools::ToolCatalog::from_boxed_registry(tools_registry.as_ref()).tool_specs(),
-        |cfg| {
-            let last_user_msg = history
-                .iter()
-                .rev()
-                .find(|m| m.role == "user" && !m.content.is_empty() && !m.content.starts_with("[Tool"))
-                .map(|m| m.content.as_str())
-                .unwrap_or_default();
-            let filtered = crate::tools::intent::select_tools_for_intent(
-                tools_registry.as_ref(),
-                last_user_msg,
-                &cfg.always_include,
-                &cfg.always_exclude,
-            );
-            tracing::debug!(
-                total = tools_registry.len(),
-                filtered = filtered.len(),
-                "tool tiering applied"
-            );
-            crate::tools::ToolCatalog::from_tools(filtered.iter().copied()).tool_specs()
-        },
-    );
-    // `stay_silent` is registered globally so the loop can always resolve a call,
-    // but it is only *advertised* to the model on smart group turns. Filter its
-    // spec out everywhere else so DMs / non-smart turns can never see (and thus
-    // never call) it — one of the three hard-coded "DM never stays silent" guards.
-    // Routed through the single shared exposure gate so every spec-construction
-    // path applies the identical rule.
-    let mut tool_specs = tool_specs;
-    crate::tools::filter_tool_specs_for_exposure(&mut tool_specs, expose_stay_silent);
     let read_only_schedule = ReadOnlyToolScheduleConfig {
         concurrency_window: read_only_tool_concurrency_window.max(1),
         priority_enabled: priority_scheduling_enabled,
@@ -5824,7 +5799,6 @@ async fn run_tool_call_loop_outcome_unguarded(
         crate::providers::traits::ProviderRequestMode::NonStreaming
     };
     let mode_capabilities = provider.capabilities_for(model, provider_mode);
-    let use_native_tools = mode_capabilities.native_tool_calling && !tool_specs.is_empty();
 
     // FIX-P3-05: Letta/MemGPT-style OS-paging. Opt-in (`os_paging.enabled`);
     // when off this whole block is a no-op and the legacy compaction path below
@@ -5940,6 +5914,36 @@ async fn run_tool_call_loop_outcome_unguarded(
                     .await;
             }
         }
+        // Refresh dynamic backends before snapshotting their schemas. Rebuild on
+        // every iteration so MCP discovery and WASM generation swaps cannot leave
+        // the provider with stale ToolSpecs for the remainder of the turn.
+        let mut tool_specs: Vec<crate::tools::ToolSpec> = tool_tiering.map_or_else(
+            || crate::tools::ToolCatalog::from_boxed_registry(tools_registry.as_ref()).tool_specs(),
+            |cfg| {
+                let last_user_msg = history
+                    .iter()
+                    .rev()
+                    .find(|message| {
+                        message.role == "user" && !message.content.is_empty() && !message.content.starts_with("[Tool")
+                    })
+                    .map(|message| message.content.as_str())
+                    .unwrap_or_default();
+                let filtered = crate::tools::intent::select_tools_for_intent(
+                    tools_registry.as_ref(),
+                    last_user_msg,
+                    &cfg.always_include,
+                    &cfg.always_exclude,
+                );
+                tracing::debug!(
+                    total = tools_registry.len(),
+                    filtered = filtered.len(),
+                    "tool tiering applied"
+                );
+                crate::tools::ToolCatalog::from_tools(filtered.iter().copied()).tool_specs()
+            },
+        );
+        crate::tools::filter_tool_specs_for_exposure(&mut tool_specs, expose_stay_silent);
+        let use_native_tools = mode_capabilities.native_tool_calling && !tool_specs.is_empty();
 
         hooks
             .emit(
@@ -6187,20 +6191,18 @@ async fn run_tool_call_loop_outcome_unguarded(
                                     apply_aggressive_trim(history, config.keep_recent_messages);
                                 }
                             }
-                        } else {
-                            if let Err(error) = apply_configurable_compaction(
-                                history,
-                                provider,
-                                model,
-                                config,
-                                document_ingest.as_ref(),
-                                "overflow_retry",
-                            )
-                            .await
-                            {
-                                tracing::warn!("Overflow retry compaction failed: {error}");
-                                apply_aggressive_trim(history, config.keep_recent_messages);
-                            }
+                        } else if let Err(error) = apply_configurable_compaction(
+                            history,
+                            provider,
+                            model,
+                            config,
+                            document_ingest.as_ref(),
+                            "overflow_retry",
+                        )
+                        .await
+                        {
+                            tracing::warn!("Overflow retry compaction failed: {error}");
+                            apply_aggressive_trim(history, config.keep_recent_messages);
                         }
                     } else {
                         apply_aggressive_trim(history, COMPACTION_KEEP_RECENT_MESSAGES);
@@ -6544,7 +6546,31 @@ async fn run_tool_call_loop_outcome_unguarded(
 /// non-native construction site (channels static prompt, skill-RAG rebuild,
 /// `build_runtime_system_prompt`) passes its own smart-turn context here so DMs
 /// / non-smart turns never learn the tool exists.
+#[cfg(test)]
 pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>], expose_stay_silent: bool) -> String {
+    build_tool_instructions_from_tools(tools_registry.iter().map(Box::as_ref), expose_stay_silent)
+}
+
+pub(crate) fn build_tool_instructions_for_intent(
+    tools_registry: &[Box<dyn Tool>],
+    user_message: &str,
+    config: &crate::config::ToolTieringConfig,
+    expose_stay_silent: bool,
+) -> String {
+    let selected = crate::tools::intent::select_tools_for_intent(
+        tools_registry,
+        user_message,
+        &config.always_include,
+        &config.always_exclude,
+    );
+    build_tool_instructions_from_tools(selected, expose_stay_silent)
+}
+
+fn build_tool_instructions_from_tools<'a>(
+    tools: impl IntoIterator<Item = &'a dyn Tool>,
+    expose_stay_silent: bool,
+) -> String {
+    let tool_specs = crate::tools::ToolCatalog::from_tools(tools).tool_specs();
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
     instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
@@ -6558,17 +6584,15 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>], expose_s
     instructions.push_str("Continue reasoning with the results until you can give a final answer.\n\n");
     instructions.push_str("### Available Tools\n\n");
 
-    for tool in tools_registry {
-        for spec in tool.specs() {
-            if !crate::tools::tool_name_is_exposed(&spec.name, expose_stay_silent) {
-                continue;
-            }
-            let _ = writeln!(
-                instructions,
-                "**{}**: {}\nParameters: `{}`\n",
-                spec.name, spec.description, spec.parameters
-            );
+    for spec in tool_specs {
+        if !crate::tools::tool_name_is_exposed(&spec.name, expose_stay_silent) {
+            continue;
         }
+        let _ = writeln!(
+            instructions,
+            "**{}**: {}\nParameters: `{}`\n",
+            spec.name, spec.description, spec.parameters
+        );
     }
 
     instructions
@@ -6994,6 +7018,7 @@ pub(crate) async fn run_with_runtime_envelope(
                 &selected_skills,
                 native_tools,
                 &tools_registry,
+                Some(&msg),
             );
 
             // Auto-save user message to memory (skip short/trivial messages)
@@ -7271,6 +7296,7 @@ pub(crate) async fn run_with_runtime_envelope(
                 &skills,
                 native_tools,
                 &tools_registry,
+                None,
             ))]
         };
 
@@ -7325,6 +7351,7 @@ pub(crate) async fn run_with_runtime_envelope(
                             &skills,
                             native_tools,
                             &tools_registry,
+                            None,
                         )));
                     }
                     // Clear conversation and daily memory
@@ -7423,6 +7450,7 @@ pub(crate) async fn run_with_runtime_envelope(
                 &selected_skills,
                 native_tools,
                 &tools_registry,
+                Some(&user_input),
             );
             if history.is_empty() {
                 history.push(ChatMessage::system(system_prompt));
@@ -7766,6 +7794,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &selected_skills,
         native_tools,
         tools_registry.as_ref(),
+        Some(message),
     );
 
     let runtime_envelope =
@@ -11294,6 +11323,24 @@ ls -la
             shown.contains(STAY_SILENT_TOOL_NAME),
             "stay_silent must be advertised on smart group turns"
         );
+    }
+
+    #[test]
+    fn prompt_guided_instructions_use_the_same_intent_filter_as_native_specs() {
+        use crate::security::SecurityPolicy;
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(crate::tools::HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Vec::new(),
+            1024,
+            5,
+        ))];
+        let config = crate::config::ToolTieringConfig::default();
+
+        let greeting = build_tool_instructions_for_intent(&tools, "hello", &config, false);
+        assert!(!greeting.contains("**http_request**"));
+
+        let web_task = build_tool_instructions_for_intent(&tools, "call this HTTP API", &config, false);
+        assert!(web_task.contains("**http_request**"));
     }
 
     #[test]

@@ -14,11 +14,14 @@ struct McpServerInfo {
     url: String,
     status: String,
     tools: Vec<McpToolInfo>,
+    last_error: Option<String>,
+    last_refresh_at: Option<String>,
 }
 
 #[derive(Serialize)]
 pub(super) struct McpServersResponse {
     servers: Vec<McpServerInfo>,
+    config_error: Option<String>,
 }
 
 pub async fn get_mcp_servers(State(state): State<AppState>) -> Json<McpServersResponse> {
@@ -32,6 +35,16 @@ pub async fn get_mcp_servers(State(state): State<AppState>) -> Json<McpServersRe
         .as_ref()
         .map(|t| t.list_discovered_tools())
         .unwrap_or_default();
+    let runtime_info = runtime
+        .mcp_tool
+        .as_ref()
+        .map(|tool| {
+            tool.server_runtime_info()
+                .into_iter()
+                .map(|server| (server.name.clone(), server))
+                .collect::<std::collections::HashMap<_, _>>()
+        })
+        .unwrap_or_default();
 
     let mut servers = Vec::new();
     for (name, server_config) in &mcp.servers {
@@ -40,8 +53,8 @@ pub async fn get_mcp_servers(State(state): State<AppState>) -> Json<McpServersRe
             |u| u.clone(),
         );
 
-        let has_runtime_tools = discovered.contains_key(name);
-        let status = if has_runtime_tools { "connected" } else { "connecting" };
+        let info = runtime_info.get(name);
+        let status = info.map_or("configured", |info| info.status.as_str());
 
         let tools: Vec<McpToolInfo> = discovered
             .get(name)
@@ -61,10 +74,13 @@ pub async fn get_mcp_servers(State(state): State<AppState>) -> Json<McpServersRe
             url,
             status: status.to_string(),
             tools,
+            last_error: info.and_then(|info| info.last_error.clone()),
+            last_refresh_at: info.and_then(|info| info.last_refresh_at.clone()),
         });
     }
 
     servers.sort_by(|a, b| a.name.cmp(&b.name));
 
-    Json(McpServersResponse { servers })
+    let config_error = runtime.mcp_tool.as_ref().and_then(|tool| tool.config_error());
+    Json(McpServersResponse { servers, config_error })
 }

@@ -24,7 +24,12 @@ impl FileReadTool {
             return false;
         }
 
-        let Ok(rel) = resolved_path.strip_prefix(&self.security.workspace_dir) else {
+        let workspace_root = self
+            .security
+            .workspace_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.security.workspace_dir.clone());
+        let Ok(rel) = resolved_path.strip_prefix(workspace_root) else {
             return false;
         };
 

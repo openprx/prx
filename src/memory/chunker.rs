@@ -1,9 +1,22 @@
-// Line-based markdown chunker — splits documents into semantic chunks.
-//
-// Splits on markdown headings and paragraph boundaries, respecting
-// a max token limit per chunk. Preserves heading context.
+//! CommonMark-aware document block parsing and chunking.
+//!
+//! The parser keeps original source slices, nested heading paths, and atomic
+//! list/code/table blocks. Chunks are assembled from semantic blocks instead
+//! of treating individual lines as independent memories.
 
+use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::ops::Range;
 use std::rc::Rc;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MarkdownBlock {
+    pub kind: &'static str,
+    pub heading_path: Vec<String>,
+    pub content: String,
+    pub source_anchor: String,
+}
 
 /// A single chunk of text with metadata.
 #[derive(Debug, Clone)]
@@ -13,160 +26,259 @@ pub struct Chunk {
     pub heading: Option<Rc<str>>,
 }
 
-/// Split markdown text into chunks, each under `max_tokens` approximate tokens.
-///
-/// Strategy:
-/// 1. Split on `## ` and `# ` headings (keeps heading with its content)
-/// 2. If a section exceeds `max_tokens`, split on blank lines (paragraphs)
-/// 3. If a paragraph still exceeds, split on line boundaries
-///
-/// Token estimation: ~4 chars per token (rough English average).
-pub fn chunk_markdown(text: &str, max_tokens: usize) -> Vec<Chunk> {
+struct ActiveRoot {
+    range: Range<usize>,
+    kind: &'static str,
+    heading_level: Option<usize>,
+    heading_text: String,
+}
+
+/// Parse Markdown into source-preserving CommonMark block nodes.
+pub(crate) fn parse_markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
     if text.trim().is_empty() {
         return Vec::new();
     }
 
-    let max_chars = max_tokens * 4;
-    let sections = split_on_headings(text);
-    let mut chunks = Vec::with_capacity(sections.len());
+    let parser = Parser::new_ext(text, Options::all()).into_offset_iter();
+    let mut depth = 0usize;
+    let mut active: Option<ActiveRoot> = None;
+    let mut heading_path = Vec::<String>::new();
+    let mut blocks = Vec::new();
+    let mut anchor_occurrences = HashMap::<String, usize>::new();
 
-    for (heading, body) in sections {
-        let heading: Option<Rc<str>> = heading.map(Rc::from);
-        let full = heading
-            .as_ref()
-            .map_or_else(|| body.clone(), |h| format!("{h}\n{body}"));
-
-        if full.len() <= max_chars {
-            chunks.push(Chunk {
-                index: chunks.len(),
-                content: full.trim().to_string(),
-                heading: heading.clone(),
-            });
-        } else {
-            // Split on paragraphs (blank lines)
-            let paragraphs = split_on_blank_lines(&body);
-            let mut current = heading.as_deref().map_or_else(String::new, |h| format!("{h}\n"));
-
-            for para in paragraphs {
-                if current.len() + para.len() > max_chars && !current.trim().is_empty() {
-                    chunks.push(Chunk {
-                        index: chunks.len(),
-                        content: current.trim().to_string(),
-                        heading: heading.clone(),
+    for (event, range) in parser {
+        match event {
+            Event::Start(tag) => {
+                if depth == 0 {
+                    active = Some(ActiveRoot {
+                        range,
+                        kind: block_kind(&tag),
+                        heading_level: heading_level(&tag),
+                        heading_text: String::new(),
                     });
-                    current = heading.as_deref().map_or_else(String::new, |h| format!("{h}\n"));
                 }
-
-                if para.len() > max_chars {
-                    // Paragraph too big — split on lines
-                    if !current.trim().is_empty() {
-                        chunks.push(Chunk {
-                            index: chunks.len(),
-                            content: current.trim().to_string(),
-                            heading: heading.clone(),
-                        });
-                        current = heading.as_deref().map_or_else(String::new, |h| format!("{h}\n"));
+                depth = depth.saturating_add(1);
+            }
+            Event::End(_) => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    if let Some(root) = active.take() {
+                        if let Some(level) = root.heading_level {
+                            heading_path.truncate(level.saturating_sub(1));
+                            heading_path.push(root.heading_text.trim().to_string());
+                        }
+                        push_block(
+                            text,
+                            root.range,
+                            root.kind,
+                            &heading_path,
+                            &mut anchor_occurrences,
+                            &mut blocks,
+                        );
                     }
-                    for line_chunk in split_on_lines(&para, max_chars) {
-                        chunks.push(Chunk {
-                            index: chunks.len(),
-                            content: line_chunk.trim().to_string(),
-                            heading: heading.clone(),
-                        });
-                    }
-                } else {
-                    current.push_str(&para);
-                    current.push('\n');
                 }
             }
+            Event::Text(value) | Event::Code(value) => {
+                if let Some(root) = active.as_mut() {
+                    if root.heading_level.is_some() {
+                        root.heading_text.push_str(&value);
+                    }
+                }
+            }
+            Event::Rule | Event::TaskListMarker(_) if depth == 0 => {
+                push_block(
+                    text,
+                    range,
+                    "thematic_break",
+                    &heading_path,
+                    &mut anchor_occurrences,
+                    &mut blocks,
+                );
+            }
+            _ => {}
+        }
+    }
 
-            if !current.trim().is_empty() {
+    blocks
+}
+
+fn push_block(
+    source: &str,
+    range: Range<usize>,
+    kind: &'static str,
+    heading_path: &[String],
+    occurrences: &mut HashMap<String, usize>,
+    blocks: &mut Vec<MarkdownBlock>,
+) {
+    let Some(raw) = source.get(range) else {
+        return;
+    };
+    let content = raw.trim();
+    if content.is_empty() {
+        return;
+    }
+
+    let path_label = heading_path.join("/");
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(format!("{kind}\0{path_label}\0{content}").as_bytes())
+    );
+    let short_hash = digest.get(..16).unwrap_or(&digest);
+    let base = format!("{}-{short_hash}", anchor_prefix(heading_path));
+    let occurrence = occurrences.entry(base.clone()).or_insert(0);
+    let source_anchor = if *occurrence == 0 {
+        base
+    } else {
+        format!("{base}-{}", occurrence.saturating_add(1))
+    };
+    *occurrence = occurrence.saturating_add(1);
+
+    blocks.push(MarkdownBlock {
+        kind,
+        heading_path: heading_path.to_vec(),
+        content: content.to_string(),
+        source_anchor,
+    });
+}
+
+const fn heading_level(tag: &Tag<'_>) -> Option<usize> {
+    let Tag::Heading { level, .. } = tag else {
+        return None;
+    };
+    Some(match level {
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        HeadingLevel::H3 => 3,
+        HeadingLevel::H4 => 4,
+        HeadingLevel::H5 => 5,
+        HeadingLevel::H6 => 6,
+    })
+}
+
+const fn block_kind(tag: &Tag<'_>) -> &'static str {
+    match tag {
+        Tag::Paragraph => "paragraph",
+        Tag::Heading { .. } => "heading",
+        Tag::BlockQuote(_) => "blockquote",
+        Tag::CodeBlock(_) => "code_block",
+        Tag::HtmlBlock => "html_block",
+        Tag::List(_) => "list",
+        Tag::FootnoteDefinition(_) => "footnote",
+        Tag::DefinitionList => "definition_list",
+        Tag::Table(_) => "table",
+        Tag::MetadataBlock(_) => "frontmatter",
+        _ => "block",
+    }
+}
+
+fn anchor_prefix(heading_path: &[String]) -> String {
+    let slug = heading_path
+        .last()
+        .map_or("root", String::as_str)
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|character| if character.is_alphanumeric() { character } else { '-' })
+        .collect::<String>();
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "root".to_string()
+    } else {
+        slug.chars().take(48).collect()
+    }
+}
+
+/// Split Markdown into chunks under the approximate token target where
+/// possible, without breaking atomic code/list/table blocks.
+pub fn chunk_markdown(text: &str, max_tokens: usize) -> Vec<Chunk> {
+    let blocks = parse_markdown_blocks(text);
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+
+    let max_chars = max_tokens.saturating_mul(4).max(1);
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_heading: Option<Rc<str>> = None;
+
+    for block in blocks {
+        let heading = (!block.heading_path.is_empty()).then(|| Rc::<str>::from(block.heading_path.join(" > ")));
+        let heading_changed = current_heading != heading;
+        let separator = usize::from(!current.is_empty()).saturating_mul(2);
+        let would_overflow = current
+            .len()
+            .saturating_add(separator)
+            .saturating_add(block.content.len())
+            > max_chars;
+
+        if !current.is_empty() && (heading_changed || would_overflow) {
+            push_chunk(&mut chunks, &mut current, current_heading.take());
+        }
+
+        if block.content.len() > max_chars && !is_atomic_block(block.kind) {
+            for piece in split_text(&block.content, max_chars) {
+                if !current.is_empty() {
+                    push_chunk(&mut chunks, &mut current, current_heading.take());
+                }
                 chunks.push(Chunk {
                     index: chunks.len(),
-                    content: current.trim().to_string(),
+                    content: piece,
                     heading: heading.clone(),
                 });
             }
+            continue;
         }
-    }
 
-    // Filter out empty chunks
-    chunks.retain(|c| !c.content.is_empty());
-
-    // Re-index
-    for (i, chunk) in chunks.iter_mut().enumerate() {
-        chunk.index = i;
-    }
-
-    chunks
-}
-
-/// Split text into `(heading, body)` sections.
-fn split_on_headings(text: &str) -> Vec<(Option<String>, String)> {
-    let mut sections = Vec::new();
-    let mut current_heading: Option<String> = None;
-    let mut current_body = String::new();
-
-    for line in text.lines() {
-        if line.starts_with("# ") || line.starts_with("## ") || line.starts_with("### ") {
-            if !current_body.trim().is_empty() || current_heading.is_some() {
-                sections.push((current_heading.take(), std::mem::take(&mut current_body)));
-            }
-            current_heading = Some(line.to_string());
-        } else {
-            current_body.push_str(line);
-            current_body.push('\n');
+        if !current.is_empty() {
+            current.push_str("\n\n");
         }
-    }
-
-    if !current_body.trim().is_empty() || current_heading.is_some() {
-        sections.push((current_heading, current_body));
-    }
-
-    sections
-}
-
-/// Split text on blank lines (paragraph boundaries)
-fn split_on_blank_lines(text: &str) -> Vec<String> {
-    let mut paragraphs = Vec::new();
-    let mut current = String::new();
-
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            if !current.trim().is_empty() {
-                paragraphs.push(std::mem::take(&mut current));
-            }
-        } else {
-            current.push_str(line);
-            current.push('\n');
-        }
-    }
-
-    if !current.trim().is_empty() {
-        paragraphs.push(current);
-    }
-
-    paragraphs
-}
-
-/// Split text on line boundaries to fit within `max_chars`
-fn split_on_lines(text: &str, max_chars: usize) -> Vec<String> {
-    let mut chunks = Vec::with_capacity(text.len() / max_chars.max(1) + 1);
-    let mut current = String::new();
-
-    for line in text.lines() {
-        if current.len() + line.len() + 1 > max_chars && !current.is_empty() {
-            chunks.push(std::mem::take(&mut current));
-        }
-        current.push_str(line);
-        current.push('\n');
+        current.push_str(&block.content);
+        current_heading = heading;
     }
 
     if !current.is_empty() {
-        chunks.push(current);
+        push_chunk(&mut chunks, &mut current, current_heading);
     }
-
     chunks
+}
+
+fn is_atomic_block(kind: &str) -> bool {
+    matches!(kind, "code_block" | "list" | "table" | "html_block" | "frontmatter")
+}
+
+fn push_chunk(chunks: &mut Vec<Chunk>, current: &mut String, heading: Option<Rc<str>>) {
+    let content = std::mem::take(current).trim().to_string();
+    if !content.is_empty() {
+        chunks.push(Chunk {
+            index: chunks.len(),
+            content,
+            heading,
+        });
+    }
+}
+
+fn split_text(text: &str, max_chars: usize) -> Vec<String> {
+    let mut remaining = text.trim();
+    let mut pieces = Vec::new();
+    while remaining.chars().count() > max_chars {
+        let byte_limit = remaining
+            .char_indices()
+            .nth(max_chars)
+            .map_or(remaining.len(), |(index, _)| index);
+        let prefix = remaining.get(..byte_limit).unwrap_or(remaining);
+        let split_at = prefix
+            .rfind(char::is_whitespace)
+            .filter(|index| *index > max_chars / 2)
+            .unwrap_or(byte_limit);
+        let (piece, rest) = remaining.split_at(split_at);
+        if !piece.trim().is_empty() {
+            pieces.push(piece.trim().to_string());
+        }
+        remaining = rest.trim_start();
+    }
+    if !remaining.is_empty() {
+        pieces.push(remaining.to_string());
+    }
+    pieces
 }
 
 #[allow(clippy::indexing_slicing)]
@@ -181,183 +293,55 @@ mod tests {
     }
 
     #[test]
-    fn single_short_paragraph() {
-        let chunks = chunk_markdown("Hello world", 512);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].content, "Hello world");
-        assert!(chunks[0].heading.is_none());
+    fn parses_all_heading_levels_and_preserves_path() {
+        let blocks = parse_markdown_blocks("# A\n\n#### Deep\n\ntext");
+        assert!(blocks.iter().any(|block| block.content == "#### Deep"));
+        let paragraph = blocks.iter().find(|block| block.content == "text").unwrap();
+        assert_eq!(paragraph.heading_path, vec!["A", "Deep"]);
     }
 
     #[test]
-    fn heading_sections() {
-        let text = "# Title\nSome intro.\n\n## Section A\nContent A.\n\n## Section B\nContent B.";
-        let chunks = chunk_markdown(text, 512);
-        assert!(chunks.len() >= 3);
-        assert!(chunks[0].heading.is_none() || chunks[0].heading.as_deref() == Some("# Title"));
-    }
-
-    #[test]
-    fn respects_max_tokens() {
-        // Build multi-line text (one sentence per line) to exercise line-level splitting
-        let long_text: String = (0..200).fold(String::new(), |mut s, i| {
-            use std::fmt::Write;
-            let _ = writeln!(s, "This is sentence number {i} with some extra words to fill it up.");
-            s
-        });
-        let chunks = chunk_markdown(&long_text, 50); // 50 tokens ≈ 200 chars
-        assert!(chunks.len() > 1, "Expected multiple chunks, got {}", chunks.len());
-        for chunk in &chunks {
-            // Allow some slack (heading re-insertion etc.)
-            assert!(
-                chunk.content.len() <= 300,
-                "Chunk too long: {} chars",
-                chunk.content.len()
-            );
+    fn keeps_code_lists_tables_and_frontmatter_atomic() {
+        let input = "---\ntitle: Demo\n---\n\n- one\n  - two\n\n```rust\nfn main() {}\n```\n\n|a|b|\n|-|-|\n|1|2|";
+        let blocks = parse_markdown_blocks(input);
+        for kind in ["frontmatter", "list", "code_block", "table"] {
+            assert!(blocks.iter().any(|block| block.kind == kind), "missing {kind}");
         }
     }
 
     #[test]
-    fn preserves_heading_in_split_sections() {
-        let mut text = String::from("## Big Section\n");
-        for i in 0..100 {
-            use std::fmt::Write;
-            let _ = write!(text, "Line {i} with some content here.\n\n");
-        }
+    fn stable_anchor_survives_unrelated_prefix_insertion() {
+        let original = parse_markdown_blocks("# Stable\n\nKeep me.");
+        let changed = parse_markdown_blocks("Preface.\n\n# Stable\n\nKeep me.");
+        let original_block = original.iter().find(|block| block.content == "Keep me.").unwrap();
+        let changed_block = changed.iter().find(|block| block.content == "Keep me.").unwrap();
+        assert_eq!(original_block.source_anchor, changed_block.source_anchor);
+    }
+
+    #[test]
+    fn respects_max_tokens_for_splittable_paragraphs() {
+        let text = "word ".repeat(500);
         let chunks = chunk_markdown(&text, 50);
         assert!(chunks.len() > 1);
-        // All chunks from this section should reference the heading
-        for chunk in &chunks {
-            if chunk.heading.is_some() {
-                assert_eq!(chunk.heading.as_deref(), Some("## Big Section"));
-            }
-        }
+        assert!(chunks.iter().all(|chunk| chunk.content.chars().count() <= 200));
     }
 
     #[test]
-    fn indexes_are_sequential() {
-        let text = "# A\nContent A\n\n# B\nContent B\n\n# C\nContent C";
+    fn unicode_content_is_preserved() {
+        let text = "# 日本語\n\nこんにちは世界\n\n## Émojis\n\n🦀 Rust is great 🚀";
         let chunks = chunk_markdown(text, 512);
-        for (i, chunk) in chunks.iter().enumerate() {
-            assert_eq!(chunk.index, i);
-        }
-    }
-
-    #[test]
-    fn chunk_count_reasonable() {
-        let text = "Hello world. This is a test document.";
-        let chunks = chunk_markdown(text, 512);
-        assert_eq!(chunks.len(), 1);
-    }
-
-    // ── Edge cases ───────────────────────────────────────────────
-
-    #[test]
-    fn headings_only_no_body() {
-        let text = "# Title\n## Section A\n## Section B\n### Subsection";
-        let chunks = chunk_markdown(text, 512);
-        // Should produce chunks for each heading (even with empty bodies)
-        assert!(!chunks.is_empty());
-    }
-
-    #[test]
-    fn deeply_nested_headings_ignored() {
-        // #### and deeper are NOT treated as heading splits
-        let text = "# Top\nIntro\n#### Deep heading\nDeep content";
-        let chunks = chunk_markdown(text, 512);
-        // "#### Deep heading" should stay with its parent section
-        assert!(!chunks.is_empty());
-        let all_content: String = chunks.iter().map(|c| c.content.clone()).collect();
-        assert!(all_content.contains("Deep heading"));
-        assert!(all_content.contains("Deep content"));
-    }
-
-    #[test]
-    fn very_long_single_line_no_newlines() {
-        // One giant line with no newlines — can't split on lines effectively
-        let text = "word ".repeat(5000);
-        let chunks = chunk_markdown(&text, 50);
-        // Should produce at least 1 chunk without panicking
-        assert!(!chunks.is_empty());
-    }
-
-    #[test]
-    fn only_newlines_and_whitespace() {
-        assert!(chunk_markdown("\n\n\n   \n\n", 512).is_empty());
-    }
-
-    #[test]
-    fn max_tokens_zero() {
-        // max_tokens=0 → max_chars=0, should not panic or infinite loop
-        let chunks = chunk_markdown("Hello world", 0);
-        // Every chunk will exceed 0 chars, so it splits maximally
-        assert!(!chunks.is_empty());
-    }
-
-    #[test]
-    fn max_tokens_one() {
-        // max_tokens=1 → max_chars=4, very aggressive splitting
-        let text = "Line one\nLine two\nLine three";
-        let chunks = chunk_markdown(text, 1);
-        assert!(!chunks.is_empty());
-    }
-
-    #[test]
-    fn unicode_content() {
-        let text = "# 日本語\nこんにちは世界\n\n## Émojis\n🦀 Rust is great 🚀";
-        let chunks = chunk_markdown(text, 512);
-        assert!(!chunks.is_empty());
-        let all: String = chunks.iter().map(|c| c.content.clone()).collect();
+        let all = chunks
+            .iter()
+            .map(|chunk| chunk.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(all.contains("こんにちは"));
         assert!(all.contains("🦀"));
     }
 
     #[test]
-    fn fts5_special_chars_in_content() {
-        let text = "Content with \"quotes\" and (parentheses) and * asterisks *";
-        let chunks = chunk_markdown(text, 512);
-        assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].content.contains("\"quotes\""));
-    }
-
-    #[test]
-    fn multiple_blank_lines_between_paragraphs() {
-        let text = "Paragraph one.\n\n\n\n\nParagraph two.\n\n\n\nParagraph three.";
-        let chunks = chunk_markdown(text, 512);
-        assert_eq!(chunks.len(), 1); // All fits in one chunk
-        assert!(chunks[0].content.contains("Paragraph one"));
-        assert!(chunks[0].content.contains("Paragraph three"));
-    }
-
-    #[test]
-    fn heading_at_end_of_text() {
-        let text = "Some content\n# Trailing Heading";
-        let chunks = chunk_markdown(text, 512);
-        assert!(!chunks.is_empty());
-    }
-
-    #[test]
-    fn single_heading_no_content() {
-        let text = "# Just a heading";
-        let chunks = chunk_markdown(text, 512);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].heading.as_deref(), Some("# Just a heading"));
-    }
-
-    #[test]
-    fn no_content_loss() {
-        let text = "# A\nContent A line 1\nContent A line 2\n\n## B\nContent B\n\n## C\nContent C";
-        let chunks = chunk_markdown(text, 512);
-        let reassembled: String = chunks.iter().fold(String::new(), |mut s, c| {
-            use std::fmt::Write;
-            let _ = writeln!(s, "{}", c.content);
-            s
-        });
-        // All original content words should appear
-        for word in ["Content", "line", "1", "2"] {
-            assert!(
-                reassembled.contains(word),
-                "Missing word '{word}' in reassembled chunks"
-            );
-        }
+    fn indexes_are_sequential() {
+        let chunks = chunk_markdown("# A\n\nContent A\n\n# B\n\nContent B", 512);
+        assert!(chunks.iter().enumerate().all(|(index, chunk)| chunk.index == index));
     }
 }

@@ -1,20 +1,59 @@
 # Tools
 
-38 built-in tools organized by category.
+Built-in and dynamically discovered tools are organized by category. The exact
+provider-visible count is selected per turn from intent, configuration, runtime
+health, MCP discovery, and the active WASM generation.
 
 | Category | Tools |
 |----------|-------|
-| **Shell & Files** | `shell`, `file_read`, `file_write`, `git_operations` |
-| **Web** | `web_search`, `web_fetch`, `http_request` |
-| **Memory** | `memory_store`, `memory_recall`, `memory_search`, `memory_get`, `memory_forget` |
+| **Shell & Files** | `shell`, `file_read`, `file_write`, `file_edit`, `git_operations` |
+| **Web** | `web_search_tool`, `web_fetch`, `http_request` |
+| **Memory & Documents** | `memory_store`, `memory_recall`, `memory_search`, `memory_get`, `memory_forget`, `memory_reindex`, `document_search`, `document_get_chunk`, `document_ingest`, `document_sync` |
+| **Skills** | `skills_list`, `skill_read` |
 | **Messaging** | `message_send` |
 | **Sessions** | `sessions_spawn`, `sessions_send`, `sessions_list`, `sessions_history`, `session_status`, `subagents`, `delegate` |
 | **Scheduling** | `cron` (calendar/time scheduling), `xin` (autonomous task and durable Goal/Step workflows) |
 | **Images** | `image`, `image_info` |
-| **MCP** | `mcp` (Model Context Protocol client — connect to any MCP server) |
+| **MCP** | `mcp_call`, `mcp_status`, plus up to 32 discovered aliases |
+| **WASM Plugins** | `wasm_plugin_call`, `wasm_plugins_status`, `wasm_plugin_reload`, plus up to 32 aliases when compiled with `wasm-plugins` |
 | **Remote Nodes** | `nodes` (control paired devices — camera, screen, location, run commands) |
 | **Infrastructure** | `gateway`, `config_reload`, `proxy_config`, `agents_list` |
 | **Integrations** | `composio` (1000+ OAuth apps), `pushover` (notifications) |
+
+`skills_list` reports whether a skill is workspace-trusted or community/lazy,
+and marks `SKILL.toml` tool declarations as `declared_not_executable` until a
+real adapter exists. `skill_read` resolves a skill by catalog name, then reads
+its instruction file or a relative resource under that skill's own canonical
+root. It never turns an arbitrary absolute path into a file-read bypass.
+
+`document_ingest` accepts UTF-8 inline content or a workspace-relative file.
+`document_sync` requires a workspace-relative file and derives a stable document
+id from its canonical source path, so a later sync updates the same durable
+document and chunks. Both operations are approval-gated, limited to 4 MiB, and
+preserve source/hash metadata. `memory_reindex` rebuilds both Memory and Document
+FTS indexes and backfills stale embeddings supported by the active backend.
+Markdown sources are parsed as CommonMark blocks with nested heading paths;
+lists, fenced code, tables, HTML blocks, and frontmatter remain atomic. Cold-start
+Markdown hydration uses stable content anchors instead of line-number keys.
+
+`mcp_status` performs discovery without calling a remote tool and reports each
+server's transport, tool list, last refresh, and retained configuration or
+discovery error. `mcp_call` also accepts `action: list|status|refresh`; its
+backward-compatible default action is `call`. Discovery runs before the
+provider-facing catalog is snapshotted. MCP and WASM aliases are deterministically
+ordered and bounded; their root call tools remain available for capabilities
+outside the alias window.
+
+For prompt-guided models, the textual tool catalog now uses the same per-turn
+intent selection as native function calling. Registered capabilities whose
+availability is only `declared` remain visible to control-plane catalogs but are
+not advertised as executable ToolSpecs.
+
+`http_request` only accepts public HTTP(S) targets. It blocks local, private,
+link-local, multicast, reserved, and legacy numeric-IP forms; applies
+`browser.allowed_domains` when configured; never follows redirects; and stops
+reading the response body at `http_request.max_response_size` rather than
+buffering an unlimited body before truncation.
 
 `cron` schedules with `kind: "at"` are one-shot regardless of physical retention: after their final success or failure they expose a typed terminal state and are never due again. `delete_after_run` atomically removes the job with its successful terminal commit; failures remain visible for run and event audit. The cron tool's update action can re-arm a retained terminal job with a new future `at` schedule; setting `enabled: true` alone does not, and an in-flight `at` schedule cannot be replaced. Manual `run` remains available for paused or terminal jobs; only a nonterminal `at` is consumed into terminal state. The CLI supports creating and displaying `at` jobs but does not expose an `at`-schedule update flag.
 

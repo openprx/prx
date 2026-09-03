@@ -9,6 +9,7 @@ use parking_lot::RwLock;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{ServiceExt, model::CallToolRequestParams};
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -18,6 +19,8 @@ use tokio::process::Command;
 
 const MCP_JSON_FILE: &str = "mcp.json";
 const MCP_ROOT_NAME: &str = "mcp_call";
+const MCP_DISCOVERY_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+const MCP_MAX_ALIAS_SPECS: usize = 32;
 
 // ── Security: command whitelist & env var blocklist ──────────────────
 
@@ -74,6 +77,20 @@ struct RuntimeState {
     /// Whether initial tool discovery has been performed at least once.
     initialized: bool,
     discovered_tools: HashMap<String, HashMap<String, DiscoveredToolMeta>>, // server -> tool -> meta
+    discovery_errors: HashMap<String, String>,
+    config_error: Option<String>,
+    last_refresh_attempt: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct McpServerRuntimeInfo {
+    pub name: String,
+    pub transport: String,
+    pub status: String,
+    pub tool_count: usize,
+    pub tools: Vec<String>,
+    pub last_error: Option<String>,
+    pub last_refresh_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -120,6 +137,16 @@ pub struct McpTool {
     state: RwLock<RuntimeState>,
 }
 
+pub struct McpStatusTool {
+    mcp: Arc<McpTool>,
+}
+
+impl McpStatusTool {
+    pub const fn new(mcp: Arc<McpTool>) -> Self {
+        Self { mcp }
+    }
+}
+
 /// Put an MCP stdio server's child into the runtime work registry.
 ///
 /// The transport owns the child, so the ledger row is bound to the returned
@@ -138,6 +165,9 @@ impl McpTool {
             mcp_json_mtime: None,
             initialized: false,
             discovered_tools: HashMap::new(),
+            discovery_errors: HashMap::new(),
+            config_error: None,
+            last_refresh_attempt: None,
         };
 
         Self {
@@ -161,6 +191,55 @@ impl McpTool {
             result.insert(server_name.clone(), entries);
         }
         result
+    }
+
+    pub fn server_runtime_info(&self) -> Vec<McpServerRuntimeInfo> {
+        let state = self.state.read();
+        let last_refresh_at = state
+            .last_refresh_attempt
+            .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339());
+        let mut servers = state
+            .effective_config
+            .servers
+            .iter()
+            .map(|(name, config)| {
+                let mut tools = state
+                    .discovered_tools
+                    .get(name)
+                    .map(|entries| entries.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                tools.sort();
+                let last_error = state.discovery_errors.get(name).cloned();
+                let status = if last_error.is_some() {
+                    "error"
+                } else if state.discovered_tools.contains_key(name) {
+                    "healthy"
+                } else if state.initialized {
+                    "unavailable"
+                } else {
+                    "configured"
+                };
+                McpServerRuntimeInfo {
+                    name: name.clone(),
+                    transport: match config.transport {
+                        McpTransport::Stdio => "stdio",
+                        McpTransport::Http => "http",
+                    }
+                    .to_string(),
+                    status: status.to_string(),
+                    tool_count: tools.len(),
+                    tools,
+                    last_error,
+                    last_refresh_at: last_refresh_at.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        servers.sort_by(|left, right| left.name.cmp(&right.name));
+        servers
+    }
+
+    pub fn config_error(&self) -> Option<String> {
+        self.state.read().config_error.clone()
     }
 
     fn alias_name(prefix: &str, server: &str, tool: &str) -> String {
@@ -671,39 +750,63 @@ impl McpTool {
         Ok(Self::extract_call_success_and_output(&value))
     }
 
-    async fn refresh_runtime_state(&self) {
+    async fn refresh_runtime_state(&self, force: bool) {
         let file_mtime = Self::file_mtime(&self.mcp_json_path).ok().flatten();
-        let (current_mtime, initialized) = {
+        let (current_mtime, initialized, has_errors, last_refresh_attempt) = {
             let state = self.state.read();
-            (state.mcp_json_mtime, state.initialized)
+            (
+                state.mcp_json_mtime,
+                state.initialized,
+                !state.discovery_errors.is_empty(),
+                state.last_refresh_attempt,
+            )
         };
 
         // Skip if already initialized and config file hasn't changed.
         // Note: `None == None` when there is no mcp.json — we must NOT skip on the
         // very first call (before `initialized` is set to true), otherwise tools are
         // never discovered when the user relies purely on config.toml.
-        if initialized && file_mtime == current_mtime {
-            return;
+        if !force && initialized && file_mtime == current_mtime {
+            if !has_errors
+                || last_refresh_attempt
+                    .and_then(|attempt| attempt.elapsed().ok())
+                    .is_some_and(|elapsed| elapsed < MCP_DISCOVERY_RETRY_BACKOFF)
+            {
+                return;
+            }
         }
 
-        let new_config = if let Ok(Some(from_file)) = self.load_effective_config_from_json() {
-            from_file
-        } else {
-            self.base_config.clone()
+        let (new_config, config_error) = match self.load_effective_config_from_json() {
+            Ok(Some(from_file)) => (from_file, None),
+            Ok(None) => (self.base_config.clone(), None),
+            Err(error) => {
+                tracing::warn!(path = %self.mcp_json_path.display(), error = %error, "MCP config reload failed");
+                (self.base_config.clone(), Some(error.to_string()))
+            }
         };
 
         let mut discovered = HashMap::new();
+        let mut discovery_errors = HashMap::new();
         for (server_name, server) in &new_config.servers {
-            if let Ok(tools) = Self::discover_server_tools(server_name, server).await {
-                discovered.insert(server_name.clone(), tools);
+            match Self::discover_server_tools(server_name, server).await {
+                Ok(tools) => {
+                    discovered.insert(server_name.clone(), tools);
+                }
+                Err(error) => {
+                    tracing::warn!(server = server_name, error = %error, "MCP tool discovery failed");
+                    discovery_errors.insert(server_name.clone(), error.to_string());
+                }
             }
         }
 
         let mut state = self.state.write();
         state.effective_config = new_config;
         state.discovered_tools = discovered;
+        state.discovery_errors = discovery_errors;
+        state.config_error = config_error;
         state.mcp_json_mtime = file_mtime;
         state.initialized = true;
+        state.last_refresh_attempt = Some(SystemTime::now());
     }
 
     fn refresh_state_from_file_only(&self) {
@@ -713,16 +816,20 @@ impl McpTool {
             return;
         }
 
-        let new_config = if let Ok(Some(from_file)) = self.load_effective_config_from_json() {
-            from_file
-        } else {
-            self.base_config.clone()
+        let (new_config, config_error) = match self.load_effective_config_from_json() {
+            Ok(Some(from_file)) => (from_file, None),
+            Ok(None) => (self.base_config.clone(), None),
+            Err(error) => (self.base_config.clone(), Some(error.to_string())),
         };
 
         let mut state = self.state.write();
         state.effective_config = new_config;
         state.discovered_tools.clear();
+        state.discovery_errors.clear();
+        state.config_error = config_error;
         state.mcp_json_mtime = file_mtime;
+        state.initialized = false;
+        state.last_refresh_attempt = None;
     }
 
     async fn validate_and_call(
@@ -765,6 +872,7 @@ impl Tool for McpTool {
 
     fn description(&self) -> &str {
         "Call tools exposed by configured MCP servers. \
+         Also lists discovery status/errors and supports explicit refresh. \
          Supports hot config reload from workspace/mcp.json and dynamic aliases."
     }
 
@@ -772,7 +880,8 @@ impl Tool for McpTool {
         self.refresh_state_from_file_only();
 
         let state = self.state.read();
-        let server_names = state.effective_config.servers.keys().cloned().collect::<Vec<_>>();
+        let mut server_names = state.effective_config.servers.keys().cloned().collect::<Vec<_>>();
+        server_names.sort();
 
         let mut tool_set = HashSet::new();
         for per_server in state.discovered_tools.values() {
@@ -806,6 +915,12 @@ impl Tool for McpTool {
         json!({
             "type": "object",
             "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["call", "list", "status", "refresh"],
+                    "default": "call",
+                    "description": "call invokes a remote tool; list/status inspect discovery; refresh forces rediscovery"
+                },
                 "server": server_schema,
                 "tool": tool_schema,
                 "arguments": {
@@ -814,15 +929,16 @@ impl Tool for McpTool {
                     "default": {}
                 }
             },
-            "required": ["server", "tool"]
+            "additionalProperties": false
         })
     }
 
     fn specs(&self) -> Vec<ToolSpec> {
         self.refresh_state_from_file_only();
 
+        let root = self.spec();
         let state = self.state.read();
-        let mut specs = vec![self.spec()];
+        let mut aliases = Vec::new();
 
         for (server_name, tools) in &state.discovered_tools {
             let Some(server_cfg) = state.effective_config.servers.get(server_name) else {
@@ -834,7 +950,7 @@ impl Tool for McpTool {
                 }
 
                 let alias = Self::alias_name(&server_cfg.tool_name_prefix, server_name, tool_name);
-                specs.push(ToolSpec {
+                aliases.push(ToolSpec {
                     name: alias,
                     description: meta
                         .description
@@ -847,7 +963,11 @@ impl Tool for McpTool {
                 });
             }
         }
-
+        aliases.sort_by(|left, right| left.name.cmp(&right.name));
+        aliases.truncate(MCP_MAX_ALIAS_SPECS);
+        let mut specs = Vec::with_capacity(aliases.len().saturating_add(1));
+        specs.push(root);
+        specs.extend(aliases);
         specs
     }
 
@@ -861,7 +981,7 @@ impl Tool for McpTool {
     }
 
     async fn refresh(&self) -> anyhow::Result<()> {
-        self.refresh_runtime_state().await;
+        self.refresh_runtime_state(false).await;
         Ok(())
     }
 
@@ -870,6 +990,30 @@ impl Tool for McpTool {
     }
 
     async fn execute_named(&self, name: &str, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let action = if name == MCP_ROOT_NAME {
+            args.get("action").and_then(serde_json::Value::as_str).unwrap_or("call")
+        } else {
+            "call"
+        };
+        if name == MCP_ROOT_NAME && matches!(action, "list" | "status" | "refresh") {
+            self.refresh_runtime_state(action == "refresh").await;
+            return Ok(ToolResult {
+                success: true,
+                output: serde_json::to_string_pretty(&json!({
+                    "initialized": self.state.read().initialized,
+                    "config_error": self.config_error(),
+                    "servers": self.server_runtime_info(),
+                }))?,
+                error: None,
+            });
+        }
+        if action != "call" {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Unknown MCP action '{action}'")),
+            });
+        }
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
@@ -878,7 +1022,7 @@ impl Tool for McpTool {
             });
         }
 
-        self.refresh_runtime_state().await;
+        self.refresh_runtime_state(false).await;
 
         let (server_name, tool_name, arguments) = if name == MCP_ROOT_NAME {
             let server_name = args
@@ -952,6 +1096,81 @@ impl Tool for McpTool {
 
     fn categories(&self) -> &'static [ToolCategory] {
         &[ToolCategory::Automation]
+    }
+
+    fn availability(&self) -> crate::capability::CapabilityAvailability {
+        let state = self.state.read();
+        if state.config_error.is_some() {
+            return crate::capability::CapabilityAvailability::configured("workspace MCP configuration is invalid");
+        }
+        if state.effective_config.servers.is_empty() {
+            return crate::capability::CapabilityAvailability::declared("no MCP servers are configured");
+        }
+        if !state.discovery_errors.is_empty() {
+            return crate::capability::CapabilityAvailability::configured(format!(
+                "MCP configuration/discovery degraded: {} server error(s)",
+                state.discovery_errors.len(),
+            ));
+        }
+        if state.initialized {
+            crate::capability::CapabilityAvailability::healthy(format!(
+                "{} MCP server(s) discovered successfully",
+                state.discovered_tools.len()
+            ))
+        } else {
+            crate::capability::CapabilityAvailability::configured(format!(
+                "{} MCP server(s) configured; discovery pending",
+                state.effective_config.servers.len()
+            ))
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for McpStatusTool {
+    fn name(&self) -> &str {
+        "mcp_status"
+    }
+
+    fn description(&self) -> &str {
+        "Discover configured MCP servers and report tools, transport, health, and the latest error without invoking a remote tool."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {"refresh": {"type": "boolean", "default": false}},
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let force = args
+            .get("refresh")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        self.mcp.refresh_runtime_state(force).await;
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&json!({
+                "config_error": self.mcp.config_error(),
+                "servers": self.mcp.server_runtime_info(),
+                "alias_exposure_limit": MCP_MAX_ALIAS_SPECS,
+            }))?,
+            error: None,
+        })
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Automation]
+    }
+
+    fn availability(&self) -> crate::capability::CapabilityAvailability {
+        self.mcp.availability()
     }
 }
 
@@ -1232,16 +1451,20 @@ mod tests {
     }
 
     #[test]
-    fn mcp_tool_schema_requires_server_and_tool() {
+    fn mcp_tool_schema_exposes_call_and_diagnostic_actions() {
         let tool = McpTool::new(
             Arc::new(SecurityPolicy::default()),
             McpConfig::default(),
             std::env::temp_dir(),
         );
         let schema = tool.parameters_schema();
-        let required = schema["required"].as_array().expect("test: required");
-        assert!(required.iter().any(|v| v == "server"));
-        assert!(required.iter().any(|v| v == "tool"));
+        let actions = schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("test: action enum");
+        for action in ["call", "list", "status", "refresh"] {
+            assert!(actions.iter().any(|value| value == action));
+        }
+        assert!(schema.get("required").is_none());
     }
 
     #[test]
@@ -1267,6 +1490,82 @@ mod tests {
         );
         let tools = tool.list_discovered_tools();
         assert!(tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_is_available_in_read_only_mode() {
+        let tool = McpTool::new(
+            Arc::new(SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::ReadOnly,
+                ..SecurityPolicy::default()
+            }),
+            McpConfig::default(),
+            std::env::temp_dir(),
+        );
+
+        let result = tool.execute(json!({"action": "status"})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("\"servers\""));
+    }
+
+    #[test]
+    fn runtime_info_preserves_discovery_errors() {
+        let mut config = McpConfig::default();
+        config.servers.insert("broken".into(), McpServerConfig::default());
+        let tool = McpTool::new(Arc::new(SecurityPolicy::default()), config, std::env::temp_dir());
+        {
+            let mut state = tool.state.write();
+            state.initialized = true;
+            state
+                .discovery_errors
+                .insert("broken".into(), "connection failed".into());
+        }
+
+        let info = tool.server_runtime_info();
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].status, "error");
+        assert_eq!(info[0].last_error.as_deref(), Some("connection failed"));
+    }
+
+    #[test]
+    fn alias_specs_are_deterministic_and_bounded_with_root_fallback() {
+        let mut config = McpConfig::default();
+        config.servers.insert("demo".into(), McpServerConfig::default());
+        let tool = McpTool::new(Arc::new(SecurityPolicy::default()), config, std::env::temp_dir());
+        {
+            let mut state = tool.state.write();
+            state.discovered_tools.insert(
+                "demo".into(),
+                (0..40)
+                    .map(|index| (format!("tool_{index:02}"), DiscoveredToolMeta::default()))
+                    .collect(),
+            );
+            state.initialized = true;
+        }
+
+        let specs = tool.specs();
+        assert_eq!(specs.len(), MCP_MAX_ALIAS_SPECS + 1);
+        assert_eq!(specs[0].name, MCP_ROOT_NAME);
+        assert!(specs[1..].windows(2).all(|pair| pair[0].name < pair[1].name));
+    }
+
+    #[test]
+    fn invalid_workspace_config_is_retained_for_diagnostics() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        std::fs::write(workspace.path().join(MCP_JSON_FILE), "{ invalid json").unwrap();
+        let tool = McpTool::new(
+            Arc::new(SecurityPolicy::default()),
+            McpConfig::default(),
+            workspace.path().to_path_buf(),
+        );
+
+        let _ = tool.parameters_schema();
+        assert!(tool.config_error().is_some());
+        assert_eq!(
+            tool.availability().level,
+            crate::capability::CapabilityAvailabilityLevel::Configured,
+            "an invalid workspace override must remain visible as degraded configuration"
+        );
     }
 
     // ── SideEffectGate coverage (design d03 / P0-C, largest un-gated surface) ──

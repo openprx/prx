@@ -1140,12 +1140,14 @@ fn build_gateway_turn_runtime(
 
     tools_list.push(Box::new(tools::ConfigReloadTool::with_security(
         shared_config,
-        security,
+        security.clone(),
     )));
 
     #[cfg(feature = "wasm-plugins")]
     if let Some(runtime) = &plugin_runtime {
         tools_list.push(runtime.tool_router());
+        tools_list.push(runtime.status_tool());
+        tools_list.push(runtime.reload_tool(security.clone()));
     }
 
     let tools_registry = Arc::new(tools_list);
@@ -1418,6 +1420,8 @@ pub async fn run_gateway(
         let tool_count = router.specs().len();
         tracing::info!(count = tool_count, "registering dynamic WASM plugin tool router");
         tools_list.push(router);
+        tools_list.push(runtime.status_tool());
+        tools_list.push(runtime.reload_tool(security.clone()));
         tracing::debug!(generation = runtime.generation_id(), "WASM plugin runtime ready");
     }
 

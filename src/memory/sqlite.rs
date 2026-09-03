@@ -2859,7 +2859,10 @@ impl SqliteMemory {
             let pool = self.pool.clone();
             crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
                 let conn = pool.write();
-                conn.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('rebuild');")?;
+                conn.execute_batch(
+                    "INSERT INTO memories_fts(memories_fts) VALUES('rebuild');
+                     INSERT INTO document_chunks_fts(document_chunks_fts) VALUES('rebuild');",
+                )?;
                 Ok(())
             })
             .await??;
@@ -8629,6 +8632,35 @@ source: tool_output\n\
         mem.store("r2", "reindex test beta", MemoryCategory::Core, None)
             .await
             .unwrap();
+        let principal = MemoryPrincipal {
+            workspace_id: "ws-reindex".to_string(),
+            ..MemoryPrincipal::default()
+        };
+        mem.ingest_document(DocumentIngestInput {
+            document_id: Some("reindex-document".to_string()),
+            workspace_id: principal.workspace_id.clone(),
+            owner_id: None,
+            topic_id: None,
+            task_id: None,
+            source_message_event_id: None,
+            source_kind: "test".to_string(),
+            source_uri: None,
+            title: Some("Reindex document".to_string()),
+            content: "document fts sentinel".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            visibility: MemoryVisibility::Workspace,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+
+        mem.pool.write().execute("DELETE FROM document_chunks_fts", []).unwrap();
+        assert!(
+            mem.search_document_chunks(&principal, "sentinel", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         // Reindex should succeed (noop embedder → 0 re-embedded)
         let count = mem.reindex().await.unwrap();
@@ -8637,6 +8669,8 @@ source: tool_output\n\
         // FTS should still work after rebuild
         let results = mem.recall("reindex", 10, None).await.unwrap();
         assert_eq!(results.len(), 2);
+        let document_results = mem.search_document_chunks(&principal, "sentinel", 10).await.unwrap();
+        assert_eq!(document_results.len(), 1);
     }
 
     // ── Recall limit test ────────────────────────────────────────

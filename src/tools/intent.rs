@@ -70,7 +70,12 @@ impl IntentClassifier {
             ("proxy", ToolCategory::System),
             ("node", ToolCategory::System),
             ("gateway", ToolCategory::System),
+            ("skill", ToolCategory::System),
+            ("\u{6280}\u{80fd}", ToolCategory::System),
             ("mcp", ToolCategory::Automation),
+            ("plugin", ToolCategory::Automation),
+            ("wasm", ToolCategory::Automation),
+            ("\u{63d2}\u{4ef6}", ToolCategory::Automation),
             ("composio", ToolCategory::Automation),
             ("delegate", ToolCategory::Automation),
             ("agent", ToolCategory::Automation),
@@ -116,7 +121,7 @@ pub fn select_tools_for_intent<'a>(
 ) -> Vec<&'a dyn Tool> {
     let activated = CLASSIFIER.classify(user_message);
 
-    all_tools
+    let selected = all_tools
         .iter()
         .filter(|tool| {
             let name = tool.name();
@@ -145,7 +150,22 @@ pub fn select_tools_for_intent<'a>(
             }
         })
         .map(|t| t.as_ref())
-        .collect()
+        .collect::<Vec<_>>();
+
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let selected_names = selected.iter().map(|tool| tool.name()).collect::<HashSet<_>>();
+        let mut active = selected_names.iter().copied().collect::<Vec<_>>();
+        let mut rejected = all_tools
+            .iter()
+            .map(|tool| tool.name())
+            .filter(|name| !selected_names.contains(name))
+            .collect::<Vec<_>>();
+        active.sort_unstable();
+        rejected.sort_unstable();
+        tracing::debug!(?active, ?rejected, "capability routing decision");
+    }
+
+    selected
 }
 
 #[cfg(test)]

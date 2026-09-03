@@ -273,6 +273,7 @@ async fn run_console_runtime_turn(
         &selected_skills,
         native_tools,
         turn_runtime.tools_registry.as_ref(),
+        Some(visible_message),
     );
 
     let mut turn_envelope = envelope

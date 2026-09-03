@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "openprx"
-version = "0.8.79"
+version = "0.8.80"
 edition = "2024"
 rust-version = "1.97.1"
 authors = ["g1e2x87"]
@@ -55,6 +55,7 @@ matrix-sdk = { version = "0.16", optional = true, default-features = false, feat
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_ignored = "0.1"
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+pulldown-cmark = { version = "0.13", default-features = false }
 
 # Config
 directories = "6.0"

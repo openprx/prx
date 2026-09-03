@@ -274,7 +274,7 @@ impl Tool for WebFetchTool {
     }
 }
 
-fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
+pub(crate) fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
     let mut normalized = domains
         .into_iter()
         .filter_map(|domain| normalize_domain(&domain))
@@ -351,7 +351,7 @@ fn extract_host(url: &str) -> anyhow::Result<String> {
     Ok(host)
 }
 
-fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
+pub(crate) fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
     allowed_domains
         .iter()
         .any(|domain| host == domain || host.strip_suffix(domain).is_some_and(|prefix| prefix.ends_with('.')))

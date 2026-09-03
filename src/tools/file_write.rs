@@ -264,10 +264,8 @@ mod tests {
     }
 
     fn approved_args(workspace: &std::path::Path, path: &str, content: &str) -> serde_json::Value {
-        let target = workspace.join(path);
-        let parent = target.parent().unwrap_or(workspace);
-        let file_name = target.file_name().unwrap_or_default();
-        let resolved_target = parent.join(file_name);
+        let resolved_workspace = workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
+        let resolved_target = resolved_workspace.join(path);
         let operation = op_id::op_id("file_write", "write", &[&op_id::ref_for_file(&resolved_target)]);
         json!({
             "path": path,

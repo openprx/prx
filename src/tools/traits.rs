@@ -145,6 +145,14 @@ pub trait Tool: Send + Sync {
         &[]
     }
 
+    /// Evidence-backed runtime availability for the canonical capability catalog.
+    fn availability(&self) -> crate::capability::CapabilityAvailability {
+        crate::capability::CapabilityAvailability::ready(format!(
+            "executable native backend '{}' is registered",
+            self.name()
+        ))
+    }
+
     /// Execute by public tool name. Default maps to `execute`.
     async fn execute_named(&self, name: &str, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         if !self.supports_name(name) {
@@ -187,6 +195,8 @@ mod tests {
 
     struct DummyTool;
 
+    struct DeclaredTool;
+
     #[async_trait]
     impl Tool for DummyTool {
         fn name(&self) -> &str {
@@ -216,6 +226,33 @@ mod tests {
                     .to_string(),
                 error: None,
             })
+        }
+    }
+
+    #[async_trait]
+    impl Tool for DeclaredTool {
+        fn name(&self) -> &str {
+            "declared"
+        }
+
+        fn description(&self) -> &str {
+            "Known but unavailable"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("declared capabilities are not executable".to_string()),
+            })
+        }
+
+        fn availability(&self) -> crate::capability::CapabilityAvailability {
+            crate::capability::CapabilityAvailability::declared("backend unavailable")
         }
     }
 
@@ -256,5 +293,13 @@ mod tests {
 
         assert!(!parsed.success);
         assert_eq!(parsed.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn declared_capability_stays_discoverable_but_is_not_provider_visible() {
+        let tool = DeclaredTool;
+        let catalog = crate::tools::ToolCatalog::from_tools([&tool as &dyn Tool]);
+        assert!(catalog.descriptor("declared").is_some());
+        assert!(catalog.tool_specs().is_empty());
     }
 }

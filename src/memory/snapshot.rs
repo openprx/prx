@@ -370,16 +370,17 @@ fn parse_snapshot(input: &str) -> Vec<(String, String)> {
 }
 
 fn parse_memory_markdown_entries(path_label: &str, input: &str) -> Vec<(String, String)> {
-    input
-        .lines()
-        .enumerate()
-        .filter_map(|(idx, line)| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                return None;
-            }
-            let clean = trimmed.strip_prefix("- ").unwrap_or(trimmed);
-            Some((format!("{path_label}:{}", idx + 1), clean.to_string()))
+    super::chunker::parse_markdown_blocks(input)
+        .into_iter()
+        .filter(|block| block.kind != "heading")
+        .map(|block| {
+            let key = format!("{path_label}:block:{}", block.source_anchor);
+            let value = if block.heading_path.is_empty() {
+                block.content
+            } else {
+                format!("Heading: {}\n\n{}", block.heading_path.join(" > "), block.content)
+            };
+            (key, value)
         })
         .collect()
 }
@@ -528,14 +529,29 @@ Rule 3: Protect the user.
     }
 
     #[test]
-    fn parse_memory_markdown_entries_skips_headers_and_blank_lines() {
-        let input = "# Header\n\n- item one\nitem two\n";
+    fn parse_memory_markdown_entries_preserves_semantic_blocks_and_headings() {
+        let input = "# Header\n\n- item one\n- item two\n\n```rust\nlet value = 1;\n```\n";
         let entries = parse_memory_markdown_entries("MEMORY.md", input);
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].0, "MEMORY.md:3");
-        assert_eq!(entries[0].1, "item one");
-        assert_eq!(entries[1].0, "MEMORY.md:4");
-        assert_eq!(entries[1].1, "item two");
+        assert!(entries.iter().all(|(key, _)| key.starts_with("MEMORY.md:block:")));
+        assert!(entries.iter().any(|(_, value)| value.contains("item one\n- item two")));
+        assert!(entries.iter().any(|(_, value)| value.contains("let value = 1")));
+        assert!(entries.iter().any(|(_, value)| value.contains("Heading: Header")));
+    }
+
+    #[test]
+    fn markdown_memory_keys_do_not_depend_on_line_numbers() {
+        let original = parse_memory_markdown_entries("MEMORY.md", "# Stable\n\nKeep me.");
+        let prefixed = parse_memory_markdown_entries("MEMORY.md", "Unrelated.\n\n# Stable\n\nKeep me.");
+        let original_key = original
+            .iter()
+            .find(|(_, value)| value.contains("Keep me."))
+            .map(|entry| &entry.0);
+        let prefixed_key = prefixed
+            .iter()
+            .find(|(_, value)| value.contains("Keep me."))
+            .map(|entry| &entry.0);
+        assert_eq!(original_key, prefixed_key);
     }
 
     #[test]
@@ -676,7 +692,7 @@ Rule 3: Protect the user.
         fs::write(tmp.path().join("MEMORY.md"), "# Memory\n- one\n- two\n").unwrap();
 
         let count = hydrate_from_snapshot(tmp.path()).unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 1, "one Markdown list is one semantic block");
     }
 
     #[test]
@@ -689,9 +705,11 @@ Rule 3: Protect the user.
 
         let conn = Connection::open(tmp.path().join("memory").join("brain.db")).unwrap();
         let visibility: String = conn
-            .query_row("SELECT visibility FROM memories WHERE key = 'MEMORY.md:2'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT visibility FROM memories WHERE key LIKE 'MEMORY.md:block:%'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(visibility, "owner");
     }

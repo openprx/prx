@@ -81,6 +81,9 @@ impl PerfRecorder {
 }
 
 /// 读 `/proc/self/status` 的 `VmHWM` (Linux); 其他平台返回 0.
+// The Linux implementation performs runtime file I/O; on non-Linux targets the
+// cfg-reduced body is constant, which would otherwise trigger a false-positive.
+#[allow(clippy::missing_const_for_fn)]
 fn read_vmhwm_kb() -> u64 {
     #[cfg(target_os = "linux")]
     {

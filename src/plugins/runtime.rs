@@ -21,7 +21,12 @@ use super::error::{PluginError, PluginResult};
 use super::event_bus::EventBus;
 use super::registry::PluginInfo;
 use crate::memory::traits::Memory;
-use crate::tools::{Tool, ToolResult, ToolSpec};
+use crate::security::SecurityPolicy;
+use crate::security::op_id;
+use crate::security::policy::{ApprovalGrant, ResourceRiskLevel, SideEffectGate};
+use crate::tools::{Tool, ToolCategory, ToolResult, ToolSpec, ToolTier};
+
+const WASM_MAX_ALIAS_SPECS: usize = 32;
 
 struct PluginGeneration {
     id: u64,
@@ -157,6 +162,19 @@ impl PluginRuntime {
         })
     }
 
+    pub fn status_tool(self: &Arc<Self>) -> Box<dyn Tool> {
+        Box::new(PluginStatusTool {
+            runtime: Arc::clone(self),
+        })
+    }
+
+    pub fn reload_tool(self: &Arc<Self>, security: Arc<SecurityPolicy>) -> Box<dyn Tool> {
+        Box::new(PluginReloadTool {
+            runtime: Arc::clone(self),
+            security,
+        })
+    }
+
     fn spawn_cron_scheduler(runtime: &Arc<Self>) {
         let runtime = Arc::downgrade(runtime);
         tokio::spawn(async move {
@@ -182,48 +200,27 @@ struct PluginToolRouter {
     runtime: Arc<PluginRuntime>,
 }
 
-#[async_trait]
-impl Tool for PluginToolRouter {
-    fn name(&self) -> &str {
-        "wasm_plugin_router"
+struct PluginStatusTool {
+    runtime: Arc<PluginRuntime>,
+}
+
+impl PluginToolRouter {
+    async fn execute_root(
+        &self,
+        args: serde_json::Value,
+        cancellation: Option<CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        let tool = args
+            .get("tool")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|tool| !tool.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing non-empty 'tool' parameter"))?;
+        let arguments = args.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({}));
+        self.dispatch_alias(tool, arguments, cancellation).await
     }
 
-    fn description(&self) -> &str {
-        "Internal dynamic router for WASM plugin tools"
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({"type": "object"})
-    }
-
-    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        anyhow::bail!("wasm_plugin_router is internal and must be called by a public plugin tool name")
-    }
-
-    fn specs(&self) -> Vec<ToolSpec> {
-        self.runtime
-            .generation
-            .load()
-            .tools
-            .iter()
-            .flat_map(|tool| tool.specs())
-            .collect()
-    }
-
-    fn supports_name(&self, name: &str) -> bool {
-        self.runtime
-            .generation
-            .load()
-            .tools
-            .iter()
-            .any(|tool| tool.supports_name(name))
-    }
-
-    async fn execute_named(&self, name: &str, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        self.execute_named_with_cancellation(name, args, None).await
-    }
-
-    async fn execute_named_with_cancellation(
+    async fn dispatch_alias(
         &self,
         name: &str,
         args: serde_json::Value,
@@ -237,6 +234,217 @@ impl Tool for PluginToolRouter {
             );
         };
         tool.execute_named_with_cancellation(name, args, cancellation).await
+    }
+}
+
+#[async_trait]
+impl Tool for PluginStatusTool {
+    fn name(&self) -> &str {
+        "wasm_plugins_status"
+    }
+
+    fn description(&self) -> &str {
+        "List loaded WASM plugins and the atomically published runtime generation."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let plugins = self.runtime.list_plugins().await;
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&serde_json::json!({
+                "generation": self.runtime.generation_id(),
+                "count": plugins.len(),
+                "plugins": plugins,
+            }))?,
+            error: None,
+        })
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Standard
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::System, ToolCategory::Automation]
+    }
+
+    fn availability(&self) -> crate::capability::CapabilityAvailability {
+        crate::capability::CapabilityAvailability::healthy(format!(
+            "WASM runtime generation {} is published",
+            self.runtime.generation_id()
+        ))
+    }
+}
+
+struct PluginReloadTool {
+    runtime: Arc<PluginRuntime>,
+    security: Arc<SecurityPolicy>,
+}
+
+#[async_trait]
+impl Tool for PluginReloadTool {
+    fn name(&self) -> &str {
+        "wasm_plugin_reload"
+    }
+
+    fn description(&self) -> &str {
+        "Atomically rebuild and reload one already-known WASM plugin by name."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "Loaded plugin name"}},
+            "required": ["name"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let name = args
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing non-empty 'name' parameter"))?;
+        let operation_name = op_id::op_id(self.name(), "reload", &[name]);
+        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+        if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
+            self.name(),
+            &operation_name,
+            ResourceRiskLevel::Low,
+            approval_grant.as_ref(),
+        ) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            });
+        }
+        match self.runtime.reload_plugin(name).await {
+            Ok(generation) => Ok(ToolResult {
+                success: true,
+                output: serde_json::json!({"plugin": name, "generation": generation}).to_string(),
+                error: None,
+            }),
+            Err(error) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error.to_string()),
+            }),
+        }
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::System, ToolCategory::Automation]
+    }
+}
+
+#[async_trait]
+impl Tool for PluginToolRouter {
+    fn name(&self) -> &str {
+        "wasm_plugin_call"
+    }
+
+    fn description(&self) -> &str {
+        "Call a tool exposed by the current atomically published WASM plugin generation."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        let mut names = self
+            .runtime
+            .generation
+            .load()
+            .tools
+            .iter()
+            .flat_map(|tool| tool.specs().into_iter().map(|spec| spec.name))
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tool": {"type": "string", "enum": names},
+                "arguments": {"type": "object", "default": {}}
+            },
+            "required": ["tool"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.execute_root(args, None).await
+    }
+
+    fn specs(&self) -> Vec<ToolSpec> {
+        let root = self.spec();
+        let mut aliases = self
+            .runtime
+            .generation
+            .load()
+            .tools
+            .iter()
+            .flat_map(|tool| tool.specs())
+            .collect::<Vec<_>>();
+        aliases.sort_by(|left, right| left.name.cmp(&right.name));
+        aliases.dedup_by(|left, right| left.name == right.name);
+        aliases.truncate(WASM_MAX_ALIAS_SPECS);
+        let mut specs = Vec::with_capacity(aliases.len().saturating_add(1));
+        specs.push(root);
+        specs.extend(aliases);
+        specs
+    }
+
+    fn supports_name(&self, name: &str) -> bool {
+        name == self.name()
+            || self
+                .runtime
+                .generation
+                .load()
+                .tools
+                .iter()
+                .any(|tool| tool.supports_name(name))
+    }
+
+    async fn execute_named(&self, name: &str, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.execute_named_with_cancellation(name, args, None).await
+    }
+
+    async fn execute_named_with_cancellation(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        cancellation: Option<CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        if name == self.name() {
+            return self.execute_root(args, cancellation).await;
+        }
+        self.dispatch_alias(name, args, cancellation).await
+    }
+
+    fn availability(&self) -> crate::capability::CapabilityAvailability {
+        let generation = self.runtime.generation.load();
+        crate::capability::CapabilityAvailability::healthy(format!(
+            "WASM generation {} exposes {} executable tool backend(s)",
+            generation.id,
+            generation.tools.len()
+        ))
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Automation]
     }
 }
 
@@ -316,5 +524,24 @@ optional = []
         assert!(runtime.reload_plugin("atomic-test").await.is_err());
         assert_eq!(runtime.generation_id(), 2);
         assert_eq!(runtime.list_plugins().await.first().unwrap().version, "2.0.0");
+    }
+
+    #[tokio::test]
+    async fn agent_control_tools_expose_generation_and_root_call_fallback() {
+        let temp = TempDir::new().unwrap();
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        let router = runtime.tool_router();
+        let status = runtime.status_tool();
+
+        assert_eq!(router.name(), "wasm_plugin_call");
+        assert_eq!(
+            router.specs().first().map(|spec| spec.name.as_str()),
+            Some("wasm_plugin_call")
+        );
+        assert!(router.supports_name("wasm_plugin_call"));
+
+        let result = status.execute(serde_json::json!({})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("\"generation\": 1"));
     }
 }

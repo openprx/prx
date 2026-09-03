@@ -386,6 +386,10 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     // Document retrieval (RAG) reads.
     "document_search",
     "document_get_chunk",
+    "skills_list",
+    "skill_read",
+    "wasm_plugins_status",
+    "mcp_status",
     // Web reads.
     "web_fetch",
     "web_search_tool",

@@ -69,9 +69,9 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
-use crate::agent::loop_::{
-    DocumentIngestRuntime, ScopeContext, build_context_with_shared_events_and_scope, build_tool_instructions,
-};
+#[cfg(test)]
+use crate::agent::loop_::build_tool_instructions;
+use crate::agent::loop_::{DocumentIngestRuntime, ScopeContext, build_context_with_shared_events_and_scope};
 use crate::config::Config;
 use crate::hooks::HookManager;
 use crate::identity;
@@ -860,25 +860,6 @@ const fn smart_group_prompt_addendum(mentioned: bool) -> &'static str {
            most messages — do not feel obliged to reply.\n\
          - Never reply just to acknowledge; silence is better than noise.\n"
     }
-}
-
-/// Prompt-guided instruction block advertising ONLY the `stay_silent` tool, for
-/// the non-native + skill-RAG-off smart group-reply path. The startup static
-/// prompt deliberately excludes `stay_silent` (so DMs / non-smart never see it);
-/// this appends just that tool's spec on a smart group turn so a prompt-guided
-/// model learns it exists. Native providers advertise it via filtered tool specs
-/// instead and never need this.
-fn stay_silent_tool_instructions() -> String {
-    let tool = tools::StaySilentTool::new();
-    let mut block = String::from("\n### Additional Tool (group chat)\n\n");
-    for spec in tool.specs() {
-        let _ = writeln!(
-            block,
-            "**{}**: {}\nParameters: `{}`\n",
-            spec.name, spec.description, spec.parameters
-        );
-    }
-    block
 }
 
 fn prompt_trim(value: &str, max_chars: usize) -> String {
@@ -3460,18 +3441,26 @@ async fn run_channel_turn(
         if !rag_ctx.native_tools {
             // Skill-RAG rebuild path: advertise `stay_silent` only on smart group
             // turns, mirroring the native spec gate so DMs / non-smart never see it.
-            prompt.push_str(&build_tool_instructions(&ctx.tools_registry, smart_group));
+            prompt.push_str(&crate::agent::loop_::build_tool_instructions_for_intent(
+                &ctx.tools_registry,
+                &msg.content,
+                &message_runtime.tool_tiering,
+                smart_group,
+            ));
         }
         prompt
     } else {
-        // Static-prompt path (skill RAG off): `ctx.system_prompt` is built once at
-        // startup with `stay_silent` excluded (build_tool_instructions(.., false)).
-        // For a non-native smart group turn we must still teach the model the tool,
-        // so append just its instruction block here. Native providers get it via
-        // the per-turn filtered tool specs instead.
+        // Static-prompt path (skill RAG off): append the same intent-selected
+        // prompt-guided registry used by the native ToolSpec path. `stay_silent`
+        // remains gated to smart group turns by the shared exposure helper.
         let mut prompt = ctx.system_prompt.to_string();
-        if smart_group && !ctx.native_tools {
-            prompt.push_str(&stay_silent_tool_instructions());
+        if !ctx.native_tools {
+            prompt.push_str(&crate::agent::loop_::build_tool_instructions_for_intent(
+                &ctx.tools_registry,
+                &msg.content,
+                &message_runtime.tool_tiering,
+                smart_group,
+            ));
         }
         prompt
     };
@@ -5546,7 +5535,7 @@ pub async fn start_channels_with_config(
     let native_tools = provider
         .capabilities_for(&model, crate::providers::traits::ProviderRequestMode::NonStreaming)
         .native_tool_calling;
-    let mut system_prompt = build_system_prompt_with_mode(
+    let system_prompt = build_system_prompt_with_mode(
         &workspace,
         &model,
         &tool_descs,
@@ -5555,12 +5544,9 @@ pub async fn start_channels_with_config(
         bootstrap_max_chars,
         native_tools,
     );
-    if !native_tools {
-        // Startup static prompt: NEVER advertise `stay_silent` here — this prompt
-        // is reused for every turn (DM and group). A non-native smart group turn
-        // appends the tool's instructions per-turn in `process_channel_message`.
-        system_prompt.push_str(&build_tool_instructions(&tools_list, false));
-    }
+    // Prompt-guided tools are selected per message in `process_channel_message`.
+    // Keeping them out of this reusable startup prompt prevents a full registry
+    // dump and lets native/non-native paths share the same intent boundary.
 
     if !skills.is_empty() {
         println!(
@@ -6001,6 +5987,8 @@ pub async fn start_channels_with_config(
             "registering dynamic WASM plugin tool router in channels"
         );
         tools_list.push(router);
+        tools_list.push(runtime.status_tool());
+        tools_list.push(runtime.reload_tool(security.clone()));
         hooks.set_plugin_runtime(Arc::clone(runtime)).await;
         tracing::debug!(
             generation = runtime.generation_id(),
