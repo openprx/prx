@@ -7836,7 +7836,7 @@ fn resolve_agent_turn_envelope(
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let observer: Arc<dyn Observer> = Arc::from(observability::create_observer(&config.observability));
-    let hooks = HookManager::new(config.workspace_dir.clone());
+    let hooks = Arc::new(HookManager::new(config.workspace_dir.clone()));
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
     let shared_config = crate::config::new_shared(config.clone());
     let config_generation = shared_config.pin();
@@ -7865,6 +7865,20 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     )?);
     let memory_fabric = MemoryFabric::new(mem.clone(), config.workspace_dir.to_string_lossy())
         .with_event_recording(config.memory.event_recording_config());
+    #[cfg(feature = "wasm-plugins")]
+    let wasm_plugin_runtime = if let Some(runtime) = wasm_early_runtime {
+        runtime
+            .attach_memory(Arc::clone(&mem))
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to attach WASM memory backend: {error}"))?;
+        Some(runtime)
+    } else {
+        crate::plugins::init_plugin_runtime(&config.workspace_dir, Some(Arc::clone(&mem))).await
+    };
+    #[cfg(feature = "wasm-plugins")]
+    if let Some(runtime) = &wasm_plugin_runtime {
+        hooks.set_plugin_runtime(Arc::clone(runtime)).await;
+    }
     let agent_run_id = Uuid::new_v4().to_string();
     let agent_session_key = format!("agent:{agent_run_id}");
 
@@ -7877,7 +7891,12 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         (None, None)
     };
     #[allow(unused_mut)]
-    let mut tools_registry = tools::all_tools_with_runtime(
+    let mut extensions = hooks.control_tool_arcs(Arc::clone(&security));
+    #[cfg(feature = "wasm-plugins")]
+    if let Some(runtime) = &wasm_plugin_runtime {
+        extensions.extend(runtime.control_tool_arcs(Arc::clone(&security)));
+    }
+    let tools_registry = tools::all_tools_with_runtime_ext_and_extensions(
         Arc::new(config.clone()),
         Arc::clone(&shared_config),
         &security,
@@ -7891,25 +7910,9 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
-    );
-    #[cfg(feature = "wasm-plugins")]
-    let wasm_plugin_runtime = if let Some(runtime) = wasm_early_runtime {
-        runtime
-            .attach_memory(Arc::clone(&mem))
-            .await
-            .map_err(|error| anyhow::anyhow!("failed to attach WASM memory backend: {error}"))?;
-        Some(runtime)
-    } else {
-        crate::plugins::init_plugin_runtime(&config.workspace_dir, Some(Arc::clone(&mem))).await
-    };
-    #[cfg(feature = "wasm-plugins")]
-    if let Some(runtime) = &wasm_plugin_runtime {
-        tools_registry.push(runtime.tool_router());
-        tools_registry.push(runtime.status_tool());
-        tools_registry.push(runtime.reload_tool(Arc::clone(&security)));
-        tools_registry.push(runtime.manage_tool(Arc::clone(&security)));
-        hooks.set_plugin_runtime(Arc::clone(runtime)).await;
-    }
+        extensions,
+    )
+    .tools;
     let tools_registry = Arc::new(tools_registry);
 
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
@@ -8012,7 +8015,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &mut history,
         Arc::clone(&tools_registry),
         observer.as_ref(),
-        &hooks,
+        hooks.as_ref(),
         provider_name,
         &model_name,
         config.default_temperature,

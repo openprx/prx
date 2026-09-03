@@ -4356,6 +4356,32 @@ impl AllowedToolProxy {
             .find(|tool| tool.supports_name(&self.public_name))
             .map(|tool| tool.as_ref())
     }
+
+    fn source_spec(&self) -> Option<crate::tools::ToolSpec> {
+        self.find_source_tool()?
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == self.public_name)
+    }
+
+    fn rewrite_args(&self, mut args: serde_json::Value) -> serde_json::Value {
+        if self.public_name == "memory_store"
+            && let Some(prefix) = &self.memory_prefix
+        {
+            let new_key = args
+                .get("key")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(|key| memory_key_prefix(prefix, key));
+            if let Some(new_key) = new_key
+                && let Some(map) = args.as_object_mut()
+            {
+                map.insert("key".to_string(), serde_json::Value::String(new_key));
+            }
+        }
+        args
+    }
 }
 
 #[async_trait]
@@ -4371,33 +4397,15 @@ impl Tool for AllowedToolProxy {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        self.find_source_tool()
-            .map(|tool| tool.parameters_schema())
-            .unwrap_or_else(|| {
-                json!({
-                    "type": "object",
-                    "description": "Unavailable proxied tool"
-                })
+        self.source_spec().map(|spec| spec.parameters).unwrap_or_else(|| {
+            json!({
+                "type": "object",
+                "description": "Unavailable proxied tool"
             })
+        })
     }
 
-    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if self.public_name == "memory_store" {
-            if let Some(prefix) = &self.memory_prefix {
-                let new_key = args
-                    .get("key")
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|k| !k.is_empty())
-                    .map(|key| memory_key_prefix(prefix, key));
-                if let Some(new_key) = new_key {
-                    if let Some(m) = args.as_object_mut() {
-                        m.insert("key".to_string(), serde_json::Value::String(new_key));
-                    }
-                }
-            }
-        }
-
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let Some(tool) = self.find_source_tool() else {
             return Ok(ToolResult {
                 success: false,
@@ -4406,7 +4414,88 @@ impl Tool for AllowedToolProxy {
             });
         };
 
-        tool.execute_named(&self.public_name, args).await
+        tool.execute_named(&self.public_name, self.rewrite_args(args)).await
+    }
+
+    async fn execute_with_cancellation(
+        &self,
+        args: serde_json::Value,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        self.execute_named_with_cancellation(&self.public_name, args, cancellation)
+            .await
+    }
+
+    async fn refresh(&self) -> anyhow::Result<()> {
+        if let Some(tool) = self.find_source_tool() {
+            tool.refresh().await?;
+        }
+        Ok(())
+    }
+
+    fn supports_name(&self, name: &str) -> bool {
+        self.find_source_tool().is_some_and(|tool| {
+            if self.public_name == tool.name() {
+                tool.supports_name(name)
+            } else {
+                name == self.public_name
+            }
+        })
+    }
+
+    fn specs(&self) -> Vec<crate::tools::ToolSpec> {
+        let Some(tool) = self.find_source_tool() else {
+            return vec![self.spec()];
+        };
+        if self.public_name == tool.name() {
+            tool.specs()
+        } else {
+            self.source_spec().into_iter().collect()
+        }
+    }
+
+    fn tier(&self) -> crate::tools::ToolTier {
+        self.find_source_tool()
+            .map_or(crate::tools::ToolTier::Standard, Tool::tier)
+    }
+
+    fn categories(&self) -> &'static [crate::tools::ToolCategory] {
+        self.find_source_tool().map_or(&[], Tool::categories)
+    }
+
+    fn availability(&self) -> crate::capability::CapabilityAvailability {
+        self.find_source_tool().map_or_else(
+            || crate::capability::CapabilityAvailability::declared("proxied tool is not registered"),
+            Tool::availability,
+        )
+    }
+
+    async fn execute_named(&self, name: &str, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let Some(tool) = self.find_source_tool() else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Tool '{}' is not registered.", self.public_name)),
+            });
+        };
+        tool.execute_named(name, self.rewrite_args(args)).await
+    }
+
+    async fn execute_named_with_cancellation(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        let Some(tool) = self.find_source_tool() else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Tool '{}' is not registered.", self.public_name)),
+            });
+        };
+        tool.execute_named_with_cancellation(name, self.rewrite_args(args), cancellation)
+            .await
     }
 }
 
@@ -4423,9 +4512,12 @@ fn resolve_tools_for_agent(
             .filter(|item| !item.is_empty())
             .collect::<Vec<_>>()
     });
+    let inherit_all = allowlist
+        .as_ref()
+        .is_none_or(|items| items.len() == 1 && items.first().is_some_and(|name| *name == "*"));
 
     let mut selected_names = Vec::new();
-    if let Some(list) = allowlist {
+    if !inherit_all && let Some(list) = allowlist {
         for name in list {
             if !selected_names.contains(&name) {
                 selected_names.push(name);
@@ -6004,6 +6096,75 @@ mod tests {
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy::default())
+    }
+
+    struct DynamicCapabilityTool;
+
+    #[async_trait]
+    impl Tool for DynamicCapabilityTool {
+        fn name(&self) -> &str {
+            "capability_call"
+        }
+
+        fn description(&self) -> &str {
+            "dynamic capability fixture"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {"root": {"type": "boolean"}}})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "capability_call".to_string(),
+                error: None,
+            })
+        }
+
+        fn specs(&self) -> Vec<crate::tools::ToolSpec> {
+            vec![
+                self.spec(),
+                crate::tools::ToolSpec {
+                    name: "capability__dynamic".to_string(),
+                    description: "dynamic alias".to_string(),
+                    parameters: json!({"type": "object", "required": ["value"]}),
+                },
+            ]
+        }
+
+        fn supports_name(&self, name: &str) -> bool {
+            matches!(name, "capability_call" | "capability__dynamic")
+        }
+
+        async fn execute_named(&self, name: &str, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: name.to_string(),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn wildcard_tool_inheritance_preserves_dynamic_specs_and_execution() {
+        let source: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(DynamicCapabilityTool)]);
+        let allowed = vec!["*".to_string()];
+        let tools = resolve_tools_for_agent(source, "worker", MemoryScope::Shared, Some(&allowed));
+
+        assert_eq!(tools.len(), 1);
+        let proxy = tools.first().expect("wildcard inherits root tool");
+        assert_eq!(proxy.name(), "capability_call");
+        assert!(proxy.supports_name("capability__dynamic"));
+        assert!(
+            proxy.specs().iter().any(|spec| spec.name == "capability__dynamic"),
+            "dynamic MCP/WASM-style aliases must survive inheritance"
+        );
+        let result = proxy
+            .execute_named("capability__dynamic", json!({"value": 1}))
+            .await
+            .expect("dynamic alias executes");
+        assert_eq!(result.output, "capability__dynamic");
     }
 
     // ── Sub-agent provider override: resilience evidence ─────────

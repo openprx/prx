@@ -424,7 +424,13 @@ impl RuntimeBootstrap {
             } else {
                 (None, None)
             };
-            let mut registry = tools::all_tools_with_runtime(
+            #[allow(unused_mut)]
+            let mut extensions = hooks.control_tool_arcs(Arc::clone(&security));
+            #[cfg(feature = "wasm-plugins")]
+            if let Some(plugin_runtime) = &plugin_runtime {
+                extensions.extend(plugin_runtime.control_tool_arcs(Arc::clone(&security)));
+            }
+            let registry = tools::all_tools_with_runtime_ext_and_extensions(
                 Arc::clone(&config),
                 Arc::clone(&config_manager),
                 &security,
@@ -438,16 +444,9 @@ impl RuntimeBootstrap {
                 &config.agents,
                 config.api_key.as_deref(),
                 &config,
-            );
-            registry.push(hooks.status_tool());
-            registry.push(hooks.manage_tool(Arc::clone(&security)));
-            #[cfg(feature = "wasm-plugins")]
-            if let Some(plugin_runtime) = &plugin_runtime {
-                registry.push(plugin_runtime.tool_router());
-                registry.push(plugin_runtime.status_tool());
-                registry.push(plugin_runtime.reload_tool(Arc::clone(&security)));
-                registry.push(plugin_runtime.manage_tool(Arc::clone(&security)));
-            }
+                extensions,
+            )
+            .tools;
             if matches!(profile, BootstrapProfile::Interactive) {
                 base_tools = Some(parking_lot::Mutex::new(Some(registry)));
             } else {
@@ -479,6 +478,37 @@ impl RuntimeBootstrap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_model_managed_capability_surface(tools: &[Box<dyn Tool>]) {
+        let names = tools.iter().map(|tool| tool.name()).collect::<Vec<_>>();
+        for expected in [
+            "skills_list",
+            "skill_read",
+            "skills_manage",
+            "skill_execute",
+            "mcp_call",
+            "mcp_status",
+            "hooks_status",
+            "hooks_manage",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing model-managed capability tool {expected}"
+            );
+        }
+        #[cfg(feature = "wasm-plugins")]
+        for expected in [
+            "wasm_plugin_call",
+            "wasm_plugins_status",
+            "wasm_plugin_reload",
+            "wasm_plugins_manage",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing model-managed capability tool {expected}"
+            );
+        }
+    }
 
     /// Minimal usable test config: an in-memory/markdown-free SQLite memory in a
     /// temp workspace, observer disabled, router disabled. Mirrors how other
@@ -546,16 +576,7 @@ mod tests {
             .expect("test: Interactive must build base_tools");
         let taken = base.lock().take().expect("test: base_tools present once");
         assert!(!taken.is_empty(), "tool registry should be non-empty");
-        let names = taken.iter().map(|tool| tool.name()).collect::<Vec<_>>();
-        assert!(names.contains(&"hooks_status"));
-        assert!(names.contains(&"hooks_manage"));
-        #[cfg(feature = "wasm-plugins")]
-        {
-            assert!(names.contains(&"wasm_plugin_call"));
-            assert!(names.contains(&"wasm_plugins_status"));
-            assert!(names.contains(&"wasm_plugin_reload"));
-            assert!(names.contains(&"wasm_plugins_manage"));
-        }
+        assert_model_managed_capability_surface(&taken);
         // The owned Vec is a one-shot take; the inner Option is now None.
         assert!(base.lock().is_none(), "base_tools take is one-shot");
         // Interactive does not enable the router.
@@ -573,6 +594,7 @@ mod tests {
 
         assert!(ctx.memory.is_some(), "AgentLoop must build memory");
         assert!(ctx.tools.is_some(), "AgentLoop must build tools");
+        assert_model_managed_capability_surface(ctx.tools.as_deref().expect("AgentLoop tools"));
         // AgentLoop has the same router footprint as Interactive: never routes.
         #[cfg(feature = "llm-router")]
         assert!(ctx.router.is_none(), "AgentLoop must not build router");

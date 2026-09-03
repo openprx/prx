@@ -19,6 +19,23 @@ health, MCP discovery, and the active WASM generation.
 | **Hooks** | `hooks_status`, `hooks_manage` |
 | **Remote Nodes** | `nodes` (control paired devices — camera, screen, location, run commands) |
 | **Infrastructure** | `gateway`, `config_reload`, `proxy_config`, `agents_list` |
+
+The model-managed capability surface is built from the same core registry in
+every model-running entrypoint:
+
+| Entrypoint | Skills | MCP | Hooks | WASM |
+|---|---:|---:|---:|---:|
+| `prx chat` (TUI or plain) | yes | yes | yes | yes |
+| `prx agent` (interactive or one-shot) | yes | yes | yes | yes |
+| embedded `process_message` | yes | yes | yes | yes |
+| standalone IM channel supervisor | yes | yes | yes | yes |
+| gateway/webhook turns | yes | yes | yes | yes |
+| delegated/session-worker turns | yes | yes | yes | yes |
+
+Delegated and session-worker turns still honor an agent's explicit
+`allowed_tools` boundary. `allowed_tools = ["*"]` inherits the complete parent
+registry, including dynamically discovered MCP and WASM aliases; a narrower
+allowlist intentionally exposes only the named capabilities.
 | **Integrations** | `composio` (1000+ OAuth apps), `pushover` (notifications) |
 
 `skills_list` reports active and disabled skills, their origin/loading mode,

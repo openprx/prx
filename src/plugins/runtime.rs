@@ -274,6 +274,27 @@ impl PluginRuntime {
         })
     }
 
+    /// Shared model-facing surface used when top-level and delegated turns must
+    /// address the same reload-safe plugin generation.
+    pub fn control_tool_arcs(self: &Arc<Self>, security: Arc<SecurityPolicy>) -> Vec<Arc<dyn Tool>> {
+        vec![
+            Arc::new(PluginToolRouter {
+                runtime: Arc::clone(self),
+            }),
+            Arc::new(PluginStatusTool {
+                runtime: Arc::clone(self),
+            }),
+            Arc::new(PluginReloadTool {
+                runtime: Arc::clone(self),
+                security: Arc::clone(&security),
+            }),
+            Arc::new(PluginManageTool {
+                runtime: Arc::clone(self),
+                security,
+            }),
+        ]
+    }
+
     /// Atomically rebuild every plugin adapter from the filesystem.
     pub async fn refresh_all(&self) -> PluginResult<u64> {
         let _reload_guard = self.reload_lock.lock().await;

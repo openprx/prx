@@ -284,6 +284,35 @@ impl HookManager {
         Box::new(HooksStatusTool { manager: self.clone() })
     }
 
+    /// Shared control objects for registries that must preserve identity across
+    /// top-level and delegated turns.
+    pub fn control_tool_arcs(
+        self: &std::sync::Arc<Self>,
+        security: std::sync::Arc<crate::security::SecurityPolicy>,
+    ) -> Vec<std::sync::Arc<dyn crate::tools::Tool>> {
+        vec![
+            std::sync::Arc::new(HooksStatusTool { manager: self.clone() }),
+            std::sync::Arc::new(HooksManageTool {
+                manager: self.clone(),
+                security,
+            }),
+        ]
+    }
+
+    /// Append the model-visible control surface for this exact live manager.
+    ///
+    /// Every model-running entrypoint uses this helper so status/management
+    /// cannot accidentally target a different hook generation, or be omitted
+    /// while hook execution itself remains enabled.
+    pub fn append_control_tools(
+        self: &std::sync::Arc<Self>,
+        tools: &mut Vec<Box<dyn crate::tools::Tool>>,
+        security: std::sync::Arc<crate::security::SecurityPolicy>,
+    ) {
+        tools.push(self.status_tool());
+        tools.push(self.manage_tool(security));
+    }
+
     pub async fn emit(&self, event: HookEvent, payload: serde_json::Value) {
         if let Err(err) = self.refresh_if_changed() {
             tracing::warn!(error = %err, "hooks refresh failed");
@@ -884,6 +913,20 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let manager = HookManager::new(temp.path().to_path_buf());
         assert_eq!(manager.hooks_json_path, temp.path().join(HOOKS_JSON_FILE));
+    }
+
+    #[test]
+    fn append_control_tools_publishes_complete_live_surface() {
+        let temp = TempDir::new().unwrap();
+        let manager = std::sync::Arc::new(HookManager::new(temp.path().to_path_buf()));
+        let mut tools = Vec::new();
+        manager.append_control_tools(
+            &mut tools,
+            std::sync::Arc::new(crate::security::SecurityPolicy::default()),
+        );
+
+        let names = tools.iter().map(|tool| tool.name()).collect::<Vec<_>>();
+        assert_eq!(names, vec!["hooks_status", "hooks_manage"]);
     }
 
     // ── refresh_if_changed edge cases ───────────────────────────

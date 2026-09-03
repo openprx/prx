@@ -924,14 +924,17 @@ impl DelegateTool {
             });
         }
 
-        let parent_tool_names = self
+        let eligible_parent_tools = self
             .parent_tools
             .iter()
-            .map(|tool| tool.name())
-            .filter(|name| *name != "delegate")
-            .collect::<std::collections::HashSet<_>>();
+            .filter(|tool| tool.name() != "delegate")
+            .collect::<Vec<_>>();
         if !inherit_all {
-            let mut unknown = requested.difference(&parent_tool_names).copied().collect::<Vec<_>>();
+            let mut unknown = requested
+                .iter()
+                .copied()
+                .filter(|name| !eligible_parent_tools.iter().any(|tool| tool.supports_name(name)))
+                .collect::<Vec<_>>();
             unknown.sort_unstable();
             if !unknown.is_empty() {
                 return Ok(DelegateAgenticExecution {
@@ -949,13 +952,26 @@ impl DelegateTool {
             }
         }
 
-        let sub_tools: Vec<Box<dyn Tool>> = self
-            .parent_tools
-            .iter()
-            .filter(|tool| tool.name() != "delegate")
-            .filter(|tool| inherit_all || requested.contains(tool.name()))
-            .map(|tool| Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
-            .collect();
+        let sub_tools: Vec<Box<dyn Tool>> = if inherit_all {
+            eligible_parent_tools
+                .iter()
+                .map(|tool| Box::new(ToolArcRef::new(Arc::clone(tool))) as Box<dyn Tool>)
+                .collect()
+        } else {
+            agent_config
+                .allowed_tools
+                .iter()
+                .map(|name| name.trim())
+                .filter(|name| !name.is_empty())
+                .filter_map(|name| {
+                    eligible_parent_tools
+                        .iter()
+                        .find(|tool| tool.supports_name(name))
+                        .and_then(|tool| ToolArcRef::for_name(Arc::clone(tool), name))
+                })
+                .map(|tool| Box::new(tool) as Box<dyn Tool>)
+                .collect()
+        };
 
         if sub_tools.is_empty() {
             return Ok(DelegateAgenticExecution {
@@ -1081,30 +1097,123 @@ impl DelegateTool {
 
 struct ToolArcRef {
     inner: Arc<dyn Tool>,
+    public_spec: Option<super::traits::ToolSpec>,
 }
 
 impl ToolArcRef {
     fn new(inner: Arc<dyn Tool>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            public_spec: None,
+        }
+    }
+
+    fn for_name(inner: Arc<dyn Tool>, public_name: &str) -> Option<Self> {
+        let public_spec = inner.specs().into_iter().find(|spec| spec.name == public_name)?;
+        Some(Self {
+            inner,
+            public_spec: Some(public_spec),
+        })
     }
 }
 
 #[async_trait]
 impl Tool for ToolArcRef {
     fn name(&self) -> &str {
-        self.inner.name()
+        self.public_spec
+            .as_ref()
+            .map_or_else(|| self.inner.name(), |spec| spec.name.as_str())
     }
 
     fn description(&self) -> &str {
-        self.inner.description()
+        self.public_spec
+            .as_ref()
+            .map_or_else(|| self.inner.description(), |spec| spec.description.as_str())
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        self.inner.parameters_schema()
+        self.public_spec
+            .as_ref()
+            .map_or_else(|| self.inner.parameters_schema(), |spec| spec.parameters.clone())
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        self.inner.execute(args).await
+        if let Some(spec) = &self.public_spec {
+            self.inner.execute_named(&spec.name, args).await
+        } else {
+            self.inner.execute(args).await
+        }
+    }
+
+    async fn execute_with_cancellation(
+        &self,
+        args: serde_json::Value,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        if let Some(spec) = &self.public_spec {
+            self.inner
+                .execute_named_with_cancellation(&spec.name, args, cancellation)
+                .await
+        } else {
+            self.inner.execute_with_cancellation(args, cancellation).await
+        }
+    }
+
+    async fn refresh(&self) -> anyhow::Result<()> {
+        self.inner.refresh().await
+    }
+
+    fn supports_name(&self, name: &str) -> bool {
+        self.public_spec
+            .as_ref()
+            .map_or_else(|| self.inner.supports_name(name), |spec| spec.name == name)
+    }
+
+    async fn set_active_recipient(&self, recipient: &str) {
+        self.inner.set_active_recipient(recipient).await;
+    }
+
+    async fn set_active_channel(&self, channel: Arc<dyn crate::channels::traits::Channel>) {
+        self.inner.set_active_channel(channel).await;
+    }
+
+    fn specs(&self) -> Vec<super::traits::ToolSpec> {
+        self.public_spec
+            .as_ref()
+            .map_or_else(|| self.inner.specs(), |spec| vec![spec.clone()])
+    }
+
+    fn tier(&self) -> ToolTier {
+        self.inner.tier()
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        self.inner.categories()
+    }
+
+    fn availability(&self) -> crate::capability::CapabilityAvailability {
+        self.inner.availability()
+    }
+
+    async fn execute_named(&self, name: &str, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if !self.supports_name(name) {
+            anyhow::bail!("Tool '{}' does not handle name '{name}'", self.name());
+        }
+        self.inner.execute_named(name, args).await
+    }
+
+    async fn execute_named_with_cancellation(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        if !self.supports_name(name) {
+            anyhow::bail!("Tool '{}' does not handle name '{name}'", self.name());
+        }
+        self.inner
+            .execute_named_with_cancellation(name, args, cancellation)
+            .await
     }
 }
 
@@ -1239,6 +1348,64 @@ mod tests {
         }
     }
 
+    struct DynamicAliasTool;
+
+    #[async_trait]
+    impl Tool for DynamicAliasTool {
+        fn name(&self) -> &str {
+            "dynamic_root"
+        }
+
+        fn description(&self) -> &str {
+            "Dynamic alias fixture"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+
+        fn specs(&self) -> Vec<super::super::traits::ToolSpec> {
+            vec![super::super::traits::ToolSpec {
+                name: "dynamic_alias".to_string(),
+                description: self.description().to_string(),
+                parameters: self.parameters_schema(),
+            }]
+        }
+
+        fn supports_name(&self, name: &str) -> bool {
+            matches!(name, "dynamic_root" | "dynamic_alias")
+        }
+
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.execute_named("dynamic_root", args).await
+        }
+
+        async fn execute_named(&self, name: &str, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: self.supports_name(name),
+                output: name.to_string(),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_tool_reference_preserves_dynamic_alias_contract() {
+        let delegated = ToolArcRef::new(Arc::new(DynamicAliasTool));
+        assert!(delegated.supports_name("dynamic_alias"));
+        assert_eq!(delegated.specs()[0].name, "dynamic_alias");
+        let result = delegated.execute_named("dynamic_alias", json!({})).await.unwrap();
+        assert!(result.success);
+        assert_eq!(result.output, "dynamic_alias");
+
+        let restricted = ToolArcRef::for_name(Arc::new(DynamicAliasTool), "dynamic_alias").unwrap();
+        assert_eq!(restricted.name(), "dynamic_alias");
+        assert_eq!(restricted.specs().len(), 1);
+        assert!(restricted.supports_name("dynamic_alias"));
+        assert!(!restricted.supports_name("dynamic_root"));
+        assert!(restricted.execute_named("dynamic_root", json!({})).await.is_err());
+    }
+
     struct OneToolThenFinalProvider;
 
     #[async_trait]
@@ -1273,6 +1440,46 @@ mod tests {
                         id: "call_1".to_string(),
                         name: "echo_tool".to_string(),
                         arguments: "{\"value\":\"ping\"}".to_string(),
+                    }],
+                    reasoning_content: None,
+                })
+            }
+        }
+    }
+
+    struct DynamicAliasThenFinalProvider;
+
+    #[async_trait]
+    impl Provider for DynamicAliasThenFinalProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            if request.messages.iter().any(|message| message.role == "tool") {
+                Ok(ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_dynamic".to_string(),
+                        name: "dynamic_alias".to_string(),
+                        arguments: "{}".to_string(),
                     }],
                     reasoning_content: None,
                 })
@@ -1810,6 +2017,30 @@ mod tests {
                 .unwrap_or("")
                 .contains("unknown or ineligible tools: missing_tool")
         );
+    }
+
+    #[tokio::test]
+    async fn agentic_mode_accepts_and_executes_one_explicit_dynamic_alias() {
+        let config = agentic_config(vec!["dynamic_alias".to_string()]);
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_parent_tools(Arc::new(vec![Arc::new(DynamicAliasTool)]));
+
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "test",
+                "test",
+                &DynamicAliasThenFinalProvider,
+                "run alias",
+                0.0,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.result.success, "{:?}", result.result.error);
+        assert!(result.result.output.ends_with("\ndone"));
     }
 
     #[tokio::test]

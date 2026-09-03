@@ -351,6 +351,43 @@ pub fn all_tools_with_runtime_ext(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> ToolsRegistryResult {
+    all_tools_with_runtime_ext_and_extensions(
+        config,
+        shared_config,
+        security,
+        runtime,
+        memory,
+        composio_key,
+        composio_entity_id,
+        browser_config,
+        http_config,
+        workspace_dir,
+        agents,
+        fallback_api_key,
+        root_config,
+        Vec::new(),
+    )
+}
+
+/// Build the full registry and expose additional live capabilities to both the
+/// owning entrypoint and its agentic delegates.
+#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+pub fn all_tools_with_runtime_ext_and_extensions(
+    config: Arc<Config>,
+    shared_config: crate::config::SharedConfig,
+    security: &Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
+    memory: Arc<dyn Memory>,
+    composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
+    browser_config: &crate::config::BrowserConfig,
+    http_config: &crate::config::HttpRequestConfig,
+    workspace_dir: &std::path::Path,
+    agents: &HashMap<String, DelegateAgentConfig>,
+    fallback_api_key: Option<&str>,
+    root_config: &crate::config::Config,
+    extensions: Vec<Arc<dyn Tool>>,
+) -> ToolsRegistryResult {
     // Core tools — always registered regardless of module flags.
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ShellTool::new(runtime.clone(), workspace_dir.to_path_buf())),
@@ -381,6 +418,10 @@ pub fn all_tools_with_runtime_ext(
         // gate). A defensive `execute` makes any out-of-loop call a no-op.
         Arc::new(StaySilentTool::new()),
     ];
+
+    // The delegate snapshot is built later from this same Arc collection, so
+    // live managers and dynamic routers remain identical at every depth.
+    tool_arcs.extend(extensions);
 
     // Vision tools are always available
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
