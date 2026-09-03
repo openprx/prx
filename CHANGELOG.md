@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.92] - 3 September 2026
+
+### Fixed
+
+- Resolve MCP, WASM, and skill aliases that are discovered after the unified
+  execution service captures its startup catalog, requiring both current
+  backend support and a live advertised spec before dispatch.
+
 ## [0.8.91] - 3 September 2026
 
 ### Fixed
