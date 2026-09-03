@@ -446,9 +446,6 @@ pub enum ConversationLine {
         /// provider's first delta.
         content: String,
     },
-    /// UI-only completion metadata shown immediately before the assistant
-    /// response. It is not persisted as conversation content.
-    TurnSummary { duration_ms: u64 },
     /// System / status message (dimmed in render).
     System { content: String },
     /// Legacy single-line tool indicator (kept for back-compat with
@@ -1315,9 +1312,6 @@ fn transcript_lines_from_conversation(conversation: &[ConversationLine]) -> (Vec
             ConversationLine::StreamingAssistant { content } => {
                 push_transcript_text(&mut lines, "assistant (streaming)", content);
             }
-            ConversationLine::TurnSummary { duration_ms } => {
-                lines.push(format!("worked: {}", format_turn_duration(*duration_ms)));
-            }
             ConversationLine::System { content } => push_transcript_text(&mut lines, "system", content),
             ConversationLine::Tool { name, success } => {
                 let status = if *success { "done" } else { "error" };
@@ -1404,7 +1398,6 @@ pub fn latest_provider_worker_tool_summary_from_conversation(
             ConversationLine::User { .. }
             | ConversationLine::Assistant { .. }
             | ConversationLine::StreamingAssistant { .. }
-            | ConversationLine::TurnSummary { .. }
             | ConversationLine::System { .. }
             | ConversationLine::Reasoning { .. } => None,
         })
@@ -1481,7 +1474,7 @@ pub fn provider_worker_io_lines_from_conversation(
             ConversationLine::Reasoning { char_count, .. } => {
                 lines.push(format!("thinking: {char_count} chars"));
             }
-            ConversationLine::User { .. } | ConversationLine::TurnSummary { .. } | ConversationLine::System { .. } => {}
+            ConversationLine::User { .. } | ConversationLine::System { .. } => {}
         }
     }
     if let Some(streaming) = streaming
@@ -3258,12 +3251,8 @@ impl TuiState {
             return;
         }
         self.streaming = None;
-        let duration_ms = self.stream_started_at_ms.take().map(turn_elapsed_ms);
+        self.stream_started_at_ms = None;
         if !final_text.is_empty() {
-            if let Some(duration_ms) = duration_ms {
-                self.conversation_lines
-                    .push(ConversationLine::TurnSummary { duration_ms });
-            }
             self.conversation_lines.push(ConversationLine::Assistant {
                 content: final_text.to_string(),
             });
@@ -3675,7 +3664,6 @@ fn estimate_line_height(line: &ConversationLine) -> u16 {
             // No prefix row, just content + trailing blank.
             content.lines().count().max(1) + 1
         }
-        ConversationLine::TurnSummary { .. } => 1,
         ConversationLine::System { content } => content.lines().count().max(1) + 1,
         ConversationLine::Tool { .. } => 1,
         ConversationLine::ToolResult {
@@ -5992,13 +5980,6 @@ fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line: &'a Conver
             push_assistant_rendered_lines(lines, render_streaming_assistant_markdown_lines(content, ascii), ascii);
             lines.push(Line::from(""));
         }
-        ConversationLine::TurnSummary { duration_ms } => {
-            let marker = if ascii { "*" } else { "•" };
-            lines.push(Line::from(Span::styled(
-                format!("{marker} Worked for {}", format_turn_duration(*duration_ms)),
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
         ConversationLine::System { content } => {
             // Claude Code style: dim gray italic, no prefix or indent.
             for text_line in content.lines() {
@@ -7945,13 +7926,18 @@ mod tests {
         assert!(state.streaming.is_none(), "streaming slot cleared after finalize");
         assert_eq!(
             state.conversation_lines.len(),
-            len_before + 2,
-            "turn summary and assistant lines pushed"
+            len_before + 1,
+            "only assistant line pushed"
         );
-        assert!(matches!(
-            state.conversation_lines.get(len_before),
-            Some(ConversationLine::TurnSummary { .. })
-        ));
+        let rendered = transcript_plain_rows(&state, 80).join("\n");
+        assert!(
+            !rendered.contains("Worked for"),
+            "completion timing must stay out of the transcript: {rendered}"
+        );
+        assert!(
+            !rendered.to_ascii_lowercase().contains("turn completed"),
+            "completion status must stay out of the transcript: {rendered}"
+        );
         let last = state
             .conversation_lines
             .last()
@@ -9033,11 +9019,8 @@ mod tests {
     }
 
     #[test]
-    fn primary_transcript_hides_reasoning_and_click_cannot_toggle_it() {
+    fn primary_transcript_hides_reasoning_and_completion_duration_and_click_cannot_toggle() {
         let mut state = TuiState::new("p", "m");
-        state
-            .conversation_lines
-            .push(ConversationLine::TurnSummary { duration_ms: 2_000 });
         state.conversation_lines.push(ConversationLine::Assistant {
             content: "final answer".to_string(),
         });
@@ -9046,8 +9029,12 @@ mod tests {
 
         let primary = transcript_plain_rows(&state, 80).join("\n");
         assert!(
-            primary.contains("Worked for 2s"),
-            "primary keeps one completion summary: {primary}"
+            !primary.contains("Worked for"),
+            "primary omits completion timing: {primary}"
+        );
+        assert!(
+            !primary.contains("turn completed"),
+            "primary omits completion status: {primary}"
         );
         assert!(primary.contains("final answer"), "primary keeps the answer: {primary}");
         assert!(

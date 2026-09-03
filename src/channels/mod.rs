@@ -4604,7 +4604,7 @@ fn build_identity_prompt_with_limit(workspace_dir: &Path, max_chars: usize) -> S
 /// Follows the `OpenClaw` framework structure by default:
 /// 1. Tooling — tool list + descriptions
 /// 2. Safety — guardrail reminder
-/// 3. Skills — full skill instructions and tool metadata
+/// 3. Skills — lazy catalog metadata; instructions are read with `skill_read`
 /// 4. Workspace — working directory
 /// 5. Bootstrap files — AGENTS, SOUL, TOOLS, IDENTITY, USER, BOOTSTRAP, MEMORY
 /// 6. Date & Time — timezone for cache stability
@@ -4704,7 +4704,7 @@ pub fn build_system_prompt_with_mode(
          - When in doubt, ask before acting externally.\n\n",
     );
 
-    // ── 3. Skills (full instructions + tool metadata) ───────────
+    // ── 3. Skills (lazy metadata + declared tool metadata) ──────
     if !skills.is_empty() {
         prompt.push_str(&crate::skills::skills_to_prompt(skills, workspace_dir));
         prompt.push_str("\n\n");
@@ -12021,7 +12021,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn prompt_skills_include_instructions_and_tools() {
+    fn prompt_skills_are_lazy_and_include_declared_tools() {
         let ws = make_workspace();
         let skills = vec![crate::skills::Skill {
             name: "code-review".into(),
@@ -12047,12 +12047,13 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("<name>code-review</name>"));
         assert!(prompt.contains("<description>Review code for bugs</description>"));
         assert!(prompt.contains("SKILL.md</location>"));
-        assert!(prompt.contains("<instructions>"));
-        assert!(prompt.contains("<instruction>Always run cargo test before final response.</instruction>"));
+        assert!(prompt.contains("call `skill_read`"));
+        assert!(!prompt.contains("<instructions>"));
+        assert!(!prompt.contains("Always run cargo test before final response."));
         assert!(prompt.contains("<tools>"));
         assert!(prompt.contains("<name>lint</name>"));
         assert!(prompt.contains("<kind>shell</kind>"));
-        assert!(!prompt.contains("loaded on demand"));
+        assert!(prompt.contains("lazy-loaded"));
     }
 
     #[test]
@@ -12083,9 +12084,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
         assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
         assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
-        assert!(
-            prompt.contains("<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>")
-        );
+        assert!(!prompt.contains("Use &lt;tool_call&gt;"));
     }
 
     #[test]

@@ -320,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn skills_section_includes_instructions_and_tools() {
+    fn skills_section_keeps_instructions_lazy_and_includes_tools() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
@@ -352,7 +352,8 @@ mod tests {
         let output = SkillsSection.build(&ctx).unwrap();
         assert!(output.contains("<available_skills>"));
         assert!(output.contains("<name>deploy</name>"));
-        assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
+        assert!(output.contains("call `skill_read`"));
+        assert!(!output.contains("Run smoke tests before deploy."));
         assert!(output.contains("<name>release_checklist</name>"));
         assert!(output.contains("<kind>shell</kind>"));
     }
@@ -379,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_builder_inlines_and_escapes_skills() {
+    fn prompt_builder_lists_and_escapes_lazy_skills() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let skills = vec![crate::skills::Skill {
             name: "code<review>&".into(),
@@ -415,9 +416,7 @@ mod tests {
         assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
         assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
         assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
-        assert!(
-            prompt.contains("<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>")
-        );
+        assert!(!prompt.contains("Use &lt;tool_call&gt;"));
     }
 
     #[test]
