@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.96] - 3 September 2026
+
+### Fixed
+
+- Coalesce request-local system context into the leading system message before
+  every provider call. Empty-response and tool-summary corrective retries,
+  OS-paging recall, and WASM request middleware can no longer create an invalid
+  mid-conversation system role for strict templates such as Qwen.
+
+### Tests
+
+- Exercise an empty-response retry against a provider that rejects every system
+  message outside position zero, while proving the correction stays out of
+  persisted conversation history.
+
 ## [0.8.95] - 3 September 2026
 
 ### Fixed
