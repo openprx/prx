@@ -10146,7 +10146,7 @@ mod tests {
         let provider = ScriptedProvider::from_text_responses(vec!["done"]);
         let mut history = vec![
             ChatMessage::system("test-system"),
-            ChatMessage::user("use the skill to create a PDF file"),
+            ChatMessage::user("use the skill to create a PDF file. Do not use browser, MCP, HTTP, plugins, or WASM."),
         ];
         let config = crate::config::ToolTieringConfig::default();
 

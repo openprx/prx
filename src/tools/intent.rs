@@ -97,12 +97,68 @@ impl IntentClassifier {
         let lower = message.to_lowercase();
         let mut cats = HashSet::new();
         for (pattern, category) in &self.entries {
-            if lower.contains(pattern.as_str()) {
+            if lower
+                .match_indices(pattern.as_str())
+                .any(|(index, _)| !keyword_is_in_negative_instruction(&lower, index))
+            {
                 cats.insert(*category);
             }
         }
         cats
     }
+}
+
+/// Return whether a keyword occurrence belongs to an explicit negative tool
+/// instruction such as "do not use browser or MCP" or "不要使用浏览器/MCP".
+///
+/// Capability routing happens before the model sees the tool catalog, so a
+/// plain substring match on a forbidden capability is particularly harmful:
+/// the request "do not use MCP" used to cold-start every configured MCP server.
+/// Keep this deliberately narrow and clause-local. Positive mentions in a
+/// later sentence or after an explicit contrast ("but use MCP" / "但使用 MCP")
+/// still activate the category.
+fn keyword_is_in_negative_instruction(message: &str, keyword_index: usize) -> bool {
+    const CLAUSE_BOUNDARIES: &[char] = &['.', '!', '?', ';', '\n', '\r', '。', '！', '？', '；'];
+    const NEGATIVE_MARKERS: &[&str] = &[
+        "do not use",
+        "don't use",
+        "dont use",
+        "must not use",
+        "without using",
+        "without",
+        "avoid using",
+        "avoid",
+        "no ",
+        "禁止使用",
+        "禁止调用",
+        "不要使用",
+        "不要调用",
+        "不使用",
+        "不调用",
+        "不得使用",
+        "不得调用",
+        "无需使用",
+        "无需调用",
+        "别用",
+        "别调用",
+    ];
+    const POSITIVE_PIVOTS: &[&str] = &[" but ", " instead ", " however ", "但", "但是", "而是", "改用"];
+
+    let before = &message[..keyword_index];
+    let clause_start = before
+        .char_indices()
+        .rev()
+        .find_map(|(index, ch)| CLAUSE_BOUNDARIES.contains(&ch).then_some(index + ch.len_utf8()))
+        .unwrap_or(0);
+    let prefix = &message[clause_start..keyword_index];
+
+    let Some(negative_index) = NEGATIVE_MARKERS.iter().filter_map(|marker| prefix.rfind(marker)).max() else {
+        return false;
+    };
+    !POSITIVE_PIVOTS
+        .iter()
+        .filter_map(|pivot| prefix.rfind(pivot))
+        .any(|pivot_index| pivot_index > negative_index)
 }
 
 static CLASSIFIER: LazyLock<IntentClassifier> = LazyLock::new(IntentClassifier::new);
@@ -223,6 +279,27 @@ mod tests {
         );
         assert!(cats.contains(&ToolCategory::WebBrowsing));
         assert!(cats.contains(&ToolCategory::Memory));
+    }
+
+    #[test]
+    fn negative_capability_instructions_do_not_activate_categories() {
+        let cats = CLASSIFIER.classify("Use the PDF skill. Do not use browser, MCP, HTTP, plugins, or WASM tools.");
+        assert!(cats.contains(&ToolCategory::System));
+        assert!(!cats.contains(&ToolCategory::WebBrowsing));
+        assert!(!cats.contains(&ToolCategory::Automation));
+    }
+
+    #[test]
+    fn chinese_negative_capability_instructions_do_not_activate_categories() {
+        let cats = CLASSIFIER.classify("读取 PDF 技能；不要调用浏览器、MCP、插件或 WASM。");
+        assert!(cats.contains(&ToolCategory::System));
+        assert!(!cats.contains(&ToolCategory::Automation));
+    }
+
+    #[test]
+    fn positive_capability_after_contrast_still_activates_category() {
+        let cats = CLASSIFIER.classify("Do not use HTTP, but use MCP to operate the browser");
+        assert!(cats.contains(&ToolCategory::Automation));
     }
 
     #[test]
