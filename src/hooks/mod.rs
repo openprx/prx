@@ -48,6 +48,15 @@ impl HookEvent {
         }
     }
 
+    #[cfg(feature = "wasm-plugins")]
+    const fn wasm_lifecycle_name(self) -> &'static str {
+        match self {
+            // The native hook name predates the public WASM lifecycle schema.
+            Self::AgentEnd => "agent_stop",
+            _ => self.as_str(),
+        }
+    }
+
     const ALL: [Self; 8] = [
         Self::AgentStart,
         Self::AgentEnd,
@@ -275,8 +284,8 @@ impl HookManager {
             let runtime = self.plugin_runtime.read().await.clone();
             if let Some(runtime) = runtime {
                 let payload_str = payload.to_string();
-                runtime.emit_hook(event.as_str(), &payload_str).await;
-                let topic = format!("prx.lifecycle.{}", event.as_str());
+                let topic = format!("prx.lifecycle.{}", event.wasm_lifecycle_name());
+                runtime.emit_hook(&topic, &payload_str).await;
                 if let Err(error) = runtime.event_bus().publish(&topic, &payload_str).await {
                     tracing::debug!(topic = %topic, error = %error, "event bus lifecycle bridge error");
                 }

@@ -1,0 +1,4 @@
+interface config {
+    get: func(key: string) -> option<string>;
+    get-all: func() -> list<tuple<string, string>>;
+}

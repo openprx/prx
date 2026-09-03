@@ -1,14 +1,8 @@
 //! Common host function registration for WASM plugins.
 //!
-//! Provides shared linker setup for the `prx:host/log`, `prx:host/config`,
-//! and `prx:host/kv` interfaces. All capability adapters (middleware, hook,
-//! cron) call `register_common_host_functions` to avoid duplicating ~200 lines
-//! of identical boilerplate.
-//!
-//! `WasmToolAdapter` uses `register_log_host_functions` and
-//! `register_config_host_functions` directly because its kv interface exposes
-//! `result<T, string>` return types that differ from the simpler variants used
-//! by the other capability types.
+//! Provides shared linker setup for the canonical PDK host interfaces. All
+//! capability adapters use the same WIT ABI so a component can move between
+//! tool, middleware, hook, and cron worlds without host-signature drift.
 
 use std::sync::Arc;
 
@@ -83,10 +77,8 @@ pub fn register_config_host_functions(linker: &mut wasmtime::component::Linker<H
 
 /// Register `prx:host/kv@0.1.0` host functions into the linker.
 ///
-/// This variant uses simple (non-`result`) return types as required by the
-/// middleware, hook, and cron WIT worlds. Permission is checked on every call;
-/// violations are logged and silently ignored (get → `None`, set → no-op,
-/// delete → `false`).
+/// Uses the canonical PDK ABI. Permission and quota failures are returned to
+/// the guest for mutating operations; reads retain their option/list shape.
 pub fn register_kv_host_functions(linker: &mut wasmtime::component::Linker<HostState>) -> PluginResult<()> {
     for iface in ["prx:host/kv@0.1.0", "prx:host/kv"] {
         let mut kv_inst = linker
@@ -117,15 +109,12 @@ pub fn register_kv_host_functions(linker: &mut wasmtime::component::Linker<HostS
                 |store: wasmtime::StoreContextMut<'_, HostState>, (key, value): (String, Vec<u8>)| {
                     Box::new(async move {
                         if let Err(e) = store.data().check_permission("kv") {
-                            tracing::warn!("{e}");
-                            return Ok(());
+                            return Ok((Err::<(), String>(e),));
                         }
                         let kv = store.data().kv_store.clone();
                         let quota = store.data().kv_quota_bytes;
-                        if let Err(error) = crate::plugins::host::host_kv_set_bounded(&kv, quota, key, value).await {
-                            tracing::warn!(plugin = %store.data().plugin_name, "{error}");
-                        }
-                        Ok(())
+                        let result = crate::plugins::host::host_kv_set_bounded(&kv, quota, key, value).await;
+                        Ok((result,))
                     })
                 },
             )
@@ -137,13 +126,12 @@ pub fn register_kv_host_functions(linker: &mut wasmtime::component::Linker<HostS
                 |store: wasmtime::StoreContextMut<'_, HostState>, (key,): (String,)| {
                     Box::new(async move {
                         if let Err(e) = store.data().check_permission("kv") {
-                            tracing::warn!("{e}");
-                            return Ok((false,));
+                            return Ok((Err::<bool, String>(e),));
                         }
                         let kv = store.data().kv_store.clone();
                         let mut guard = kv.write().await;
                         let existed = guard.remove(&key).is_some();
-                        Ok((existed,))
+                        Ok((Ok::<bool, String>(existed),))
                     })
                 },
             )
@@ -361,6 +349,76 @@ pub fn register_http_host_functions(linker: &mut wasmtime::component::Linker<Hos
     Ok(())
 }
 
+/// Register `prx:host/memory@0.1.0` using the configured live memory backend.
+pub fn register_memory_host_functions(linker: &mut wasmtime::component::Linker<HostState>) -> PluginResult<()> {
+    for iface in ["prx:host/memory@0.1.0", "prx:host/memory"] {
+        let mut mem_inst = linker
+            .instance(iface)
+            .map_err(|e| PluginError::Instantiation(format!("linker error ({iface}): {e}")))?;
+
+        mem_inst
+            .func_wrap_async(
+                "store",
+                |store: wasmtime::StoreContextMut<'_, HostState>, (text, category): (String, String)| {
+                    Box::new(async move {
+                        if let Err(e) = store.data().check_permission("memory") {
+                            return Ok((Err::<String, String>(e),));
+                        }
+                        let Some(memory) = store.data().memory.clone() else {
+                            return Ok((Err::<String, String>("memory backend not configured".to_string()),));
+                        };
+                        let plugin_name = store.data().plugin_name.clone();
+                        let key = format!("plugin:{plugin_name}:{}", uuid::Uuid::new_v4());
+                        let category = match category.as_str() {
+                            "core" => crate::memory::traits::MemoryCategory::Core,
+                            "daily" => crate::memory::traits::MemoryCategory::Daily,
+                            "conversation" => crate::memory::traits::MemoryCategory::Conversation,
+                            other => crate::memory::traits::MemoryCategory::Custom(other.to_string()),
+                        };
+                        match memory.store(&key, &text, category, None).await {
+                            Ok(()) => Ok((Ok::<String, String>(key),)),
+                            Err(error) => Ok((Err(format!("memory store failed: {error}")),)),
+                        }
+                    })
+                },
+            )
+            .map_err(|e| PluginError::Instantiation(format!("link {iface}.store: {e}")))?;
+
+        mem_inst
+            .func_wrap_async(
+                "recall",
+                |store: wasmtime::StoreContextMut<'_, HostState>, (query, limit): (String, u32)| {
+                    Box::new(async move {
+                        if let Err(e) = store.data().check_permission("memory") {
+                            return Ok((Err::<Vec<(String, String, String, f64)>, String>(e),));
+                        }
+                        let Some(memory) = store.data().memory.clone() else {
+                            return Ok((Err::<Vec<(String, String, String, f64)>, String>(
+                                "memory backend not configured".to_string(),
+                            ),));
+                        };
+                        match memory.recall(&query, limit as usize, None).await {
+                            Ok(entries) => Ok((Ok(entries
+                                .into_iter()
+                                .map(|entry| {
+                                    (
+                                        entry.id,
+                                        entry.content,
+                                        entry.category.to_string(),
+                                        entry.score.unwrap_or(0.0),
+                                    )
+                                })
+                                .collect()),)),
+                            Err(error) => Ok((Err(format!("memory recall failed: {error}")),)),
+                        }
+                    })
+                },
+            )
+            .map_err(|e| PluginError::Instantiation(format!("link {iface}.recall: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Register `prx:host/websocket-outbound@0.1.0` host functions into the linker.
 ///
 /// Exposes websocket connect/send/receive/close operations to WASM plugins.
@@ -463,16 +521,16 @@ pub fn register_websocket_host_functions(linker: &mut wasmtime::component::Linke
     Ok(())
 }
 
-/// Register all common host functions (log + config + kv) in a single call.
-///
-/// Used by middleware, hook, and cron capability adapters. Tool adapters have
-/// a different kv interface (`result<T, string>` return types) and call the
-/// individual helpers instead.
+/// Register the complete canonical PDK import surface in a single call.
 pub fn register_common_host_functions(linker: &mut wasmtime::component::Linker<HostState>) -> PluginResult<()> {
+    wasmtime_wasi::p2::add_to_linker_async(linker)
+        .map_err(|e| PluginError::Instantiation(format!("WASI link: {e}")))?;
     register_log_host_functions(linker)?;
     register_config_host_functions(linker)?;
     register_kv_host_functions(linker)?;
     register_event_host_functions(linker)?;
+    register_http_host_functions(linker)?;
+    register_memory_host_functions(linker)?;
     register_websocket_host_functions(linker)?;
     Ok(())
 }

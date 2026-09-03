@@ -221,7 +221,10 @@ Create `hooks.json` in the workspace directory:
 - `hooks.json` is capped at 256 KiB and hot-reloaded by content generation; an invalid candidate leaves the active generation unchanged
 - payloads are capped at 4 MiB and passed through a restrictive temporary file plus optional stdin
 - timeout covers stdin and process execution; timed-out children are killed and reaped, and temporary payload files are removed on every exit path
-- WASM plugins with the `hook` capability also receive these events
+- WASM plugins with the `hook` capability receive the same lifecycle through
+  canonical `prx.lifecycle.*` topics (native `agent_end` is exposed as
+  `prx.lifecycle.agent_stop`). Exact topics, `prefix.*`, `*`, and legacy short
+  event names are accepted in manifests.
 
 `hooks_status` reports the live config path, validity, timeout, event coverage,
 and action count. `hooks_manage` supports `status`, `refresh`, `validate`,
@@ -230,6 +233,11 @@ published; removal moves the previous file to `.hooks-trash` and reports the
 recovery path. Unknown or duplicate normalized event names are rejected. The
 manager behind these tools is the same instance that emits the current turn's
 events.
+
+`wasm_plugins_status` and `wasm_plugins_manage {"action":"status"}` include
+`hook_adapters` diagnostics with each adapter's patterns, invocation count,
+last delivered event, and last error. This distinguishes a parsed/loaded
+component from one that has actually executed successfully.
 
 ## Webhook Receiver
 

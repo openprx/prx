@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.88] - 3 September 2026
+
+### Fixed
+
+- Make documented WASM hook manifests load by accepting both string event lists
+  and `[[capabilities.events]]` pattern tables.
+- Dispatch canonical `prx.lifecycle.*` topics to WASM hooks, support exact,
+  wildcard, and legacy short-name matching, and expose invocation diagnostics.
+- Align middleware, hook, and cron host registration with the canonical PDK KV
+  result ABI and complete HTTP, memory, events, WebSocket, and WASI surface.
+- Make the Rust `audit-hook` example build as a real component and connect live
+  memory backends to non-tool adapters.
+
 ## [0.8.87] - 3 September 2026
 
 ### Added
