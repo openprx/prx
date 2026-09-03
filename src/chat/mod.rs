@@ -2133,44 +2133,15 @@ const fn consume_deferred_visible_input_pop(defer_visible_input_pop_once: &mut b
     should_defer
 }
 
-#[cfg_attr(not(feature = "terminal-tui"), allow(dead_code))]
-fn format_turn_elapsed_message(
-    status: &str,
-    started_at: chrono::DateTime<chrono::Utc>,
-    finished_at: chrono::DateTime<chrono::Utc>,
-) -> String {
-    let elapsed = crate::chat::sessions::model::format_elapsed_compact(
-        crate::chat::sessions::model::elapsed_seconds_between(started_at, finished_at),
-    );
-    format!("turn {status} {elapsed}")
-}
-
-#[cfg_attr(not(feature = "terminal-tui"), allow(unused_variables))]
-fn turn_elapsed_message_for_surface(
-    redraw_tx: Option<&mpsc::Sender<()>>,
-    status: &str,
-    started_at: chrono::DateTime<chrono::Utc>,
-    finished_at: chrono::DateTime<chrono::Utc>,
-) -> Option<String> {
-    redraw_tx?;
-    Some(format_turn_elapsed_message(status, started_at, finished_at))
-}
-
-#[cfg_attr(not(feature = "terminal-tui"), allow(unused_variables))]
 fn surface_turn_elapsed_message(
-    dispatcher: &dispatcher::ChatDispatcher,
-    redraw_tx: Option<&mpsc::Sender<()>>,
-    status: &str,
-    started_at: chrono::DateTime<chrono::Utc>,
-    finished_at: chrono::DateTime<chrono::Utc>,
+    _dispatcher: &dispatcher::ChatDispatcher,
+    _redraw_tx: Option<&mpsc::Sender<()>>,
+    _status: &str,
+    _started_at: chrono::DateTime<chrono::Utc>,
+    _finished_at: chrono::DateTime<chrono::Utc>,
 ) {
-    #[cfg(feature = "terminal-tui")]
-    {
-        let Some(text) = turn_elapsed_message_for_surface(redraw_tx, status, started_at, finished_at) else {
-            return;
-        };
-        surface_session_message(dispatcher, redraw_tx, &text);
-    }
+    // Completion timing remains available in structured state and diagnostics,
+    // but it is intentionally not emitted into the conversation transcript.
 }
 
 fn format_fallback_chat_output_for(text: &str, stdout_is_terminal: bool) -> String {
@@ -2566,31 +2537,9 @@ mod runtime_display_tests {
         assert!(out.contains("third retained line"));
     }
 
-    #[test]
-    fn main_turn_elapsed_message_uses_compact_runtime() {
-        assert_eq!(
-            format_turn_elapsed_message("completed", ts("2026-07-04T12:00:00Z"), ts("2026-07-04T12:00:03Z")),
-            "turn completed 3s"
-        );
-    }
-
-    #[test]
-    fn plain_mode_suppresses_turn_elapsed_chrome() {
-        assert_eq!(
-            turn_elapsed_message_for_surface(
-                None,
-                "completed",
-                ts("2026-07-04T12:00:00Z"),
-                ts("2026-07-04T12:00:03Z")
-            ),
-            None,
-            "plain/fallback path must not surface turn completed chrome"
-        );
-    }
-
     #[cfg(feature = "terminal-tui")]
     #[test]
-    fn surface_turn_elapsed_message_dispatches_system_message_and_redraw() {
+    fn surface_turn_elapsed_message_stays_out_of_transcript_and_redraw() {
         let (dispatcher, mut action_rx) = dispatcher::ChatDispatcher::new();
         let (redraw_tx, mut redraw_rx) = mpsc::channel(1);
 
@@ -2602,16 +2551,13 @@ mod runtime_display_tests {
             ts("2026-07-04T12:00:03Z"),
         );
 
-        assert!(redraw_rx.try_recv().is_ok(), "surface path should request redraw");
-        let action = action_rx
-            .try_recv()
-            .expect("surface path should dispatch system message");
         assert!(
-            matches!(
-                action,
-                crate::chat::action::Action::SystemMessageAdded { ref text } if text == "turn completed 3s"
-            ),
-            "unexpected action: {action:?}"
+            redraw_rx.try_recv().is_err(),
+            "completion timing should not request redraw"
+        );
+        assert!(
+            action_rx.try_recv().is_err(),
+            "completion timing should not enter transcript state"
         );
     }
 
