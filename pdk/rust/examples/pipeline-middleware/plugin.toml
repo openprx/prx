@@ -1,0 +1,19 @@
+[plugin]
+name = "pipeline-middleware"
+version = "0.1.0"
+description = "Observable middleware fixture for every PRX turn entrypoint"
+wasm = "plugin.wasm"
+
+[[capabilities]]
+type = "middleware"
+name = "pipeline-marker"
+priority = 10
+
+[permissions]
+required = []
+optional = []
+
+[resources]
+max_fuel = 50000000
+max_memory_mb = 8
+max_execution_time_ms = 500

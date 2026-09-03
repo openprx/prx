@@ -1390,6 +1390,11 @@ pub fn create_provider_with_options(
     api_key: Option<&str>,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
+    #[cfg(feature = "wasm-plugins")]
+    if name.starts_with("wasm:") {
+        return crate::plugins::runtime::resolve_process_provider(name)
+            .ok_or_else(|| anyhow::anyhow!("WASM provider '{name}' is not loaded in this process"));
+    }
     match name {
         "openai-codex" | "openai_codex" | "codex" => Ok(Box::new(openai_codex::OpenAiCodexProvider::new(options))),
         _ => create_provider_with_url_and_options(name, api_key, None, options),
@@ -1402,6 +1407,11 @@ pub fn create_provider_with_url(
     api_key: Option<&str>,
     api_url: Option<&str>,
 ) -> anyhow::Result<Box<dyn Provider>> {
+    #[cfg(feature = "wasm-plugins")]
+    if name.starts_with("wasm:") {
+        return crate::plugins::runtime::resolve_process_provider(name)
+            .ok_or_else(|| anyhow::anyhow!("WASM provider '{name}' is not loaded in this process"));
+    }
     create_provider_with_url_and_options(name, api_key, api_url, &ProviderRuntimeOptions::default())
 }
 
@@ -1413,6 +1423,11 @@ fn create_provider_with_url_and_options(
     api_url: Option<&str>,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
+    #[cfg(feature = "wasm-plugins")]
+    if name.starts_with("wasm:") {
+        return crate::plugins::runtime::resolve_process_provider(name)
+            .ok_or_else(|| anyhow::anyhow!("WASM provider '{name}' is not loaded in this process"));
+    }
     let resolved = resolve_provider_credentials(name, api_key, options);
     // Break static-analysis taint chain from the sensitive-named input before
     // downstream provider storage.
@@ -1811,6 +1826,11 @@ pub fn create_resilient_provider_with_options(
     reliability: &crate::config::ReliabilityConfig,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
+    #[cfg(feature = "wasm-plugins")]
+    if primary_name.starts_with("wasm:") {
+        return crate::plugins::runtime::resolve_process_provider(primary_name)
+            .ok_or_else(|| anyhow::anyhow!("WASM provider '{primary_name}' is not loaded in this process"));
+    }
     let availability = summarize_provider_availability(primary_name, api_key, reliability, options);
     let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
     let mut unavailable = availability.unavailable.clone();
@@ -2068,6 +2088,10 @@ fn openai_codex_auth_profile_available() -> bool {
 }
 
 pub fn provider_matches_model_prefix(provider_name: &str, model: &str) -> bool {
+    #[cfg(feature = "wasm-plugins")]
+    if provider_name.starts_with("wasm:") {
+        return true;
+    }
     let model = model.trim();
     if model.is_empty() {
         // An empty model means "use the provider's configured default", which is

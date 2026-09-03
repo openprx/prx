@@ -1,0 +1,9 @@
+package prx:plugin@0.1.0;
+
+interface provider-exports {
+    record chat-message { role: string, content: string }
+    record tool-call { id: string, name: string, arguments: string }
+    record chat-response { text: option<string>, tool-calls: list<tool-call> }
+    name: func() -> string;
+    chat: func(messages: list<chat-message>, model: string, temperature: f64) -> result<chat-response, string>;
+}

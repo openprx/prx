@@ -166,6 +166,38 @@ impl HookManager {
         *self.plugin_runtime.write().await = Some(runtime);
     }
 
+    /// Transform one shared agent-pipeline envelope through the current WASM
+    /// middleware generation. Invalid JSON output is isolated and the original
+    /// envelope is preserved so a plugin cannot corrupt the turn protocol.
+    #[cfg(feature = "wasm-plugins")]
+    pub async fn process_wasm_middleware(
+        &self,
+        stage: crate::plugins::capabilities::middleware::MiddlewareStage,
+        envelope: serde_json::Value,
+    ) -> serde_json::Value {
+        let runtime = self.plugin_runtime.read().await.clone();
+        let Some(runtime) = runtime else {
+            return envelope;
+        };
+        let chain = runtime.middleware();
+        if chain.is_empty() {
+            return envelope;
+        }
+        let original = envelope.to_string();
+        let transformed = chain.process(stage, &original).await;
+        match serde_json::from_str(&transformed) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    stage = stage.as_str(),
+                    error = %error,
+                    "WASM middleware returned invalid JSON; preserving the original envelope"
+                );
+                envelope
+            }
+        }
+    }
+
     pub fn diagnostics(&self) -> HookDiagnostics {
         let error = self.refresh_if_changed().err().map(|error| error.to_string());
         let state = self.state.read();

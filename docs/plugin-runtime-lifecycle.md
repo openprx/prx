@@ -4,7 +4,30 @@ PRX owns exactly one `PluginRuntime` per canonical workspace in a process. Gatew
 
 ## Generation boundary
 
-A plugin generation contains the compiled registry plus the tool, middleware, hook, and cron adapters derived from it. Tools are exposed through one stable multi-spec router; hook dispatch and cron scheduling resolve the current generation at execution time.
+A plugin generation contains the compiled registry plus tool, middleware, hook,
+cron, provider, and storage adapters derived from it. Every long-lived consumer
+uses a stable proxy that resolves the current generation at execution time, so
+install, update, enable, disable, and reload never leave an IM channel or CLI
+holding a stale provider/storage instance.
+
+WASM providers and storage backends are selected explicitly as
+`wasm:<exported-name>` in `default_provider`, model routes, or
+`memory.backend`. The explicit prefix prevents a plugin from shadowing a
+built-in backend. TUI chat, the interactive and one-shot agent CLIs, gateway,
+standalone channels, and session workers all initialize the workspace plugin
+runtime before resolving an explicitly selected WASM backend.
+
+The four middleware stages use JSON envelopes and run in the shared agent tool
+loop: `inbound` once per admitted turn, `llm_request` before each provider call,
+`llm_response` after each provider response, and `outbound` before delivery.
+Consequently the same transformation path covers TUI, CLI, gateway, and every
+IM channel. Invalid JSON or structurally invalid message replacements are
+isolated and the original envelope is preserved.
+
+`wasm_plugins_manage` also exposes direct component probes for operational
+verification: `middleware_test`, `cron_run`, `provider_chat`, and storage
+health/store/recall/forget/count actions. These probes use the same current
+generation as production traffic; they are not separate mock adapters.
 
 `POST /api/plugins/{name}/reload` performs these steps:
 

@@ -712,9 +712,10 @@ impl PluginManager {
     pub async fn create_provider_adapters(
         &self,
         event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
-    ) -> Vec<capabilities::provider::WasmProvider> {
+    ) -> PluginAdapterBuild<Vec<capabilities::provider::WasmProvider>> {
         let plugins = self.registry.list().await;
         let mut providers = Vec::new();
+        let mut errors = Vec::new();
 
         for info in &plugins {
             if !matches!(info.status, registry::PluginStatus::Active) {
@@ -732,7 +733,10 @@ impl PluginManager {
             let component = match self.registry.get_component(&info.name).await {
                 Some(c) => c,
                 None => {
-                    tracing::debug!(plugin = %info.name, "skipping provider adapter — no WASM component");
+                    errors.push(format!(
+                        "plugin '{}' declares provider but has no WASM component",
+                        info.name
+                    ));
                     continue;
                 }
             };
@@ -766,11 +770,15 @@ impl PluginManager {
                 }
                 Err(e) => {
                     tracing::warn!(plugin = %info.name, error = %e, "failed to create provider adapter");
+                    errors.push(format!("plugin '{}' provider adapter failed: {e}", info.name));
                 }
             }
         }
 
-        providers
+        PluginAdapterBuild {
+            value: providers,
+            errors,
+        }
     }
 
     /// Create storage adapters for all plugins with storage capabilities.
@@ -780,9 +788,10 @@ impl PluginManager {
     pub async fn create_storage_adapters(
         &self,
         event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
-    ) -> Vec<capabilities::storage::WasmStorage> {
+    ) -> PluginAdapterBuild<Vec<capabilities::storage::WasmStorage>> {
         let plugins = self.registry.list().await;
         let mut storages = Vec::new();
+        let mut errors = Vec::new();
 
         for info in &plugins {
             if !matches!(info.status, registry::PluginStatus::Active) {
@@ -800,7 +809,10 @@ impl PluginManager {
             let component = match self.registry.get_component(&info.name).await {
                 Some(c) => c,
                 None => {
-                    tracing::debug!(plugin = %info.name, "skipping storage adapter — no WASM component");
+                    errors.push(format!(
+                        "plugin '{}' declares storage but has no WASM component",
+                        info.name
+                    ));
                     continue;
                 }
             };
@@ -834,11 +846,15 @@ impl PluginManager {
                 }
                 Err(e) => {
                     tracing::warn!(plugin = %info.name, error = %e, "failed to create storage adapter");
+                    errors.push(format!("plugin '{}' storage adapter failed: {e}", info.name));
                 }
             }
         }
 
-        storages
+        PluginAdapterBuild {
+            value: storages,
+            errors,
+        }
     }
 
     /// Get a reference to the wasmtime engine.
@@ -1170,7 +1186,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("test: tempdir");
         let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
         let providers = manager.create_provider_adapters(None).await;
-        assert!(providers.is_empty());
+        assert!(providers.value.is_empty());
+        assert!(providers.errors.is_empty());
     }
 
     #[tokio::test]
@@ -1178,6 +1195,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("test: tempdir");
         let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
         let storages = manager.create_storage_adapters(None).await;
-        assert!(storages.is_empty());
+        assert!(storages.value.is_empty());
+        assert!(storages.errors.is_empty());
     }
 }

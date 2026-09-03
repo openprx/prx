@@ -1,0 +1,18 @@
+package prx:plugin@0.1.0;
+
+interface storage-exports {
+    record memory-entry {
+        id: string,
+        key: string,
+        content: string,
+        category: string,
+        timestamp: string,
+        score: option<f64>,
+    }
+    name: func() -> string;
+    store-memory: func(key: string, content: string, category: string, session-id: option<string>) -> result<_, string>;
+    recall-memory: func(query: string, limit: u32, session-id: option<string>) -> result<list<memory-entry>, string>;
+    forget-memory: func(key: string) -> result<bool, string>;
+    count-memories: func() -> result<u32, string>;
+    health-check: func() -> bool;
+}

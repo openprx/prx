@@ -19,6 +19,7 @@ use crate::plugins::manifest::PluginManifest;
 use crate::providers::traits::{ChatMessage, ChatResponse, Provider, ToolCall};
 
 /// A loaded WASM provider plugin instance.
+#[derive(Clone)]
 pub struct WasmProvider {
     /// The cached provider name (returned by `name()` at load time).
     provider_name: String,
@@ -110,12 +111,7 @@ impl WasmProvider {
     ///
     /// Provider world imports: log, config, http-outbound, events.
     fn register_host_functions(linker: &mut wasmtime::component::Linker<HostState>) -> PluginResult<()> {
-        super::common::register_log_host_functions(linker)?;
-        super::common::register_config_host_functions(linker)?;
-        super::common::register_http_host_functions(linker)?;
-        super::common::register_websocket_host_functions(linker)?;
-        super::common::register_event_host_functions(linker)?;
-        Ok(())
+        super::common::register_common_host_functions(linker)
     }
 
     /// Call the `name` export to get the provider name.
@@ -306,6 +302,32 @@ impl WasmProvider {
 
 #[async_trait]
 impl Provider for WasmProvider {
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+
+    async fn chat(
+        &self,
+        request: crate::providers::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(self.timeout_ms),
+            self.call_chat_inner(request.messages, model, temperature),
+        )
+        .await;
+        match result {
+            Err(_) => anyhow::bail!(
+                "WASM provider '{}' timed out after {}ms",
+                self.provider_name,
+                self.timeout_ms
+            ),
+            Ok(Err(error)) => anyhow::bail!("{error}"),
+            Ok(Ok(response)) => Ok(response),
+        }
+    }
+
     /// Execute a chat completion via the WASM plugin.
     ///
     /// Builds a message list from the system prompt and user message,

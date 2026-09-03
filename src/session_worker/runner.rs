@@ -620,6 +620,14 @@ async fn run_validated_manifest(
 
     let provider_runtime_options = crate::providers::provider_runtime_options_from_config(&config);
 
+    #[cfg(feature = "wasm-plugins")]
+    let wasm_early_runtime =
+        if manifest.provider_name.starts_with("wasm:") || configured_memory_backend.starts_with("wasm:") {
+            crate::plugins::init_plugin_runtime(&manifest.workspace_dir, None).await
+        } else {
+            None
+        };
+
     let provider: Arc<dyn Provider> = Arc::from(crate::providers::create_resilient_provider_with_options(
         &manifest.provider_name,
         manifest.api_key.as_deref().or(config.api_key.as_deref()),
@@ -650,6 +658,16 @@ async fn run_validated_manifest(
             manifest.memory_db_path.clone(),
             config.memory.acl_enabled,
         )?)
+    };
+    #[cfg(feature = "wasm-plugins")]
+    let wasm_plugin_runtime = if let Some(runtime) = wasm_early_runtime {
+        runtime
+            .attach_memory(Arc::clone(&memory))
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to attach WASM memory backend in session-worker: {error}"))?;
+        Some(runtime)
+    } else {
+        crate::plugins::init_plugin_runtime(&manifest.workspace_dir, Some(Arc::clone(&memory))).await
     };
     let memory_workspace_id = manifest
         .memory_workspace_id
@@ -693,7 +711,8 @@ async fn run_validated_manifest(
         (None, None)
     };
 
-    let full_tools = tools::all_tools_with_runtime(
+    #[allow(unused_mut)]
+    let mut full_tools = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         shared_config,
         &security,
@@ -708,6 +727,13 @@ async fn run_validated_manifest(
         manifest.api_key.as_deref().or(config.api_key.as_deref()),
         &config,
     );
+    #[cfg(feature = "wasm-plugins")]
+    if let Some(plugin_runtime) = &wasm_plugin_runtime {
+        full_tools.push(plugin_runtime.tool_router());
+        full_tools.push(plugin_runtime.status_tool());
+        full_tools.push(plugin_runtime.reload_tool(Arc::clone(&security)));
+        full_tools.push(plugin_runtime.manage_tool(Arc::clone(&security)));
+    }
 
     let tools_registry = select_tools_for_worker(full_tools, &manifest.allowed_tools)?;
     let system_prompt = resolve_system_prompt(&manifest);
@@ -742,6 +768,10 @@ async fn run_validated_manifest(
 
         let observer = NoopObserver;
         let hooks = HookManager::new(manifest.workspace_dir.clone());
+        #[cfg(feature = "wasm-plugins")]
+        if let Some(plugin_runtime) = &wasm_plugin_runtime {
+            hooks.set_plugin_runtime(Arc::clone(plugin_runtime)).await;
+        }
         let scope_ctx = match (
             manifest.scope_sender.as_deref(),
             manifest.scope_channel.as_deref(),

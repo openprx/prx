@@ -300,6 +300,11 @@ pub fn create_memory_with_storage_and_routes_with_acl(
     user_policies: &[UserPolicyConfig],
 ) -> anyhow::Result<Box<dyn Memory>> {
     let backend_name = effective_memory_backend_name(&config.backend, storage_provider);
+    #[cfg(feature = "wasm-plugins")]
+    if backend_name.starts_with("wasm:") {
+        return crate::plugins::runtime::resolve_process_storage(&backend_name)
+            .ok_or_else(|| anyhow::anyhow!("WASM storage backend '{backend_name}' is not loaded in this process"));
+    }
     let backend_kind = classify_memory_backend(&backend_name);
     let resolved_embedding = resolve_embedding_config(config, embedding_routes, api_key);
 
@@ -487,6 +492,9 @@ fn upsert_acl_bootstrap(
 }
 
 pub fn create_memory_for_migration(backend: &str, workspace_dir: &Path) -> anyhow::Result<Box<dyn Memory>> {
+    if backend.starts_with("wasm:") {
+        anyhow::bail!("memory migration for WASM storage backend '{backend}' is unsupported");
+    }
     if matches!(classify_memory_backend(backend), MemoryBackendKind::None) {
         anyhow::bail!("memory backend 'none' disables persistence; choose sqlite, lucid, or markdown before migration");
     }

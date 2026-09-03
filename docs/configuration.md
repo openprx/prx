@@ -253,6 +253,14 @@ claude-opus-4-6 = ["claude-sonnet-4-6"]
 fallback_providers = ["xai"]
 ```
 
+When the `wasm-plugins` feature is enabled, an installed provider component can
+be selected with `default_provider = "wasm:<exported-name>"`. Likewise,
+`memory.backend = "wasm:<exported-name>"` selects an installed storage
+component. The explicit `wasm:` namespace is required so plugins cannot shadow
+built-in provider or memory backend names. These selections are supported by
+TUI chat, both agent CLIs, gateway turns, standalone IM channels, delegated
+agents, and process-isolated session workers.
+
 An unrestricted profile is always explicit: set `workspace_only = false`,
 clear `forbidden_paths`, and widen both ceilings deliberately. `prx doctor`
 warns when all four unrestricted choices are active together.

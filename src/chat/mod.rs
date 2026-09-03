@@ -4580,6 +4580,8 @@ pub async fn run(
         }
     };
     #[cfg(not(feature = "terminal-tui"))]
+    let redraw_tx_for_main: Option<mpsc::Sender<()>> = None;
+    #[cfg(not(feature = "terminal-tui"))]
     {
         println!("{banner}");
         let terminal_for_listen = TerminalChannel::new(plain_mode);

@@ -170,6 +170,19 @@ impl WasmCronManager {
         &self.jobs
     }
 
+    /// Adapter inventory used by runtime status and management surfaces.
+    pub fn adapters(&self) -> Vec<serde_json::Value> {
+        self.jobs
+            .iter()
+            .map(|job| {
+                serde_json::json!({
+                    "plugin": job.plugin_name(),
+                    "schedule": job.schedule(),
+                })
+            })
+            .collect()
+    }
+
     /// Returns true if no cron jobs are registered.
     pub const fn is_empty(&self) -> bool {
         self.jobs.is_empty()

@@ -284,6 +284,24 @@ impl RuntimeBootstrap {
         // workspace_dir as Arc<Path>: borrow the config path, no String detour.
         let workspace_dir: Arc<Path> = Arc::from(config.workspace_dir.as_path());
 
+        // A WASM storage backend must be loaded before the synchronous memory
+        // factory can resolve it. The runtime is therefore created in a
+        // memory-less first phase only for `memory.backend = "wasm:<name>"`;
+        // after resolution we atomically rebuild its adapters with that live
+        // backend attached. Native backends keep the original construction path.
+        #[cfg(feature = "wasm-plugins")]
+        let wasm_storage_bootstrap = if profile.needs_memory()
+            && crate::memory::effective_memory_backend_name(
+                &config.memory.backend,
+                Some(&config.storage.provider.config),
+            )
+            .starts_with("wasm:")
+        {
+            crate::plugins::init_plugin_runtime(&config.workspace_dir, None).await
+        } else {
+            None
+        };
+
         // 3. memory — only when the profile needs it (Minimal stays None; keeps
         //    early-exit/Minimal paths free of new failure surface, F4).
         let memory: Option<Arc<dyn Memory>> = if profile.needs_memory() {
@@ -313,8 +331,17 @@ impl RuntimeBootstrap {
         };
 
         #[cfg(feature = "wasm-plugins")]
-        let plugin_runtime = if profile.needs_tools() {
-            crate::plugins::init_plugin_runtime(&config.workspace_dir, memory.clone()).await
+        let plugin_runtime = if profile.needs_tools() || wasm_storage_bootstrap.is_some() {
+            if let Some(runtime) = wasm_storage_bootstrap {
+                if let Some(memory) = memory.as_ref()
+                    && let Err(error) = runtime.attach_memory(Arc::clone(memory)).await
+                {
+                    return Err(anyhow::anyhow!("failed to attach WASM memory backend: {error}"));
+                }
+                Some(runtime)
+            } else {
+                crate::plugins::init_plugin_runtime(&config.workspace_dir, memory.clone()).await
+            }
         } else {
             None
         };
@@ -639,6 +666,33 @@ mod tests {
 
         assert!(ctx.memory.is_some(), "Channel must build memory");
         assert!(ctx.tools.is_some(), "Channel must build tools");
+    }
+
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn wasm_storage_bootstraps_before_memory_and_provider_factory_resolution() {
+        let tmp = tempfile::tempdir().expect("test: create temp dir");
+        for example in ["map-storage", "echo-provider"] {
+            let destination = tmp.path().join("plugins").join(example);
+            std::fs::create_dir_all(&destination).unwrap();
+            let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("pdk/rust/examples")
+                .join(example);
+            std::fs::copy(fixture.join("plugin.toml"), destination.join("plugin.toml")).unwrap();
+            std::fs::copy(fixture.join("plugin.wasm"), destination.join("plugin.wasm")).unwrap();
+        }
+        let mut config = test_config(tmp.path());
+        config.memory.backend = "wasm:wasm-map".to_string();
+        config.default_provider = Some("wasm:wasm-echo".to_string());
+
+        let ctx = RuntimeBootstrap::build(config, BootstrapProfile::Interactive)
+            .await
+            .expect("WASM storage bootstrap should succeed");
+        assert_eq!(ctx.memory.as_ref().map(|memory| memory.name()), Some("wasm-map"));
+        let runtime = ctx.plugin_runtime.as_ref().expect("plugin runtime");
+        assert_eq!(runtime.storage_names(), vec!["wasm-map"]);
+        assert_eq!(runtime.provider_names(), vec!["wasm-echo"]);
+        assert!(crate::providers::create_provider("wasm:wasm-echo", None).is_ok());
     }
 
     #[tokio::test]

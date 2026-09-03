@@ -32,6 +32,16 @@ impl MiddlewareStage {
             Self::LlmResponse => "llm_response",
         }
     }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "inbound" => Some(Self::Inbound),
+            "outbound" => Some(Self::Outbound),
+            "llm_request" => Some(Self::LlmRequest),
+            "llm_response" => Some(Self::LlmResponse),
+            _ => None,
+        }
+    }
 }
 
 /// A loaded middleware plugin instance.
@@ -223,5 +233,18 @@ impl MiddlewareChain {
     /// Number of middlewares in the chain.
     pub const fn len(&self) -> usize {
         self.middlewares.len()
+    }
+
+    /// Ordered adapter inventory used by runtime diagnostics.
+    pub fn adapters(&self) -> Vec<serde_json::Value> {
+        self.middlewares
+            .iter()
+            .map(|middleware| {
+                serde_json::json!({
+                    "plugin": middleware.plugin_name(),
+                    "priority": middleware.priority(),
+                })
+            })
+            .collect()
     }
 }

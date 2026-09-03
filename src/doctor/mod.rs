@@ -374,6 +374,10 @@ fn check_console_runtime(config: &Config, items: &mut Vec<DiagItem>) {
                 format!("backend '{backend}' does not provide durable conversation sessions"),
             ));
         }
+        crate::memory::MemoryBackendKind::Unknown if backend.starts_with("wasm:") => items.push(DiagItem::unknown(
+            cat,
+            format!("WASM backend '{backend}' conversation persistence is defined by the plugin"),
+        )),
         crate::memory::MemoryBackendKind::Unknown => items.push(DiagItem::error(
             cat,
             format!("unknown configured memory backend '{backend}'"),
@@ -426,6 +430,12 @@ fn check_runtime_memory_health(config: &Config, items: &mut Vec<DiagItem>) {
                     format!("read-only {backend} backend probe failed: {error}"),
                 )),
             }
+        }
+        crate::memory::MemoryBackendKind::Unknown if backend.starts_with("wasm:") => {
+            items.push(DiagItem::ready(
+                cat,
+                format!("WASM memory backend '{backend}' will be health-checked by the live plugin runtime"),
+            ));
         }
         crate::memory::MemoryBackendKind::Unknown => {
             items.push(DiagItem::error(

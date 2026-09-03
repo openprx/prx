@@ -17,6 +17,8 @@ use super::PluginManager;
 use super::capabilities::cron::WasmCronManager;
 use super::capabilities::hook::WasmHookExecutor;
 use super::capabilities::middleware::MiddlewareChain;
+use super::capabilities::provider::WasmProvider;
+use super::capabilities::storage::WasmStorage;
 use super::error::{PluginError, PluginResult};
 use super::event_bus::EventBus;
 use super::manifest::PluginManifest;
@@ -36,6 +38,8 @@ struct PluginGeneration {
     middleware: Arc<MiddlewareChain>,
     hooks: Arc<WasmHookExecutor>,
     cron: Arc<WasmCronManager>,
+    providers: HashMap<String, Arc<WasmProvider>>,
+    storages: HashMap<String, Arc<WasmStorage>>,
     errors: Vec<String>,
 }
 
@@ -58,7 +62,11 @@ impl PluginGeneration {
         let hooks_build = manager
             .create_hook_executor_with_memory(memory.clone(), Some(Arc::clone(&event_bus)))
             .await;
-        let cron_build = manager.create_cron_manager_with_memory(memory, Some(event_bus)).await;
+        let cron_build = manager
+            .create_cron_manager_with_memory(memory, Some(Arc::clone(&event_bus)))
+            .await;
+        let provider_build = manager.create_provider_adapters(Some(Arc::clone(&event_bus))).await;
+        let storage_build = manager.create_storage_adapters(Some(event_bus)).await;
         let tools = tools_build.value.into_iter().map(Arc::<dyn Tool>::from).collect();
         let middleware = Arc::new(middleware_build.value);
         let hooks = Arc::new(hooks_build.value);
@@ -69,15 +77,21 @@ impl PluginGeneration {
             .chain(middleware_build.errors)
             .chain(hooks_build.errors)
             .chain(cron_build.errors)
+            .chain(provider_build.errors)
+            .chain(storage_build.errors)
             .collect::<Vec<_>>();
-        for plugin in manager.list_plugins().await {
-            for capability in &plugin.capabilities {
-                if capability.starts_with("provider:") || capability.starts_with("storage:") {
-                    errors.push(format!(
-                        "plugin '{}' declares '{}' but that adapter type is not connected to the live process runtime",
-                        plugin.name, capability
-                    ));
-                }
+        let mut providers = HashMap::new();
+        for provider in provider_build.value {
+            let name = provider.provider_name().to_string();
+            if providers.insert(name.clone(), Arc::new(provider)).is_some() {
+                errors.push(format!("duplicate WASM provider export '{name}'"));
+            }
+        }
+        let mut storages = HashMap::new();
+        for storage in storage_build.value {
+            let name = storage.storage_name().to_string();
+            if storages.insert(name.clone(), Arc::new(storage)).is_some() {
+                errors.push(format!("duplicate WASM storage export '{name}'"));
             }
         }
 
@@ -88,6 +102,8 @@ impl PluginGeneration {
             middleware,
             hooks,
             cron,
+            providers,
+            storages,
             errors,
         })
     }
@@ -96,7 +112,7 @@ impl PluginGeneration {
 /// Sole process-level owner of a workspace's plugin generation and event bus.
 pub struct PluginRuntime {
     plugins_dir: PathBuf,
-    memory: Option<Arc<dyn Memory>>,
+    memory: parking_lot::RwLock<Option<Arc<dyn Memory>>>,
     event_bus: Arc<EventBus>,
     generation: ArcSwap<PluginGeneration>,
     reload_lock: Mutex<()>,
@@ -111,7 +127,7 @@ impl PluginRuntime {
             PluginGeneration::build(1, plugins_dir.clone(), memory.clone(), Arc::clone(&event_bus)).await?;
         let runtime = Arc::new(Self {
             plugins_dir,
-            memory,
+            memory: parking_lot::RwLock::new(memory),
             event_bus,
             generation: ArcSwap::from_pointee(generation),
             reload_lock: Mutex::new(()),
@@ -153,13 +169,9 @@ impl PluginRuntime {
         }
 
         let next_id = old.id.saturating_add(1);
-        let candidate = PluginGeneration::build(
-            next_id,
-            self.plugins_dir.clone(),
-            self.memory.clone(),
-            Arc::clone(&self.event_bus),
-        )
-        .await?;
+        let memory = self.memory.read().clone();
+        let candidate =
+            PluginGeneration::build(next_id, self.plugins_dir.clone(), memory, Arc::clone(&self.event_bus)).await?;
         if candidate.manager.get_plugin(name).await.is_none() {
             return Err(PluginError::Runtime(format!(
                 "reload candidate did not contain plugin '{name}'"
@@ -181,6 +193,14 @@ impl PluginRuntime {
         self.generation.load().hooks.diagnostics()
     }
 
+    pub fn middleware_diagnostics(&self) -> Vec<serde_json::Value> {
+        self.generation.load().middleware.adapters()
+    }
+
+    pub fn cron_diagnostics(&self) -> Vec<serde_json::Value> {
+        self.generation.load().cron.adapters()
+    }
+
     /// Snapshot the current middleware generation for one request pipeline.
     pub fn middleware(&self) -> Arc<MiddlewareChain> {
         Arc::clone(&self.generation.load().middleware)
@@ -189,6 +209,42 @@ impl PluginRuntime {
     /// Snapshot the current cron generation for scheduler integration.
     pub fn cron(&self) -> Arc<WasmCronManager> {
         Arc::clone(&self.generation.load().cron)
+    }
+
+    /// Names exported by provider adapters in the current generation.
+    pub fn provider_names(&self) -> Vec<String> {
+        let mut names = self.generation.load().providers.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    /// Names exported by storage adapters in the current generation.
+    pub fn storage_names(&self) -> Vec<String> {
+        let mut names = self.generation.load().storages.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    /// Return a reload-safe provider proxy for an exported provider name.
+    pub fn provider(self: &Arc<Self>, name: &str) -> Option<Box<dyn crate::providers::traits::Provider>> {
+        let name = strip_wasm_prefix(name);
+        self.generation.load().providers.contains_key(name).then(|| {
+            Box::new(RuntimeWasmProvider {
+                runtime: Arc::clone(self),
+                name: name.to_string(),
+            }) as Box<dyn crate::providers::traits::Provider>
+        })
+    }
+
+    /// Return a reload-safe memory proxy for an exported storage name.
+    pub fn storage(self: &Arc<Self>, name: &str) -> Option<Arc<dyn Memory>> {
+        let name = strip_wasm_prefix(name);
+        self.generation.load().storages.contains_key(name).then(|| {
+            Arc::new(RuntimeWasmStorage {
+                runtime: Arc::clone(self),
+                name: name.to_string(),
+            }) as Arc<dyn Memory>
+        })
     }
 
     /// A stable multi-spec tool that resolves every call against one current generation.
@@ -223,15 +279,31 @@ impl PluginRuntime {
         let _reload_guard = self.reload_lock.lock().await;
         let old = self.generation.load_full();
         let next_id = old.id.saturating_add(1);
+        let memory = self.memory.read().clone();
+        let candidate =
+            PluginGeneration::build(next_id, self.plugins_dir.clone(), memory, Arc::clone(&self.event_bus)).await?;
+        self.generation.store(Arc::new(candidate));
+        tracing::info!(generation = next_id, "plugin generation atomically refreshed");
+        Ok(next_id)
+    }
+
+    /// Attach or replace the host memory backend and atomically rebuild every
+    /// adapter. This supports the two-phase bootstrap required when the memory
+    /// backend itself is supplied by a WASM storage plugin.
+    pub async fn attach_memory(&self, memory: Arc<dyn Memory>) -> PluginResult<u64> {
+        let _reload_guard = self.reload_lock.lock().await;
+        let old = self.generation.load_full();
+        let next_id = old.id.saturating_add(1);
         let candidate = PluginGeneration::build(
             next_id,
             self.plugins_dir.clone(),
-            self.memory.clone(),
+            Some(Arc::clone(&memory)),
             Arc::clone(&self.event_bus),
         )
         .await?;
+        *self.memory.write() = Some(memory);
         self.generation.store(Arc::new(candidate));
-        tracing::info!(generation = next_id, "plugin generation atomically refreshed");
+        tracing::info!(generation = next_id, "plugin generation attached live memory backend");
         Ok(next_id)
     }
 
@@ -253,6 +325,138 @@ impl PluginRuntime {
                     .await;
             }
         });
+    }
+}
+
+fn strip_wasm_prefix(name: &str) -> &str {
+    name.strip_prefix("wasm:").unwrap_or(name)
+}
+
+struct RuntimeWasmProvider {
+    runtime: Arc<PluginRuntime>,
+    name: String,
+}
+
+impl RuntimeWasmProvider {
+    fn current(&self) -> anyhow::Result<Arc<WasmProvider>> {
+        self.runtime
+            .generation
+            .load()
+            .providers
+            .get(&self.name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("WASM provider '{}' is unavailable in the current generation", self.name))
+    }
+}
+
+#[async_trait]
+impl crate::providers::traits::Provider for RuntimeWasmProvider {
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+
+    async fn chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        self.current()?
+            .chat_with_system(system_prompt, message, model, temperature)
+            .await
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[crate::providers::traits::ChatMessage],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        self.current()?.chat_with_history(messages, model, temperature).await
+    }
+
+    async fn chat(
+        &self,
+        request: crate::providers::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<crate::providers::traits::ChatResponse> {
+        self.current()?.chat(request, model, temperature).await
+    }
+}
+
+struct RuntimeWasmStorage {
+    runtime: Arc<PluginRuntime>,
+    name: String,
+}
+
+impl RuntimeWasmStorage {
+    fn current(&self) -> anyhow::Result<Arc<WasmStorage>> {
+        self.runtime
+            .generation
+            .load()
+            .storages
+            .get(&self.name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("WASM storage '{}' is unavailable in the current generation", self.name))
+    }
+}
+
+#[async_trait]
+impl Memory for RuntimeWasmStorage {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn store(
+        &self,
+        key: &str,
+        content: &str,
+        category: crate::memory::traits::MemoryCategory,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.current()?.store(key, content, category, session_id).await
+    }
+
+    async fn recall(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::memory::traits::MemoryEntry>> {
+        self.current()?.recall(query, limit, session_id).await
+    }
+
+    async fn get(&self, key: &str) -> anyhow::Result<Option<crate::memory::traits::MemoryEntry>> {
+        self.current()?.get(key).await
+    }
+
+    async fn list(
+        &self,
+        category: Option<&crate::memory::traits::MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::memory::traits::MemoryEntry>> {
+        self.current()?.list(category, session_id).await
+    }
+
+    async fn forget(&self, key: &str) -> anyhow::Result<bool> {
+        self.current()?.forget(key).await
+    }
+
+    async fn count(&self) -> anyhow::Result<usize> {
+        self.current()?.count().await
+    }
+
+    async fn health_check(&self) -> bool {
+        match self.current() {
+            Ok(storage) => storage.health_check().await,
+            Err(_) => false,
+        }
+    }
+
+    fn supports_document_ingest(&self) -> bool {
+        false
     }
 }
 
@@ -322,6 +526,10 @@ impl Tool for PluginStatusTool {
                 "count": plugins.len(),
                 "plugins": plugins,
                 "hook_adapters": hook_adapters,
+                "middleware_adapters": self.runtime.middleware_diagnostics(),
+                "cron_adapters": self.runtime.cron_diagnostics(),
+                "provider_adapters": self.runtime.provider_names(),
+                "storage_adapters": self.runtime.storage_names(),
                 "errors": errors,
             }))?,
             error: None,
@@ -365,10 +573,11 @@ impl PluginManageTool {
 
     fn authorize(&self, action: &str, args: &serde_json::Value) -> Result<(), ToolResult> {
         let risk = match action {
-            "status" | "get" => return Ok(()),
+            "status" | "get" | "middleware_test" | "provider_chat" | "storage_health" | "storage_recall"
+            | "storage_count" => return Ok(()),
             "refresh" | "enable" | "disable" => ResourceRiskLevel::Low,
-            "install" | "update" => ResourceRiskLevel::Medium,
-            "remove" => ResourceRiskLevel::High,
+            "install" | "update" | "cron_run" | "storage_store" => ResourceRiskLevel::Medium,
+            "remove" | "storage_forget" => ResourceRiskLevel::High,
             _ => return Ok(()),
         };
         let operation = format!("wasm_plugins_manage:{action}");
@@ -697,6 +906,108 @@ impl PluginManageTool {
         }
         Ok(inventory)
     }
+
+    async fn test_middleware(&self, args: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let stage_name = Self::required_string(args, "stage")?;
+        let stage = super::capabilities::middleware::MiddlewareStage::parse(stage_name)
+            .ok_or_else(|| anyhow::anyhow!("unsupported middleware stage '{stage_name}'"))?;
+        let input = args.get("data").cloned().unwrap_or_else(|| serde_json::json!({}));
+        let output = self.runtime.middleware().process(stage, &input.to_string()).await;
+        let output: serde_json::Value = serde_json::from_str(&output)
+            .map_err(|error| anyhow::anyhow!("middleware output is not valid JSON: {error}"))?;
+        Ok(serde_json::json!({"stage": stage_name, "input": input, "output": output}))
+    }
+
+    async fn run_cron(&self, args: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let name = Self::required_string(args, "name")?;
+        let output = self.runtime.cron().run_job(name).await?;
+        Ok(serde_json::json!({"plugin": name, "output": output}))
+    }
+
+    async fn chat_provider(&self, args: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let name = Self::required_string(args, "name")?;
+        let model = args
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("default");
+        let temperature = args
+            .get("temperature")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        let messages = if let Some(messages) = args.get("messages") {
+            serde_json::from_value::<Vec<crate::providers::traits::ChatMessage>>(messages.clone())?
+        } else {
+            vec![crate::providers::traits::ChatMessage::user(Self::required_string(
+                args, "message",
+            )?)]
+        };
+        let generation = self.runtime.generation.load_full();
+        let provider = generation
+            .providers
+            .get(strip_wasm_prefix(name))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("WASM provider '{name}' is not available"))?;
+        let response = crate::providers::traits::Provider::chat(
+            provider.as_ref(),
+            crate::providers::traits::ChatRequest {
+                messages: &messages,
+                tools: None,
+            },
+            model,
+            temperature,
+        )
+        .await?;
+        Ok(serde_json::json!({
+            "provider": name,
+            "model": model,
+            "text": response.text,
+            "tool_calls": response.tool_calls,
+            "reasoning_content": response.reasoning_content,
+        }))
+    }
+
+    async fn storage_operation(&self, action: &str, args: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let name = Self::required_string(args, "name")?;
+        let generation = self.runtime.generation.load_full();
+        let storage = generation
+            .storages
+            .get(strip_wasm_prefix(name))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("WASM storage '{name}' is not available"))?;
+        match action {
+            "storage_health" => Ok(serde_json::json!({"storage": name, "healthy": storage.health_check().await})),
+            "storage_count" => Ok(serde_json::json!({"storage": name, "count": storage.count().await?})),
+            "storage_store" => {
+                let key = Self::required_string(args, "key")?;
+                let content = Self::required_string(args, "content")?;
+                let category = args
+                    .get("category")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("custom");
+                let category = match category {
+                    "core" => crate::memory::traits::MemoryCategory::Core,
+                    "daily" => crate::memory::traits::MemoryCategory::Daily,
+                    "conversation" => crate::memory::traits::MemoryCategory::Conversation,
+                    other => crate::memory::traits::MemoryCategory::Custom(other.to_string()),
+                };
+                let session_id = args.get("session_id").and_then(serde_json::Value::as_str);
+                storage.store(key, content, category, session_id).await?;
+                Ok(serde_json::json!({"storage": name, "stored": true, "key": key}))
+            }
+            "storage_recall" => {
+                let query = args.get("query").and_then(serde_json::Value::as_str).unwrap_or("");
+                let limit = args.get("limit").and_then(serde_json::Value::as_u64).unwrap_or(10) as usize;
+                let session_id = args.get("session_id").and_then(serde_json::Value::as_str);
+                let entries = storage.recall(query, limit, session_id).await?;
+                Ok(serde_json::json!({"storage": name, "entries": entries}))
+            }
+            "storage_forget" => {
+                let key = Self::required_string(args, "key")?;
+                Ok(serde_json::json!({"storage": name, "key": key, "forgotten": storage.forget(key).await?}))
+            }
+            _ => anyhow::bail!("unsupported storage action '{action}'"),
+        }
+    }
 }
 
 fn validate_plugin_name(name: &str) -> anyhow::Result<()> {
@@ -718,18 +1029,52 @@ impl Tool for PluginManageTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect and manage workspace WASM plugins: install or update from a workspace directory, enable, disable, remove recoverably, or atomically refresh the runtime."
+        "Inspect, manage, and invoke workspace WASM plugins across tool, middleware, hook, cron, provider, and storage capabilities."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["status", "get", "refresh", "install", "update", "enable", "disable", "remove"]},
-                "name": {"type": "string", "description": "Plugin name for get, enable, disable, or remove"},
-                "source": {"type": "string", "description": "Plugin source directory inside the workspace for install or update"}
+                "action": {"type": "string", "enum": ["status", "get", "refresh", "install", "update", "enable", "disable", "remove", "middleware_test", "cron_run", "provider_chat", "storage_health", "storage_store", "storage_recall", "storage_forget", "storage_count"]},
+                "name": {"type": "string", "minLength": 1, "description": "Required for get, enable, disable, remove, cron_run, provider_chat, and every storage_* action; use a plugin name or exported adapter name"},
+                "source": {"type": "string", "description": "Plugin source directory inside the workspace for install or update"},
+                "stage": {"type": "string", "enum": ["inbound", "outbound", "llm_request", "llm_response"]},
+                "data": {"description": "JSON envelope for middleware_test"},
+                "message": {"type": "string", "description": "Single user message for provider_chat"},
+                "messages": {"type": "array", "items": {"type": "object", "required": ["role", "content"]}},
+                "model": {"type": "string"},
+                "temperature": {"type": "number"},
+                "key": {"type": "string"},
+                "content": {"type": "string"},
+                "category": {"type": "string"},
+                "session_id": {"type": "string"},
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1}
             },
             "required": ["action"],
+            "allOf": [
+                {
+                    "if": {"properties": {"action": {"enum": ["get", "enable", "disable", "remove", "cron_run", "provider_chat", "storage_health", "storage_store", "storage_recall", "storage_forget", "storage_count"]}}},
+                    "then": {"required": ["name"]}
+                },
+                {
+                    "if": {"properties": {"action": {"enum": ["install", "update"]}}},
+                    "then": {"required": ["source"]}
+                },
+                {
+                    "if": {"properties": {"action": {"const": "middleware_test"}}},
+                    "then": {"required": ["stage"]}
+                },
+                {
+                    "if": {"properties": {"action": {"const": "storage_store"}}},
+                    "then": {"required": ["key", "content"]}
+                },
+                {
+                    "if": {"properties": {"action": {"const": "storage_forget"}}},
+                    "then": {"required": ["key"]}
+                }
+            ],
             "additionalProperties": false
         })
     }
@@ -745,6 +1090,10 @@ impl Tool for PluginManageTool {
                 "active": self.active_inventory().await?,
                 "disabled": self.disabled_plugins()?,
                 "hook_adapters": self.runtime.hook_diagnostics(),
+                "middleware_adapters": self.runtime.middleware_diagnostics(),
+                "cron_adapters": self.runtime.cron_diagnostics(),
+                "provider_adapters": self.runtime.provider_names(),
+                "storage_adapters": self.runtime.storage_names(),
                 "errors": self.runtime.adapter_errors(),
             })),
             "get" => {
@@ -777,6 +1126,12 @@ impl Tool for PluginManageTool {
             "enable" => self.enable(Self::required_string(&args, "name")?).await,
             "disable" => self.disable(Self::required_string(&args, "name")?).await,
             "remove" => self.remove(Self::required_string(&args, "name")?).await,
+            "middleware_test" => self.test_middleware(&args).await,
+            "cron_run" => self.run_cron(&args).await,
+            "provider_chat" => self.chat_provider(&args).await,
+            action @ ("storage_health" | "storage_store" | "storage_recall" | "storage_forget" | "storage_count") => {
+                self.storage_operation(action, &args).await
+            }
             _ => anyhow::bail!("Unsupported wasm_plugins_manage action: {action}"),
         };
         Ok(match result {
@@ -967,6 +1322,49 @@ impl Tool for PluginToolRouter {
 
 type RuntimeMap = HashMap<PathBuf, Weak<PluginRuntime>>;
 static PROCESS_RUNTIMES: OnceLock<Mutex<RuntimeMap>> = OnceLock::new();
+static PROCESS_RUNTIME_INDEX: OnceLock<parking_lot::RwLock<Vec<Weak<PluginRuntime>>>> = OnceLock::new();
+
+fn register_process_runtime(runtime: &Arc<PluginRuntime>) {
+    let index = PROCESS_RUNTIME_INDEX.get_or_init(|| parking_lot::RwLock::new(Vec::new()));
+    let mut runtimes = index.write();
+    runtimes.retain(|candidate| candidate.strong_count() > 0);
+    if !runtimes
+        .iter()
+        .filter_map(Weak::upgrade)
+        .any(|candidate| Arc::ptr_eq(&candidate, runtime))
+    {
+        runtimes.push(Arc::downgrade(runtime));
+    }
+}
+
+/// Resolve `wasm:<exported-name>` through the process runtime index.
+///
+/// Provider factories call this synchronously after the workspace runtime has
+/// been initialized. Restricting implicit lookup to the explicit `wasm:` prefix
+/// prevents a plugin from shadowing a built-in provider name.
+pub fn resolve_process_provider(name: &str) -> Option<Box<dyn crate::providers::traits::Provider>> {
+    let exported = name.strip_prefix("wasm:")?;
+    let runtimes = PROCESS_RUNTIME_INDEX.get()?.read();
+    runtimes
+        .iter()
+        .rev()
+        .filter_map(Weak::upgrade)
+        .find_map(|runtime| runtime.provider(exported))
+}
+
+/// Resolve `wasm:<exported-name>` as a reload-safe Memory backend.
+pub fn resolve_process_storage(name: &str) -> Option<Box<dyn Memory>> {
+    let exported = name.strip_prefix("wasm:")?;
+    let runtimes = PROCESS_RUNTIME_INDEX.get()?.read();
+    runtimes.iter().rev().filter_map(Weak::upgrade).find_map(|runtime| {
+        runtime.generation.load().storages.contains_key(exported).then(|| {
+            Box::new(RuntimeWasmStorage {
+                runtime,
+                name: exported.to_string(),
+            }) as Box<dyn Memory>
+        })
+    })
+}
 
 /// Return the one process-level runtime for `workspace_dir`, creating it once.
 pub async fn init_plugin_runtime(workspace_dir: &Path, memory: Option<Arc<dyn Memory>>) -> Option<Arc<PluginRuntime>> {
@@ -979,6 +1377,7 @@ pub async fn init_plugin_runtime(workspace_dir: &Path, memory: Option<Arc<dyn Me
 
     match PluginRuntime::new(&key, memory).await {
         Ok(runtime) => {
+            register_process_runtime(&runtime);
             runtimes.insert(key, Arc::downgrade(&runtime));
             Some(runtime)
         }
@@ -1012,6 +1411,16 @@ optional = []
             ),
         )
         .unwrap();
+    }
+
+    fn install_example_fixture(workspace: &Path, example: &str) {
+        let plugin_dir = workspace.join("plugins").join(example);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("pdk/rust/examples")
+            .join(example);
+        std::fs::copy(fixture.join("plugin.toml"), plugin_dir.join("plugin.toml")).unwrap();
+        std::fs::copy(fixture.join("plugin.wasm"), plugin_dir.join("plugin.wasm")).unwrap();
     }
 
     #[tokio::test]
@@ -1060,6 +1469,34 @@ optional = []
         let result = status.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("\"generation\": 1"));
+    }
+
+    #[tokio::test]
+    async fn manage_schema_declares_action_specific_required_fields() {
+        let temp = TempDir::new().unwrap();
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        let config = crate::config::Config {
+            workspace_dir: temp.path().to_path_buf(),
+            ..crate::config::Config::default()
+        };
+        let manage = runtime.manage_tool(crate::runtime::bootstrap::build_security_policy(&config));
+        let schema = manage.parameters_schema();
+        let conditions = schema
+            .get("allOf")
+            .and_then(serde_json::Value::as_array)
+            .expect("manage schema should publish action-specific requirements");
+
+        assert!(conditions.iter().any(|condition| {
+            condition.pointer("/if/properties/action/const") == Some(&serde_json::json!("storage_forget"))
+                && condition.pointer("/then/required") == Some(&serde_json::json!(["key"]))
+        }));
+        assert!(conditions.iter().any(|condition| {
+            condition
+                .pointer("/if/properties/action/enum")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|actions| actions.contains(&serde_json::json!("storage_forget")))
+                && condition.pointer("/then/required") == Some(&serde_json::json!(["name"]))
+        }));
     }
 
     #[tokio::test]
@@ -1148,5 +1585,149 @@ optional = []
         assert_eq!(hook.invocation_count, 1);
         assert_eq!(hook.last_event.as_deref(), Some("prx.lifecycle.turn_complete"));
         assert!(hook.last_error.is_none(), "{:?}", hook.last_error);
+    }
+
+    #[tokio::test]
+    async fn every_wasm_capability_executes_through_the_live_generation() {
+        let temp = TempDir::new().unwrap();
+        for example in ["pipeline-middleware", "counter-cron", "echo-provider", "map-storage"] {
+            install_example_fixture(temp.path(), example);
+        }
+
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+        assert_eq!(runtime.middleware_diagnostics().len(), 1);
+        assert_eq!(runtime.cron_diagnostics().len(), 1);
+        assert_eq!(runtime.provider_names(), vec!["wasm-echo"]);
+        assert_eq!(runtime.storage_names(), vec!["wasm-map"]);
+
+        let middleware_output = runtime
+            .middleware()
+            .process(
+                super::super::capabilities::middleware::MiddlewareStage::Outbound,
+                r#"{"text":"hello"}"#,
+            )
+            .await;
+        let middleware_output: serde_json::Value = serde_json::from_str(&middleware_output).unwrap();
+        assert_eq!(
+            middleware_output.get("text").and_then(serde_json::Value::as_str),
+            Some("[wasm-middleware] hello")
+        );
+        assert_eq!(
+            middleware_output
+                .pointer("/middleware_probe/stage")
+                .and_then(serde_json::Value::as_str),
+            Some("outbound")
+        );
+
+        assert_eq!(
+            runtime.cron().run_job("counter-cron").await.unwrap(),
+            "counter-cron-run-1"
+        );
+        assert_eq!(
+            runtime.cron().run_job("counter-cron").await.unwrap(),
+            "counter-cron-run-2"
+        );
+
+        let provider = runtime.provider("wasm-echo").unwrap();
+        let response = provider
+            .chat(
+                crate::providers::traits::ChatRequest {
+                    messages: &[crate::providers::traits::ChatMessage::user("provider probe")],
+                    tools: None,
+                },
+                "fixture-model",
+                0.0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.text.as_deref(),
+            Some("wasm-echo/fixture-model: provider probe")
+        );
+        assert!(crate::providers::create_provider("wasm:wasm-echo", None).is_ok());
+
+        let storage = runtime.storage("wasm-map").unwrap();
+        storage
+            .store(
+                "fixture-key",
+                "fixture-content",
+                crate::memory::traits::MemoryCategory::Core,
+                Some("fixture-session"),
+            )
+            .await
+            .unwrap();
+        assert!(storage.health_check().await);
+        assert_eq!(storage.count().await.unwrap(), 1);
+        let recalled = storage.recall("fixture", 10, Some("fixture-session")).await.unwrap();
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled.first().map(|entry| entry.key.as_str()), Some("fixture-key"));
+        assert!(storage.forget("fixture-key").await.unwrap());
+        assert_eq!(storage.count().await.unwrap(), 0);
+
+        runtime.refresh_all().await.unwrap();
+        let refreshed = provider
+            .simple_chat("after refresh", "fixture-model", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(refreshed, "wasm-echo/fixture-model: after refresh");
+        assert!(
+            storage.health_check().await,
+            "storage proxy must resolve the refreshed generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_capability_stress_executes_one_thousand_component_calls() {
+        let temp = TempDir::new().unwrap();
+        for example in ["pipeline-middleware", "counter-cron", "echo-provider", "map-storage"] {
+            install_example_fixture(temp.path(), example);
+        }
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        let provider = runtime.provider("wasm-echo").unwrap();
+        let storage = runtime.storage("wasm-map").unwrap();
+
+        let mut calls = 0usize;
+        for index in 0..200usize {
+            let middleware_output = runtime
+                .middleware()
+                .process(
+                    super::super::capabilities::middleware::MiddlewareStage::LlmRequest,
+                    &serde_json::json!({"index": index}).to_string(),
+                )
+                .await;
+            assert!(middleware_output.contains("middleware_probe"));
+            calls += 1;
+
+            let cron_output = runtime.cron().run_job("counter-cron").await.unwrap();
+            assert!(cron_output.starts_with("counter-cron-run-"));
+            calls += 1;
+
+            let response = provider
+                .simple_chat(&format!("probe-{index}"), "stress-model", 0.0)
+                .await
+                .unwrap();
+            assert!(response.ends_with(&format!("probe-{index}")));
+            calls += 1;
+
+            let key = format!("stress-{index}");
+            storage
+                .store(
+                    &key,
+                    "stress-content",
+                    crate::memory::traits::MemoryCategory::Custom("stress".to_string()),
+                    None,
+                )
+                .await
+                .unwrap();
+            calls += 1;
+
+            let recalled = storage.recall(&key, 1, None).await.unwrap();
+            assert_eq!(recalled.first().map(|entry| entry.key.as_str()), Some(key.as_str()));
+            calls += 1;
+        }
+
+        assert_eq!(calls, 1_000);
+        assert_eq!(storage.count().await.unwrap(), 200);
     }
 }
