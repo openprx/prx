@@ -2133,7 +2133,7 @@ const fn consume_deferred_visible_input_pop(defer_visible_input_pop_once: &mut b
     should_defer
 }
 
-fn surface_turn_elapsed_message(
+const fn surface_turn_elapsed_message(
     _dispatcher: &dispatcher::ChatDispatcher,
     _redraw_tx: Option<&mpsc::Sender<()>>,
     _status: &str,
