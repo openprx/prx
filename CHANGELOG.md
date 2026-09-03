@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.83] - 3 September 2026
+
+### Changed
+
+- Align assistant and tool-call transcript hierarchy with Codex-style neutral
+  filled markers, action wording, branch glyphs, and block spacing.
+- Bound MCP output inserted into model history to 16K characters per call while
+  retaining oversized results through the existing document reference path.
+
+### Fixed
+
+- Detach stdio MCP child stderr from the interactive terminal so `npx` and
+  package-manager notices cannot overwrite the TUI input or status rows.
+- Retry an empty model response once with a request-local corrective instruction
+  and fail honestly if the retry is also empty instead of completing a false
+  successful turn.
+- Republish main-queue status after immediate dequeue so fast slash commands
+  such as `/new` cannot leave a stale `queue:1` badge behind.
+
 ## [0.8.82] - 3 September 2026
 
 ### Fixed

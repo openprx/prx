@@ -3670,12 +3670,12 @@ fn estimate_line_height(line: &ConversationLine) -> u16 {
         ConversationLine::ToolResult {
             folded, result, status, ..
         } => {
-            // Claude-Code style: bullet header (1 row) + an optional follow-on
-            // block. While running there is no follow-on yet.
+            // Compact action header (1 row) + an optional follow-on block.
+            // While running there is no follow-on yet.
             if matches!(status, ToolStatus::Running) {
                 1
             } else if *folded {
-                // header + `⎿ output ✓ metrics` summary row + bounded preview.
+                // Header + branch/metrics summary row + bounded preview.
                 let result_text = result.as_deref().unwrap_or("");
                 let preview_rows = if result_text.trim().is_empty() {
                     0
@@ -4273,6 +4273,7 @@ fn push_live_turn_transcript_lines<'a, V: BottomChromeView + ?Sized>(lines: &mut
         }
         return;
     }
+    push_blank_line_if_needed(lines);
     push_assistant_rendered_lines(
         lines,
         render_streaming_assistant_markdown_lines(&streaming.accumulated, state.ascii_fallback()),
@@ -5933,6 +5934,7 @@ fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line: &'a Conver
             // PRX chat uses an explicit actor marker for assistant-authored
             // prose so it is visually distinct from tool IO and child-session
             // output when scanning a dense orchestration transcript.
+            push_blank_line_if_needed(lines);
             let rendered = cached_finalized_assistant_markdown_lines(content);
             push_assistant_rendered_lines(lines, rendered.iter().cloned(), ascii);
             lines.push(Line::from(""));
@@ -5942,6 +5944,7 @@ fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line: &'a Conver
             // glyph (`▌`, or `_` in ASCII mode) signals that more bytes are
             // still inbound; once the stream finalises the variant becomes
             // `Assistant` and the cursor disappears.
+            push_blank_line_if_needed(lines);
             push_assistant_rendered_lines(lines, render_streaming_assistant_markdown_lines(content, ascii), ascii);
             lines.push(Line::from(""));
         }
@@ -6003,8 +6006,8 @@ fn push_assistant_rendered_lines<'a, I>(lines: &mut Vec<Line<'a>>, rendered: I, 
 where
     I: IntoIterator<Item = Line<'static>>,
 {
-    let marker = if ascii { "o" } else { "\u{25CB}" }; // ○
-    let marker_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let marker = if ascii { "*" } else { "\u{25CF}" }; // ●
+    let marker_style = Style::default().fg(Color::DarkGray);
     let continuation_style = Style::default().fg(Color::DarkGray);
     let mut any = false;
     for (idx, line) in rendered.into_iter().enumerate() {
@@ -6020,6 +6023,15 @@ where
     }
     if !any {
         lines.push(Line::from(Span::styled(format!("{marker} "), marker_style)));
+    }
+}
+
+fn push_blank_line_if_needed(lines: &mut Vec<Line<'_>>) {
+    let last_is_blank = lines
+        .last()
+        .is_none_or(|line| line.spans.iter().all(|span| span.content.as_ref().trim().is_empty()));
+    if !last_is_blank {
+        lines.push(Line::from(""));
     }
 }
 
@@ -6208,12 +6220,13 @@ const fn ansi_basic_color(code: u16, bright: bool) -> Color {
     }
 }
 
-/// Render a `ToolResult` card in Claude-Code style.
+/// Render a compact `ToolResult` card using the same hierarchy as Codex:
+/// a low-emphasis action row followed by indented result metadata and preview.
 ///
 /// Folded layout (default):
 /// ```text
-/// ✓ run shell(command="ls /tmp")
-///   ⎿ output ✓ 234ms · 12 lines · 1.4kB
+/// • Ran shell(command="ls /tmp")
+///   └ 234ms · 12 lines · 1.4kB
 /// ```
 /// Expanded layout shows readable input plus bounded output/error rows. While
 /// While `Running`, no follow-on row is shown — just the animated tool header.
@@ -6230,10 +6243,14 @@ fn render_tool_result<'a>(
     ascii: bool,
 ) {
     let (_, hook) = tool_card_glyphs(ascii);
-    let (status_glyph, status_color) = if matches!(status, ToolStatus::Running) {
-        (spinner_frame_for_tick(ascii, current_animation_tick()), Color::Cyan)
-    } else {
-        tool_status_marker(status, ascii)
+    let (status_glyph, status_color, action) = match status {
+        ToolStatus::Running => (
+            spinner_frame_for_tick(ascii, current_animation_tick()),
+            Color::Cyan,
+            "Running ",
+        ),
+        ToolStatus::Done => (if ascii { "*" } else { "\u{2022}" }, Color::DarkGray, "Ran "),
+        ToolStatus::Error => (if ascii { "x" } else { "\u{00D7}" }, Color::Red, "Failed "),
     };
     let preview_ellipsis = if ascii {
         ARGS_PREVIEW_ELLIPSIS_ASCII
@@ -6254,14 +6271,12 @@ fn render_tool_result<'a>(
     lines.push(Line::from(vec![
         Span::styled(format!("{status_glyph} "), Style::default().fg(status_color)),
         Span::styled(
-            "run ",
-            Style::default()
-                .fg(if matches!(status, ToolStatus::Error) {
-                    Color::Red
-                } else {
-                    Color::Green
-                })
-                .add_modifier(Modifier::BOLD),
+            action,
+            Style::default().fg(if matches!(status, ToolStatus::Error) {
+                Color::Red
+            } else {
+                Color::DarkGray
+            }),
         ),
         Span::raw(header),
     ]));
@@ -6298,30 +6313,22 @@ fn push_folded_tool_summary<'a>(
     result: Option<&str>,
     ascii: bool,
 ) {
-    let (status_glyph, status_color) = tool_status_marker(status, ascii);
     let metrics_style = Style::default().fg(Color::DarkGray);
     let result_text = result.unwrap_or("");
     let metrics = tool_card_metrics(status, elapsed_ms, result_text, ascii);
-    let label = if matches!(status, ToolStatus::Error) {
-        "error"
+    let prefix = if matches!(status, ToolStatus::Error) {
+        "error · "
     } else {
-        "output"
+        ""
     };
-    let label_style = Style::default()
-        .fg(if matches!(status, ToolStatus::Error) {
-            Color::Red
+    lines.push(Line::from(Span::styled(
+        format!("  {hook} {prefix}{metrics}"),
+        if matches!(status, ToolStatus::Error) {
+            Style::default().fg(Color::Red)
         } else {
-            Color::Green
-        })
-        .add_modifier(Modifier::BOLD);
-
-    lines.push(Line::from(vec![
-        Span::styled(format!("  {hook} "), metrics_style),
-        Span::styled(label, label_style),
-        Span::styled(" ", metrics_style),
-        Span::styled(status_glyph, Style::default().fg(status_color)),
-        Span::styled(format!(" {metrics}"), metrics_style),
-    ]));
+            metrics_style
+        },
+    )));
     push_folded_tool_result_preview(lines, tool_name, result_text, ascii);
 }
 
@@ -6874,12 +6881,12 @@ const fn reasoning_card_glyphs(ascii: bool) -> (&'static str, &'static str) {
     }
 }
 
-/// Pick the legacy bullet (`●` / `*`) and hook glyph (`⎿` / `L`) used by tool cards.
+/// Pick the bullet and branch glyph used by tool cards.
 ///
 /// Completed cards use the hook for the follow-on summary/body. Running rich
 /// cards replace the legacy bullet with the shared spinner at render time.
 const fn tool_card_glyphs(ascii: bool) -> (&'static str, &'static str) {
-    if ascii { ("*", "L") } else { ("\u{25CF}", "\u{23BF}") }
+    if ascii { ("*", "L") } else { ("\u{25CF}", "\u{2514}") }
 }
 
 /// Status → header/result marker + marker color.
@@ -7661,7 +7668,7 @@ mod tests {
             true, // ascii — deterministic, no unicode glyphs
         );
         let header = lines.first().map(line_to_plain).expect("test: header line present");
-        assert!(header.starts_with("v "), "success marker present: {header}");
+        assert!(header.starts_with("* Ran "), "success marker present: {header}");
         assert!(header.contains("delegate("), "tool name + preview: {header}");
         assert!(
             header.contains("task=\"investigate the bug\""),
@@ -8046,6 +8053,24 @@ mod tests {
     }
 
     #[test]
+    fn assistant_marker_is_filled_neutral_and_separated_from_tool_output() {
+        let mut sink: Vec<Line<'_>> = vec![Line::from("• Ran shell(command=\"pwd\")")];
+        let line = ConversationLine::Assistant {
+            content: "done".to_string(),
+        };
+        render_conversation_line(&mut sink, &line, false);
+
+        assert_eq!(
+            line_to_plain(&sink[1]),
+            "",
+            "tool and assistant blocks need a blank row"
+        );
+        assert!(line_to_plain(&sink[2]).starts_with("● done"));
+        assert_eq!(sink[2].spans[0].style.fg, Some(Color::DarkGray));
+        assert!(!sink[2].spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
     fn streaming_assistant_empty_content_still_renders() {
         let line = ConversationLine::StreamingAssistant { content: String::new() };
         let mut sink: Vec<Line<'_>> = Vec::new();
@@ -8218,7 +8243,7 @@ mod tests {
             UNICODE_SPINNER_FRAMES.iter().any(|frame| rendered.contains(frame)),
             "uses animated spinner: {rendered}"
         );
-        assert!(rendered.contains("run "), "shows run marker: {rendered}");
+        assert!(rendered.contains("Running "), "shows running marker: {rendered}");
         assert!(
             rendered.contains(r#"shell(command="ls")"#),
             "shows Tool(args) preview: {rendered}"
@@ -8228,8 +8253,8 @@ mod tests {
 
     #[test]
     fn render_folded_tool_card_done_shows_hook_summary() {
-        // Claude-Code style follow-on: `  ⎿ output ✓ 234ms · 3 lines · 5B`
-        // under the run header once the tool finishes.
+        // Codex-style follow-on: `  └ 234ms · 3 lines · 5B` under
+        // the low-emphasis action header once the tool finishes.
         let mut lines: Vec<Line<'_>> = Vec::new();
         let card = ConversationLine::ToolResult {
             tool_name: "shell".to_string(),
@@ -8249,18 +8274,15 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(summary.contains("\u{23BF}"), "uses ⎿ hook glyph: {summary}");
-        assert!(summary.contains("output"), "labels output stream: {summary}");
-        assert!(summary.contains("\u{2713}"), "shows success check: {summary}");
+        assert!(summary.contains("\u{2514}"), "uses └ branch glyph: {summary}");
         assert!(summary.contains("234ms"), "shows elapsed ms: {summary}");
         assert!(summary.contains("3 lines"), "shows result line count: {summary}");
         assert!(summary.contains("5B"), "shows result byte count: {summary}");
         assert_eq!(line_to_plain(lines.get(2).expect("test: preview line")), "    │ a");
         assert_eq!(line_to_plain(lines.get(3).expect("test: preview line")), "    │ b");
         assert_eq!(line_to_plain(lines.get(4).expect("test: preview line")), "    │ c");
-        assert_eq!(span_fg(&lines, 0, 0), Some(Color::Green));
-        assert_eq!(span_fg(&lines, 1, 1), Some(Color::Green));
-        assert_eq!(span_fg(&lines, 1, 3), Some(Color::Green));
+        assert_eq!(span_fg(&lines, 0, 0), Some(Color::DarkGray));
+        assert_eq!(span_fg(&lines, 1, 0), Some(Color::DarkGray));
     }
 
     #[test]
@@ -8316,13 +8338,13 @@ mod tests {
         let header = line_to_plain(lines.first().expect("test: header"));
         let summary = line_to_plain(lines.get(1).expect("test: summary"));
 
-        assert!(header.starts_with("\u{2717} run "), "error header marker: {header}");
+        assert!(header.starts_with("\u{00D7} Failed "), "error header marker: {header}");
         assert!(
-            summary.contains("error \u{2717} 50ms \u{00B7} permission denied"),
+            summary.contains("error \u{00B7} 50ms \u{00B7} permission denied"),
             "error summary: {summary}"
         );
         assert_eq!(span_fg(&lines, 0, 0), Some(Color::Red));
-        assert_eq!(span_fg(&lines, 1, 1), Some(Color::Red));
+        assert_eq!(span_fg(&lines, 1, 0), Some(Color::Red));
         assert_eq!(
             line_to_plain(lines.get(2).expect("error preview first line")),
             "    │ permission denied",
@@ -8348,10 +8370,10 @@ mod tests {
             folded: false,
         };
         render_conversation_line(&mut lines, &card, false);
-        // Claude-Code style expanded:
-        //   row 0  `✓ run shell(command="ls -la /tmp")`
-        //   row 1  `  ⎿ input  command="ls -la /tmp"`
-        //   row 2  `  ⎿ output ✓ 2 lines · 20B`
+        // Compact expanded style:
+        //   row 0  `• Ran shell(command="ls -la /tmp")`
+        //   row 1  `  └ input  command="ls -la /tmp"`
+        //   row 2  `  └ output ✓ 2 lines · 20B`
         //   row 3+ output body
         assert_eq!(lines.len(), 5, "expanded card line count: {}", lines.len());
         let join = |i: usize| -> String {
@@ -8363,14 +8385,13 @@ mod tests {
                 .map(|s| s.content.as_ref())
                 .collect()
         };
-        assert!(join(0).contains("\u{2713}"), "uses ✓ marker: {}", join(0));
-        assert!(join(0).contains("run "), "uses run marker: {}", join(0));
+        assert!(join(0).starts_with("\u{2022} Ran "), "uses action marker: {}", join(0));
         assert!(
             join(0).contains("shell(command=\"ls -la /tmp\")"),
             "shows readable args: {}",
             join(0)
         );
-        assert!(join(1).contains("\u{23BF}"), "uses ⎿ hook on input row: {}", join(1));
+        assert!(join(1).contains("\u{2514}"), "uses └ branch on input row: {}", join(1));
         assert!(
             join(1).contains("input  command=\"ls -la /tmp\""),
             "input row: {}",
@@ -8440,7 +8461,7 @@ mod tests {
         // Running keeps the white bullet; terminal states get explicit markers.
         let (bullet, hook) = tool_card_glyphs(false);
         assert_eq!(bullet, "\u{25CF}", "unicode bullet ●");
-        assert_eq!(hook, "\u{23BF}", "unicode hook ⎿");
+        assert_eq!(hook, "\u{2514}", "unicode branch └");
         assert_eq!(
             tool_status_marker(ToolStatus::Running, false),
             ("\u{25CF}", Color::White)
@@ -8507,7 +8528,7 @@ mod tests {
         };
         render_conversation_line(&mut done_lines, &done_card, true);
         let done_header = done_lines.first().expect("test: done header");
-        assert!(line_to_plain(done_header).starts_with("v run "), "ASCII success marker");
+        assert!(line_to_plain(done_header).starts_with("* Ran "), "ASCII success marker");
     }
 
     #[test]
@@ -12948,7 +12969,7 @@ mod tests {
 
             assert!(rendered.contains("Working"), "width {width}: {rows:?}");
             assert!(rendered.contains("Esc to interrupt"), "width {width}: {rows:?}");
-            assert!(!rendered.contains("○ ▌"), "width {width}: {rows:?}");
+            assert!(!rendered.contains("● ▌"), "width {width}: {rows:?}");
             assert!(!rendered.contains("turns"), "width {width}: {rows:?}");
             assert!(rendered.contains("› "), "width {width}: main input prompt: {rows:?}");
         }
@@ -13522,7 +13543,7 @@ mod tests {
             "waiting state is explicit and timed: {rendered}"
         );
         assert!(
-            !rendered.contains("○ ▌"),
+            !rendered.contains("● ▌"),
             "empty assistant placeholder must not look stuck: {rendered}"
         );
     }

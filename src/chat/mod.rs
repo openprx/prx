@@ -5037,6 +5037,11 @@ pub async fn run(
                     visible_input_admission_kind,
                     max_concurrent_visible_turns,
                 ) {
+                    // The enqueue snapshot above reports this item as queued.
+                    // Publish again after dequeue so fast slash commands, which
+                    // never enter the provider-turn path, cannot leave a stale
+                    // `queue:1` badge behind in the TUI.
+                    publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
                     break Some(next);
                 }
                 continue;

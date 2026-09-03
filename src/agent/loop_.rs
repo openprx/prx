@@ -80,6 +80,9 @@ impl ChatMode {
 }
 
 pub(crate) const EMPTY_ASSISTANT_RESPONSE_MESSAGE: &str = "model returned empty response";
+const EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE: &str = "The previous assistant response was empty. \
+     Continue the pending work now: either invoke the next required tools or provide a complete final answer. \
+     Do not return an empty response.";
 const TOOL_SUMMARY_ONLY_RESPONSE_MESSAGE: &str = "The previous assistant response was an internal tool-use summary, not a valid answer. \
      Either invoke the required tools now or provide a complete final answer. \
      Do not output a '[Used tools: ...]' summary.";
@@ -406,6 +409,12 @@ const TOOL_PARSE_LOG_PREVIEW_CHARS: usize = 200;
 /// 🟡 Behavior-limits Phase 1: raised 8K -> 48K (6x) so medium tool outputs stay
 /// directly visible to the agent instead of needing a second search.
 const MAX_TOOL_RESULT_INLINE_CHARS: usize = 48_000;
+
+/// Browser and other MCP results commonly contain accessibility trees or
+/// structured payloads much larger than the decision-relevant part. Keep those
+/// calls responsive while retaining the full output in the document layer
+/// referenced by the compacted history entry.
+const MAX_MCP_TOOL_RESULT_INLINE_CHARS: usize = 16_000;
 
 /// Approximate chunk size for large tool-output document references.
 /// 🟡 Behavior-limits Phase 1: raised 2048 -> 4096 (fewer chunks per big output).
@@ -809,11 +818,17 @@ pub(crate) fn compact_tool_result_for_budget(tool_name: &str, content: &str, max
 }
 
 pub(crate) fn tool_result_inline_budget_for_history(
+    tool_name: &str,
     history: &[ChatMessage],
     config: Option<&crate::config::AgentCompactionConfig>,
 ) -> usize {
+    let absolute_cap = if tool_name == "mcp_call" || tool_name.starts_with("mcp__") {
+        MAX_MCP_TOOL_RESULT_INLINE_CHARS
+    } else {
+        MAX_TOOL_RESULT_INLINE_CHARS
+    };
     let Some(config) = config else {
-        return MAX_TOOL_RESULT_INLINE_CHARS;
+        return absolute_cap;
     };
     let budget = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
     let remaining_tokens = budget.available_input_tokens.saturating_sub(budget.used_tokens);
@@ -821,7 +836,7 @@ pub(crate) fn tool_result_inline_budget_for_history(
     // remeasuring history after insertion, so this conversion is deliberately
     // conservative and bounded by the absolute resident-memory guard.
     let token_derived_chars = remaining_tokens.saturating_mul(3).saturating_div(4);
-    token_derived_chars.min(MAX_TOOL_RESULT_INLINE_CHARS)
+    token_derived_chars.min(absolute_cap)
 }
 
 fn compact_tool_result_for_history_with_status(
@@ -5848,6 +5863,8 @@ async fn run_tool_call_loop_outcome_unguarded(
     let mut unrecoverable_failures: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     let mut tool_summary_retry_attempted = false;
     let mut inject_tool_summary_retry_instruction = false;
+    let mut empty_response_retry_attempted = false;
+    let mut inject_empty_response_retry_instruction = false;
 
     let mut iteration = 0usize;
     loop {
@@ -5901,6 +5918,12 @@ async fn run_tool_call_loop_outcome_unguarded(
                 .messages
                 .push(ChatMessage::system(TOOL_SUMMARY_ONLY_RESPONSE_MESSAGE));
             inject_tool_summary_retry_instruction = false;
+        }
+        if inject_empty_response_retry_instruction {
+            prepared_messages
+                .messages
+                .push(ChatMessage::system(EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE));
+            inject_empty_response_retry_instruction = false;
         }
         for tool in tools_registry.iter() {
             if let Err(err) = tool.refresh().await {
@@ -6243,15 +6266,17 @@ async fn run_tool_call_loop_outcome_unguarded(
                 continue;
             }
             if is_empty_assistant_response(&response_text, false) {
+                if empty_response_retry_attempted {
+                    anyhow::bail!("model returned an empty response after one corrective retry");
+                }
                 tracing::warn!(
                     provider = provider_name,
                     model,
-                    user_message = EMPTY_ASSISTANT_RESPONSE_MESSAGE,
-                    "model returned empty assistant response; suppressing assistant history turn"
+                    "model returned empty assistant response; retrying once with a corrective instruction"
                 );
-                last_turn_trace.any_turn_had_fallback = any_turn_had_fallback;
-                last_turn_trace.tokens_used = usage_accumulator.finish();
-                return Ok((ToolLoopOutcome::Text(String::new()), last_turn_trace));
+                empty_response_retry_attempted = true;
+                inject_empty_response_retry_instruction = true;
+                continue;
             }
             // If a streaming sender is provided, relay the text in small chunks
             // so the channel can progressively update the draft message.
@@ -6469,7 +6494,8 @@ async fn run_tool_call_loop_outcome_unguarded(
             // FIX-P2-02: record the status so the native-history branch can reuse
             // it without persisting the same document a second time.
             document_statuses.push(document_status);
-            let max_inline_chars = tool_result_inline_budget_for_history(executed.history(), compaction_config);
+            let max_inline_chars =
+                tool_result_inline_budget_for_history(&call.name, executed.history(), compaction_config);
             let truncated_result =
                 compact_tool_result_for_history_with_status(&call.name, result, max_inline_chars, document_status);
             let _ = writeln!(
@@ -6505,7 +6531,8 @@ async fn run_tool_call_loop_outcome_unguarded(
                     .get(index)
                     .copied()
                     .unwrap_or("pending_document_backend");
-                let max_inline_chars = tool_result_inline_budget_for_history(executed.history(), compaction_config);
+                let max_inline_chars =
+                    tool_result_inline_budget_for_history(&native_call.name, executed.history(), compaction_config);
                 let truncated_result = compact_tool_result_for_history_with_status(
                     &native_call.name,
                     result,
@@ -12576,6 +12603,23 @@ ls -la
         );
     }
 
+    #[test]
+    fn mcp_tool_results_use_a_smaller_inline_history_budget() {
+        let history = vec![ChatMessage::system("sys")];
+        assert_eq!(
+            tool_result_inline_budget_for_history("mcp_call", &history, None),
+            MAX_MCP_TOOL_RESULT_INLINE_CHARS
+        );
+        assert_eq!(
+            tool_result_inline_budget_for_history("mcp__playwright__browser_snapshot", &history, None),
+            MAX_MCP_TOOL_RESULT_INLINE_CHARS
+        );
+        assert_eq!(
+            tool_result_inline_budget_for_history("shell", &history, None),
+            MAX_TOOL_RESULT_INLINE_CHARS
+        );
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Recovery Tests - Tool Call Parsing Edge Cases
     // ═══════════════════════════════════════════════════════════════════════
@@ -14067,16 +14111,32 @@ Let me check the result."#;
         }
 
         #[tokio::test]
-        async fn empty_assistant_response_writes_no_assistant_history() {
-            let (result, history) = run_without_tools(vec!["   \n"]).await;
-            let (outcome, _trace) = result.expect("empty response turn should complete");
+        async fn empty_assistant_response_retries_and_returns_real_answer() {
+            let (result, history) = run_without_tools(vec!["   \n", "Recovered answer."]).await;
+            let (outcome, _trace) = result.expect("empty response corrective retry should complete");
 
-            assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text.is_empty()));
-            assert_eq!(history.len(), 2, "empty assistant turn must not be appended");
-            assert!(
-                history.iter().all(|message| message.role != "assistant"),
-                "history must not contain an assistant turn after empty response: {history:?}"
+            assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "Recovered answer."));
+            assert_eq!(history.len(), 3);
+            assert_eq!(
+                history.last().map(|message| message.content.as_str()),
+                Some("Recovered answer.")
             );
+            assert!(
+                history
+                    .iter()
+                    .all(|message| !message.content.contains(EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE)),
+                "the corrective instruction must remain request-local: {history:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn repeated_empty_assistant_response_fails_without_polluting_history() {
+            let (result, history) = run_without_tools(vec!["", " \n "]).await;
+            let error = result.expect_err("a repeated empty response must fail closed");
+
+            assert!(error.to_string().contains("after one corrective retry"));
+            assert_eq!(history.len(), 2);
+            assert!(history.iter().all(|message| message.role != "assistant"));
         }
 
         #[tokio::test]

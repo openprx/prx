@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
 use tokio::process::Command;
@@ -577,6 +578,13 @@ impl McpTool {
         let mut cmd = Command::new(command);
         cmd.args(&server.args);
         cmd.kill_on_drop(true);
+        // MCP servers are protocol children, not interactive terminal peers.
+        // Inheriting stderr lets package-manager notices (for example
+        // `npm notice run npx`) write directly into ratatui's alternate screen
+        // and corrupt the input/status rows. Protocol failures still travel
+        // through MCP responses and transport errors, so keep child stderr
+        // detached from the user's terminal.
+        cmd.stderr(Stdio::null());
         if !server.env.is_empty() {
             cmd.envs(server.env.clone());
         }
@@ -709,6 +717,9 @@ impl McpTool {
             let mut cmd = Command::new(command);
             cmd.args(&server.args);
             cmd.kill_on_drop(true);
+            // See `discover_stdio`: persistent runtime sessions must never own
+            // the TUI terminal's stderr either.
+            cmd.stderr(Stdio::null());
             if !server.env.is_empty() {
                 cmd.envs(server.env.clone());
             }

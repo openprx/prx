@@ -3141,7 +3141,7 @@ async fn execute_single_tool_call(
                     .unwrap_or_else(|| "tool failed with no output".to_string())
             };
             let max_inline_chars =
-                crate::agent::loop_::tool_result_inline_budget_for_history(history, compaction_config);
+                crate::agent::loop_::tool_result_inline_budget_for_history(&call.name, history, compaction_config);
             let content = crate::agent::loop_::compact_tool_result_for_budget(&call.name, &content, max_inline_chars);
             let payload = serde_json::json!({
                 "tool_call_id": call.id,
@@ -6111,18 +6111,22 @@ mod real_mode_tests {
     }
 
     #[tokio::test]
-    async fn real_mode_empty_stream_surfaces_system_message_without_assistant_record() {
+    async fn real_mode_empty_stream_retries_and_records_recovered_answer() {
         use crate::providers::traits::{
             ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
             StreamResult,
         };
         use async_trait::async_trait;
         use futures::stream::{self, BoxStream, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        struct ReasoningOnlyProvider;
+        #[derive(Default)]
+        struct EmptyThenAnswerProvider {
+            calls: AtomicUsize,
+        }
 
         #[async_trait]
-        impl Provider for ReasoningOnlyProvider {
+        impl Provider for EmptyThenAnswerProvider {
             fn capabilities(&self) -> ProviderCapabilities {
                 ProviderCapabilities::default()
             }
@@ -6152,11 +6156,19 @@ mod real_mode_tests {
                 _temperature: f64,
                 _options: StreamOptions,
             ) -> BoxStream<'static, StreamResult<StreamChunk>> {
-                stream::iter(vec![
-                    Ok(StreamChunk::reasoning_delta("thinking only")),
-                    Ok(StreamChunk::final_chunk()),
-                ])
-                .boxed()
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    stream::iter(vec![
+                        Ok(StreamChunk::reasoning_delta("thinking only")),
+                        Ok(StreamChunk::final_chunk()),
+                    ])
+                    .boxed()
+                } else {
+                    stream::iter(vec![
+                        Ok(StreamChunk::delta("recovered")),
+                        Ok(StreamChunk::final_chunk()),
+                    ])
+                    .boxed()
+                }
             }
             async fn warmup(&self) -> anyhow::Result<()> {
                 Ok(())
@@ -6166,7 +6178,7 @@ mod real_mode_tests {
         let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
         let shutdown = CancellationToken::new();
         let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
-        deps.provider = Arc::new(ReasoningOnlyProvider);
+        deps.provider = Arc::new(EmptyThenAnswerProvider::default());
         let executor = EffectExecutor::new_with_deps(deps);
 
         executor
@@ -6183,20 +6195,20 @@ mod real_mode_tests {
             })
             .await;
 
-        let mut saw_system_message = false;
+        let mut saw_assistant_record = false;
         let mut saw_completion = false;
-        for _ in 0..5 {
+        for _ in 0..6 {
             let action = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
                 .await
                 .expect("driver action within 1.5s")
                 .expect("driver action received");
             match action {
                 Action::SystemMessageAdded { text } => {
-                    assert_eq!(text, crate::agent::loop_::EMPTY_ASSISTANT_RESPONSE_MESSAGE);
-                    saw_system_message = true;
+                    panic!("a recovered empty response must not surface a failure notice: {text}");
                 }
                 Action::RecordAssistantTurn { content: text, .. } => {
-                    panic!("empty response must not record assistant turn: {text:?}");
+                    assert_eq!(text, "recovered");
+                    saw_assistant_record = true;
                 }
                 Action::StreamCompleted {
                     draft_id,
@@ -6204,11 +6216,8 @@ mod real_mode_tests {
                     reasoning,
                 } => {
                     assert_eq!(draft_id, "draft-empty");
-                    assert!(final_text.is_empty(), "empty response completion stays empty");
-                    assert!(
-                        reasoning.is_empty(),
-                        "reasoning-only empty response must not render a reasoning card"
-                    );
+                    assert_eq!(final_text, "recovered");
+                    let _ = reasoning;
                     saw_completion = true;
                     break;
                 }
@@ -6216,8 +6225,8 @@ mod real_mode_tests {
             }
         }
 
-        assert!(saw_system_message, "empty response must surface a system message");
-        assert!(saw_completion, "empty response must still complete and clear the draft");
+        assert!(saw_assistant_record, "the recovered answer must be recorded");
+        assert!(saw_completion, "the recovered turn must complete and clear the draft");
     }
 
     /// Step 5a-2 — provider stream 产生 Err 时发 StreamFailed（含 retryable 判定）.
