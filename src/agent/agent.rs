@@ -830,7 +830,29 @@ impl Agent {
         // retry must remove history, so a minimal history cannot spin forever.
         loop {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
-            for tool in &self.tools {
+            // Select first, then refresh only the capabilities this turn will
+            // expose. Otherwise an unrelated direct-agent request is blocked by
+            // cold dynamic backends (notably stdio MCP servers started by npx).
+            let last_user_msg = self
+                .history
+                .iter()
+                .rev()
+                .find_map(|m| match m {
+                    ConversationMessage::Chat(cm)
+                        if cm.role == "user" && !cm.content.is_empty() && !cm.content.starts_with("[Tool") =>
+                    {
+                        Some(cm.content.as_str())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let selected_tools = crate::tools::intent::select_tools_for_intent(
+                &self.tools,
+                last_user_msg,
+                &self.tool_tiering.always_include,
+                &self.tool_tiering.always_exclude,
+            );
+            for tool in &selected_tools {
                 let _ = tool.refresh().await;
             }
             self.hooks
@@ -843,29 +865,8 @@ impl Agent {
                     }),
                 )
                 .await;
-            let mut dynamic_tool_specs: Vec<_> = {
-                // Extract last user message for intent classification
-                let last_user_msg = self
-                    .history
-                    .iter()
-                    .rev()
-                    .find_map(|m| match m {
-                        ConversationMessage::Chat(cm)
-                            if cm.role == "user" && !cm.content.is_empty() && !cm.content.starts_with("[Tool") =>
-                        {
-                            Some(cm.content.as_str())
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-                let filtered = crate::tools::intent::select_tools_for_intent(
-                    &self.tools,
-                    last_user_msg,
-                    &self.tool_tiering.always_include,
-                    &self.tool_tiering.always_exclude,
-                );
-                crate::tools::ToolCatalog::from_tools(filtered.iter().copied()).tool_specs()
-            };
+            let mut dynamic_tool_specs: Vec<_> =
+                crate::tools::ToolCatalog::from_tools(selected_tools.iter().copied()).tool_specs();
             // Agent::turn is never a smart-group-reply turn; stay_silent must not be
             // advertised to the model on this path (expose_stay_silent = false).
             filter_tool_specs_for_exposure(&mut dynamic_tool_specs, false);

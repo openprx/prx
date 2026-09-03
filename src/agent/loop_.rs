@@ -5948,7 +5948,32 @@ async fn run_tool_call_loop_outcome_unguarded(
                 .push(ChatMessage::system(EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE));
             inject_empty_response_retry_instruction = false;
         }
-        for tool in tools_registry.iter() {
+        // Route the turn before refreshing dynamic tools. Refreshing the whole
+        // registry here made an unrelated turn wait for every configured MCP
+        // server (for example, a PDF-only WhatsApp request paid Playwright's
+        // cold `npx` startup cost). The selected slice is also the exact slice
+        // whose schemas are exposed below, so runtime discovery and the model's
+        // catalog stay on one capability boundary.
+        let selected_tools: Vec<&dyn Tool> = tool_tiering.map_or_else(
+            || tools_registry.iter().map(|tool| tool.as_ref()).collect(),
+            |cfg| {
+                let last_user_msg = history
+                    .iter()
+                    .rev()
+                    .find(|message| {
+                        message.role == "user" && !message.content.is_empty() && !message.content.starts_with("[Tool")
+                    })
+                    .map(|message| message.content.as_str())
+                    .unwrap_or_default();
+                crate::tools::intent::select_tools_for_intent(
+                    tools_registry.as_ref(),
+                    last_user_msg,
+                    &cfg.always_include,
+                    &cfg.always_exclude,
+                )
+            },
+        );
+        for tool in &selected_tools {
             if let Err(err) = tool.refresh().await {
                 let message = format!("refresh failed for tool {}: {err}", tool.name());
                 observer.record_event(&ObserverEvent::Error {
@@ -5963,31 +5988,13 @@ async fn run_tool_call_loop_outcome_unguarded(
         // Refresh dynamic backends before snapshotting their schemas. Rebuild on
         // every iteration so MCP discovery and WASM generation swaps cannot leave
         // the provider with stale ToolSpecs for the remainder of the turn.
-        let mut tool_specs: Vec<crate::tools::ToolSpec> = tool_tiering.map_or_else(
-            || crate::tools::ToolCatalog::from_boxed_registry(tools_registry.as_ref()).tool_specs(),
-            |cfg| {
-                let last_user_msg = history
-                    .iter()
-                    .rev()
-                    .find(|message| {
-                        message.role == "user" && !message.content.is_empty() && !message.content.starts_with("[Tool")
-                    })
-                    .map(|message| message.content.as_str())
-                    .unwrap_or_default();
-                let filtered = crate::tools::intent::select_tools_for_intent(
-                    tools_registry.as_ref(),
-                    last_user_msg,
-                    &cfg.always_include,
-                    &cfg.always_exclude,
-                );
-                tracing::debug!(
-                    total = tools_registry.len(),
-                    filtered = filtered.len(),
-                    "tool tiering applied"
-                );
-                crate::tools::ToolCatalog::from_tools(filtered.iter().copied()).tool_specs()
-            },
+        tracing::debug!(
+            total = tools_registry.len(),
+            filtered = selected_tools.len(),
+            "tool tiering applied"
         );
+        let mut tool_specs: Vec<crate::tools::ToolSpec> =
+            crate::tools::ToolCatalog::from_tools(selected_tools.iter().copied()).tool_specs();
         crate::tools::filter_tool_specs_for_exposure(&mut tool_specs, expose_stay_silent);
 
         #[cfg(feature = "wasm-plugins")]
@@ -8265,6 +8272,7 @@ mod tests {
     use crate::observability::NoopObserver;
     use crate::providers::ChatResponse;
     use crate::providers::traits::ProviderCapabilities;
+    use crate::tools::{ToolCategory, ToolTier};
     use tempfile::TempDir;
 
     struct NonVisionProvider {
@@ -9986,6 +9994,168 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    struct RefreshCountingTool {
+        name: &'static str,
+        category: ToolCategory,
+        refreshes: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for RefreshCountingTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Counts dynamic capability refreshes"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "ok".to_string(),
+                error: None,
+            })
+        }
+
+        async fn refresh(&self) -> anyhow::Result<()> {
+            self.refreshes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn tier(&self) -> ToolTier {
+            ToolTier::Extended
+        }
+
+        fn categories(&self) -> &'static [ToolCategory] {
+            match self.category {
+                ToolCategory::System => &[ToolCategory::System],
+                ToolCategory::Automation => &[ToolCategory::Automation],
+                _ => &[],
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_loop_refreshes_only_intent_selected_dynamic_capabilities() {
+        let skill_refreshes = Arc::new(AtomicUsize::new(0));
+        let mcp_refreshes = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(RefreshCountingTool {
+                name: "skill_probe",
+                category: ToolCategory::System,
+                refreshes: Arc::clone(&skill_refreshes),
+            }),
+            Box::new(RefreshCountingTool {
+                name: "mcp_probe",
+                category: ToolCategory::Automation,
+                refreshes: Arc::clone(&mcp_refreshes),
+            }),
+        ];
+        let provider = ScriptedProvider::from_text_responses(vec!["done"]);
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("use the skill to create a PDF file"),
+        ];
+        let config = crate::config::ToolTieringConfig::default();
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            Arc::new(tools_registry),
+            &NoopObserver,
+            &HookManager::new(std::env::temp_dir()),
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "wacli",
+            &crate::config::MultimodalConfig::default(),
+            2,
+            false,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&config),
+            ToolLoopMemory::none(),
+            ChatMode::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "done");
+        assert_eq!(skill_refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            mcp_refreshes.load(Ordering::SeqCst),
+            0,
+            "an unrelated skill/PDF turn must not cold-start MCP"
+        );
+
+        let skill_refreshes = Arc::new(AtomicUsize::new(0));
+        let mcp_refreshes = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(RefreshCountingTool {
+                name: "skill_probe",
+                category: ToolCategory::System,
+                refreshes: Arc::clone(&skill_refreshes),
+            }),
+            Box::new(RefreshCountingTool {
+                name: "mcp_probe",
+                category: ToolCategory::Automation,
+                refreshes: Arc::clone(&mcp_refreshes),
+            }),
+        ];
+        let provider = ScriptedProvider::from_text_responses(vec!["done"]);
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("use MCP to operate the browser"),
+        ];
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            Arc::new(tools_registry),
+            &NoopObserver,
+            &HookManager::new(std::env::temp_dir()),
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "gateway",
+            &crate::config::MultimodalConfig::default(),
+            2,
+            false,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&config),
+            ToolLoopMemory::none(),
+            ChatMode::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "done");
+        assert_eq!(skill_refreshes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            mcp_refreshes.load(Ordering::SeqCst),
+            1,
+            "an explicit MCP/browser turn must still refresh MCP before schema exposure"
+        );
     }
 
     /// A provider whose call never returns and never errors — the exact shape
