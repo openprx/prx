@@ -5648,7 +5648,10 @@ fn render_provider_worker_status_compact(status: ProviderWorkerStatus) -> Option
 }
 
 fn render_provider_worker_status_with_rows(status: ProviderWorkerStatus, include_rows: bool) -> Option<String> {
-    if status.running == 0 && status.cancelling == 0 && status.awaiting_commit == 0 && status.finalized_payloads == 0 {
+    // Finalized payload counters are cumulative bookkeeping. Once no worker is
+    // running, cancelling, or waiting to commit, showing `wtok` makes a
+    // completed turn look active and survives `/new` as stale UI state.
+    if status.running == 0 && status.cancelling == 0 && status.awaiting_commit == 0 {
         return None;
     }
     let mut parts = Vec::new();
@@ -13357,6 +13360,28 @@ mod tests {
         assert!(
             !line.contains("w#8:detached:done:1.2k"),
             "status should not keep completed workers in the switchable row list: {line}"
+        );
+    }
+
+    #[test]
+    fn status_bar_hides_terminal_only_worker_accounting() {
+        let mut state = TuiState::new("provider", "model");
+        state.provider_worker_status = ProviderWorkerStatus {
+            running: 0,
+            cancelling: 0,
+            awaiting_commit: 0,
+            finalized_payloads: 1,
+            finalized_total_tokens: 68_800,
+            oldest_started_at_ms: None,
+            rows: Vec::new(),
+        };
+
+        let line = render_status_bar_text(&state, 180);
+
+        assert!(!line.contains("wtok:"), "terminal worker usage is stale chrome: {line}");
+        assert!(
+            !line.contains("wpayload:"),
+            "terminal payload count is stale chrome: {line}"
         );
     }
 

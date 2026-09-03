@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.85] - 3 September 2026
+
+### Fixed
+
+- Hide cumulative provider-worker payload/token counters after all workers are
+  terminal so completed turns and `/new` no longer display stale `wtok` state.
+
 ## [0.8.84] - 3 September 2026
 
 ### Fixed
