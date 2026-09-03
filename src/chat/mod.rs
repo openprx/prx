@@ -19124,6 +19124,45 @@ mod p3_directional_switch_tests {
     }
 
     #[test]
+    fn session_reset_commands_wait_for_active_turn_even_when_concurrency_has_capacity() {
+        for command in ["/new", "/clear"] {
+            let mut backlog = std::collections::VecDeque::new();
+            let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+            let active = scheduler.enqueue("active", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+            scheduler.start_task(active).expect("active task starts");
+
+            let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+            workers
+                .start_from_task(
+                    scheduler.task(active).expect("active task"),
+                    crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+                )
+                .expect("active worker starts");
+            enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg(command), 7);
+            let queued_task = backlog
+                .front()
+                .and_then(|queued| queued.turn_task_id)
+                .expect("queued command task id");
+
+            let popped = pop_next_visible_input_task_with_scheduler(
+                &mut backlog,
+                &mut scheduler,
+                &workers,
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+                2,
+            );
+
+            assert!(popped.is_none(), "{command} must wait for the active turn to persist");
+            assert_eq!(backlog.len(), 1, "{command} must remain queued");
+            assert_eq!(
+                scheduler.task(queued_task).expect("queued command task").state,
+                crate::chat::turn_scheduler::TurnTaskState::Queued,
+                "{command} must not be dispatched across the session boundary"
+            );
+        }
+    }
+
+    #[test]
     fn visible_input_pop_prefers_priority_when_detached_slot_is_available() {
         let mut backlog = std::collections::VecDeque::new();
         let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
