@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.90] - 3 September 2026
+
+### Fixed
+
+- Keep one ordinary main provider turn out of the TUI worker/session chrome, so
+  internal command summaries such as `run npx ...` cannot appear below the
+  composer; concurrent turns and explicit worker diagnostics remain visible.
+- Separate transcript output from the gray status bar with a stable blank row
+  and use the same neutral filled marker for completed tools and assistant text.
+- Expose the live hook status/management tools in standalone `process_message`
+  and process-isolated session-worker entrypoints.
+- Make `allowed_tools = ["*"]` actually inherit the complete tool registry in
+  task and process sub-agents, preserving dynamic MCP/WASM alias specs and
+  named-call dispatch through the proxy boundary.
+- Let explicit delegated allowlists select one dynamic MCP/WASM alias without
+  exposing sibling aliases, and share the live Hooks/WASM control objects with
+  in-process delegates across every model-running entrypoint.
+
+## [0.8.89] - 3 September 2026
+
+### Added
+
+- Execute middleware, cron, provider, and storage WASM adapters through the
+  current atomic plugin generation, with direct operational probes and real
+  component fixtures.
+- Resolve explicit `wasm:` providers and memory backends in chat, agent CLI,
+  gateway, IM channels, daemon tasks, delegates, and session workers.
+
+### Fixed
+
+- Run all four middleware stages in the shared agent loop used by TUI, CLI,
+  gateway, and IM delivery, isolating malformed plugin output.
+- Publish action-specific required fields in the WASM management tool schema.
+
 ## [0.8.88] - 3 September 2026
 
 ### Fixed

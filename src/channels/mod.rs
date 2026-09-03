@@ -5439,6 +5439,20 @@ pub async fn start_channels_with_config(
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
+    #[cfg(feature = "wasm-plugins")]
+    let wasm_plugin_runtime = if let Some(runtime) = wasm_early_runtime {
+        runtime
+            .attach_memory(Arc::clone(&mem))
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to attach WASM memory backend in channels: {error}"))?;
+        Some(runtime)
+    } else {
+        crate::plugins::init_plugin_runtime(&config.workspace_dir, Some(Arc::clone(&mem))).await
+    };
+    #[cfg(feature = "wasm-plugins")]
+    if let Some(runtime) = &wasm_plugin_runtime {
+        hooks.set_plugin_runtime(Arc::clone(runtime)).await;
+    }
     let conversation_histories = Arc::new(Mutex::new(
         load_persisted_histories(&config.workspace_dir, mem.as_ref()).await,
     ));
@@ -5454,7 +5468,13 @@ pub async fn start_channels_with_config(
     let workspace = config.workspace_dir.clone();
     // Keep as mutable Vec so we can append channel-aware tools (e.g. sessions_spawn)
     // before wrapping in Arc below.
-    let mut tools_list = tools::all_tools_with_runtime(
+    #[allow(unused_mut)]
+    let mut extensions = hooks.control_tool_arcs(Arc::clone(&security));
+    #[cfg(feature = "wasm-plugins")]
+    if let Some(runtime) = &wasm_plugin_runtime {
+        extensions.extend(runtime.control_tool_arcs(Arc::clone(&security)));
+    }
+    let mut tools_list = tools::all_tools_with_runtime_ext_and_extensions(
         Arc::new(config.clone()),
         Arc::clone(&shared_config),
         &security,
@@ -5468,7 +5488,9 @@ pub async fn start_channels_with_config(
         &config.agents,
         config.api_key.as_deref(),
         &config,
-    );
+        extensions,
+    )
+    .tools;
 
     let skill_embedder = crate::memory::create_embedder_from_config(&config, config.api_key.as_deref());
     let skills = crate::skills::load_skills_with_embeddings(&workspace, &config, skill_embedder.as_ref()).await?;
@@ -5983,34 +6005,8 @@ pub async fn start_channels_with_config(
             security.clone(),
         )));
     }
-    tools_list.push(hooks.status_tool());
-    tools_list.push(hooks.manage_tool(security.clone()));
-
-    // ── Register the same process-level WASM runtime used by every entrypoint ──
-    #[cfg(feature = "wasm-plugins")]
-    let wasm_plugin_runtime = if let Some(runtime) = wasm_early_runtime {
-        if let Err(error) = runtime.attach_memory(Arc::clone(&mem)).await {
-            return Err(anyhow::anyhow!(
-                "failed to attach WASM memory backend in channels: {error}"
-            ));
-        }
-        Some(runtime)
-    } else {
-        crate::plugins::init_plugin_runtime(&config.workspace_dir, Some(Arc::clone(&mem))).await
-    };
     #[cfg(feature = "wasm-plugins")]
     if let Some(runtime) = &wasm_plugin_runtime {
-        let router = runtime.tool_router();
-        let tool_count = router.specs().len();
-        tracing::info!(
-            count = tool_count,
-            "registering dynamic WASM plugin tool router in channels"
-        );
-        tools_list.push(router);
-        tools_list.push(runtime.status_tool());
-        tools_list.push(runtime.reload_tool(security.clone()));
-        tools_list.push(runtime.manage_tool(security.clone()));
-        hooks.set_plugin_runtime(Arc::clone(runtime)).await;
         tracing::debug!(
             generation = runtime.generation_id(),
             "shared WASM plugin runtime ready in channels"

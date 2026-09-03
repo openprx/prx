@@ -1201,7 +1201,18 @@ fn bottom_chrome_session_entries_with_workers(
     workers: ProviderWorkerStatus,
     focus: crate::chat::sessions::FocusTarget,
 ) -> Vec<crate::chat::sessions::SwitcherEntry> {
-    let mut out = provider_worker_switcher_entries(workers, focus);
+    // A single provider worker is the ordinary main-chat turn, not a child
+    // session. Rendering it below the input duplicated the transcript's
+    // Working/tool feedback and leaked internal details such as `run npx ...`
+    // into the composer chrome. Surface worker rows here only when there is
+    // real concurrent turn activity, or while the user is explicitly viewing
+    // a worker. `/workers` and Ctrl+G keep the full diagnostic inventory.
+    let active_workers = workers.rows.iter().filter(|row| row.is_active()).count();
+    let mut out = if active_workers > 1 || focus.worker_sequence().is_some() {
+        provider_worker_switcher_entries(workers, focus)
+    } else {
+        Vec::new()
+    };
     out.extend(bottom_chrome_session_entries(entries, focus));
     out
 }
@@ -3949,9 +3960,13 @@ impl BottomChromeView for crate::chat::state::UiSnapshot {
     }
 }
 
+/// One blank row separating conversation output from the persistent chrome.
+/// This keeps the final assistant/tool line from touching the gray status bar.
+const TRANSCRIPT_CHROME_GAP_HEIGHT: u16 = 1;
+
 /// Minimum height (rows) of the pinned fullscreen bottom chrome. Reserves space
-/// for status, input, and footer.
-pub const BOTTOM_CHROME_MIN_HEIGHT: u16 = 3;
+/// for the transcript gap, status, input, and footer.
+pub const BOTTOM_CHROME_MIN_HEIGHT: u16 = 4;
 
 /// Hard upper bound on the pinned fullscreen bottom chrome height.
 pub const BOTTOM_CHROME_MAX_HEIGHT: u16 = 24;
@@ -4310,14 +4325,19 @@ fn fullscreen_bottom_chrome_base_height<V: BottomChromeView + ?Sized>(state: &V)
     let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
     let footer_rows = session_footer_desired_rows(state);
-    1u16.saturating_add(input_height).saturating_add(footer_rows)
+    TRANSCRIPT_CHROME_GAP_HEIGHT
+        .saturating_add(1)
+        .saturating_add(input_height)
+        .saturating_add(footer_rows)
 }
 
 fn fullscreen_bottom_chrome_height_for_width<V: BottomChromeView + ?Sized>(state: &V, width: u16) -> u16 {
     let visible_input_rows = input_visual_rows_for_width(state, width).clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
     let footer_rows = session_footer_desired_rows(state);
-    1u16.saturating_add(input_height)
+    TRANSCRIPT_CHROME_GAP_HEIGHT
+        .saturating_add(1)
+        .saturating_add(input_height)
         .saturating_add(footer_rows)
         .clamp(BOTTOM_CHROME_MIN_HEIGHT, BOTTOM_CHROME_MAX_HEIGHT)
 }
@@ -4330,15 +4350,24 @@ fn render_fullscreen_bottom_chrome_at<V: BottomChromeView + ?Sized>(
 ) {
     let visible_input_rows = input_visual_rows_for_width(state, area.width).clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
-    let max_footer_rows = area.height.saturating_sub(1).saturating_sub(input_height).max(1);
+    let max_footer_rows = area
+        .height
+        .saturating_sub(TRANSCRIPT_CHROME_GAP_HEIGHT)
+        .saturating_sub(1)
+        .saturating_sub(input_height)
+        .max(1);
     let footer_rows = session_footer_desired_rows(state).min(max_footer_rows);
 
-    let fixed_rows = 1u16.saturating_add(input_height).saturating_add(footer_rows);
+    let fixed_rows = TRANSCRIPT_CHROME_GAP_HEIGHT
+        .saturating_add(1)
+        .saturating_add(input_height)
+        .saturating_add(footer_rows);
     let spacer_rows = area.height.saturating_sub(fixed_rows);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(TRANSCRIPT_CHROME_GAP_HEIGHT),
             Constraint::Length(1),
             Constraint::Length(spacer_rows),
             Constraint::Length(input_height),
@@ -4348,9 +4377,9 @@ fn render_fullscreen_bottom_chrome_at<V: BottomChromeView + ?Sized>(
 
     #[allow(clippy::indexing_slicing)]
     {
-        render_status_bar(frame, chunks[0], state);
-        render_input(frame, chunks[2], state);
-        render_fullscreen_footer(frame, chunks[3], state, show_new_output_below);
+        render_status_bar(frame, chunks[1], state);
+        render_input(frame, chunks[3], state);
+        render_fullscreen_footer(frame, chunks[4], state, show_new_output_below);
     }
 }
 
@@ -5654,6 +5683,18 @@ fn render_provider_worker_status_with_rows(status: ProviderWorkerStatus, include
     if status.running == 0 && status.cancelling == 0 && status.awaiting_commit == 0 {
         return None;
     }
+    // One worker is the normal main turn. Its progress already appears in the
+    // transcript; repeating it as `workers:1 w#...:detached` is internal
+    // implementation leakage. Reserve status-bar worker telemetry for actual
+    // concurrent turns.
+    if status
+        .running
+        .saturating_add(status.cancelling)
+        .saturating_add(status.awaiting_commit)
+        <= 1
+    {
+        return None;
+    }
     let mut parts = Vec::new();
     if status.running > 0 {
         parts.push(format!("workers:{}", status.running));
@@ -6228,7 +6269,7 @@ const fn ansi_basic_color(code: u16, bright: bool) -> Color {
 ///
 /// Folded layout (default):
 /// ```text
-/// • Ran shell(command="ls /tmp")
+/// ● Ran shell(command="ls /tmp")
 ///   └ 234ms · 12 lines · 1.4kB
 /// ```
 /// Expanded layout shows readable input plus bounded output/error rows. While
@@ -6252,7 +6293,7 @@ fn render_tool_result<'a>(
             Color::Cyan,
             "Running ",
         ),
-        ToolStatus::Done => (if ascii { "*" } else { "\u{2022}" }, Color::DarkGray, "Ran "),
+        ToolStatus::Done => (if ascii { "*" } else { "\u{25CF}" }, Color::DarkGray, "Ran "),
         ToolStatus::Error => (if ascii { "x" } else { "\u{00D7}" }, Color::Red, "Failed "),
     };
     let preview_ellipsis = if ascii {
@@ -8057,7 +8098,7 @@ mod tests {
 
     #[test]
     fn assistant_marker_is_filled_neutral_and_separated_from_tool_output() {
-        let mut sink: Vec<Line<'_>> = vec![Line::from("• Ran shell(command=\"pwd\")")];
+        let mut sink: Vec<Line<'_>> = vec![Line::from("● Ran shell(command=\"pwd\")")];
         let line = ConversationLine::Assistant {
             content: "done".to_string(),
         };
@@ -8271,6 +8312,10 @@ mod tests {
         };
         render_conversation_line(&mut lines, &card, false);
         assert_eq!(lines.len(), 5, "done folded card renders header + summary + preview");
+        assert!(
+            line_to_plain(lines.first().expect("test: header")).starts_with("\u{25CF} Ran "),
+            "completed tool uses the same filled neutral marker as assistant output"
+        );
         let summary: String = lines
             .get(1)
             .expect("test: summary line present")
@@ -8375,7 +8420,7 @@ mod tests {
         };
         render_conversation_line(&mut lines, &card, false);
         // Compact expanded style:
-        //   row 0  `• Ran shell(command="ls -la /tmp")`
+        //   row 0  `● Ran shell(command="ls -la /tmp")`
         //   row 1  `  └ input  command="ls -la /tmp"`
         //   row 2  `  └ output ✓ 2 lines · 20B`
         //   row 3+ output body
@@ -8389,7 +8434,11 @@ mod tests {
                 .map(|s| s.content.as_ref())
                 .collect()
         };
-        assert!(join(0).starts_with("\u{2022} Ran "), "uses action marker: {}", join(0));
+        assert!(
+            join(0).starts_with("\u{25CF} Ran "),
+            "uses filled action marker: {}",
+            join(0)
+        );
         assert!(
             join(0).contains("shell(command=\"ls -la /tmp\")"),
             "shows readable args: {}",
@@ -8462,7 +8511,8 @@ mod tests {
 
     #[test]
     fn render_tool_card_status_glyphs_and_colors() {
-        // Running keeps the white bullet; terminal states get explicit markers.
+        // Running/result metadata keep explicit markers; the completed card
+        // header itself uses the same neutral filled circle as assistant text.
         let (bullet, hook) = tool_card_glyphs(false);
         assert_eq!(bullet, "\u{25CF}", "unicode bullet ●");
         assert_eq!(hook, "\u{2514}", "unicode branch └");
@@ -11522,8 +11572,8 @@ mod tests {
             }],
         };
         assert!(
-            periodic_redraw_active_for_view(&state),
-            "running provider workers also drive the bottom spinner redraw"
+            !periodic_redraw_active_for_view(&state),
+            "a hidden single main worker does not create a duplicate bottom animation"
         );
 
         let row = state
@@ -11988,7 +12038,7 @@ mod tests {
     }
 
     #[test]
-    fn phase2_bottom_direction_opens_provider_worker_view_immediately() {
+    fn single_main_worker_is_not_a_bottom_session_target() {
         let mut state = TuiState::new("p", "m");
         state.provider_worker_status = provider_worker_status_fixture();
         state.visible_streaming_drafts = Arc::new(vec![crate::chat::state::VisibleStreamingDraftView {
@@ -12000,7 +12050,11 @@ mod tests {
             },
         }]);
         let out = dispatch_global_key(key(KeyCode::Right), &mut state);
-        assert_eq!(out, KeyDispatch::OpenProviderWorkerView { sequence: 3 });
+        assert_eq!(
+            out,
+            KeyDispatch::Consumed,
+            "an ordinary single main turn must not masquerade as a bottom child session"
+        );
         assert_eq!(
             state
                 .streaming_draft_for_worker(3)
@@ -12012,6 +12066,44 @@ mod tests {
                 .streaming_draft_for_worker(PROVIDER_WORKER_SWITCHER_SEQ_BASE + 3)
                 .is_none(),
             "synthetic switcher seq must not be used for draft lookup"
+        );
+    }
+
+    #[test]
+    fn single_main_worker_does_not_leak_tool_command_into_composer_chrome() {
+        let mut state = TuiState::new("p", "m");
+        state.provider_worker_status = provider_worker_status_fixture();
+        state
+            .provider_worker_status
+            .rows
+            .first_mut()
+            .expect("fixture has one worker")
+            .recent_tool_call = Some("run shell running: command=\"npx browser-mcp\"".to_string());
+
+        assert!(
+            !session_footer_has_sessions(&state),
+            "one ordinary main turn must not create a session footer"
+        );
+        let rows = render_sessions_list_lines(&state, 120, 4);
+        assert!(
+            rows.iter().all(|row| !line_to_plain(row).contains("npx browser-mcp")),
+            "internal provider command must not appear under the input: {rows:?}"
+        );
+
+        let mut second = state
+            .provider_worker_status
+            .rows
+            .first()
+            .expect("fixture has one worker")
+            .clone();
+        second.task_id = 43;
+        second.sequence = 4;
+        second.recent_tool_call = Some("run web_search running".to_string());
+        state.provider_worker_status.rows.push(second);
+        state.provider_worker_status.running = 2;
+        assert!(
+            session_footer_has_sessions(&state),
+            "real concurrent main turns remain discoverable"
         );
     }
 
@@ -12655,9 +12747,10 @@ mod tests {
 
     #[test]
     fn fullscreen_bottom_chrome_height_expands_with_input_not_streaming() {
-        // Resting state: status (1) + input border (1) + input row (1) +
-        // footer (1) = 4. Streaming is rendered at the transcript tail, not in
-        // bottom chrome. A long multi-line input adds rows up to the visible cap.
+        // Resting state: transcript gap (1) + status (1) + input border (1) +
+        // input row (1) + footer (1) = 5. Streaming is rendered at the
+        // transcript tail, not in bottom chrome. A long multi-line input adds
+        // rows up to the visible cap.
         let mut state = TuiState::new("p", "m");
         let idle = fullscreen_bottom_chrome_height(&state);
         assert!(idle >= BOTTOM_CHROME_MIN_HEIGHT);
@@ -12727,6 +12820,15 @@ mod tests {
         assert!(
             rows.last().is_some_and(|row| row.contains("Ctrl+G")),
             "footer pinned to bottom row: {rows:?}"
+        );
+        let status_row = rows
+            .iter()
+            .position(|row| row.contains("PRX") && row.contains("mode:"))
+            .expect("status row");
+        assert!(status_row > 0, "status row has a separator above it");
+        assert!(
+            rows.get(status_row - 1).is_some_and(|row| row.trim().is_empty()),
+            "a fixed blank row separates transcript output from the gray status bar: {rows:?}"
         );
     }
 
@@ -13411,8 +13513,8 @@ mod tests {
         let line = render_status_bar_text(&state, 180);
 
         assert!(
-            line.contains("w#7:detached:ready:"),
-            "completion-ready workers should not look like still-running provider execution: {line}"
+            !line.contains("workers:") && !line.contains("w#7:"),
+            "one ordinary main-turn worker is transcript activity, not persistent chrome: {line}"
         );
     }
 
@@ -13433,7 +13535,7 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_keeps_provider_worker_status_without_duplicate_activity() {
+    fn status_bar_hides_single_main_worker_without_duplicate_activity() {
         let mut state = TuiState::new("provider-with-long-name", "model-with-long-name");
         state.session_title = "long running orchestration title".to_string();
         state.provider_worker_status = ProviderWorkerStatus {
@@ -13459,8 +13561,8 @@ mod tests {
         let line = render_status_bar_text(&state, 72);
 
         assert!(
-            line.contains("workers:1"),
-            "compact active status should retain worker status: {line}"
+            !line.contains("workers:1"),
+            "single main worker must stay out of chrome: {line}"
         );
         assert!(!line.contains("generating"), "activity belongs in transcript: {line}");
     }

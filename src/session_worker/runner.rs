@@ -159,19 +159,22 @@ async fn next_steer(steer_rx: &mut Option<tokio::sync::mpsc::Receiver<String>>) 
 }
 
 fn select_tools_for_worker(source: Vec<Box<dyn Tool>>, allowed_tools: &[String]) -> Result<Vec<Box<dyn Tool>>> {
-    if allowed_tools.is_empty() {
+    let normalized = allowed_tools
+        .iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    if normalized.is_empty() || normalized.as_slice() == ["*"] {
         return Ok(source);
+    }
+    if normalized.contains(&"*") {
+        anyhow::bail!("Worker allowed_tools must use '*' exclusively");
     }
 
     let mut selected = Vec::new();
     let mut remaining = source;
 
-    for allowed in allowed_tools {
-        let allowed = allowed.trim();
-        if allowed.is_empty() {
-            continue;
-        }
-
+    for allowed in normalized {
         if let Some(index) = remaining
             .iter()
             .position(|tool| tool.name() == allowed || tool.supports_name(allowed))
@@ -701,6 +704,11 @@ async fn run_validated_manifest(
 
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
     let shared_config = crate::config::new_shared(config.clone());
+    let hooks = Arc::new(HookManager::new(manifest.workspace_dir.clone()));
+    #[cfg(feature = "wasm-plugins")]
+    if let Some(plugin_runtime) = &wasm_plugin_runtime {
+        hooks.set_plugin_runtime(Arc::clone(plugin_runtime)).await;
+    }
 
     let (composio_key, composio_entity_id) = if config.composio.configured() {
         (
@@ -712,7 +720,12 @@ async fn run_validated_manifest(
     };
 
     #[allow(unused_mut)]
-    let mut full_tools = tools::all_tools_with_runtime(
+    let mut extensions = hooks.control_tool_arcs(Arc::clone(&security));
+    #[cfg(feature = "wasm-plugins")]
+    if let Some(plugin_runtime) = &wasm_plugin_runtime {
+        extensions.extend(plugin_runtime.control_tool_arcs(Arc::clone(&security)));
+    }
+    let full_tools = tools::all_tools_with_runtime_ext_and_extensions(
         Arc::new(config.clone()),
         shared_config,
         &security,
@@ -726,14 +739,9 @@ async fn run_validated_manifest(
         &config.agents,
         manifest.api_key.as_deref().or(config.api_key.as_deref()),
         &config,
-    );
-    #[cfg(feature = "wasm-plugins")]
-    if let Some(plugin_runtime) = &wasm_plugin_runtime {
-        full_tools.push(plugin_runtime.tool_router());
-        full_tools.push(plugin_runtime.status_tool());
-        full_tools.push(plugin_runtime.reload_tool(Arc::clone(&security)));
-        full_tools.push(plugin_runtime.manage_tool(Arc::clone(&security)));
-    }
+        extensions,
+    )
+    .tools;
 
     let tools_registry = select_tools_for_worker(full_tools, &manifest.allowed_tools)?;
     let system_prompt = resolve_system_prompt(&manifest);
@@ -767,11 +775,6 @@ async fn run_validated_manifest(
         let initial_history = vec![ChatMessage::system(system_prompt), ChatMessage::user(user_task)];
 
         let observer = NoopObserver;
-        let hooks = HookManager::new(manifest.workspace_dir.clone());
-        #[cfg(feature = "wasm-plugins")]
-        if let Some(plugin_runtime) = &wasm_plugin_runtime {
-            hooks.set_plugin_runtime(Arc::clone(plugin_runtime)).await;
-        }
         let scope_ctx = match (
             manifest.scope_sender.as_deref(),
             manifest.scope_channel.as_deref(),
@@ -802,7 +805,7 @@ async fn run_validated_manifest(
         // fields out of the `FnMut` closure's captured environment.
         let provider_ref = provider.as_ref();
         let observer_ref = &observer;
-        let hooks_ref = &hooks;
+        let hooks_ref = hooks.as_ref();
         let scope_ctx_ref = scope_ctx.as_ref();
         let memory_ref = &memory;
         let provider_name_ref: &str = &manifest.provider_name;
@@ -1404,6 +1407,24 @@ mod tests {
             parent_run_id: None,
             compaction_config: None,
         }
+    }
+
+    #[test]
+    fn worker_wildcard_inherits_complete_tool_registry() {
+        let source = crate::tools::default_tools(Arc::new(crate::security::SecurityPolicy::default()));
+        let expected = source.len();
+        let selected = select_tools_for_worker(source, &["*".to_string()]).expect("wildcard selection");
+        assert_eq!(selected.len(), expected);
+    }
+
+    #[test]
+    fn worker_wildcard_must_be_exclusive() {
+        let source = crate::tools::default_tools(Arc::new(crate::security::SecurityPolicy::default()));
+        let error = match select_tools_for_worker(source, &["*".to_string(), "shell".to_string()]) {
+            Ok(_) => panic!("mixed wildcard must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("exclusively"));
     }
 
     /// A fake agent-loop segment: parks until cancelled for its first

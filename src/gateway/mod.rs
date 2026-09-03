@@ -1068,7 +1068,13 @@ fn build_gateway_turn_runtime(
     } else {
         (None, None)
     };
-    let tools_result = tools::all_tools_with_runtime_ext(
+    #[allow(unused_mut)]
+    let mut extensions = hooks.control_tool_arcs(Arc::clone(&security));
+    #[cfg(feature = "wasm-plugins")]
+    if let Some(runtime) = &plugin_runtime {
+        extensions.extend(runtime.control_tool_arcs(Arc::clone(&security)));
+    }
+    let tools_result = tools::all_tools_with_runtime_ext_and_extensions(
         Arc::clone(&generation.effective),
         Arc::clone(&shared_config),
         &security,
@@ -1082,6 +1088,7 @@ fn build_gateway_turn_runtime(
         &config.agents,
         config.api_key.as_deref(),
         config,
+        extensions,
     );
     let mut tools_list = tools_result.tools;
     let mcp_tool = tools_result.mcp_tool;
@@ -1147,17 +1154,6 @@ fn build_gateway_turn_runtime(
         shared_config,
         security.clone(),
     )));
-    tools_list.push(hooks.status_tool());
-    tools_list.push(hooks.manage_tool(security.clone()));
-
-    #[cfg(feature = "wasm-plugins")]
-    if let Some(runtime) = &plugin_runtime {
-        tools_list.push(runtime.tool_router());
-        tools_list.push(runtime.status_tool());
-        tools_list.push(runtime.reload_tool(security.clone()));
-        tools_list.push(runtime.manage_tool(security.clone()));
-    }
-
     let tools_registry = Arc::new(tools_list);
     if let Some(handle) = spawn_tools_handle {
         let _ = handle.set(Arc::clone(&tools_registry));
@@ -1255,6 +1251,17 @@ pub async fn run_gateway(
     // atomically by GatewayTurnRuntimeOwner. Resource-mutation routes independently
     // pin the manager's active generation at each authorization decision.
     let security = crate::runtime::bootstrap::build_security_policy(&config);
+    let hooks = Arc::new(HookManager::new(config.workspace_dir.clone()));
+    #[cfg(feature = "wasm-plugins")]
+    let wasm_plugin_runtime = if let Some(runtime) = wasm_early_runtime {
+        runtime
+            .attach_memory(Arc::clone(&mem))
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to attach WASM memory backend in gateway: {error}"))?;
+        Some(runtime)
+    } else {
+        crate::plugins::init_plugin_runtime(&config.workspace_dir, Some(Arc::clone(&mem))).await
+    };
 
     let (composio_key, composio_entity_id) = if config.composio.configured() {
         (
@@ -1266,7 +1273,13 @@ pub async fn run_gateway(
     };
 
     // Build the base tool list (mutable so we can append channel-aware tools below)
-    let tools_result = tools::all_tools_with_runtime_ext(
+    #[allow(unused_mut)]
+    let mut extensions = hooks.control_tool_arcs(Arc::clone(&security));
+    #[cfg(feature = "wasm-plugins")]
+    if let Some(runtime) = &wasm_plugin_runtime {
+        extensions.extend(runtime.control_tool_arcs(Arc::clone(&security)));
+    }
+    let tools_result = tools::all_tools_with_runtime_ext_and_extensions(
         Arc::new(config.clone()),
         Arc::clone(&shared_config_for_reload),
         &security,
@@ -1280,10 +1293,10 @@ pub async fn run_gateway(
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        extensions,
     );
     let mut tools_list = tools_result.tools;
     let mcp_tool = tools_result.mcp_tool;
-    let hooks = Arc::new(HookManager::new(config.workspace_dir.clone()));
     // Generic /webhook auth can require a standalone token and/or HMAC signature.
     let webhook_token_hash: Option<Arc<str>> = config.webhook.token.as_ref().and_then(|raw_token| {
         let trimmed_token = raw_token.trim();
@@ -1430,30 +1443,8 @@ pub async fn run_gateway(
         Arc::clone(&shared_config_for_reload),
         security.clone(),
     )));
-    tools_list.push(hooks.status_tool());
-    tools_list.push(hooks.manage_tool(security.clone()));
-
-    // ── Register the stable router backed by the sole process-level plugin runtime ──
-    #[cfg(feature = "wasm-plugins")]
-    let wasm_plugin_runtime = if let Some(runtime) = wasm_early_runtime {
-        if let Err(error) = runtime.attach_memory(Arc::clone(&mem)).await {
-            return Err(anyhow::anyhow!(
-                "failed to attach WASM memory backend in gateway: {error}"
-            ));
-        }
-        Some(runtime)
-    } else {
-        crate::plugins::init_plugin_runtime(&config.workspace_dir, Some(Arc::clone(&mem))).await
-    };
     #[cfg(feature = "wasm-plugins")]
     if let Some(runtime) = &wasm_plugin_runtime {
-        let router = runtime.tool_router();
-        let tool_count = router.specs().len();
-        tracing::info!(count = tool_count, "registering dynamic WASM plugin tool router");
-        tools_list.push(router);
-        tools_list.push(runtime.status_tool());
-        tools_list.push(runtime.reload_tool(security.clone()));
-        tools_list.push(runtime.manage_tool(security.clone()));
         tracing::debug!(generation = runtime.generation_id(), "WASM plugin runtime ready");
     }
 
