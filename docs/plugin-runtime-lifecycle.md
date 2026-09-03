@@ -19,6 +19,18 @@ Any parse, compile, or target-presence failure leaves the previous generation ac
 
 EventBus queues are bounded. Publishing never waits for a consumer; when a subscriber queue is full, that event is dropped with a warning. Host `subscribe` is accepted only for hook-capable instances that own an `on-event` export. A real pump continuously consumes the subscription receiver and delivers `(topic, payload)` to that guest export. Other plugin capabilities receive an explicit unsupported error.
 
+Native lifecycle names are bridged into the documented `prx.lifecycle.*`
+namespace before WASM dispatch (`agent_end` maps to
+`prx.lifecycle.agent_stop`). Hook manifest events accept string arrays and the
+documented `[[capabilities.events]]` table form, with exact, prefix-wildcard,
+global-wildcard, and legacy short-name matching. Status reports per-adapter
+invocation counters and the last event/error for end-to-end verification.
+
+Middleware, hook, and cron adapters link the same canonical PDK host ABI as
+tool plugins, including result-bearing KV mutations plus HTTP, memory, events,
+WebSocket, and WASI imports. Their host state receives the live memory backend
+when one is configured.
+
 ## Admission and trust
 
 - `plugin.toml` is limited to 256 KiB and cannot be a symlink.

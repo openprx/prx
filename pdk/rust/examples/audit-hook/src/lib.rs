@@ -20,6 +20,10 @@
 
 use prx_pdk::prelude::*;
 
+#[allow(warnings)]
+#[cfg(target_arch = "wasm32")]
+mod bindings;
+
 // ── Plugin implementation ─────────────────────────────────────────────────────
 
 /// Audit hook plugin. Stateless struct; all state lives in KV.
@@ -106,7 +110,8 @@ impl AuditHook {
 #[cfg(target_arch = "wasm32")]
 mod wasm_exports {
     use super::AuditHook;
-    use bindings::Guest;
+    use super::bindings;
+    use bindings::exports::prx::plugin::hook_exports::Guest;
 
     impl Guest for AuditHook {
         fn on_event(event: String, payload_json: String) -> Result<(), String> {

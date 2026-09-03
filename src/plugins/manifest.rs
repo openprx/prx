@@ -3,7 +3,7 @@
 //! Aligned with spec: supports `[permissions]` with `required`/`optional` lists,
 //! `http_allowlist`, and `[resources]` for execution limits.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::path::Path;
 
 use super::error::{PluginError, PluginResult};
@@ -55,11 +55,37 @@ pub struct Capability {
     #[serde(default = "default_priority")]
     pub priority: i32,
     /// List of events this hook listens to (for hook capabilities).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_event_patterns")]
     pub events: Vec<String>,
     /// Cron schedule expression (for cron capabilities), 5-field format.
     #[serde(default)]
     pub schedule: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EventPattern {
+    Name(String),
+    Detailed {
+        pattern: String,
+        #[serde(default)]
+        _description: Option<String>,
+    },
+}
+
+fn deserialize_event_patterns<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Vec::<EventPattern>::deserialize(deserializer).map(|patterns| {
+        patterns
+            .into_iter()
+            .map(|pattern| match pattern {
+                EventPattern::Name(name) => name,
+                EventPattern::Detailed { pattern, .. } => pattern,
+            })
+            .collect()
+    })
 }
 
 const fn default_priority() -> i32 {
@@ -226,6 +252,12 @@ impl PluginManifest {
                     capability.name
                 )));
             }
+            if capability.capability_type == "hook" && capability.events.iter().any(|event| event.trim().is_empty()) {
+                return Err(PluginError::Manifest(format!(
+                    "hook capability '{}' contains an empty event pattern",
+                    capability.name
+                )));
+            }
         }
         Ok(())
     }
@@ -324,6 +356,33 @@ name = "my_hook"
         assert!(manifest.has_capability("tool"));
         assert!(manifest.has_capability("hook"));
         assert!(!manifest.has_capability("channel"));
+    }
+
+    #[test]
+    fn hook_events_accept_strings_and_detailed_tables() {
+        let string_manifest: PluginManifest = toml::from_str(
+            r#"
+[plugin]
+name = "string-hook"
+version = "0.1.0"
+
+[[capabilities]]
+type = "hook"
+name = "audit"
+events = ["turn_complete", "prx.lifecycle.tool_call"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            string_manifest.capabilities[0].events,
+            ["turn_complete", "prx.lifecycle.tool_call"]
+        );
+
+        let detailed_manifest = PluginManifest::from_file(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("pdk/rust/examples/audit-hook/plugin.toml"),
+        )
+        .expect("the documented audit hook manifest must be loadable");
+        assert_eq!(detailed_manifest.capabilities[0].events, ["prx.lifecycle.*"]);
     }
 
     #[test]

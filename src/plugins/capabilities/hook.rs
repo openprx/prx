@@ -3,8 +3,11 @@
 //! Hook plugins observe lifecycle events (agent_start, tool_call, etc.)
 //! without modifying the data flow.
 
+use parking_lot::RwLock;
+use serde::Serialize;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 use wasmtime::AsContextMut;
 
@@ -20,6 +23,23 @@ pub struct WasmHook {
     events: HashSet<String>,
     inner: Arc<Mutex<WasmHookInner>>,
     timeout_ms: u64,
+    invocation_state: Arc<HookInvocationState>,
+}
+
+#[derive(Default)]
+struct HookInvocationState {
+    count: AtomicU64,
+    last_event: RwLock<Option<String>>,
+    last_error: RwLock<Option<String>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WasmHookDiagnostics {
+    pub plugin: String,
+    pub event_patterns: Vec<String>,
+    pub invocation_count: u64,
+    pub last_event: Option<String>,
+    pub last_error: Option<String>,
 }
 
 struct WasmHookInner {
@@ -37,6 +57,7 @@ impl WasmHook {
         manifest: &PluginManifest,
         granted_permissions: HashSet<String>,
         events: HashSet<String>,
+        memory: Option<Arc<dyn crate::memory::traits::Memory>>,
         event_bus: Option<std::sync::Arc<crate::plugins::event_bus::EventBus>>,
     ) -> PluginResult<Self> {
         let timeout_ms = manifest.resources.max_execution_time_ms;
@@ -54,6 +75,9 @@ impl WasmHook {
             manifest.resources.max_kv_storage_mb,
         )
         .with_event_sink(event_sink);
+        if let Some(memory) = memory {
+            host_state = host_state.with_memory(memory);
+        }
         if let Some(bus) = event_bus {
             host_state = host_state.with_event_bus(bus);
         }
@@ -74,22 +98,27 @@ impl WasmHook {
 
         let plugin_name = manifest.plugin.name.clone();
         let inner = Arc::new(Mutex::new(WasmHookInner { store, instance }));
+        let invocation_state = Arc::new(HookInvocationState::default());
         let weak_inner = Arc::downgrade(&inner);
         let pump_plugin_name = plugin_name.clone();
+        let pump_invocation_state = Arc::clone(&invocation_state);
         tokio::spawn(async move {
             while let Some(message) = event_receiver.recv().await {
                 let Some(inner) = weak_inner.upgrade() else {
                     break;
                 };
-                if let Err(error) =
-                    invoke_guest_event(&inner, &pump_plugin_name, &message.topic, &message.payload, timeout_ms).await
+                match invoke_guest_event(&inner, &pump_plugin_name, &message.topic, &message.payload, timeout_ms).await
                 {
-                    tracing::warn!(
-                        plugin = %pump_plugin_name,
-                        topic = %message.topic,
-                        error = %error,
-                        "WASM subscriber pump delivery failed"
-                    );
+                    Ok(()) => record_invocation(&pump_invocation_state, &message.topic, None),
+                    Err(error) => {
+                        record_invocation(&pump_invocation_state, &message.topic, Some(error.to_string()));
+                        tracing::warn!(
+                            plugin = %pump_plugin_name,
+                            topic = %message.topic,
+                            error = %error,
+                            "WASM subscriber pump delivery failed"
+                        );
+                    }
                 }
             }
         });
@@ -99,12 +128,13 @@ impl WasmHook {
             events,
             inner,
             timeout_ms,
+            invocation_state,
         })
     }
 
     /// Check if this hook listens for a specific event.
     pub fn handles_event(&self, event: &str) -> bool {
-        self.events.contains(event) || self.events.contains("*")
+        self.events.iter().any(|pattern| event_pattern_matches(pattern, event))
     }
 
     /// Fire the hook for an event.
@@ -113,17 +143,60 @@ impl WasmHook {
             return Ok(());
         }
 
-        invoke_guest_event(&self.inner, &self.plugin_name, event, payload_json, self.timeout_ms).await
+        let result = invoke_guest_event(&self.inner, &self.plugin_name, event, payload_json, self.timeout_ms).await;
+        record_invocation(
+            &self.invocation_state,
+            event,
+            result.as_ref().err().map(ToString::to_string),
+        );
+        result
     }
 
     pub fn plugin_name(&self) -> &str {
         &self.plugin_name
     }
 
+    pub fn diagnostics(&self) -> WasmHookDiagnostics {
+        let mut event_patterns = self.events.iter().cloned().collect::<Vec<_>>();
+        event_patterns.sort();
+        WasmHookDiagnostics {
+            plugin: self.plugin_name.clone(),
+            event_patterns,
+            invocation_count: self.invocation_state.count.load(Ordering::Relaxed),
+            last_event: self.invocation_state.last_event.read().clone(),
+            last_error: self.invocation_state.last_error.read().clone(),
+        }
+    }
+
     /// Register host functions for hook plugins.
     fn register_host_functions(linker: &mut wasmtime::component::Linker<HostState>) -> PluginResult<()> {
         super::common::register_common_host_functions(linker)
     }
+}
+
+fn record_invocation(state: &HookInvocationState, event: &str, error: Option<String>) {
+    state.count.fetch_add(1, Ordering::Relaxed);
+    *state.last_event.write() = Some(event.to_string());
+    *state.last_error.write() = error;
+}
+
+fn event_pattern_matches(pattern: &str, event: &str) -> bool {
+    let pattern = pattern.trim();
+    let event = event.trim();
+    if pattern == "*" || pattern == event {
+        return true;
+    }
+
+    let raw_event = event.strip_prefix("prx.lifecycle.").unwrap_or(event);
+    if pattern == raw_event {
+        return true;
+    }
+
+    pattern.strip_suffix('*').is_some_and(|prefix| {
+        event.starts_with(prefix)
+            || raw_event.starts_with(prefix)
+            || format!("prx.lifecycle.{raw_event}").starts_with(prefix)
+    })
 }
 
 async fn invoke_guest_event(
@@ -226,5 +299,26 @@ impl WasmHookExecutor {
     /// Returns true if no hooks are registered.
     pub const fn is_empty(&self) -> bool {
         self.hooks.is_empty()
+    }
+
+    pub fn diagnostics(&self) -> Vec<WasmHookDiagnostics> {
+        self.hooks.iter().map(WasmHook::diagnostics).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::event_pattern_matches;
+
+    #[test]
+    fn lifecycle_patterns_match_canonical_and_legacy_names() {
+        assert!(event_pattern_matches("prx.lifecycle.*", "prx.lifecycle.turn_complete"));
+        assert!(event_pattern_matches(
+            "prx.lifecycle.turn_complete",
+            "prx.lifecycle.turn_complete"
+        ));
+        assert!(event_pattern_matches("turn_complete", "prx.lifecycle.turn_complete"));
+        assert!(event_pattern_matches("prx.lifecycle.*", "turn_complete"));
+        assert!(!event_pattern_matches("prx.lifecycle.tool_call", "prx.lifecycle.error"));
     }
 }

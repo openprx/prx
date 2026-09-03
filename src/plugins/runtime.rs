@@ -50,11 +50,15 @@ impl PluginGeneration {
         manager.load_all().await?;
 
         let tools_build = manager
-            .create_tool_adapters_with_memory(memory, Some(Arc::clone(&event_bus)))
+            .create_tool_adapters_with_memory(memory.clone(), Some(Arc::clone(&event_bus)))
             .await;
-        let middleware_build = manager.create_middleware_chain(Some(Arc::clone(&event_bus))).await;
-        let hooks_build = manager.create_hook_executor(Some(Arc::clone(&event_bus))).await;
-        let cron_build = manager.create_cron_manager(Some(event_bus)).await;
+        let middleware_build = manager
+            .create_middleware_chain_with_memory(memory.clone(), Some(Arc::clone(&event_bus)))
+            .await;
+        let hooks_build = manager
+            .create_hook_executor_with_memory(memory.clone(), Some(Arc::clone(&event_bus)))
+            .await;
+        let cron_build = manager.create_cron_manager_with_memory(memory, Some(event_bus)).await;
         let tools = tools_build.value.into_iter().map(Arc::<dyn Tool>::from).collect();
         let middleware = Arc::new(middleware_build.value);
         let hooks = Arc::new(hooks_build.value);
@@ -171,6 +175,10 @@ impl PluginRuntime {
     pub async fn emit_hook(&self, event: &str, payload_json: &str) {
         let generation = self.generation.load_full();
         generation.hooks.emit(event, payload_json).await;
+    }
+
+    pub fn hook_diagnostics(&self) -> Vec<super::capabilities::hook::WasmHookDiagnostics> {
+        self.generation.load().hooks.diagnostics()
     }
 
     /// Snapshot the current middleware generation for one request pipeline.
@@ -306,12 +314,14 @@ impl Tool for PluginStatusTool {
     async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let plugins = self.runtime.list_plugins().await;
         let errors = self.runtime.adapter_errors();
+        let hook_adapters = self.runtime.hook_diagnostics();
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&serde_json::json!({
                 "generation": self.runtime.generation_id(),
                 "count": plugins.len(),
                 "plugins": plugins,
+                "hook_adapters": hook_adapters,
                 "errors": errors,
             }))?,
             error: None,
@@ -734,6 +744,7 @@ impl Tool for PluginManageTool {
                 "generation": self.runtime.generation_id(),
                 "active": self.active_inventory().await?,
                 "disabled": self.disabled_plugins()?,
+                "hook_adapters": self.runtime.hook_diagnostics(),
                 "errors": self.runtime.adapter_errors(),
             })),
             "get" => {
@@ -1110,5 +1121,32 @@ optional = []
         assert!(removed.success, "remove failed: {:?}", removed.error);
         assert!(runtime.list_plugins().await.is_empty());
         assert!(temp.path().join(".plugins-trash").is_dir());
+    }
+
+    #[tokio::test]
+    async fn documented_audit_hook_instantiates_and_records_real_delivery() {
+        let temp = TempDir::new().unwrap();
+        let plugin_dir = temp.path().join("plugins/audit-hook");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("pdk/rust/examples/audit-hook");
+        std::fs::copy(fixture.join("plugin.toml"), plugin_dir.join("plugin.toml")).unwrap();
+        std::fs::copy(fixture.join("plugin.wasm"), plugin_dir.join("plugin.wasm")).unwrap();
+        std::fs::write(plugin_dir.join(".prx-managed"), "test fixture\n").unwrap();
+
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+        let before = runtime.hook_diagnostics();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before.first().unwrap().invocation_count, 0);
+
+        runtime
+            .emit_hook("prx.lifecycle.turn_complete", r#"{"source":"regression-test"}"#)
+            .await;
+
+        let after = runtime.hook_diagnostics();
+        let hook = after.first().unwrap();
+        assert_eq!(hook.invocation_count, 1);
+        assert_eq!(hook.last_event.as_deref(), Some("prx.lifecycle.turn_complete"));
+        assert!(hook.last_error.is_none(), "{:?}", hook.last_error);
     }
 }

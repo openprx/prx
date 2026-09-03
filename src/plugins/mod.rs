@@ -448,6 +448,14 @@ impl PluginManager {
         &self,
         event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
     ) -> PluginAdapterBuild<capabilities::middleware::MiddlewareChain> {
+        self.create_middleware_chain_with_memory(None, event_bus).await
+    }
+
+    pub async fn create_middleware_chain_with_memory(
+        &self,
+        memory: Option<Arc<dyn crate::memory::traits::Memory>>,
+        event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
+    ) -> PluginAdapterBuild<capabilities::middleware::MiddlewareChain> {
         let plugins = self.registry.list().await;
         let mut chain = capabilities::middleware::MiddlewareChain::new();
         let mut errors = Vec::new();
@@ -499,6 +507,7 @@ impl PluginManager {
                 &manifest,
                 granted_permissions,
                 priority,
+                memory.clone(),
                 event_bus.clone(),
             )
             .await
@@ -524,6 +533,14 @@ impl PluginManager {
     /// Create hook adapters for all plugins with hook capabilities.
     pub async fn create_hook_executor(
         &self,
+        event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
+    ) -> PluginAdapterBuild<capabilities::hook::WasmHookExecutor> {
+        self.create_hook_executor_with_memory(None, event_bus).await
+    }
+
+    pub async fn create_hook_executor_with_memory(
+        &self,
+        memory: Option<Arc<dyn crate::memory::traits::Memory>>,
         event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
     ) -> PluginAdapterBuild<capabilities::hook::WasmHookExecutor> {
         let plugins = self.registry.list().await;
@@ -577,6 +594,7 @@ impl PluginManager {
                 &manifest,
                 granted_permissions,
                 events,
+                memory.clone(),
                 event_bus.clone(),
             )
             .await
@@ -601,6 +619,14 @@ impl PluginManager {
     /// Create cron adapters for all plugins with cron capabilities.
     pub async fn create_cron_manager(
         &self,
+        event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
+    ) -> PluginAdapterBuild<capabilities::cron::WasmCronManager> {
+        self.create_cron_manager_with_memory(None, event_bus).await
+    }
+
+    pub async fn create_cron_manager_with_memory(
+        &self,
+        memory: Option<Arc<dyn crate::memory::traits::Memory>>,
         event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
     ) -> PluginAdapterBuild<capabilities::cron::WasmCronManager> {
         let plugins = self.registry.list().await;
@@ -660,6 +686,7 @@ impl PluginManager {
                 &manifest,
                 granted_permissions,
                 schedule.clone(),
+                memory.clone(),
                 event_bus.clone(),
             )
             .await

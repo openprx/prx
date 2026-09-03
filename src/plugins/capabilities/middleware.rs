@@ -57,6 +57,7 @@ impl WasmMiddleware {
         manifest: &PluginManifest,
         granted_permissions: std::collections::HashSet<String>,
         priority: i32,
+        memory: Option<Arc<dyn crate::memory::traits::Memory>>,
         event_bus: Option<std::sync::Arc<crate::plugins::event_bus::EventBus>>,
     ) -> PluginResult<Self> {
         let timeout_ms = manifest.resources.max_execution_time_ms;
@@ -72,6 +73,9 @@ impl WasmMiddleware {
             timeout_ms,
             manifest.resources.max_kv_storage_mb,
         );
+        if let Some(memory) = memory {
+            host_state = host_state.with_memory(memory);
+        }
         if let Some(bus) = event_bus {
             host_state = host_state.with_event_bus(bus);
         }
