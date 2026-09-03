@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.82] - 3 September 2026
+
+### Fixed
+
+- Keep one stateful stdio MCP client alive per configured server so browser and
+  other session-oriented MCP tools retain context across separate calls.
+- Serialize calls to the same stdio server, close cached sessions on explicit
+  refresh or configuration changes, and reset failed transports without
+  replaying potentially side-effecting calls.
+
 ## [0.8.81] - 3 September 2026
 
 ### Added

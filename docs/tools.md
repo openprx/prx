@@ -60,6 +60,13 @@ provider-facing catalog is snapshotted. MCP and WASM aliases are deterministical
 ordered and bounded; their root call tools remain available for capabilities
 outside the alias window.
 
+Stdio MCP servers are stateful: PRX keeps one client process alive per server
+and serializes that server's calls, while calls to different servers may run in
+parallel. An explicit refresh or workspace MCP configuration change closes the
+cached session before rediscovery. A timeout or transport failure also resets
+the session, but PRX does not replay the failed call because it may have already
+performed an external side effect.
+
 For prompt-guided models, the textual tool catalog now uses the same per-turn
 intent selection as native function calling. Registered capabilities whose
 availability is only `declared` remain visible to control-plane catalogs but are

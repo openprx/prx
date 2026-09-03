@@ -5,7 +5,7 @@ use crate::security::op_id;
 use crate::security::policy::{ApprovalGrant, ResourceRiskLevel, SideEffectGate};
 use anyhow::bail;
 use async_trait::async_trait;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{ServiceExt, model::CallToolRequestParams};
 use serde::Deserialize;
@@ -21,6 +21,10 @@ const MCP_JSON_FILE: &str = "mcp.json";
 const MCP_ROOT_NAME: &str = "mcp_call";
 const MCP_DISCOVERY_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 const MCP_MAX_ALIAS_SPECS: usize = 32;
+const MCP_STDIO_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+
+type McpClient = rmcp::service::RunningService<rmcp::RoleClient, ()>;
+type StdioSessionSlot = Arc<tokio::sync::Mutex<Option<StdioSession>>>;
 
 // ── Security: command whitelist & env var blocklist ──────────────────
 
@@ -82,6 +86,22 @@ struct RuntimeState {
     last_refresh_attempt: Option<SystemTime>,
 }
 
+struct StdioSession {
+    client: McpClient,
+    registration: crate::runtime::registry::WorkGuard,
+}
+
+impl StdioSession {
+    async fn close(mut self) {
+        if matches!(
+            self.client.close_with_timeout(MCP_STDIO_CLOSE_TIMEOUT).await,
+            Ok(Some(_))
+        ) {
+            self.registration.mark_reaped();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct McpServerRuntimeInfo {
     pub name: String,
@@ -135,6 +155,8 @@ pub struct McpTool {
     base_config: McpConfig,
     mcp_json_path: PathBuf,
     state: RwLock<RuntimeState>,
+    stdio_sessions: Mutex<HashMap<String, StdioSessionSlot>>,
+    lifecycle: tokio::sync::RwLock<()>,
 }
 
 pub struct McpStatusTool {
@@ -175,6 +197,8 @@ impl McpTool {
             base_config,
             mcp_json_path: workspace_dir.join(MCP_JSON_FILE),
             state: RwLock::new(state),
+            stdio_sessions: Mutex::new(HashMap::new()),
+            lifecycle: tokio::sync::RwLock::new(()),
         }
     }
 
@@ -634,6 +658,7 @@ impl McpTool {
     }
 
     async fn call_stdio(
+        &self,
         server_name: &str,
         server: &McpServerConfig,
         tool_name: &str,
@@ -658,33 +683,70 @@ impl McpTool {
             );
         }
 
-        let mut cmd = Command::new(command);
-        cmd.args(&server.args);
-        cmd.kill_on_drop(true);
-        if !server.env.is_empty() {
-            cmd.envs(server.env.clone());
-        }
-
-        // Own process group; see `discover_stdio` for the rationale.
-        #[cfg(unix)]
-        cmd.process_group(0);
-
         let startup_timeout = Duration::from_millis(server.startup_timeout_ms);
         let request_timeout = Duration::from_millis(server.request_timeout_ms);
-        let transport = TokioChildProcess::new(cmd)?;
-        let _registration = register_mcp_child(server_name, &transport);
-        let client = tokio::time::timeout(startup_timeout, ().serve(transport))
-            .await
-            .map_err(|_| anyhow::anyhow!("MCP startup timed out after {} ms", server.startup_timeout_ms))??;
 
-        let result = tokio::time::timeout(
+        let slot = {
+            let mut sessions = self.stdio_sessions.lock();
+            Arc::clone(
+                sessions
+                    .entry(server_name.to_string())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None))),
+            )
+        };
+        let mut session = slot.lock().await;
+
+        if session
+            .as_ref()
+            .is_some_and(|session| session.client.is_closed() || session.client.is_transport_closed())
+        {
+            if let Some(stale) = session.take() {
+                stale.close().await;
+            }
+        }
+
+        if session.is_none() {
+            let mut cmd = Command::new(command);
+            cmd.args(&server.args);
+            cmd.kill_on_drop(true);
+            if !server.env.is_empty() {
+                cmd.envs(server.env.clone());
+            }
+
+            // Own process group; see `discover_stdio` for the rationale.
+            #[cfg(unix)]
+            cmd.process_group(0);
+
+            let transport = TokioChildProcess::new(cmd)?;
+            let registration = register_mcp_child(server_name, &transport);
+            let client = tokio::time::timeout(startup_timeout, ().serve(transport))
+                .await
+                .map_err(|_| anyhow::anyhow!("MCP startup timed out after {} ms", server.startup_timeout_ms))??;
+            *session = Some(StdioSession { client, registration });
+        }
+
+        let Some(active_session) = session.as_ref() else {
+            bail!("MCP stdio session for '{server_name}' was not initialized");
+        };
+        let client = &active_session.client;
+
+        let result = match tokio::time::timeout(
             request_timeout,
             client.call_tool(Self::call_tool_params(tool_name, arguments)),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("MCP call timed out after {} ms", server.request_timeout_ms))?;
-
-        let _ = client.cancel().await;
+        {
+            Ok(result) => result,
+            Err(_) => {
+                if let Some(failed) = session.take() {
+                    failed.close().await;
+                }
+                return Err(anyhow::anyhow!(
+                    "MCP call timed out after {} ms; stdio session was reset and the call was not replayed",
+                    server.request_timeout_ms
+                ));
+            }
+        };
 
         match result {
             Ok(r) => {
@@ -710,7 +772,35 @@ impl McpTool {
             }
             Err(e) => {
                 tracing::warn!(server = server_name, tool = tool_name, error = %e, "MCP call_stdio: error");
+                if matches!(
+                    e,
+                    rmcp::service::ServiceError::TransportSend(_)
+                        | rmcp::service::ServiceError::TransportClosed
+                        | rmcp::service::ServiceError::UnexpectedResponse
+                        | rmcp::service::ServiceError::Cancelled { .. }
+                        | rmcp::service::ServiceError::Timeout { .. }
+                ) && let Some(failed) = session.take()
+                {
+                    failed.close().await;
+                }
                 Err(e.into())
+            }
+        }
+    }
+
+    async fn close_stdio_sessions(&self) {
+        let sessions = {
+            let mut sessions = self.stdio_sessions.lock();
+            sessions.drain().map(|(_, slot)| slot).collect::<Vec<_>>()
+        };
+
+        for slot in sessions {
+            let session = {
+                let mut session = slot.lock().await;
+                session.take()
+            };
+            if let Some(session) = session {
+                session.close().await;
             }
         }
     }
@@ -751,6 +841,7 @@ impl McpTool {
     }
 
     async fn refresh_runtime_state(&self, force: bool) {
+        let _lifecycle = self.lifecycle.write().await;
         let file_mtime = Self::file_mtime(&self.mcp_json_path).ok().flatten();
         let (current_mtime, initialized, has_errors, last_refresh_attempt) = {
             let state = self.state.read();
@@ -775,6 +866,11 @@ impl McpTool {
                 return;
             }
         }
+
+        // A forced refresh or config change is an explicit lifecycle boundary:
+        // close stateful stdio servers before rediscovery so calls cannot retain
+        // stale configuration or browser/session state from the old generation.
+        self.close_stdio_sessions().await;
 
         let (new_config, config_error) = match self.load_effective_config_from_json() {
             Ok(Some(from_file)) => (from_file, None),
@@ -838,6 +934,7 @@ impl McpTool {
         tool_name: String,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> anyhow::Result<(bool, String)> {
+        let _lifecycle = self.lifecycle.read().await;
         let (effective_config, discovered_for_server) = {
             let state = self.state.read();
             (
@@ -858,7 +955,7 @@ impl McpTool {
         }
 
         match server.transport {
-            McpTransport::Stdio => Self::call_stdio(&server_name, server, &tool_name, arguments).await,
+            McpTransport::Stdio => self.call_stdio(&server_name, server, &tool_name, arguments).await,
             McpTransport::Http => Self::call_http(&server_name, server, &tool_name, arguments).await,
         }
     }
@@ -1492,6 +1589,156 @@ mod tests {
         );
         let tools = tool.list_discovered_tools();
         assert!(tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stdio_session_persists_across_calls_and_resets_on_refresh() {
+        if std::process::Command::new("python3").arg("--version").output().is_err() {
+            eprintln!("skipping stateful stdio MCP regression test: python3 is unavailable");
+            return;
+        }
+
+        const SERVER: &str = r#"
+import json
+import sys
+
+counter = 0
+for line in sys.stdin:
+    message = json.loads(line)
+    if "id" not in message:
+        continue
+    method = message.get("method")
+    if method == "initialize":
+        result = {
+            "protocolVersion": message.get("params", {}).get("protocolVersion", "2024-11-05"),
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "stateful-test", "version": "1.0.0"},
+        }
+    elif method == "tools/list":
+        result = {
+            "tools": [
+                {
+                    "name": "increment",
+                    "description": "increment a process-local counter",
+                    "inputSchema": {"type": "object", "properties": {}},
+                },
+                {
+                    "name": "read",
+                    "description": "read a process-local counter",
+                    "inputSchema": {"type": "object", "properties": {}},
+                },
+            ]
+        }
+    elif method == "tools/call":
+        if message.get("params", {}).get("name") == "increment":
+            counter += 1
+        result = {"content": [{"type": "text", "text": str(counter)}], "isError": False}
+    elif method == "ping":
+        result = {}
+    else:
+        response = {
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "error": {"code": -32601, "message": "method not found"},
+        }
+        print(json.dumps(response), flush=True)
+        continue
+    print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+"#;
+
+        let server = McpServerConfig {
+            command: Some("python3".into()),
+            args: vec!["-u".into(), "-c".into(), SERVER.into()],
+            startup_timeout_ms: 5_000,
+            request_timeout_ms: 5_000,
+            ..McpServerConfig::default()
+        };
+        let mut config = McpConfig::default();
+        config.servers.insert("stateful_a".into(), server.clone());
+        config.servers.insert("stateful_b".into(), server.clone());
+        let tool = McpTool::new(Arc::new(SecurityPolicy::default()), config, std::env::temp_dir());
+
+        for expected in 1..=1_000 {
+            let (increment_a, increment_b) = tokio::join!(
+                tool.call_stdio("stateful_a", &server, "increment", None),
+                tool.call_stdio("stateful_b", &server, "increment", None),
+            );
+            let expected = expected.to_string();
+            assert_eq!(
+                increment_a.unwrap_or_else(|error| panic!("server A increment failed: {error}")),
+                (true, expected.clone())
+            );
+            assert_eq!(
+                increment_b.unwrap_or_else(|error| panic!("server B increment failed: {error}")),
+                (true, expected.clone())
+            );
+
+            let (read_a, read_b) = tokio::join!(
+                tool.call_stdio("stateful_a", &server, "read", None),
+                tool.call_stdio("stateful_b", &server, "read", None),
+            );
+            assert_eq!(
+                read_a.unwrap_or_else(|error| panic!("server A read failed: {error}")),
+                (true, expected.clone()),
+                "different tools on server A must share one stateful session"
+            );
+            assert_eq!(
+                read_b.unwrap_or_else(|error| panic!("server B read failed: {error}")),
+                (true, expected),
+                "server B must retain independent state without cross-talk"
+            );
+        }
+
+        let concurrent =
+            futures::future::join_all((0..100).map(|_| tool.call_stdio("stateful_a", &server, "increment", None)))
+                .await;
+        let mut concurrent_values = concurrent
+            .into_iter()
+            .map(|result| {
+                let (success, output) = result.expect("concurrent server A increment succeeds");
+                assert!(success);
+                output.parse::<usize>().expect("counter output is numeric")
+            })
+            .collect::<Vec<_>>();
+        concurrent_values.sort_unstable();
+        assert_eq!(
+            concurrent_values,
+            (1_001..=1_100).collect::<Vec<_>>(),
+            "concurrent calls to one server must be serialized without loss or duplication"
+        );
+        assert_eq!(
+            tool.call_stdio("stateful_b", &server, "read", None)
+                .await
+                .expect("server B remains callable"),
+            (true, "1000".into()),
+            "concurrent activity on server A must not alter server B"
+        );
+        assert_eq!(
+            tool.stdio_sessions.lock().len(),
+            2,
+            "one persistent process must be retained per server"
+        );
+
+        tool.refresh_runtime_state(true).await;
+        assert!(
+            tool.stdio_sessions.lock().is_empty(),
+            "refresh must retire both persistent server sessions"
+        );
+        let (after_refresh_a, after_refresh_b) = tokio::join!(
+            tool.call_stdio("stateful_a", &server, "increment", None),
+            tool.call_stdio("stateful_b", &server, "increment", None),
+        );
+        assert_eq!(
+            after_refresh_a.expect("server A call after refresh succeeds"),
+            (true, "1".into()),
+            "refresh must start a clean server A session"
+        );
+        assert_eq!(
+            after_refresh_b.expect("server B call after refresh succeeds"),
+            (true, "1".into()),
+            "refresh must start a clean server B session"
+        );
+        tool.close_stdio_sessions().await;
     }
 
     #[tokio::test]
