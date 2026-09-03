@@ -1,0 +1,5 @@
+package prx:plugin@0.1.0;
+
+world middleware {
+    export middleware-exports;
+}

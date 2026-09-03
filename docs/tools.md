@@ -76,6 +76,10 @@ the shared generation, and rolls back if any declared adapter cannot be built.
 An approved managed install records a `.prx-managed` marker and grants the
 plugin's declared required host interfaces; manually placed plugins retain the
 conservative permission filter.
+Actions that target an installed plugin or exported adapter declare `name` as
+required in the tool schema. Storage store/forget actions additionally declare
+their required key/content fields, so native tool callers can validate an
+operation before dispatch instead of learning the contract from a failed call.
 Disable keeps the plugin under `.plugins-disabled`; remove moves it under
 `.plugins-trash` and reports the recovery path. Status includes active,
 disabled, and isolated adapter errors. The same runtime and controls are

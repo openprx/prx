@@ -1163,6 +1163,19 @@ async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionSchedule
             )
         })?;
 
+    #[cfg(feature = "wasm-plugins")]
+    let wasm_early_runtime = if config
+        .default_provider
+        .as_deref()
+        .is_some_and(|provider| provider.starts_with("wasm:"))
+        || crate::memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config))
+            .starts_with("wasm:")
+    {
+        crate::plugins::init_plugin_runtime(&config.workspace_dir, None).await
+    } else {
+        None
+    };
+
     let shared = new_shared_evolution_config(cfg.clone());
     let storage_root = resolve_evolution_storage_root(config, &cfg.runtime);
     let writer = Arc::new(
@@ -1203,6 +1216,13 @@ async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionSchedule
             &config.identity_bindings,
             &config.user_policies,
         )?);
+    #[cfg(feature = "wasm-plugins")]
+    if let Some(runtime) = wasm_early_runtime {
+        runtime
+            .attach_memory(Arc::clone(&evolution_memory))
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to attach WASM memory backend for evolution: {error}"))?;
+    }
     let memory_engine = Box::new(
         MemoryEvolutionEngine::new(shared.clone(), &cfg_path, Some(writer.clone()))
             .with_context(|| format!("failed to initialize memory evolution engine: {}", cfg_path.display()))?

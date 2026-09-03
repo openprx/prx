@@ -5393,6 +5393,15 @@ pub async fn start_channels_with_config(
     #[cfg(not(test))]
     let _ = &config_generation;
     let provider_name = resolved_default_provider(&config);
+    #[cfg(feature = "wasm-plugins")]
+    let wasm_early_runtime = if provider_name.starts_with("wasm:")
+        || memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config))
+            .starts_with("wasm:")
+    {
+        crate::plugins::init_plugin_runtime(&config.workspace_dir, None).await
+    } else {
+        None
+    };
     let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
         &provider_name,
@@ -5979,7 +5988,16 @@ pub async fn start_channels_with_config(
 
     // ── Register the same process-level WASM runtime used by every entrypoint ──
     #[cfg(feature = "wasm-plugins")]
-    let wasm_plugin_runtime = crate::plugins::init_plugin_runtime(&config.workspace_dir, Some(Arc::clone(&mem))).await;
+    let wasm_plugin_runtime = if let Some(runtime) = wasm_early_runtime {
+        if let Err(error) = runtime.attach_memory(Arc::clone(&mem)).await {
+            return Err(anyhow::anyhow!(
+                "failed to attach WASM memory backend in channels: {error}"
+            ));
+        }
+        Some(runtime)
+    } else {
+        crate::plugins::init_plugin_runtime(&config.workspace_dir, Some(Arc::clone(&mem))).await
+    };
     #[cfg(feature = "wasm-plugins")]
     if let Some(runtime) = &wasm_plugin_runtime {
         let router = runtime.tool_router();

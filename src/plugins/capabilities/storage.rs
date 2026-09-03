@@ -16,6 +16,7 @@ use crate::plugins::host::{HostState, apply_store_epoch_deadline, apply_store_re
 use crate::plugins::manifest::PluginManifest;
 
 /// A loaded WASM storage plugin instance.
+#[derive(Clone)]
 pub struct WasmStorage {
     /// The cached storage backend name (returned by `name()` at load time).
     storage_name: String,
@@ -108,12 +109,7 @@ impl WasmStorage {
     ///
     /// Storage world imports: log, config, http-outbound, events.
     fn register_host_functions(linker: &mut wasmtime::component::Linker<HostState>) -> PluginResult<()> {
-        super::common::register_log_host_functions(linker)?;
-        super::common::register_config_host_functions(linker)?;
-        super::common::register_http_host_functions(linker)?;
-        super::common::register_websocket_host_functions(linker)?;
-        super::common::register_event_host_functions(linker)?;
-        Ok(())
+        super::common::register_common_host_functions(linker)
     }
 
     /// Call the `name` export to get the storage backend name.

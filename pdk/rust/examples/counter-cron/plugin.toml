@@ -1,0 +1,19 @@
+[plugin]
+name = "counter-cron"
+version = "0.1.0"
+description = "Observable scheduled WASM fixture"
+wasm = "plugin.wasm"
+
+[[capabilities]]
+type = "cron"
+name = "counter"
+schedule = "*/30 * * * * *"
+
+[permissions]
+required = []
+optional = []
+
+[resources]
+max_fuel = 50000000
+max_memory_mb = 8
+max_execution_time_ms = 500

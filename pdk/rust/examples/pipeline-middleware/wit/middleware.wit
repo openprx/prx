@@ -1,0 +1,5 @@
+package prx:plugin@0.1.0;
+
+interface middleware-exports {
+    process: func(stage: string, data-json: string) -> result<string, string>;
+}

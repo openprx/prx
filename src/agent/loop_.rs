@@ -27,7 +27,6 @@ use sha2::Digest;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
 use std::io::Write as _;
-#[cfg(feature = "llm-router")]
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -5859,6 +5858,30 @@ async fn run_tool_call_loop_outcome_unguarded(
         }
     }
 
+    // One inbound middleware pass per user turn. Every TUI, CLI, gateway, and
+    // IM channel reaches this shared loop, so the transformation cannot drift
+    // between entrypoints. A malformed or structurally invalid replacement is
+    // ignored and the original history remains authoritative.
+    #[cfg(feature = "wasm-plugins")]
+    {
+        let transformed = hooks
+            .process_wasm_middleware(
+                crate::plugins::capabilities::middleware::MiddlewareStage::Inbound,
+                serde_json::json!({
+                    "channel": channel_name,
+                    "messages": history,
+                }),
+            )
+            .await;
+        if let Some(messages) = transformed.get("messages")
+            && let Ok(candidate) = serde_json::from_value::<Vec<ChatMessage>>(messages.clone())
+            && !candidate.is_empty()
+            && candidate.iter().all(|message| !message.role.trim().is_empty())
+        {
+            *history = candidate;
+        }
+    }
+
     let mut consecutive_failures: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut unrecoverable_failures: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     let mut tool_summary_retry_attempted = false;
@@ -5966,6 +5989,34 @@ async fn run_tool_call_loop_outcome_unguarded(
             },
         );
         crate::tools::filter_tool_specs_for_exposure(&mut tool_specs, expose_stay_silent);
+
+        #[cfg(feature = "wasm-plugins")]
+        {
+            let transformed = hooks
+                .process_wasm_middleware(
+                    crate::plugins::capabilities::middleware::MiddlewareStage::LlmRequest,
+                    serde_json::json!({
+                        "provider": provider_name,
+                        "model": model,
+                        "temperature": temperature,
+                        "messages": prepared_messages.messages,
+                        "tools": tool_specs,
+                    }),
+                )
+                .await;
+            if let Some(messages) = transformed.get("messages")
+                && let Ok(candidate) = serde_json::from_value::<Vec<ChatMessage>>(messages.clone())
+                && !candidate.is_empty()
+                && candidate.iter().all(|message| !message.role.trim().is_empty())
+            {
+                prepared_messages.messages = candidate;
+            }
+            if let Some(tools) = transformed.get("tools")
+                && let Ok(candidate) = serde_json::from_value::<Vec<crate::tools::ToolSpec>>(tools.clone())
+            {
+                tool_specs = candidate;
+            }
+        }
         let use_native_tools = mode_capabilities.native_tool_calling && !tool_specs.is_empty();
 
         hooks
@@ -6061,7 +6112,43 @@ async fn run_tool_call_loop_outcome_unguarded(
                     any_turn_had_fallback: false,
                     tokens_used: TokenUsage::default(),
                 };
-                let resp = trace.response;
+                #[allow(unused_mut)]
+                let mut resp = trace.response;
+
+                #[cfg(feature = "wasm-plugins")]
+                {
+                    let transformed = hooks
+                        .process_wasm_middleware(
+                            crate::plugins::capabilities::middleware::MiddlewareStage::LlmResponse,
+                            serde_json::json!({
+                                "provider": provider_name,
+                                "model": model,
+                                "text": resp.text,
+                                "tool_calls": resp.tool_calls,
+                                "reasoning_content": resp.reasoning_content,
+                            }),
+                        )
+                        .await;
+                    if let Some(text) = transformed.get("text") {
+                        resp.text = if text.is_null() {
+                            None
+                        } else {
+                            text.as_str().map(ToString::to_string).or(resp.text)
+                        };
+                    }
+                    if let Some(tool_calls) = transformed.get("tool_calls")
+                        && let Ok(candidate) = serde_json::from_value(tool_calls.clone())
+                    {
+                        resp.tool_calls = candidate;
+                    }
+                    if let Some(reasoning) = transformed.get("reasoning_content") {
+                        resp.reasoning_content = if reasoning.is_null() {
+                            None
+                        } else {
+                            reasoning.as_str().map(ToString::to_string).or(resp.reasoning_content)
+                        };
+                    }
+                }
                 let duration = llm_started_at.elapsed();
                 hooks
                     .emit(
@@ -6244,11 +6331,29 @@ async fn run_tool_call_loop_outcome_unguarded(
                 Ok(values) => values,
             };
 
-        let display_text = if parsed_text.is_empty() {
+        #[allow(unused_mut)]
+        let mut display_text = if parsed_text.is_empty() {
             response_text.clone()
         } else {
             parsed_text
         };
+
+        #[cfg(feature = "wasm-plugins")]
+        {
+            let transformed = hooks
+                .process_wasm_middleware(
+                    crate::plugins::capabilities::middleware::MiddlewareStage::Outbound,
+                    serde_json::json!({
+                        "channel": channel_name,
+                        "text": display_text,
+                        "has_tool_calls": !tool_calls.is_empty(),
+                    }),
+                )
+                .await;
+            if let Some(text) = transformed.get("text").and_then(serde_json::Value::as_str) {
+                display_text = text.to_string();
+            }
+        }
 
         if tool_calls.is_empty() {
             // No tool calls — this is the final response.
@@ -6321,7 +6426,7 @@ async fn run_tool_call_loop_outcome_unguarded(
                     }
                 }
             }
-            history.push(ChatMessage::assistant(response_text.clone()));
+            history.push(ChatMessage::assistant(display_text.clone()));
             // FIX-P0-30/31: returning turn — hand back this turn's real
             // provider attribution alongside the final answer.
             // FIX #2: fold the cross-turn fallback flag into the returned trace so
@@ -7740,6 +7845,15 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
             .with_audit_config(config.security.audit.clone()),
     );
+    #[cfg(feature = "wasm-plugins")]
+    let wasm_early_runtime =
+        if memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config))
+            .starts_with("wasm:")
+        {
+            crate::plugins::init_plugin_runtime(&config.workspace_dir, None).await
+        } else {
+            None
+        };
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes_with_acl(
         &config.memory,
         &config.embedding_routes,
@@ -7762,7 +7876,8 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         (None, None)
     };
-    let tools_registry = Arc::new(tools::all_tools_with_runtime(
+    #[allow(unused_mut)]
+    let mut tools_registry = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         Arc::clone(&shared_config),
         &security,
@@ -7776,7 +7891,26 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
-    ));
+    );
+    #[cfg(feature = "wasm-plugins")]
+    let wasm_plugin_runtime = if let Some(runtime) = wasm_early_runtime {
+        runtime
+            .attach_memory(Arc::clone(&mem))
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to attach WASM memory backend: {error}"))?;
+        Some(runtime)
+    } else {
+        crate::plugins::init_plugin_runtime(&config.workspace_dir, Some(Arc::clone(&mem))).await
+    };
+    #[cfg(feature = "wasm-plugins")]
+    if let Some(runtime) = &wasm_plugin_runtime {
+        tools_registry.push(runtime.tool_router());
+        tools_registry.push(runtime.status_tool());
+        tools_registry.push(runtime.reload_tool(Arc::clone(&security)));
+        tools_registry.push(runtime.manage_tool(Arc::clone(&security)));
+        hooks.set_plugin_runtime(Arc::clone(runtime)).await;
+    }
+    let tools_registry = Arc::new(tools_registry);
 
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = config
@@ -14050,6 +14184,61 @@ Let me check the result."#;
                 "short preview kept verbatim: {short}"
             );
         }
+    }
+
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn shared_tool_loop_applies_wasm_middleware_to_delivered_text_and_history() {
+        let temp = TempDir::new().unwrap();
+        let plugin_dir = temp.path().join("plugins/pipeline-middleware");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("pdk/rust/examples/pipeline-middleware");
+        std::fs::copy(fixture.join("plugin.toml"), plugin_dir.join("plugin.toml")).unwrap();
+        std::fs::copy(fixture.join("plugin.wasm"), plugin_dir.join("plugin.wasm")).unwrap();
+
+        let runtime = crate::plugins::init_plugin_runtime(temp.path(), None).await.unwrap();
+        let hooks = crate::hooks::HookManager::new(temp.path().to_path_buf());
+        hooks.set_plugin_runtime(runtime).await;
+        let provider = ScriptedProvider::from_text_responses(vec!["plain response"]);
+        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("hello")];
+        let (outcome, _) = run_tool_call_loop_outcome(
+            &provider,
+            &mut history,
+            Arc::new(Vec::new()),
+            &NoopObserver,
+            &hooks,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp",
+            &crate::config::MultimodalConfig::default(),
+            2,
+            false,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ToolLoopMemory::none(),
+            ChatMode::default(),
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            ToolLoopOutcome::Text(ref text) if text == "[wasm-middleware] plain response"
+        ));
+        assert_eq!(
+            history.last().map(|message| message.content.as_str()),
+            Some("[wasm-middleware] plain response")
+        );
     }
 
     // ── Smart group-reply: stay_silent terminal outcome ──────────────────────
