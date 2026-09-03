@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.95] - 3 September 2026
+
+### Fixed
+
+- Route each model turn before refreshing dynamic capabilities, so unrelated
+  Skill, document, and ordinary chat requests no longer wait for cold MCP or
+  WASM backends. Explicit MCP/WASM intents still refresh before their current
+  schemas are exposed. The shared loop applies this ordering to TUI, CLI,
+  Gateway, WhatsApp/Wacli, and every other IM channel.
+
+### Tests
+
+- Prove that a Skill/PDF turn does not refresh an MCP capability while an
+  explicit MCP/browser turn still does.
+
 ## [0.8.94] - 3 September 2026
 
 ### Fixed
