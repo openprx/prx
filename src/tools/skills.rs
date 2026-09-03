@@ -59,7 +59,7 @@ impl Tool for SkillsListTool {
                     "description": skill.description,
                     "version": skill.version,
                     "origin": if trusted { "workspace" } else { "community" },
-                    "instruction_mode": if skill.prompts.is_empty() { "lazy" } else { "preloaded" },
+                    "instruction_mode": "lazy",
                     "location": location,
                     "declared_tools": skill.tools.iter().map(|tool| json!({
                         "name": tool.name,
@@ -809,6 +809,7 @@ mod tests {
         let result = tool.execute(json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("executable_via_skill_execute"));
+        assert!(result.output.contains("\"instruction_mode\": \"lazy\""));
     }
 
     #[tokio::test]

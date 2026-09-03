@@ -22,6 +22,7 @@ const MAX_CATALOGS: usize = 64;
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_SKILL_MD_BYTES: u64 = 64 * 1024;
 const MAX_DESCRIPTION_BYTES: usize = 1024;
+#[cfg(test)]
 const MAX_INSTRUCTION_BYTES: usize = 16 * 1024;
 const MAX_SKILLS_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_EMBEDDING_CACHE_ENTRIES: usize = 2048;
@@ -85,8 +86,6 @@ struct SkillManifest {
     skill: SkillMeta,
     #[serde(default)]
     tools: Vec<SkillTool>,
-    #[serde(default)]
-    prompts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -654,9 +653,6 @@ fn mark_open_skills_synced(repo_dir: &Path) -> Result<()> {
 fn load_skill_toml(path: &Path) -> Result<Skill> {
     let content = read_utf8_bounded(path, MAX_MANIFEST_BYTES)?;
     let manifest: SkillManifest = toml::from_str(&content)?;
-    let untrusted = path
-        .parent()
-        .is_some_and(|dir| dir.join(UNTRUSTED_ORIGIN_MARKER).exists());
 
     Ok(Skill {
         name: bounded_text(&manifest.skill.name, MAX_DESCRIPTION_BYTES),
@@ -665,11 +661,9 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         author: manifest.skill.author,
         tags: manifest.skill.tags,
         tools: manifest.tools,
-        prompts: if untrusted {
-            Vec::new()
-        } else {
-            bounded_instructions(manifest.prompts)
-        },
+        // Instructions are always resolved through skill_read. Keep the
+        // catalog snapshot metadata-only even for workspace-owned manifests.
+        prompts: Vec::new(),
         location: Some(path.to_path_buf()),
         embedding: None,
     })
@@ -678,24 +672,19 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
 /// Load a skill from a SKILL.md file (simpler format)
 fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
     let content = read_utf8_bounded(path, MAX_SKILL_MD_BYTES)?;
-    let name = dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
+    let fallback_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+    let frontmatter = parse_skill_frontmatter(&content);
+    let (name, description) = frontmatter.unwrap_or_else(|| (fallback_name.to_string(), extract_description(&content)));
 
     Ok(Skill {
-        name,
-        description: bounded_text(&extract_description(&content), MAX_DESCRIPTION_BYTES),
+        name: bounded_text(&name, MAX_DESCRIPTION_BYTES),
+        description: bounded_text(&description, MAX_DESCRIPTION_BYTES),
         version: "0.1.0".to_string(),
         author: None,
         tags: Vec::new(),
         tools: Vec::new(),
-        prompts: if dir.join(UNTRUSTED_ORIGIN_MARKER).exists() {
-            Vec::new()
-        } else {
-            bounded_instructions(vec![content])
-        },
+        // skill_read owns instruction hydration for every origin and entrypoint.
+        prompts: Vec::new(),
         location: Some(path.to_path_buf()),
         embedding: None,
     })
@@ -746,13 +735,6 @@ fn bounded_text(value: &str, max_bytes: usize) -> String {
         end = end.saturating_sub(1);
     }
     value[..end].to_string()
-}
-
-fn bounded_instructions(instructions: Vec<String>) -> Vec<String> {
-    instructions
-        .into_iter()
-        .map(|instruction| bounded_text(&instruction, MAX_INSTRUCTION_BYTES))
-        .collect()
 }
 
 fn extract_description(content: &str) -> String {
@@ -903,9 +885,20 @@ pub async fn sync_community_skill_repositories(config: &crate::config::Config) -
     Ok(())
 }
 
-/// Parse YAML frontmatter from an OpenClaw SKILL.md file.
+fn parse_frontmatter_scalar(value: &str) -> String {
+    let value = value.trim();
+    if value.starts_with('"') && value.ends_with('"') {
+        return serde_json::from_str::<String>(value).unwrap_or_else(|_| value.trim_matches('"').to_string());
+    }
+    if value.starts_with('\'') && value.ends_with('\'') {
+        return value.trim_matches('\'').replace("''", "'");
+    }
+    value.to_string()
+}
+
+/// Parse the catalog metadata from a SKILL.md YAML frontmatter block.
 /// Returns `(name, description)` if both fields are found.
-fn parse_openclaw_frontmatter(content: &str) -> Option<(String, String)> {
+fn parse_skill_frontmatter(content: &str) -> Option<(String, String)> {
     if !content.starts_with("---") {
         return None;
     }
@@ -918,9 +911,9 @@ fn parse_openclaw_frontmatter(content: &str) -> Option<(String, String)> {
     for line in yaml_block.lines() {
         let line = line.trim();
         if let Some(val) = line.strip_prefix("name:") {
-            name = Some(val.trim().trim_matches('"').to_string());
+            name = Some(parse_frontmatter_scalar(val));
         } else if let Some(val) = line.strip_prefix("description:") {
-            description = Some(val.trim().trim_matches('"').to_string());
+            description = Some(parse_frontmatter_scalar(val));
         }
     }
 
@@ -957,7 +950,7 @@ fn load_openclaw_skills_from_dir(skills_dir: &Path) -> Vec<Skill> {
             continue;
         };
 
-        let (name, description) = if let Some((n, d)) = parse_openclaw_frontmatter(&content) {
+        let (name, description) = if let Some((n, d)) = parse_skill_frontmatter(&content) {
             (n, d)
         } else {
             // Fallback: use directory name and first non-heading line
@@ -1722,6 +1715,30 @@ command = "echo hello"
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "md-skill");
         assert!(skills[0].description.contains("cool things"));
+        assert!(skills[0].prompts.is_empty(), "workspace SKILL.md must stay lazy");
+    }
+
+    #[test]
+    fn load_workspace_skill_uses_frontmatter_catalog_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("skills").join("directory-name");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: office-docx\ndescription: \"Create \\\"Word\\\" documents\"\n---\n# Hidden body\nDo the detailed work.\n",
+        )
+        .unwrap();
+
+        let skills = load_skills(dir.path());
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "office-docx");
+        assert_eq!(skills[0].description, "Create \"Word\" documents");
+        assert!(skills[0].prompts.is_empty(), "frontmatter skills must stay lazy");
+
+        let prompt = skills_to_prompt(&skills, dir.path());
+        assert!(prompt.contains("<name>office-docx</name>"));
+        assert!(prompt.contains("<description>Create &quot;Word&quot; documents</description>"));
+        assert!(!prompt.contains("Do the detailed work."));
     }
 
     #[test]
@@ -1818,7 +1835,7 @@ command = "echo hello"
         let skills = load_skills_with_config(&workspace_dir, &config);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].description, "Workspace wins.");
-        assert_eq!(skills[0].prompts, vec!["# Same\nWorkspace wins.\n"]);
+        assert!(skills[0].prompts.is_empty());
         assert!(
             !missing_openclaw.exists(),
             "catalog loading must never clone or create a repo"
@@ -2273,10 +2290,10 @@ description = "Bare minimum"
     // --- frontmatter parser ---
 
     #[test]
-    fn parse_openclaw_frontmatter_returns_name_and_description() {
+    fn parse_skill_frontmatter_returns_name_and_description() {
         let content =
             "---\nname: weather\ndescription: \"Get current weather info\"\nmetadata: {}\n---\n# Weather Skill\n...";
-        let result = parse_openclaw_frontmatter(content);
+        let result = parse_skill_frontmatter(content);
         assert_eq!(
             result,
             Some(("weather".to_string(), "Get current weather info".to_string()))
@@ -2284,21 +2301,21 @@ description = "Bare minimum"
     }
 
     #[test]
-    fn parse_openclaw_frontmatter_no_leading_dashes_returns_none() {
+    fn parse_skill_frontmatter_no_leading_dashes_returns_none() {
         let content = "# No frontmatter here\nJust markdown.";
-        assert!(parse_openclaw_frontmatter(content).is_none());
+        assert!(parse_skill_frontmatter(content).is_none());
     }
 
     #[test]
-    fn parse_openclaw_frontmatter_missing_name_returns_none() {
+    fn parse_skill_frontmatter_missing_name_returns_none() {
         let content = "---\ndescription: \"Only description\"\n---\n# Skill";
-        assert!(parse_openclaw_frontmatter(content).is_none());
+        assert!(parse_skill_frontmatter(content).is_none());
     }
 
     #[test]
-    fn parse_openclaw_frontmatter_missing_description_returns_none() {
+    fn parse_skill_frontmatter_missing_description_returns_none() {
         let content = "---\nname: only-name\n---\n# Skill";
-        assert!(parse_openclaw_frontmatter(content).is_none());
+        assert!(parse_skill_frontmatter(content).is_none());
     }
 
     // --- load_openclaw_skills_from_dir ---
