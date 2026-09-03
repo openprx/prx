@@ -5837,8 +5837,54 @@ Retry with a compatible model: /provider {new_provider} <model>"
             continue;
         }
 
-        // Handle /clear separately (needs mutable history)
-        if matches!(user_input.as_str(), "/clear" | "/new") {
+        // `/new` is a real session boundary: save the current durable state,
+        // create a fresh session identity, and atomically replace every
+        // session-scoped UI/model ledger. It must not share `/clear` semantics,
+        // otherwise the old title, turns, and token usage survive indefinitely.
+        if user_input == "/new" {
+            match start_new_chat_session(
+                mem.as_ref(),
+                ChatSwitchCtx {
+                    chat_session: &mut chat_session,
+                    chat_session_key: &mut chat_session_key,
+                    fabric_turn_seq: &mut fabric_turn_seq,
+                    history: &mut history,
+                    approval_router: approval_router.as_ref(),
+                    pending_chat_rewind: &mut pending_chat_rewind,
+                    pending_diff_apply: &mut pending_diff_apply,
+                    chat_sessions: &mut chat_sessions,
+                    ignored_session_events: &mut ignored_session_events,
+                    session_rings: &mut session_rings,
+                    reported_sessions: &mut reported_sessions,
+                    announced_started_sessions: &mut announced_started_sessions,
+                    last_sessions_summary: &mut last_sessions_summary,
+                    last_sessions_entries: &mut last_sessions_entries,
+                    attached_follow: &mut attached_follow,
+                    attached_follow_seq: &mut attached_follow_seq,
+                    chat_dispatcher: &chat_dispatcher,
+                    redraw_handle: sessions_redraw_handle.as_ref(),
+                    config: &config,
+                    provider_name,
+                    model_name,
+                    tool_descs: &tool_descs,
+                    skills: &skills,
+                    native_tools,
+                    tools_registry: &tools_registry,
+                    #[cfg(feature = "terminal-tui")]
+                    chat_mirror: &chat_mirror,
+                },
+            )
+            .await
+            {
+                Ok(message) => emit_chat_output(&message),
+                Err(e) => emit_chat_output(&e.to_string()),
+            }
+            continue;
+        }
+
+        // Handle /clear separately (needs mutable history). This intentionally
+        // keeps the current session identity and accounting ledger.
+        if user_input == "/clear" {
             history.clear();
             // S2-C Step 4: 双写 HistoryCleared 到 reducer。reducer 的语义是
             // "drain 所有非 system + 保留 system"——legacy 是先 clear 再可能 push
@@ -9483,6 +9529,8 @@ fn is_persistence_dependent_command(input: &str) -> bool {
         || command == "/apply"
         || command == "/cost"
         || command == "/export"
+        || command == "/new"
+        || command == "/clear"
         || command == "/resume"
         || command.starts_with("/resume ")
         || command == "/branch"
@@ -14171,6 +14219,55 @@ async fn resume_saved_session_by_id(mem: &dyn Memory, target_id: &str, ctx: Chat
     ))
 }
 
+async fn start_new_chat_session(mem: &dyn Memory, ctx: ChatSwitchCtx<'_>) -> Result<String> {
+    let current_child_summaries = ctx
+        .chat_sessions
+        .snapshot()
+        .await
+        .iter()
+        .map(|view| crate::chat::sessions::PersistedSessionSummary::from_view(view, String::new()))
+        .collect::<Vec<_>>();
+    let mut current_to_save = ctx.chat_session.clone();
+    for summary in &current_child_summaries {
+        current_to_save.record_background_session(summary.clone());
+    }
+
+    if let Err(e) = save_session(mem, &current_to_save).await {
+        anyhow::bail!("New session aborted: failed to save current session: {e}");
+    }
+    for summary in &current_child_summaries {
+        let _ = ctx.chat_dispatcher.dispatch_or_log(
+            crate::chat::action::Action::BackgroundSessionRecorded {
+                summary: summary.clone(),
+            },
+            "chat.new_record_child_summary_before_switch",
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    let current_mode = ctx.chat_mirror.lock().chat_mode;
+    #[cfg(not(feature = "terminal-tui"))]
+    let current_mode = ctx.chat_session.mode;
+
+    let previous_id = current_to_save.id.clone();
+    let new_session = fresh_chat_session(ctx.provider_name, ctx.model_name, current_mode);
+    let new_id = new_session.id.clone();
+    if let Err(e) = save_session(mem, &new_session).await {
+        anyhow::bail!("New session aborted: failed to persist new session: {e}");
+    }
+
+    apply_chat_session_switch(ctx, new_session).await;
+    Ok(format!(
+        "Started new chat session {new_id}. Previous session {previous_id} was saved."
+    ))
+}
+
+fn fresh_chat_session(provider_name: &str, model_name: &str, mode: commands::ChatMode) -> session::ChatSession {
+    let mut session = session::ChatSession::new(provider_name, model_name);
+    session.set_mode(mode);
+    session
+}
+
 async fn apply_chat_session_switch(mut ctx: ChatSwitchCtx<'_>, mut loaded_session: session::ChatSession) {
     let cleared_approvals = clear_pending_approvals_for_session_switch(&mut ctx);
     if cleared_approvals > 0 {
@@ -18132,6 +18229,8 @@ mod p3_directional_switch_tests {
             "/apply",
             "/cost",
             "/export",
+            "/new",
+            "/clear",
             "/resume",
             "/resume last",
             "/branch 1",
@@ -18143,6 +18242,21 @@ mod p3_directional_switch_tests {
         for command in ["hello", "/help", "/workers", "/queue status"] {
             assert!(!is_persistence_dependent_command(command), "{command}");
         }
+    }
+
+    #[test]
+    fn new_session_has_fresh_identity_and_empty_session_scoped_ledgers() {
+        let first = fresh_chat_session("provider-a", "model-a", commands::ChatMode::Plan);
+        let second = fresh_chat_session("provider-a", "model-a", commands::ChatMode::Plan);
+
+        assert_ne!(first.id, second.id);
+        assert!(first.title.is_empty());
+        assert!(first.turns.is_empty());
+        assert!(first.token_usage_records.is_empty());
+        assert!(first.background_sessions.is_empty());
+        assert_eq!(first.provider, "provider-a");
+        assert_eq!(first.model, "model-a");
+        assert_eq!(first.mode, commands::ChatMode::Plan);
     }
 
     #[cfg(feature = "terminal-tui")]

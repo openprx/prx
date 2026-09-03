@@ -203,9 +203,16 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/clear",
-        aliases: &["/new"],
+        aliases: &[],
         args_hint: "",
-        description: "Clear conversation history",
+        description: "Clear context in the current session",
+        arg: NO_ARG,
+    },
+    CommandSpec {
+        name: "/new",
+        aliases: &[],
+        args_hint: "",
+        description: "Save this session and start a new one",
         arg: NO_ARG,
     },
     CommandSpec {
