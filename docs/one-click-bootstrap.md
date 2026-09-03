@@ -124,6 +124,13 @@ prx service start
 prx service status
 ```
 
+The generated launchd or systemd user service preserves the installer's
+absolute `PATH` entries. This keeps stdio MCP launchers such as `npx`, `uvx`,
+and `bun` available to daemon-owned channel, gateway, hook, and scheduled
+turns just as they are in the interactive CLI. Re-run `prx service install`
+after changing the toolchain location so the service definition captures the
+new path.
+
 Apply a new binary or configuration with:
 
 ```bash
