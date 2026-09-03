@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.94] - 3 September 2026
+
+### Fixed
+
+- Parse `name` and `description` from `SKILL.md` YAML frontmatter for installed
+  workspace skills instead of exposing the `---` delimiter as their catalog
+  description.
+- Keep both Markdown and TOML skill catalog snapshots metadata-only and report
+  every enabled skill as lazy; `skill_read` is the single instruction hydration
+  path across TUI, CLI, Gateway, WhatsApp/Wacli, and other IM channels.
+
 ## [0.8.93] - 3 September 2026
 
 ### Changed
