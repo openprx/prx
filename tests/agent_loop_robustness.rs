@@ -310,13 +310,15 @@ async fn agent_handles_mixed_tool_success_and_failure() {
 // TG4.3: Long tool sequence completion (#777)
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Agent should allow a long, progressing tool sequence to finish naturally.
+/// Agent should allow at least one thousand progressing model/tool iterations
+/// to finish naturally. This guards the unbounded-runtime contract against a
+/// hidden or accidentally reintroduced iteration ceiling.
 #[tokio::test]
-async fn agent_allows_long_tool_sequence_to_finish() {
+async fn agent_allows_one_thousand_tool_iterations_to_finish() {
     let (counting_tool, count) = CountingTool::new();
 
-    // Create 20 tool call responses followed by a final answer.
-    let mut responses: Vec<ChatResponse> = (0..20)
+    // Create 1,000 tool-call responses followed by a final answer.
+    let mut responses: Vec<ChatResponse> = (0..1_000)
         .map(|i| {
             tool_response(vec![ToolCall {
                 id: format!("tc_{i}"),
@@ -335,7 +337,7 @@ async fn agent_allows_long_tool_sequence_to_finish() {
         .await
         .expect("long sequence should finish");
     assert_eq!(result, "Final response after iterations");
-    assert_eq!(*count.lock().unwrap(), 20);
+    assert_eq!(*count.lock().unwrap(), 1_000);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
