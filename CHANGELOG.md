@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.97] - 3 September 2026
+
+### Fixed
+
+- Treat explicit negative capability instructions such as "do not use MCP" and
+  "不要调用浏览器/MCP" as exclusions during intent routing. Forbidden dynamic
+  capabilities no longer cold-start merely because their names appear in the
+  user's constraint, while a later positive contrast still activates them.
+
+### Tests
+
+- Cover English and Chinese negative instructions, positive contrast clauses,
+  and the shared model loop's dynamic refresh boundary.
+
 ## [0.8.96] - 3 September 2026
 
 ### Fixed
