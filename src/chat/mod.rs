@@ -7081,7 +7081,8 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 DocumentIngestRuntime::from_envelope(mem.clone(), &runtime_envelope)
                     .with_source_message_event_id(chat_user_event.as_ref().map(|event| event.event_id.clone())),
             ),
-        );
+        )
+        .with_routing_input(user_input_for_prompt.clone());
         let semantic_scope = chat_runtime_write_context(&runtime_envelope);
         let mem_context = build_context_with_shared_events_and_scope(
             mem.as_ref(),

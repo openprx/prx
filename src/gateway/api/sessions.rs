@@ -371,7 +371,8 @@ async fn run_console_runtime_turn(
                 DocumentIngestRuntime::from_envelope(state.mem.clone(), &turn_envelope)
                     .with_source_message_event_id(source_message_event_id),
             ),
-        ),
+        )
+        .with_routing_input(visible_message.to_string()),
         crate::agent::loop_::ChatMode::default(),
     )
     .await;

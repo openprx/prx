@@ -3760,7 +3760,8 @@ async fn run_channel_turn(
                         &ctx.memory,
                         &ctx.workspace_dir,
                         Some(DocumentIngestRuntime::from_scope(ctx.memory.clone(), &scope_ctx)),
-                    ),
+                    )
+                    .with_routing_input(msg.content.clone()),
                     crate::agent::loop_::ChatMode::default(),
                     None,
                     // expose_stay_silent: ONLY on smart group turns. DMs / non-smart

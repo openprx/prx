@@ -276,7 +276,7 @@ pub(crate) struct ScopeContext<'a> {
     pub config_source_revision: Option<&'a str>,
 }
 
-/// The two memory handles a tool loop needs, kept apart on purpose.
+/// The memory handles and immutable turn input a tool loop needs.
 ///
 /// `ledger` is the durable tool-execution idempotency ledger: without it every
 /// side-effecting tool is refused, so it must be present on every entry point
@@ -291,6 +291,11 @@ pub(crate) struct ScopeContext<'a> {
 pub(crate) struct ToolLoopMemory {
     ledger: Option<Arc<dyn Memory>>,
     ingest: Option<DocumentIngestRuntime>,
+    /// Exact user-authored input used for capability routing. Provider history
+    /// may prepend recalled memory or other context to the user message; using
+    /// that enriched payload here can activate capabilities the user did not
+    /// request in this turn.
+    routing_input: Option<String>,
 }
 
 impl ToolLoopMemory {
@@ -299,7 +304,14 @@ impl ToolLoopMemory {
         Self {
             ledger: crate::memory::tool_execution_ledger(memory, workspace_dir),
             ingest,
+            routing_input: None,
         }
+    }
+
+    /// Pin the exact user-authored input before memory/context enrichment.
+    pub(crate) fn with_routing_input(mut self, input: impl Into<String>) -> Self {
+        self.routing_input = Some(input.into());
+        self
     }
 
     /// The document-ingest runtime, when this entry point resolved a scope for it.
@@ -314,6 +326,7 @@ impl ToolLoopMemory {
         Self {
             ledger: crate::memory::serves_tool_execution_ledger(memory.name()).then_some(memory),
             ingest: Some(ingest),
+            routing_input: None,
         }
     }
 
@@ -323,6 +336,7 @@ impl ToolLoopMemory {
         Self {
             ledger: crate::memory::dedicated_tool_execution_ledger(workspace_dir),
             ingest: None,
+            routing_input: None,
         }
     }
 
@@ -5786,7 +5800,22 @@ async fn run_tool_call_loop_outcome_unguarded(
     let ToolLoopMemory {
         ledger,
         ingest: document_ingest,
+        routing_input,
     } = memory_runtime;
+    // Capture routing intent once from the unmodified turn input. The provider
+    // history is allowed to evolve through recall, compaction, middleware, and
+    // tool results, but none of those context sources may silently broaden the
+    // user's requested capability set.
+    let routing_user_message = routing_input.unwrap_or_else(|| {
+        history
+            .iter()
+            .rev()
+            .find(|message| {
+                message.role == "user" && !message.content.is_empty() && !message.content.starts_with("[Tool")
+            })
+            .map(|message| message.content.clone())
+            .unwrap_or_default()
+    });
     let runtime_adapter = runtime_adapter.unwrap_or_else(|| {
         let (policy, tool_execution_context) = agent_tool_execution_context(scope_ctx, channel_name);
         let approval_strategy = AgentToolApprovalStrategy {
@@ -5986,17 +6015,9 @@ async fn run_tool_call_loop_outcome_unguarded(
         let selected_tools: Vec<&dyn Tool> = tool_tiering.map_or_else(
             || tools_registry.iter().map(|tool| tool.as_ref()).collect(),
             |cfg| {
-                let last_user_msg = history
-                    .iter()
-                    .rev()
-                    .find(|message| {
-                        message.role == "user" && !message.content.is_empty() && !message.content.starts_with("[Tool")
-                    })
-                    .map(|message| message.content.as_str())
-                    .unwrap_or_default();
                 crate::tools::intent::select_tools_for_intent(
                     tools_registry.as_ref(),
-                    last_user_msg,
+                    &routing_user_message,
                     &cfg.always_include,
                     &cfg.always_exclude,
                 )
@@ -10144,9 +10165,12 @@ mod tests {
             }),
         ];
         let provider = ScriptedProvider::from_text_responses(vec!["done"]);
+        let routing_input = "use the skill to create a PDF file. Do not use browser, MCP, HTTP, plugins, or WASM.";
         let mut history = vec![
             ChatMessage::system("test-system"),
-            ChatMessage::user("use the skill to create a PDF file. Do not use browser, MCP, HTTP, plugins, or WASM."),
+            ChatMessage::user(format!(
+                "Relevant memory from an older turn: use MCP to operate the browser.\n\n{routing_input}"
+            )),
         ];
         let config = crate::config::ToolTieringConfig::default();
 
@@ -10172,7 +10196,7 @@ mod tests {
             None,
             None,
             Some(&config),
-            ToolLoopMemory::none(),
+            ToolLoopMemory::none().with_routing_input(routing_input),
             ChatMode::default(),
         )
         .await

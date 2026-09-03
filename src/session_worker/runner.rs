@@ -810,6 +810,7 @@ async fn run_validated_manifest(
         let memory_ref = &memory;
         let provider_name_ref: &str = &manifest.provider_name;
         let model_ref: &str = &manifest.model;
+        let routing_input_ref: &str = &manifest.task;
         let workspace_dir_ref: &Path = &manifest.workspace_dir;
         let compaction_config_ref = manifest.compaction_config.as_ref();
         let multimodal_ref = &config.multimodal;
@@ -855,7 +856,8 @@ async fn run_validated_manifest(
                             &memory,
                             workspace_dir_ref,
                             scope_ctx_ref.map(|ctx| DocumentIngestRuntime::from_scope(Arc::clone(&memory), ctx)),
-                        ),
+                        )
+                        .with_routing_input(routing_input_ref),
                         crate::agent::loop_::ChatMode::default(),
                     )
                     .await;

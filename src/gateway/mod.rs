@@ -2162,7 +2162,8 @@ async fn run_gateway_chat_with_multimodal(
                     state.mem.clone(),
                     &runtime_envelope,
                 )),
-            ),
+            )
+            .with_routing_input(message.to_string()),
             crate::agent::loop_::ChatMode::default(),
         ),
     )
