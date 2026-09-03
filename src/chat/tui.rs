@@ -8064,13 +8064,14 @@ mod tests {
         render_conversation_line(&mut sink, &line, false);
 
         assert_eq!(
-            line_to_plain(&sink[1]),
-            "",
+            sink.get(1).map(line_to_plain).as_deref(),
+            Some(""),
             "tool and assistant blocks need a blank row"
         );
-        assert!(line_to_plain(&sink[2]).starts_with("● done"));
-        assert_eq!(sink[2].spans[0].style.fg, Some(Color::DarkGray));
-        assert!(!sink[2].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(sink.get(2).is_some_and(|row| line_to_plain(row).starts_with("● done")));
+        let marker_style = sink.get(2).and_then(|row| row.spans.first()).map(|span| span.style);
+        assert_eq!(marker_style.and_then(|style| style.fg), Some(Color::DarkGray));
+        assert!(marker_style.is_some_and(|style| !style.add_modifier.contains(Modifier::BOLD)));
     }
 
     #[test]

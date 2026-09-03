@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.86] - 3 September 2026
+
+### Changed
+
+- Make `/new` save the current chat and create a fresh session identity instead
+  of aliasing `/clear`; `/clear` now explicitly keeps the current session.
+
+### Fixed
+
+- Reset the visible title, turns, context budget, token usage, child-session
+  summaries, and pending interaction state when starting a new chat session.
+- Defer `/new` and `/clear` behind an active provider turn so its ordered
+  completion and durable save cannot cross the session boundary.
+
 ## [0.8.85] - 3 September 2026
 
 ### Fixed

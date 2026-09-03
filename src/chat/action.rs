@@ -289,7 +289,7 @@ pub enum Action {
     /// 负责 UI / session 账本）。`model` 为 `Some` 时表示切换同时改了 model（命令带了
     /// 兼容 model 参数或当前 model 已变），reducer 一并同步 `session.model`。
     ProviderChanged { provider: String, model: Option<String> },
-    /// 清除历史（/clear /new）
+    /// 清除当前会话的上下文（/clear）。/new 使用 SessionLoaded 切换到新会话。
     HistoryCleared,
     /// 清除历史并在同一 UI snapshot 中追加用户可见回执。
     HistoryClearedWithNotice { notice: String },

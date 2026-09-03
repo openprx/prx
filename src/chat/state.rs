@@ -4414,6 +4414,41 @@ mod tests {
 
     #[cfg(feature = "terminal-tui")]
     #[test]
+    fn loading_fresh_session_clears_visible_title_turns_and_token_usage() {
+        let mut state = make_state();
+        state.session.id = "sess-old".to_string();
+        state.session.title = "stale title".to_string();
+        state.session.turns.push(ChatTurn {
+            role: "user".to_string(),
+            content: "old turn".to_string(),
+            timestamp: chrono::Utc::now(),
+            tool_calls: Vec::new(),
+        });
+        state.ui.turn_count = 1;
+        state.ui.token_usage_summary = MainSessionTokenUsageSummary {
+            total_tokens: 68_700,
+            prompt_tokens: 68_000,
+            completion_tokens: 700,
+            request_count: 1,
+            unknown_cost_requests: 1,
+            ..MainSessionTokenUsageSummary::default()
+        };
+
+        let mut fresh = ChatSession::new("prov-new", "model-new");
+        fresh.id = "sess-fresh".to_string();
+        let _ = state.reduce(Action::SessionLoaded(fresh));
+
+        assert_eq!(state.session.id, "sess-fresh");
+        assert!(state.session.title.is_empty());
+        assert!(state.session.turns.is_empty());
+        assert!(state.session.token_usage_records.is_empty());
+        assert_eq!(state.ui.turn_count, 0);
+        assert_eq!(state.ui.token_usage_summary, MainSessionTokenUsageSummary::default());
+        assert!(state.ui.conversation_lines.is_empty());
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
     fn session_loaded_is_rejected_while_generating_without_clearing_active_turn() {
         let mut state = make_state();
         state.session.id = "sess-old".to_string();
