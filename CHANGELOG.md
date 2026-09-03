@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.84] - 3 September 2026
+
+### Fixed
+
+- Enforce detached MCP child stderr through `rmcp`'s transport builder; its
+  convenience constructor otherwise overwrote the command-level setting and
+  continued leaking `npx` notices into the TUI.
+
 ## [0.8.83] - 3 September 2026
 
 ### Changed

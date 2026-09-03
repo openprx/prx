@@ -578,13 +578,6 @@ impl McpTool {
         let mut cmd = Command::new(command);
         cmd.args(&server.args);
         cmd.kill_on_drop(true);
-        // MCP servers are protocol children, not interactive terminal peers.
-        // Inheriting stderr lets package-manager notices (for example
-        // `npm notice run npx`) write directly into ratatui's alternate screen
-        // and corrupt the input/status rows. Protocol failures still travel
-        // through MCP responses and transport errors, so keep child stderr
-        // detached from the user's terminal.
-        cmd.stderr(Stdio::null());
         if !server.env.is_empty() {
             cmd.envs(server.env.clone());
         }
@@ -595,7 +588,11 @@ impl McpTool {
         cmd.process_group(0);
 
         let startup_timeout = Duration::from_millis(server.startup_timeout_ms);
-        let transport = TokioChildProcess::new(cmd)?;
+        // `TokioChildProcess::new` deliberately replaces the command's stderr
+        // with `inherit`, even if callers configured it beforehand. Use the
+        // builder override so package-manager notices cannot corrupt ratatui's
+        // alternate screen. MCP/transport failures still surface structurally.
+        let (transport, _stderr) = TokioChildProcess::builder(cmd).stderr(Stdio::null()).spawn()?;
         let _registration = register_mcp_child(server_name, &transport);
         let client = tokio::time::timeout(startup_timeout, ().serve(transport))
             .await
@@ -717,9 +714,6 @@ impl McpTool {
             let mut cmd = Command::new(command);
             cmd.args(&server.args);
             cmd.kill_on_drop(true);
-            // See `discover_stdio`: persistent runtime sessions must never own
-            // the TUI terminal's stderr either.
-            cmd.stderr(Stdio::null());
             if !server.env.is_empty() {
                 cmd.envs(server.env.clone());
             }
@@ -728,7 +722,9 @@ impl McpTool {
             #[cfg(unix)]
             cmd.process_group(0);
 
-            let transport = TokioChildProcess::new(cmd)?;
+            // See `discover_stdio`: the builder override is required because
+            // the convenience constructor always inherits stderr.
+            let (transport, _stderr) = TokioChildProcess::builder(cmd).stderr(Stdio::null()).spawn()?;
             let registration = register_mcp_child(server_name, &transport);
             let client = tokio::time::timeout(startup_timeout, ().serve(transport))
                 .await
