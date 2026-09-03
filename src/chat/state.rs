@@ -1804,8 +1804,7 @@ impl ChatState {
         let tool_key = ToolTaskKey::from_task_id(removed_draft.task_id);
         self.control.remove_turn_cancel(tool_key);
         let no_visible_drafts = !self.stream.has_visible_drafts();
-        let duration_ms = crate::chat::tui::turn_elapsed_ms(removed_draft.started_at_ms);
-        self.stream.last_duration_ms = Some(duration_ms);
+        self.stream.last_duration_ms = Some(crate::chat::tui::turn_elapsed_ms(removed_draft.started_at_ms));
         if no_visible_drafts {
             self.stream.started_at_ms = None;
         }
@@ -1815,9 +1814,6 @@ impl ChatState {
             self.control.generating = false;
         }
         if !final_text.is_empty() {
-            self.ui
-                .conversation_lines
-                .push(ConversationLine::TurnSummary { duration_ms });
             self.ui.conversation_lines.push(ConversationLine::Assistant {
                 content: final_text.clone(),
             });
@@ -5275,15 +5271,7 @@ mod tests {
             assert!(state.stream.primary_streaming_draft().is_none(), "draft 应清空");
             assert!(state.control.active_cancel.is_none());
             assert!(!state.control.generating);
-            assert_eq!(
-                state.ui.conversation_lines.len(),
-                prev_lines + 2,
-                "应 push TurnSummary + Assistant"
-            );
-            assert!(matches!(
-                state.ui.conversation_lines.get(prev_lines),
-                Some(crate::chat::tui::ConversationLine::TurnSummary { .. })
-            ));
+            assert_eq!(state.ui.conversation_lines.len(), prev_lines + 1, "应只 push Assistant");
             // 验证最后一行是 Assistant("final answer")
             if let Some(crate::chat::tui::ConversationLine::Assistant { content }) = state.ui.conversation_lines.last()
             {
@@ -5311,11 +5299,11 @@ mod tests {
                 final_text: "ans".to_string(),
                 reasoning: "thinking step".to_string(),
             });
-            // 应有 TurnSummary + Assistant + Reasoning 共 3 行
-            assert_eq!(state.ui.conversation_lines.len(), 3);
+            // 完成耗时不进入 UI 正文；仅保留 Assistant + Reasoning。
+            assert_eq!(state.ui.conversation_lines.len(), 2);
             assert!(matches!(
                 state.ui.conversation_lines.first(),
-                Some(crate::chat::tui::ConversationLine::TurnSummary { .. })
+                Some(crate::chat::tui::ConversationLine::Assistant { .. })
             ));
             assert!(
                 matches!(
@@ -9891,7 +9879,7 @@ mod tests {
                 reasoning: String::new(),
             });
 
-            // 对账五类 ConversationLine（TurnSummary 的毫秒值允许极小执行时差）。
+            // 对账 UI 可见 ConversationLine；完成耗时不进入正文。
             let mirror_lines: Vec<&ConversationLine> = mirror.conversation_lines.iter().collect();
             let reducer_lines: Vec<&ConversationLine> = state.ui.conversation_lines.iter().collect();
 
@@ -9934,7 +9922,6 @@ mod tests {
                     (ConversationLine::User { content: mc }, ConversationLine::User { content: rc }) => {
                         assert_eq!(mc, rc, "line {i} User content mismatch");
                     }
-                    (ConversationLine::TurnSummary { .. }, ConversationLine::TurnSummary { .. }) => {}
                     _ => panic!("line {i} variant 不匹配: mirror={m_dbg}, reducer={r_dbg}"),
                 }
             }
@@ -10047,12 +10034,11 @@ mod tests {
                 final_text: "ok".to_string(),
                 reasoning: String::new(),
             });
-            assert_eq!(state.ui.conversation_lines.len(), 5, "reducer 单源应 push 5 行");
+            assert_eq!(state.ui.conversation_lines.len(), 4, "reducer 单源应 push 4 行");
             let mut iter = state.ui.conversation_lines.iter();
             assert!(matches!(iter.next(), Some(ConversationLine::System { .. })));
             assert!(matches!(iter.next(), Some(ConversationLine::User { .. })));
             assert!(matches!(iter.next(), Some(ConversationLine::ToolResult { .. })));
-            assert!(matches!(iter.next(), Some(ConversationLine::TurnSummary { .. })));
             assert!(matches!(iter.next(), Some(ConversationLine::Assistant { .. })));
         }
 
