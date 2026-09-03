@@ -1405,7 +1405,7 @@ mod tests {
         assert_eq!(
             entries
                 .iter()
-                .filter(|entry| **entry == PathBuf::from("/usr/bin"))
+                .filter(|entry| entry.as_path() == Path::new("/usr/bin"))
                 .count(),
             1
         );

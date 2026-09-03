@@ -74,9 +74,12 @@ Markdown hydration uses stable content anchors instead of line-number keys.
 server's transport, tool list, last refresh, and retained configuration or
 discovery error. `mcp_call` also accepts `action: list|status|refresh`; its
 backward-compatible default action is `call`. Discovery runs before the
-provider-facing catalog is snapshotted. MCP and WASM aliases are deterministically
-ordered and bounded; their root call tools remain available for capabilities
-outside the alias window.
+provider-facing specs are selected. If an alias is discovered after an
+entrypoint's immutable execution catalog was created, the execution service
+requires a matching live backend spec before dispatching that alias through the
+same policy, approval, preparation, and audit pipeline. MCP and WASM aliases are
+deterministically ordered and bounded; their root call tools remain available
+for capabilities outside the alias window.
 
 Stdio MCP servers are stateful: PRX keeps one client process alive per server
 and serializes that server's calls, while calls to different servers may run in

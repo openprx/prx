@@ -948,13 +948,42 @@ impl ToolExecutionService {
     }
 
     fn resolve(&self, public_name: &str) -> Option<ResolvedTool> {
-        let descriptor = self.catalog.descriptor(public_name)?.clone();
-        let backend = self
-            .backends
-            .iter()
-            .find(|backend| backend.root_name() == descriptor.backend_name && backend.supports_name(public_name))?
-            .clone();
-        Some(ResolvedTool { backend, descriptor })
+        if let Some(descriptor) = self.catalog.descriptor(public_name).cloned() {
+            let backend = self
+                .backends
+                .iter()
+                .find(|backend| backend.root_name() == descriptor.backend_name && backend.supports_name(public_name))?
+                .clone();
+            return Some(ResolvedTool { backend, descriptor });
+        }
+
+        // MCP, WASM, and skill aliases can appear after this service's
+        // immutable startup catalog was captured. Provider discovery reads the
+        // live backend specs, so execution must resolve the exact same newly
+        // advertised name instead of rejecting a valid model call as unknown.
+        // Requiring both supports_name() and a matching current spec prevents a
+        // permissive dynamic router from accepting names it did not advertise.
+        for backend in self.backends.iter() {
+            if !backend.supports_name(public_name) {
+                continue;
+            }
+            let Some(spec) = backend.specs().into_iter().find(|spec| spec.name == public_name) else {
+                continue;
+            };
+            let descriptor = tool_descriptor(
+                backend.root_name(),
+                spec,
+                backend.tier(),
+                backend.categories(),
+                |name| backend.adapter_kind(name),
+                backend.availability(),
+            );
+            return Some(ResolvedTool {
+                backend: Arc::clone(backend),
+                descriptor,
+            });
+        }
+        None
     }
 
     #[must_use]
@@ -2040,6 +2069,58 @@ mod tests {
         }
     }
 
+    struct LateAliasTool {
+        enabled: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for LateAliasTool {
+        fn name(&self) -> &str {
+            "mcp_call"
+        }
+
+        fn description(&self) -> &str {
+            "late alias fixture"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+
+        fn specs(&self) -> Vec<ToolSpec> {
+            let mut specs = vec![self.spec()];
+            if self.enabled.load(AtomicOrdering::Acquire) {
+                specs.push(ToolSpec {
+                    name: "mcp__late__navigate".to_string(),
+                    description: "runtime-discovered alias".to_string(),
+                    parameters: serde_json::json!({"type":"object", "required":["url"]}),
+                });
+            }
+            specs
+        }
+
+        fn supports_name(&self, name: &str) -> bool {
+            name == self.name() || (name == "mcp__late__navigate" && self.enabled.load(AtomicOrdering::Acquire))
+        }
+
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.execute_named(self.name(), args).await
+        }
+
+        async fn execute_named(&self, name: &str, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            if !self.supports_name(name) {
+                anyhow::bail!("unsupported fixture alias")
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: format!("executed:{name}"),
+                error: None,
+            })
+        }
+    }
+
     struct PollRecordingBackend {
         calls: Arc<AtomicUsize>,
     }
@@ -2970,6 +3051,54 @@ mod tests {
         assert_eq!(descriptor.adapter, ToolAdapterKind::McpAlias);
         assert_eq!(descriptor.effect, ToolEffect::Act);
         assert_eq!(outcome.model_content, "executed:mcp__docs__search");
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_discovered_alias_resolves_after_execution_catalog_snapshot() {
+        let fixture = fixture();
+        let enabled = Arc::new(AtomicBool::new(false));
+        let service = ToolExecutionService::new(
+            vec![Arc::new(LateAliasTool {
+                enabled: Arc::clone(&enabled),
+                calls: Arc::clone(&fixture.calls),
+            })],
+            Arc::new(FixedPolicy {
+                decision: ToolExecutionDecision::Allow,
+                stages: Arc::clone(&fixture.stages),
+            }),
+            Arc::new(FixedApproval {
+                decision: approved(),
+                stages: Arc::clone(&fixture.stages),
+            }),
+            Arc::new(RecordingPreparation {
+                stages: Arc::clone(&fixture.stages),
+                allowed: true,
+            }),
+            Arc::new(RecordingAudit {
+                records: Arc::clone(&fixture.records),
+                stages: Arc::clone(&fixture.stages),
+            }),
+        );
+
+        assert!(service.catalog().descriptor("mcp__late__navigate").is_none());
+        enabled.store(true, AtomicOrdering::Release);
+
+        let outcome = service
+            .execute(
+                ToolExecutionCommand::new("mcp__late__navigate", serde_json::json!({"url":"https://example.com"})),
+                context(),
+                None,
+            )
+            .await;
+
+        let descriptor = outcome.descriptor.expect("dynamic alias descriptor");
+        assert_eq!(outcome.status, ToolExecutionStatus::Succeeded);
+        assert_eq!(descriptor.public_name, "mcp__late__navigate");
+        assert_eq!(descriptor.backend_name, "mcp_call");
+        assert_eq!(descriptor.adapter, ToolAdapterKind::McpAlias);
+        assert_eq!(descriptor.effect, ToolEffect::Act);
+        assert_eq!(outcome.model_content, "executed:mcp__late__navigate");
         assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
     }
 
