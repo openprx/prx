@@ -1011,7 +1011,12 @@ fn write_xml_text_element(out: &mut String, indent: usize, tag: &str, value: &st
     out.push_str(">\n");
 }
 
-/// Build the "Available Skills" system prompt section with full skill instructions.
+/// Build the "Available Skills" system prompt section from catalog metadata.
+///
+/// Skill instruction bodies stay lazy and are loaded through `skill_read` only
+/// when selected. Keeping full `SKILL.md` contents out of the reusable system
+/// prefix prevents installed skills from multiplying every provider request and
+/// keeps TUI, CLI, gateway, and channel entrypoints on the same lifecycle.
 pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
     use std::fmt::Write;
 
@@ -1021,8 +1026,8 @@ pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
 
     let mut prompt = String::from(
         "## Available Skills\n\n\
-         Skills are listed below. Some have preloaded instructions; others are lazy-loaded.\n\
-         For skills without <instructions>, read the SKILL.md at <location> when the skill is needed.\n\n\
+         Skills are listed as metadata and are lazy-loaded.\n\
+         When a skill is needed, call `skill_read` with its <name> before following its instructions or reading relative resources.\n\n\
          <available_skills>\n",
     );
 
@@ -1053,34 +1058,6 @@ pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
             "location",
             &bounded_text(&location.display().to_string(), 4096),
         );
-
-        if !skill.prompts.is_empty() {
-            let instructions_start = rendered.len();
-            let _ = writeln!(rendered, "    <instructions>");
-            for instruction in &skill.prompts {
-                let before = rendered.len();
-                write_xml_text_element(
-                    &mut rendered,
-                    6,
-                    "instruction",
-                    &bounded_text(instruction, MAX_INSTRUCTION_BYTES),
-                );
-                if prompt
-                    .len()
-                    .saturating_add(rendered.len())
-                    .saturating_add(CLOSING.len())
-                    > MAX_SKILLS_PROMPT_BYTES
-                {
-                    rendered.truncate(before);
-                    break;
-                }
-            }
-            if rendered.len() == instructions_start + "    <instructions>\n".len() {
-                rendered.truncate(instructions_start);
-            } else {
-                let _ = writeln!(rendered, "    </instructions>");
-            }
-        }
 
         if !skill.tools.is_empty() {
             let tools_start = rendered.len();
@@ -1769,7 +1746,30 @@ command = "echo hello"
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("<name>test</name>"));
-        assert!(prompt.contains("<instruction>Do the thing.</instruction>"));
+        assert!(prompt.contains("call `skill_read`"));
+        assert!(!prompt.contains("Do the thing."));
+        assert!(!prompt.contains("<instructions>"));
+    }
+
+    #[test]
+    fn skills_prompt_is_stable_when_instruction_bodies_change() {
+        let make_skill = |instructions: &str| Skill {
+            name: "office".to_string(),
+            description: "Create office documents".to_string(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec![instructions.to_string()],
+            location: Some(PathBuf::from("/tmp/office/SKILL.md")),
+            embedding: None,
+        };
+
+        let short = skills_to_prompt(&[make_skill("short")], Path::new("/tmp"));
+        let huge = skills_to_prompt(&[make_skill(&"x".repeat(MAX_INSTRUCTION_BYTES))], Path::new("/tmp"));
+
+        assert_eq!(short, huge, "SKILL.md bodies must not alter the reusable prompt prefix");
+        assert!(short.len() < 1_024, "one metadata-only skill should remain compact");
     }
 
     #[test]
@@ -2165,7 +2165,7 @@ description = "Bare minimum"
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("<name>xml&lt;skill&gt;</name>"));
         assert!(prompt.contains("<description>A &amp; B</description>"));
-        assert!(prompt.contains("<instruction>Use &lt;tool&gt; &amp; check &quot;quotes&quot;.</instruction>"));
+        assert!(!prompt.contains("Use &lt;tool&gt;"));
     }
 
     #[test]
