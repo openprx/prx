@@ -86,7 +86,7 @@ use crate::channels::{
 };
 use crate::chat::terminal_proto::DraftVersionCounter;
 use crate::config::Config;
-use crate::hooks::{HookEvent, HookManager, payload_error};
+use crate::hooks::{HookEvent, payload_error};
 use crate::llm::route_decision::{
     ProviderExecutionOutcome, RouteDecision, record_provider_outcome_events as record_raw_provider_outcome_events,
     record_route_decision_event as record_raw_route_decision_event, route_event_scope,
@@ -3924,8 +3924,7 @@ pub async fn run(
 
     let observer = Arc::clone(&ctx.observer);
     let security = Arc::clone(&ctx.security);
-    // hooks are not part of AppContext — keep the local construction unchanged.
-    let hooks = Arc::new(HookManager::new(config.workspace_dir.clone()));
+    let hooks = Arc::clone(&ctx.hooks);
 
     // ── Memory ───────────────────────────────────────────────────
     // Both MemoryOnly and Interactive profiles build memory, so it is always

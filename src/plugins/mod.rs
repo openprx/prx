@@ -112,6 +112,13 @@ pub struct PluginMetricsSnapshot {
     pub total_instantiations: u64,
 }
 
+/// Runtime adapters built from one plugin-directory scan plus any per-plugin
+/// failures that were isolated instead of taking down the whole WASM runtime.
+pub struct PluginAdapterBuild<T> {
+    pub value: T,
+    pub errors: Vec<String>,
+}
+
 /// Central manager for the WASM plugin system.
 ///
 /// Owns the wasmtime `Engine` (shared across all plugins), the disk-based
@@ -268,7 +275,7 @@ impl PluginManager {
         Ok(())
     }
 
-    fn prepare_plugin(&self, plugin_dir: &Path) -> PluginResult<LoadedPlugin> {
+    pub(crate) fn prepare_plugin(&self, plugin_dir: &Path) -> PluginResult<LoadedPlugin> {
         let manifest_path = plugin_dir.join("plugin.toml");
         let manifest = PluginManifest::from_file(&manifest_path)?;
         let plugin_name = manifest.plugin.name.clone();
@@ -316,7 +323,11 @@ impl PluginManager {
             None
         };
 
-        Ok(LoadedPlugin::new(manifest, plugin_dir.to_path_buf(), component))
+        if plugin_dir.join(".prx-managed").is_file() {
+            Ok(LoadedPlugin::new_trusted(manifest, plugin_dir.to_path_buf(), component))
+        } else {
+            Ok(LoadedPlugin::new(manifest, plugin_dir.to_path_buf(), component))
+        }
     }
 
     fn update_cache_metrics(&self) {
@@ -355,7 +366,7 @@ impl PluginManager {
     /// Returns a list of boxed `Tool` trait objects ready for registration
     /// in the tools_registry.
     pub async fn create_tool_adapters(&self) -> Vec<Box<dyn Tool>> {
-        self.create_tool_adapters_with_memory(None, None).await
+        self.create_tool_adapters_with_memory(None, None).await.value
     }
 
     /// Create tool adapters for all plugins with tool capabilities,
@@ -364,9 +375,10 @@ impl PluginManager {
         &self,
         memory: Option<Arc<dyn crate::memory::traits::Memory>>,
         event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
-    ) -> Vec<Box<dyn Tool>> {
+    ) -> PluginAdapterBuild<Vec<Box<dyn Tool>>> {
         let plugins = self.registry.list().await;
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+        let mut errors = Vec::new();
 
         for info in &plugins {
             if !matches!(info.status, registry::PluginStatus::Active) {
@@ -386,7 +398,10 @@ impl PluginManager {
             let component = match self.registry.get_component(&info.name).await {
                 Some(c) => c,
                 None => {
-                    tracing::debug!(plugin = %info.name, "skipping tool adapter — no WASM component");
+                    errors.push(format!(
+                        "plugin '{}' declares a tool but has no WASM component",
+                        info.name
+                    ));
                     continue;
                 }
             };
@@ -419,26 +434,23 @@ impl PluginManager {
                     );
                     tools.push(Box::new(adapter));
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        plugin = %info.name,
-                        error = %e,
-                        "failed to create tool adapter"
-                    );
+                Err(error) => {
+                    errors.push(format!("plugin '{}' tool adapter failed: {error}", info.name));
                 }
             }
         }
 
-        tools
+        PluginAdapterBuild { value: tools, errors }
     }
 
     /// Create middleware adapters for all plugins with middleware capabilities.
     pub async fn create_middleware_chain(
         &self,
         event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
-    ) -> capabilities::middleware::MiddlewareChain {
+    ) -> PluginAdapterBuild<capabilities::middleware::MiddlewareChain> {
         let plugins = self.registry.list().await;
         let mut chain = capabilities::middleware::MiddlewareChain::new();
+        let mut errors = Vec::new();
 
         for info in &plugins {
             if !matches!(info.status, registry::PluginStatus::Active) {
@@ -456,7 +468,10 @@ impl PluginManager {
             let component = match self.registry.get_component(&info.name).await {
                 Some(c) => c,
                 None => {
-                    tracing::debug!(plugin = %info.name, "skipping middleware adapter — no WASM component");
+                    errors.push(format!(
+                        "plugin '{}' declares middleware but has no WASM component",
+                        info.name
+                    ));
                     continue;
                 }
             };
@@ -498,20 +513,22 @@ impl PluginManager {
                 }
                 Err(e) => {
                     tracing::warn!(plugin = %info.name, error = %e, "failed to create middleware adapter");
+                    errors.push(format!("plugin '{}' middleware adapter failed: {e}", info.name));
                 }
             }
         }
 
-        chain
+        PluginAdapterBuild { value: chain, errors }
     }
 
     /// Create hook adapters for all plugins with hook capabilities.
     pub async fn create_hook_executor(
         &self,
         event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
-    ) -> capabilities::hook::WasmHookExecutor {
+    ) -> PluginAdapterBuild<capabilities::hook::WasmHookExecutor> {
         let plugins = self.registry.list().await;
         let mut executor = capabilities::hook::WasmHookExecutor::new();
+        let mut errors = Vec::new();
 
         for info in &plugins {
             if !matches!(info.status, registry::PluginStatus::Active) {
@@ -529,7 +546,10 @@ impl PluginManager {
             let component = match self.registry.get_component(&info.name).await {
                 Some(c) => c,
                 None => {
-                    tracing::debug!(plugin = %info.name, "skipping hook adapter — no WASM component");
+                    errors.push(format!(
+                        "plugin '{}' declares hooks but has no WASM component",
+                        info.name
+                    ));
                     continue;
                 }
             };
@@ -567,20 +587,25 @@ impl PluginManager {
                 }
                 Err(e) => {
                     tracing::warn!(plugin = %info.name, error = %e, "failed to create hook adapter");
+                    errors.push(format!("plugin '{}' hook adapter failed: {e}", info.name));
                 }
             }
         }
 
-        executor
+        PluginAdapterBuild {
+            value: executor,
+            errors,
+        }
     }
 
     /// Create cron adapters for all plugins with cron capabilities.
     pub async fn create_cron_manager(
         &self,
         event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
-    ) -> capabilities::cron::WasmCronManager {
+    ) -> PluginAdapterBuild<capabilities::cron::WasmCronManager> {
         let plugins = self.registry.list().await;
         let mut manager = capabilities::cron::WasmCronManager::new();
+        let mut errors = Vec::new();
 
         for info in &plugins {
             if !matches!(info.status, registry::PluginStatus::Active) {
@@ -598,7 +623,10 @@ impl PluginManager {
             let component = match self.registry.get_component(&info.name).await {
                 Some(c) => c,
                 None => {
-                    tracing::debug!(plugin = %info.name, "skipping cron adapter — no WASM component");
+                    errors.push(format!(
+                        "plugin '{}' declares cron but has no WASM component",
+                        info.name
+                    ));
                     continue;
                 }
             };
@@ -622,6 +650,7 @@ impl PluginManager {
 
             if schedule.is_empty() {
                 tracing::warn!(plugin = %info.name, "cron plugin has no schedule, skipping");
+                errors.push(format!("plugin '{}' cron capability has no schedule", info.name));
                 continue;
             }
 
@@ -641,11 +670,12 @@ impl PluginManager {
                 }
                 Err(e) => {
                     tracing::warn!(plugin = %info.name, error = %e, "failed to create cron adapter");
+                    errors.push(format!("plugin '{}' cron adapter failed: {e}", info.name));
                 }
             }
         }
 
-        manager
+        PluginAdapterBuild { value: manager, errors }
     }
 
     /// Create provider adapters for all plugins with provider capabilities.
@@ -1105,7 +1135,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("test: tempdir");
         let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
         let chain = manager.create_middleware_chain(None).await;
-        assert!(chain.is_empty());
+        assert!(chain.value.is_empty());
     }
 
     #[tokio::test]

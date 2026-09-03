@@ -899,6 +899,7 @@ pub struct GatewayTurnRuntimeOwner {
     whatsapp: Option<Arc<WhatsAppChannel>>,
     linq: Option<Arc<LinqChannel>>,
     nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
+    hooks: Arc<HookManager>,
     #[cfg(feature = "wasm-plugins")]
     plugin_runtime: Option<Arc<crate::plugins::PluginRuntime>>,
 }
@@ -912,6 +913,7 @@ impl GatewayTurnRuntimeOwner {
         whatsapp: Option<Arc<WhatsAppChannel>>,
         linq: Option<Arc<LinqChannel>>,
         nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
+        hooks: Arc<HookManager>,
         #[cfg(feature = "wasm-plugins")] plugin_runtime: Option<Arc<crate::plugins::PluginRuntime>>,
     ) -> Self {
         Self {
@@ -922,6 +924,7 @@ impl GatewayTurnRuntimeOwner {
             whatsapp,
             linq,
             nextcloud_talk,
+            hooks,
             #[cfg(feature = "wasm-plugins")]
             plugin_runtime,
         }
@@ -940,6 +943,7 @@ impl GatewayTurnRuntimeOwner {
             self.whatsapp.clone(),
             self.linq.clone(),
             self.nextcloud_talk.clone(),
+            Arc::clone(&self.hooks),
             #[cfg(feature = "wasm-plugins")]
             self.plugin_runtime.clone(),
         )
@@ -1038,6 +1042,7 @@ fn build_gateway_turn_runtime(
     whatsapp: Option<Arc<WhatsAppChannel>>,
     linq: Option<Arc<LinqChannel>>,
     nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
+    hooks: Arc<HookManager>,
     #[cfg(feature = "wasm-plugins")] plugin_runtime: Option<Arc<crate::plugins::PluginRuntime>>,
 ) -> anyhow::Result<TurnRuntimeGeneration> {
     let config = generation.effective.as_ref();
@@ -1142,12 +1147,15 @@ fn build_gateway_turn_runtime(
         shared_config,
         security.clone(),
     )));
+    tools_list.push(hooks.status_tool());
+    tools_list.push(hooks.manage_tool(security.clone()));
 
     #[cfg(feature = "wasm-plugins")]
     if let Some(runtime) = &plugin_runtime {
         tools_list.push(runtime.tool_router());
         tools_list.push(runtime.status_tool());
         tools_list.push(runtime.reload_tool(security.clone()));
+        tools_list.push(runtime.manage_tool(security.clone()));
     }
 
     let tools_registry = Arc::new(tools_list);
@@ -1410,6 +1418,8 @@ pub async fn run_gateway(
         Arc::clone(&shared_config_for_reload),
         security.clone(),
     )));
+    tools_list.push(hooks.status_tool());
+    tools_list.push(hooks.manage_tool(security.clone()));
 
     // ── Register the stable router backed by the sole process-level plugin runtime ──
     #[cfg(feature = "wasm-plugins")]
@@ -1422,6 +1432,7 @@ pub async fn run_gateway(
         tools_list.push(router);
         tools_list.push(runtime.status_tool());
         tools_list.push(runtime.reload_tool(security.clone()));
+        tools_list.push(runtime.manage_tool(security.clone()));
         tracing::debug!(generation = runtime.generation_id(), "WASM plugin runtime ready");
     }
 
@@ -1563,6 +1574,7 @@ pub async fn run_gateway(
         whatsapp_channel.clone(),
         linq_channel.clone(),
         nextcloud_talk_channel.clone(),
+        Arc::clone(&hooks),
         #[cfg(feature = "wasm-plugins")]
         wasm_plugin_runtime.clone(),
     ));

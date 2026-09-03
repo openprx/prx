@@ -5974,6 +5974,8 @@ pub async fn start_channels_with_config(
             security.clone(),
         )));
     }
+    tools_list.push(hooks.status_tool());
+    tools_list.push(hooks.manage_tool(security.clone()));
 
     // ── Register the same process-level WASM runtime used by every entrypoint ──
     #[cfg(feature = "wasm-plugins")]
@@ -5989,6 +5991,7 @@ pub async fn start_channels_with_config(
         tools_list.push(router);
         tools_list.push(runtime.status_tool());
         tools_list.push(runtime.reload_tool(security.clone()));
+        tools_list.push(runtime.manage_tool(security.clone()));
         hooks.set_plugin_runtime(Arc::clone(runtime)).await;
         tracing::debug!(
             generation = runtime.generation_id(),

@@ -1,7 +1,9 @@
+use async_trait::async_trait;
 use parking_lot::RwLock;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -44,6 +46,22 @@ impl HookEvent {
             Self::TurnComplete => "turn_complete",
             Self::Error => "error",
         }
+    }
+
+    const ALL: [Self; 8] = [
+        Self::AgentStart,
+        Self::AgentEnd,
+        Self::LlmRequest,
+        Self::LlmResponse,
+        Self::ToolCallStart,
+        Self::ToolCall,
+        Self::TurnComplete,
+        Self::Error,
+    ];
+
+    fn from_name(name: &str) -> Option<Self> {
+        let normalized = normalize_event_name(name);
+        Self::ALL.into_iter().find(|event| event.as_str() == normalized)
     }
 }
 
@@ -95,6 +113,17 @@ struct RuntimeState {
     hooks_json_digest: Option<[u8; 32]>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct HookDiagnostics {
+    pub configured: bool,
+    pub valid: bool,
+    pub config_path: String,
+    pub timeout_ms: u64,
+    pub action_count: usize,
+    pub events: BTreeMap<String, usize>,
+    pub error: Option<String>,
+}
+
 pub struct HookManager {
     workspace_dir: PathBuf,
     hooks_json_path: PathBuf,
@@ -126,6 +155,92 @@ impl HookManager {
     #[cfg(feature = "wasm-plugins")]
     pub async fn set_plugin_runtime(&self, runtime: std::sync::Arc<crate::plugins::PluginRuntime>) {
         *self.plugin_runtime.write().await = Some(runtime);
+    }
+
+    pub fn diagnostics(&self) -> HookDiagnostics {
+        let error = self.refresh_if_changed().err().map(|error| error.to_string());
+        let state = self.state.read();
+        let events = state
+            .config
+            .hooks
+            .iter()
+            .map(|(event, actions)| (event.clone(), actions.len()))
+            .collect::<BTreeMap<_, _>>();
+        HookDiagnostics {
+            configured: self.hooks_json_path.is_file(),
+            valid: error.is_none(),
+            config_path: self.hooks_json_path.display().to_string(),
+            timeout_ms: state.config.timeout_ms,
+            action_count: events.values().sum(),
+            events,
+            error,
+        }
+    }
+
+    pub fn validate_config(&self, content: &str) -> anyhow::Result<HookDiagnostics> {
+        if content.len() as u64 > MAX_HOOKS_FILE_BYTES {
+            anyhow::bail!("hooks config exceeds {MAX_HOOKS_FILE_BYTES} byte limit");
+        }
+        let config = parse_hook_config(content.as_bytes())?;
+        let events = config
+            .hooks
+            .iter()
+            .map(|(event, actions)| (event.clone(), actions.len()))
+            .collect::<BTreeMap<_, _>>();
+        Ok(HookDiagnostics {
+            configured: false,
+            valid: true,
+            config_path: self.hooks_json_path.display().to_string(),
+            timeout_ms: config.timeout_ms,
+            action_count: events.values().sum(),
+            events,
+            error: None,
+        })
+    }
+
+    pub fn replace_config(&self, content: &str) -> anyhow::Result<HookDiagnostics> {
+        let _ = self.validate_config(content)?;
+        std::fs::create_dir_all(&self.workspace_dir)?;
+        let mut candidate = tempfile::Builder::new()
+            .prefix(".hooks-json-")
+            .suffix(".tmp")
+            .tempfile_in(&self.workspace_dir)?;
+        candidate.write_all(content.as_bytes())?;
+        candidate.flush()?;
+        candidate.persist(&self.hooks_json_path).map_err(|error| error.error)?;
+        self.refresh_if_changed()?;
+        Ok(self.diagnostics())
+    }
+
+    pub fn remove_config(&self) -> anyhow::Result<Option<PathBuf>> {
+        if !self.hooks_json_path.exists() {
+            *self.state.write() = RuntimeState::default();
+            return Ok(None);
+        }
+        let trash_dir = self.workspace_dir.join(".hooks-trash");
+        std::fs::create_dir_all(&trash_dir)?;
+        let backup = trash_dir.join(format!("hooks-{}.json", uuid::Uuid::new_v4()));
+        std::fs::rename(&self.hooks_json_path, &backup)?;
+        *self.state.write() = RuntimeState::default();
+        Ok(Some(backup))
+    }
+
+    pub async fn test_event(&self, event: HookEvent, payload: serde_json::Value) {
+        self.emit(event, payload).await;
+    }
+
+    pub fn manage_tool(
+        self: &std::sync::Arc<Self>,
+        security: std::sync::Arc<crate::security::SecurityPolicy>,
+    ) -> Box<dyn crate::tools::Tool> {
+        Box::new(HooksManageTool {
+            manager: self.clone(),
+            security,
+        })
+    }
+
+    pub fn status_tool(self: &std::sync::Arc<Self>) -> Box<dyn crate::tools::Tool> {
+        Box::new(HooksStatusTool { manager: self.clone() })
     }
 
     pub async fn emit(&self, event: HookEvent, payload: serde_json::Value) {
@@ -183,16 +298,7 @@ impl HookManager {
             return Ok(());
         }
 
-        let parsed: HooksFile = serde_json::from_slice(&raw)?;
-        validate_hooks_file(&parsed)?;
-        let config = HookConfig {
-            timeout_ms: bounded_timeout(parsed.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS))?,
-            hooks: parsed
-                .hooks
-                .into_iter()
-                .map(|(name, actions)| (normalize_event_name(&name), actions))
-                .collect(),
-        };
+        let config = parse_hook_config(&raw)?;
 
         // Candidate parsing and validation finish before this single generation swap.
         *self.state.write() = RuntimeState {
@@ -356,6 +462,165 @@ impl HookManager {
     }
 }
 
+pub struct HooksManageTool {
+    manager: std::sync::Arc<HookManager>,
+    security: std::sync::Arc<crate::security::SecurityPolicy>,
+}
+
+pub struct HooksStatusTool {
+    manager: std::sync::Arc<HookManager>,
+}
+
+#[async_trait]
+impl crate::tools::Tool for HooksStatusTool {
+    fn name(&self) -> &str {
+        "hooks_status"
+    }
+
+    fn description(&self) -> &str {
+        "Inspect the active workspace lifecycle-hooks configuration, event coverage, action count, and validation error."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({"type": "object", "properties": {}, "additionalProperties": false})
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+        Ok(crate::tools::ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&self.manager.diagnostics())?,
+            error: None,
+        })
+    }
+
+    fn tier(&self) -> crate::tools::ToolTier {
+        crate::tools::ToolTier::Standard
+    }
+
+    fn categories(&self) -> &'static [crate::tools::ToolCategory] {
+        &[
+            crate::tools::ToolCategory::System,
+            crate::tools::ToolCategory::Automation,
+        ]
+    }
+}
+
+impl HooksManageTool {
+    fn authorize(&self, action: &str, args: &serde_json::Value) -> Result<(), crate::tools::ToolResult> {
+        use crate::security::policy::{ApprovalGrant, ResourceRiskLevel, SideEffectGate};
+        let risk = match action {
+            "test" => ResourceRiskLevel::High,
+            "replace" | "remove" => ResourceRiskLevel::Medium,
+            _ => return Ok(()),
+        };
+        let grant = ApprovalGrant::from_runtime_args("hooks_manage", args);
+        SideEffectGate::new(self.security.as_ref())
+            .authorize_resource_operation("hooks_manage", &format!("hooks_manage:{action}"), risk, grant.as_ref())
+            .map(|_| ())
+            .map_err(|error| crate::tools::ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            })
+    }
+
+    fn required_string<'a>(args: &'a serde_json::Value, key: &str) -> anyhow::Result<&'a str> {
+        args.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing non-empty '{key}' parameter"))
+    }
+}
+
+#[async_trait]
+impl crate::tools::Tool for HooksManageTool {
+    fn name(&self) -> &str {
+        "hooks_manage"
+    }
+
+    fn description(&self) -> &str {
+        "Inspect, validate, atomically replace, remove, refresh, or test workspace lifecycle hooks. Mutating and test actions are approval-gated."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["status", "refresh", "validate", "replace", "remove", "test"]},
+                "content": {"type": "string", "description": "Complete hooks.json for validate or replace"},
+                "event": {"type": "string", "enum": HookEvent::ALL.map(HookEvent::as_str)},
+                "payload": {"type": "object", "description": "Synthetic payload for test"}
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+        use crate::tools::ToolResult;
+        let action = Self::required_string(&args, "action")?;
+        if let Err(result) = self.authorize(action, &args) {
+            return Ok(result);
+        }
+        let result: anyhow::Result<serde_json::Value> = match action {
+            "status" | "refresh" => serde_json::to_value(self.manager.diagnostics()).map_err(Into::into),
+            "validate" => {
+                let content = Self::required_string(&args, "content")?;
+                self.manager
+                    .validate_config(content)
+                    .and_then(|status| serde_json::to_value(status).map_err(Into::into))
+            }
+            "replace" => {
+                let content = Self::required_string(&args, "content")?;
+                self.manager
+                    .replace_config(content)
+                    .and_then(|status| serde_json::to_value(status).map_err(Into::into))
+            }
+            "remove" => self
+                .manager
+                .remove_config()
+                .map(|backup| json!({"removed": backup.is_some(), "recoverable_backup": backup})),
+            "test" => {
+                let event_name = Self::required_string(&args, "event")?;
+                let event = HookEvent::from_name(event_name)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown hook event '{event_name}'"))?;
+                let payload = args
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"source": "hooks_manage", "test": true}));
+                self.manager.test_event(event, payload).await;
+                Ok(json!({"tested": true, "event": event.as_str()}))
+            }
+            _ => anyhow::bail!("Unsupported hooks_manage action: {action}"),
+        };
+
+        Ok(match result {
+            Ok(output) => ToolResult {
+                success: true,
+                output: serde_json::to_string_pretty(&output)?,
+                error: None,
+            },
+            Err(error) => ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error.to_string()),
+            },
+        })
+    }
+
+    fn tier(&self) -> crate::tools::ToolTier {
+        crate::tools::ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [crate::tools::ToolCategory] {
+        &[
+            crate::tools::ToolCategory::System,
+            crate::tools::ToolCategory::Automation,
+        ]
+    }
+}
+
 fn bounded_timeout(timeout_ms: u64) -> anyhow::Result<u64> {
     if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
         anyhow::bail!("hook timeout_ms must be between 1 and {MAX_TIMEOUT_MS}");
@@ -371,6 +636,16 @@ fn validate_hooks_file(file: &HooksFile) -> anyhow::Result<()> {
     if action_count > MAX_ACTIONS {
         anyhow::bail!("hooks.json has {action_count} actions; limit is {MAX_ACTIONS}");
     }
+    let mut normalized_events = std::collections::HashSet::new();
+    for event in file.hooks.keys() {
+        let normalized = normalize_event_name(event);
+        if HookEvent::from_name(&normalized).is_none() {
+            anyhow::bail!("unknown hook event '{event}'");
+        }
+        if !normalized_events.insert(normalized) {
+            anyhow::bail!("duplicate hook event after normalization: '{event}'");
+        }
+    }
     for actions in file.hooks.values() {
         for action in actions {
             if action.args.len() > MAX_ARGS_PER_ACTION {
@@ -385,6 +660,19 @@ fn validate_hooks_file(file: &HooksFile) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn parse_hook_config(raw: &[u8]) -> anyhow::Result<HookConfig> {
+    let parsed: HooksFile = serde_json::from_slice(raw)?;
+    validate_hooks_file(&parsed)?;
+    Ok(HookConfig {
+        timeout_ms: bounded_timeout(parsed.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS))?,
+        hooks: parsed
+            .hooks
+            .into_iter()
+            .map(|(name, actions)| (normalize_event_name(&name), actions))
+            .collect(),
+    })
 }
 
 fn normalize_event_name(name: &str) -> String {
@@ -592,6 +880,55 @@ mod tests {
         let state = manager.state.read();
         assert_eq!(state.config.timeout_ms, 1200);
         assert_eq!(state.hooks_json_digest, active_digest);
+    }
+
+    #[test]
+    fn diagnostics_and_recoverable_lifecycle_reflect_active_config() {
+        let temp = TempDir::new().unwrap();
+        let manager = HookManager::new(temp.path().to_path_buf());
+        let candidate = r#"{
+  "timeout_ms": 1500,
+  "hooks": {
+    "tool-call": [{"command": "true"}],
+    "turn_complete": [{"command": "true"}]
+  }
+}"#;
+
+        let validated = manager.validate_config(candidate).unwrap();
+        assert!(!validated.configured);
+        assert!(validated.valid);
+        assert_eq!(validated.action_count, 2);
+
+        let active = manager.replace_config(candidate).unwrap();
+        assert!(active.configured);
+        assert!(active.valid);
+        assert_eq!(active.timeout_ms, 1500);
+        assert_eq!(active.events.get("tool_call"), Some(&1));
+
+        let backup = manager.remove_config().unwrap().unwrap();
+        assert!(!temp.path().join(HOOKS_JSON_FILE).exists());
+        assert!(backup.is_file());
+        assert!(!manager.diagnostics().configured);
+    }
+
+    #[test]
+    fn validation_rejects_unknown_and_duplicate_normalized_events() {
+        let temp = TempDir::new().unwrap();
+        let manager = HookManager::new(temp.path().to_path_buf());
+        assert!(
+            manager
+                .validate_config(r#"{"hooks":{"not-real":[]}}"#)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown hook event")
+        );
+        assert!(
+            manager
+                .validate_config(r#"{"hooks":{"tool-call":[],"tool_call":[]}}"#)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate hook event")
+        );
     }
 
     #[test]

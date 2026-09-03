@@ -22,21 +22,30 @@ pub fn register_log_host_functions(linker: &mut wasmtime::component::Linker<Host
             .instance(iface)
             .map_err(|e| PluginError::Instantiation(format!("linker error ({iface}): {e}")))?;
         log_inst
-            .func_wrap(
-                "log",
-                |store: wasmtime::StoreContextMut<'_, HostState>, (level, message): (String, String)| {
-                    let name = store.data().plugin_name.clone();
-                    match level.as_str() {
-                        "trace" => tracing::trace!(plugin = %name, "{message}"),
-                        "debug" => tracing::debug!(plugin = %name, "{message}"),
-                        "info" => tracing::info!(plugin = %name, "{message}"),
-                        "warn" => tracing::warn!(plugin = %name, "{message}"),
-                        "error" => tracing::error!(plugin = %name, "{message}"),
-                        _ => tracing::info!(plugin = %name, level = %level, "{message}"),
-                    }
-                    Ok(())
-                },
-            )
+            .func_new("log", |store, _type, params, results| {
+                let [
+                    wasmtime::component::Val::Enum(level),
+                    wasmtime::component::Val::String(message),
+                ] = params
+                else {
+                    return Err(wasmtime::Error::msg(
+                        "log host function expected (level enum, message string)",
+                    ));
+                };
+                if !results.is_empty() {
+                    return Err(wasmtime::Error::msg("log host function expected no results"));
+                }
+                let name = store.data().plugin_name.clone();
+                match level.as_str() {
+                    "trace" => tracing::trace!(plugin = %name, "{message}"),
+                    "debug" => tracing::debug!(plugin = %name, "{message}"),
+                    "info" => tracing::info!(plugin = %name, "{message}"),
+                    "warn" => tracing::warn!(plugin = %name, "{message}"),
+                    "error" => tracing::error!(plugin = %name, "{message}"),
+                    _ => tracing::info!(plugin = %name, level = %level, "{message}"),
+                }
+                Ok(())
+            })
             .map_err(|e| PluginError::Instantiation(format!("link {iface}.log: {e}")))?;
     }
     Ok(())

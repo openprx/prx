@@ -27,6 +27,12 @@
 
 PRX WASM plugins are **WebAssembly components** that run inside the PRX process. They extend PRX without modifying its source code — no recompilation, no process restarts (for most changes).
 
+The agent-facing `wasm_plugins_manage` tool owns runtime lifecycle operations.
+It installs or updates only from a source directory inside the configured
+workspace, and supports status/get/refresh/enable/disable/recoverable-remove.
+The root `wasm_plugin_call` tool remains available even when a plugin alias is
+outside the bounded provider-visible alias window.
+
 ### Why WASM?
 
 | Property | Benefit |
@@ -1411,7 +1417,10 @@ The plugin's capability type is `tool` but the `get-spec` export is missing from
 - The wrong world was selected at build time.
 - The cargo-component `export!` macro was not invoked.
 
-Run `prx-plugin validate plugin.wasm` for a detailed export check.
+Use `wasm_plugins_manage` with `action: "install"` or `"update"`; the staged
+candidate is compiled and every declared runtime adapter is constructed before
+the active generation is accepted. Failures are returned by the tool and are
+also visible in `wasm_plugins_status`.
 
 ---
 
