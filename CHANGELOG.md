@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.93] - 3 September 2026
+
+### Changed
+
+- Keep installed skill instructions out of the reusable system prompt and load
+  `SKILL.md` through `skill_read` only when a skill is selected. TUI, CLI,
+  Gateway, WhatsApp/Wacli, and other IM channels now share this metadata-only
+  catalog behavior while retaining declared skill tool metadata.
+
+### Fixed
+
+- Remove completed-turn elapsed-time lines from the TUI transcript and status
+  event bridge while preserving live working elapsed time and per-tool timing.
+
+### Tests
+
+- Exercise 1,000 progressing model/tool iterations without an artificial turn
+  ceiling, alongside the persistent MCP and WASM 1,000-call stress regressions.
+
 ## [0.8.92] - 3 September 2026
 
 ### Fixed
