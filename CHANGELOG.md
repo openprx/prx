@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.91] - 3 September 2026
+
+### Fixed
+
+- Preserve absolute installer `PATH` entries in generated launchd and systemd
+  user services, so daemon-owned IM, gateway, hook, and scheduled turns can
+  launch the same stdio MCP commands (`npx`, `uvx`, `bun`, and similar) as the
+  interactive CLI.
+
 ## [0.8.90] - 3 September 2026
 
 ### Fixed

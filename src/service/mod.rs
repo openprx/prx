@@ -2,6 +2,7 @@
 
 use crate::config::Config;
 use anyhow::{Context, Result, bail};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -9,6 +10,7 @@ use tokio::process::Command;
 
 const SERVICE_LABEL: &str = "com.prx.daemon";
 const WINDOWS_TASK_NAME: &str = "PRX Daemon";
+const UNIX_SERVICE_FALLBACK_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
@@ -58,6 +60,44 @@ fn selected_config_dir(config: &Config) -> Result<&Path> {
         .config_path
         .parent()
         .context("configured service config path must have a parent directory")
+}
+
+/// Build the PATH inherited by a user service from the environment in which
+/// it was installed. launchd and systemd user services otherwise start with a
+/// minimal PATH, which makes configured stdio MCP launchers such as `npx`,
+/// `uvx`, and `bun` work in an interactive CLI but disappear in channels,
+/// gateways, hooks, and scheduled daemon turns.
+///
+/// Only absolute entries are retained. This preserves the operator's selected
+/// toolchain while refusing relative/current-directory lookup in a long-lived
+/// service. The PRX executable directory and standard system directories are
+/// always present as deterministic fallbacks.
+fn inherited_service_path(exe: &Path) -> OsString {
+    let inherited = std::env::var_os("PATH");
+    service_path_from(exe, inherited.as_deref())
+}
+
+fn service_path_from(exe: &Path, inherited: Option<&std::ffi::OsStr>) -> OsString {
+    let mut entries = Vec::<PathBuf>::new();
+    let mut add = |path: PathBuf| {
+        if path.is_absolute() && !entries.contains(&path) {
+            entries.push(path);
+        }
+    };
+
+    if let Some(parent) = exe.parent() {
+        add(parent.to_path_buf());
+    }
+    if let Some(path) = inherited {
+        for entry in std::env::split_paths(path) {
+            add(entry);
+        }
+    }
+    for entry in std::env::split_paths(&OsString::from(UNIX_SERVICE_FALLBACK_PATH)) {
+        add(entry);
+    }
+
+    std::env::join_paths(entries).unwrap_or_else(|_| OsString::from(UNIX_SERVICE_FALLBACK_PATH))
 }
 
 /// Supported init systems for service management
@@ -461,7 +501,8 @@ fn install_macos(config: &Config) -> Result<()> {
     let stdout = logs_dir.join("daemon.stdout.log");
     let stderr = logs_dir.join("daemon.stderr.log");
 
-    let plist = generate_launchd_plist(&exe, config_dir, &stdout, &stderr);
+    let service_path = inherited_service_path(&exe);
+    let plist = generate_launchd_plist(&exe, config_dir, &stdout, &stderr, &service_path);
 
     fs::write(&file, plist)?;
     println!("✅ Installed launchd service: {}", file.display());
@@ -469,7 +510,13 @@ fn install_macos(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn generate_launchd_plist(exe: &Path, config_dir: &Path, stdout: &Path, stderr: &Path) -> String {
+fn generate_launchd_plist(
+    exe: &Path,
+    config_dir: &Path,
+    stdout: &Path,
+    stderr: &Path,
+    service_path: &std::ffi::OsStr,
+) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -484,6 +531,11 @@ fn generate_launchd_plist(exe: &Path, config_dir: &Path, stdout: &Path, stderr: 
     <string>{config_dir}</string>
     <string>daemon</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>{service_path}</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -499,7 +551,8 @@ fn generate_launchd_plist(exe: &Path, config_dir: &Path, stdout: &Path, stderr: 
         exe = xml_escape(&exe.display().to_string()),
         config_dir = xml_escape(&config_dir.display().to_string()),
         stdout = xml_escape(&stdout.display().to_string()),
-        stderr = xml_escape(&stderr.display().to_string())
+        stderr = xml_escape(&stderr.display().to_string()),
+        service_path = xml_escape(&service_path.to_string_lossy())
     )
 }
 
@@ -518,7 +571,8 @@ async fn install_linux_systemd(config: &Config) -> Result<()> {
     }
 
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
-    let unit = generate_systemd_unit(&exe, selected_config_dir(config)?);
+    let service_path = inherited_service_path(&exe);
+    let unit = generate_systemd_unit(&exe, selected_config_dir(config)?, &service_path);
 
     fs::write(&file, unit)?;
     run_checked(Command::new("systemctl").args(["--user", "daemon-reload"])).await?;
@@ -528,12 +582,22 @@ async fn install_linux_systemd(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn generate_systemd_unit(exe: &Path, config_dir: &Path) -> String {
+fn generate_systemd_unit(exe: &Path, config_dir: &Path, service_path: &std::ffi::OsStr) -> String {
     format!(
-        "[Unit]\nDescription=PRX daemon\nAfter=network.target\n\n[Service]\nType=notify\nNotifyAccess=main\nWatchdogSec=30s\nExecStart={} --config-dir {} daemon\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=PRX daemon\nAfter=network.target\n\n[Service]\nType=notify\nNotifyAccess=main\nWatchdogSec=30s\nEnvironment={}\nExecStart={} --config-dir {} daemon\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
+        systemd_quote_value(&format!("PATH={}", service_path.to_string_lossy())),
         systemd_quote_arg(exe),
         systemd_quote_arg(config_dir),
     )
+}
+
+fn systemd_quote_value(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%")
+        .replace('$', "$$");
+    format!("\"{escaped}\"")
 }
 
 fn systemd_quote_arg(path: &Path) -> String {
@@ -1275,10 +1339,15 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn systemd_unit_uses_notify_and_watchdog() {
-        let unit = generate_systemd_unit(Path::new("/usr/local/bin/prx"), Path::new("/opt/prx-selected"));
+        let unit = generate_systemd_unit(
+            Path::new("/usr/local/bin/prx"),
+            Path::new("/opt/prx-selected"),
+            std::ffi::OsStr::new("/toolchain/bin:/usr/bin:/bin"),
+        );
         assert!(unit.contains("Type=notify"));
         assert!(unit.contains("NotifyAccess=main"));
         assert!(unit.contains("WatchdogSec=30s"));
+        assert!(unit.contains("Environment=\"PATH=/toolchain/bin:/usr/bin:/bin\""));
         assert!(unit.contains("ExecStart=\"/usr/local/bin/prx\" --config-dir \"/opt/prx-selected\" daemon"));
         assert!(!unit.contains("Type=simple"));
     }
@@ -1286,7 +1355,11 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn systemd_unit_preserves_selected_config_directory() {
-        let unit = generate_systemd_unit(Path::new("/usr/local/bin/prx"), Path::new("/opt/prx-selected"));
+        let unit = generate_systemd_unit(
+            Path::new("/usr/local/bin/prx"),
+            Path::new("/opt/prx-selected"),
+            std::ffi::OsStr::new("/usr/bin:/bin"),
+        );
         assert!(
             unit.contains("--config-dir \"/opt/prx-selected\" daemon"),
             "service definition must preserve the selected config directory"
@@ -1300,6 +1373,7 @@ mod tests {
             Path::new("/Users/example/PRX & Config"),
             Path::new("/tmp/prx.stdout"),
             Path::new("/tmp/prx.stderr"),
+            std::ffi::OsStr::new("/Users/example/.nvm/current/bin:/usr/bin:/bin"),
         );
         assert!(plist.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
         assert!(
@@ -1308,7 +1382,33 @@ mod tests {
         );
         assert!(plist.contains("<string>--config-dir</string>"));
         assert!(plist.contains("<string>/Users/example/PRX &amp; Config</string>"));
+        assert!(plist.contains("<key>EnvironmentVariables</key>"));
+        assert!(plist.contains("<string>/Users/example/.nvm/current/bin:/usr/bin:/bin</string>"));
         assert!(plist.ends_with("</plist>\n"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn inherited_service_path_keeps_absolute_toolchains_and_rejects_relative_entries() {
+        let path = service_path_from(
+            Path::new("/opt/prx/bin/prx"),
+            Some(std::ffi::OsStr::new(
+                "relative:/Users/example/.nvm/current/bin:/usr/bin",
+            )),
+        );
+        let entries = std::env::split_paths(&path).collect::<Vec<_>>();
+
+        assert_eq!(entries.first(), Some(&PathBuf::from("/opt/prx/bin")));
+        assert!(entries.contains(&PathBuf::from("/Users/example/.nvm/current/bin")));
+        assert!(entries.contains(&PathBuf::from("/usr/bin")));
+        assert!(!entries.contains(&PathBuf::from("relative")));
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| **entry == PathBuf::from("/usr/bin"))
+                .count(),
+            1
+        );
     }
 
     #[test]
