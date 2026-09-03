@@ -102,6 +102,35 @@ pub(crate) fn is_tool_summary_only_response(text: &str) -> bool {
     !tool_names.trim().is_empty() && !tool_names.contains(['\n', '\r'])
 }
 
+/// Canonicalize request-local system instructions for providers whose chat
+/// templates require one system message at the beginning of the transcript.
+///
+/// History remains untouched: callers run this on the prepared request copy.
+/// That matters for corrective retries and OS-paging recall, both of which may
+/// add request-local system context after ordinary conversation turns.
+fn coalesce_system_messages_at_front(messages: &mut Vec<ChatMessage>) {
+    let system_count = messages.iter().filter(|message| message.role == "system").count();
+    if system_count == 0 || system_count == 1 && messages.first().is_some_and(|message| message.role == "system") {
+        return;
+    }
+
+    let mut system_parts = Vec::with_capacity(system_count);
+    let mut conversation = Vec::with_capacity(messages.len().saturating_sub(system_count));
+    for message in std::mem::take(messages) {
+        if message.role == "system" {
+            if !message.content.trim().is_empty() {
+                system_parts.push(message.content);
+            }
+        } else {
+            conversation.push(message);
+        }
+    }
+    if !system_parts.is_empty() {
+        messages.push(ChatMessage::system(system_parts.join("\n\n")));
+    }
+    messages.extend(conversation);
+}
+
 /// Lightweight notification for tool call progress (used by chat/TUI integration).
 #[derive(Debug, Clone)]
 pub enum ToolCallNotification {
@@ -6024,6 +6053,12 @@ async fn run_tool_call_loop_outcome_unguarded(
                 tool_specs = candidate;
             }
         }
+        // Some provider templates (including the deployed Qwen template)
+        // reject any system message that is not the first transcript item.
+        // Corrective retries, recalled pages, and middleware are all allowed to
+        // contribute request-local system context, so canonicalize only the
+        // prepared request after every contributor has run.
+        coalesce_system_messages_at_front(&mut prepared_messages.messages);
         let use_native_tools = mode_capabilities.native_tool_calling && !tool_specs.is_empty();
 
         hooks
@@ -8514,6 +8549,56 @@ mod tests {
             responses
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("scripted provider exhausted responses"))
+        }
+    }
+
+    struct StrictSystemPositionRetryProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for StrictSystemPositionRetryProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in strict system-position tests");
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            if request
+                .messages
+                .iter()
+                .enumerate()
+                .any(|(index, message)| message.role == "system" && index != 0)
+            {
+                anyhow::bail!("system message must be at the beginning");
+            }
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return Ok(ChatResponse {
+                    text: Some(String::new()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                });
+            }
+            let leading_system = request.messages.first().filter(|message| message.role == "system");
+            if !leading_system.is_some_and(|message| message.content.contains(EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE)) {
+                anyhow::bail!("corrective retry instruction was not merged into the leading system message");
+            }
+            Ok(ChatResponse {
+                text: Some("Recovered answer.".to_string()),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            })
         }
     }
 
@@ -14482,6 +14567,53 @@ Let me check the result."#;
                 history.last().map(|message| message.content.as_str()),
                 Some("Recovered answer.")
             );
+            assert!(
+                history
+                    .iter()
+                    .all(|message| !message.content.contains(EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE)),
+                "the corrective instruction must remain request-local: {history:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn empty_response_retry_keeps_all_system_context_at_the_front() {
+            let provider = StrictSystemPositionRetryProvider {
+                calls: AtomicUsize::new(0),
+            };
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
+            let result = run_tool_call_loop_outcome(
+                &provider,
+                &mut history,
+                Arc::new(Vec::new()),
+                &NoopObserver,
+                &HookManager::new(std::env::temp_dir()),
+                "strict-provider",
+                "strict-model",
+                0.0,
+                true,
+                None,
+                "cli",
+                &crate::config::MultimodalConfig::default(),
+                2,
+                false,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ToolLoopMemory::none(),
+                ChatMode::default(),
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("strict provider should accept the canonical retry transcript");
+
+            assert!(matches!(result.0, ToolLoopOutcome::Text(ref text) if text == "Recovered answer."));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
             assert!(
                 history
                     .iter()
