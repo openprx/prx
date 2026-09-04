@@ -720,7 +720,7 @@ mod tests {
 
     #[test]
     fn store_resource_limits_reject_large_linear_memory() {
-        let engine = wasmtime::Engine::default();
+        let engine = crate::plugins::shared_wasm_engine().expect("test: shared wasm engine");
         let mut store = wasmtime::Store::new(&engine, test_state());
         apply_store_resource_limits(&mut store, 1);
 

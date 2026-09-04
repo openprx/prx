@@ -286,10 +286,25 @@ fn initial_history() -> Vec<ChatMessage> {
     vec![ChatMessage::system("fixture system"), ChatMessage::user("fixture user")]
 }
 
+fn overflow_history() -> Vec<ChatMessage> {
+    let mut history = initial_history();
+    history.extend((0..30).map(|index| ChatMessage::user(format!("fixture overflow turn {index}"))));
+    history
+}
+
 async fn run_chat_fixture(
     provider: Arc<FixtureProvider>,
     registry: Option<Arc<Vec<Box<dyn Tool>>>>,
     cancellation: CancellationToken,
+) -> Vec<Action> {
+    run_chat_fixture_with_history(provider, registry, cancellation, initial_history()).await
+}
+
+async fn run_chat_fixture_with_history(
+    provider: Arc<FixtureProvider>,
+    registry: Option<Arc<Vec<Box<dyn Tool>>>>,
+    cancellation: CancellationToken,
+    history: Vec<ChatMessage>,
 ) -> Vec<Action> {
     let (action_tx, mut action_rx) = mpsc::channel::<Action>(128);
     let policy = Arc::new(SecurityPolicy::default());
@@ -312,8 +327,8 @@ async fn run_chat_fixture(
     drive_start_turn_stream(
         None,
         provider,
-        initial_history(),
-        initial_history(),
+        history.clone(),
+        history,
         FIXTURE_MODEL.to_string(),
         0.0,
         None,
@@ -344,13 +359,24 @@ async fn run_agent_fixture(
     on_delta: Option<mpsc::Sender<String>>,
     on_tool_call: Option<mpsc::Sender<crate::agent::loop_::ToolCallNotification>>,
 ) -> (anyhow::Result<(ToolLoopOutcome, ToolLoopTrace)>, Vec<ChatMessage>) {
+    run_agent_fixture_with_history(provider, tools, cancellation, on_delta, on_tool_call, initial_history()).await
+}
+
+async fn run_agent_fixture_with_history(
+    provider: Arc<FixtureProvider>,
+    tools: Vec<Box<dyn Tool>>,
+    cancellation: CancellationToken,
+    on_delta: Option<mpsc::Sender<String>>,
+    on_tool_call: Option<mpsc::Sender<crate::agent::loop_::ToolCallNotification>>,
+    history: Vec<ChatMessage>,
+) -> (anyhow::Result<(ToolLoopOutcome, ToolLoopTrace)>, Vec<ChatMessage>) {
     let temp = tempfile::TempDir::new().expect("fixture tempdir");
     let memory: Arc<dyn crate::memory::Memory> =
         Arc::new(crate::memory::SqliteMemory::new(temp.path()).expect("agent fixture sqlite"));
     let envelope =
         crate::runtime::envelope::RuntimeEnvelope::agent(temp.path().to_string_lossy().to_string(), FIXTURE_DRAFT);
     let document_ingest = crate::agent::loop_::DocumentIngestRuntime::from_envelope(memory, &envelope);
-    let mut history = initial_history();
+    let mut history = history;
     let result = crate::agent::loop_::run_tool_call_loop_outcome(
         provider.as_ref(),
         &mut history,
@@ -560,14 +586,21 @@ async fn step_7_1_same_success_fixture_characterizes_stream_tool_usage_history_a
 #[tokio::test]
 async fn step_7_1_same_overflow_fixture_characterizes_recovery_signals() {
     let chat_provider = Arc::new(FixtureProvider::new(overflow_then_final_script()));
-    let chat_actions = run_chat_fixture(Arc::clone(&chat_provider), None, CancellationToken::new()).await;
+    let chat_actions = run_chat_fixture_with_history(
+        Arc::clone(&chat_provider),
+        None,
+        CancellationToken::new(),
+        overflow_history(),
+    )
+    .await;
     let agent_provider = Arc::new(FixtureProvider::new(overflow_then_final_script()));
-    let (agent_result, agent_history) = run_agent_fixture(
+    let (agent_result, agent_history) = run_agent_fixture_with_history(
         Arc::clone(&agent_provider),
         Vec::new(),
         CancellationToken::new(),
         None,
         None,
+        overflow_history(),
     )
     .await;
 

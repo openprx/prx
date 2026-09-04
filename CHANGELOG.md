@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.102] - 4 September 2026
+
+### Fixed
+
+- Normalize macOS `/var` and `/private/var` aliases before enforcing
+  workspace ownership, while preserving symlink-escape and traversal checks
+  for media artifacts and evolution rollback writes.
+- Reliably reap and classify macOS process groups and zombies after session
+  cancellation, including detached descendants and PTY-backed commands.
+- Run WASM plugins through one process-shared engine and use Wasmtime's
+  POSIX-signal trap backend on macOS. Concurrent shell/session-worker activity
+  can no longer abort the test process from Wasmtime's Mach-port handler.
+
+### Tests
+
+- Make provider deadline, Lucid context merge, process cleanup, and WASM
+  resource-limit coverage deterministic under the default parallel test runner.
+
 ## [0.8.101] - 4 September 2026
 
 ### Fixed

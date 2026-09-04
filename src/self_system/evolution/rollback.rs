@@ -1,5 +1,5 @@
 use crate::self_system::evolution::record::EvolutionLayer;
-use crate::self_system::evolution::safety_utils::{atomic_write, validate_path_in_workspace};
+use crate::self_system::evolution::safety_utils::{atomic_write, resolve_path_in_workspace};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -162,19 +162,7 @@ impl RollbackManager {
 }
 
 fn normalize_path_in_workspace(workspace_root: &Path, path: &Path) -> Result<PathBuf> {
-    let rel = if path.is_absolute() {
-        path.strip_prefix(workspace_root).with_context(|| {
-            format!(
-                "path is outside workspace root: path={}, workspace_root={}",
-                path.display(),
-                workspace_root.display()
-            )
-        })?
-    } else {
-        path
-    };
-
-    validate_path_in_workspace(workspace_root, rel)
+    resolve_path_in_workspace(workspace_root, path)
 }
 
 fn sanitize_version_id(version_id: &str) -> Result<String> {

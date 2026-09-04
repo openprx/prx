@@ -60,19 +60,34 @@ fn normalize_target_in_workspace(workspace_root: &Path, target: &Path) -> Result
     let canonical_root = workspace_root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize workspace root: {}", workspace_root.display()))?;
-    let relative = if target.is_absolute() {
-        target.strip_prefix(&canonical_root).with_context(|| {
-            format!(
-                "target path is outside workspace: target={}, workspace={}",
-                target.display(),
-                canonical_root.display()
-            )
-        })?
+    // Normalize before comparing prefixes.  On macOS, tempfile and callers can
+    // spell the same directory through `/var/...` while `canonicalize` returns
+    // `/private/var/...`; a lexical prefix check would reject a path that is
+    // physically inside the workspace.  `canonicalize_for_workspace_target`
+    // resolves only existing ancestors, so this remains valid for a target that
+    // is about to be created and the later re-check still closes swap races.
+    let requested = if target.is_absolute() {
+        canonicalize_for_workspace_target(target)?
     } else {
-        target
+        canonicalize_for_workspace_target(&canonical_root.join(target))?
     };
+    let relative = requested.strip_prefix(&canonical_root).with_context(|| {
+        format!(
+            "target path is outside workspace: target={}, workspace={}",
+            requested.display(),
+            canonical_root.display()
+        )
+    })?;
     let canonical_target = validate_path_in_workspace(&canonical_root, relative)?;
     Ok((canonical_root, canonical_target))
+}
+
+/// Resolve a relative path, or an absolute path physically inside the
+/// workspace, to its canonical workspace-owned target. This is the shared
+/// entry point for evolution components that receive paths from persisted
+/// proposals or rollback metadata.
+pub(crate) fn resolve_path_in_workspace(workspace_root: &Path, target: &Path) -> Result<PathBuf> {
+    normalize_target_in_workspace(workspace_root, target).map(|(_, target)| target)
 }
 
 async fn ensure_atomic_tmp_dir(canonical_root: &Path) -> Result<PathBuf> {
@@ -307,7 +322,7 @@ mod tests {
         let nested = target.parent().unwrap().to_path_buf();
         let outside_link = outside.path().join("escaped");
         let _hook = set_atomic_write_test_hook(
-            target.clone(),
+            canonicalize_for_workspace_target(&target).unwrap(),
             Box::new(move || {
                 let _ = std::fs::remove_dir_all(&nested);
                 let _ = symlink(&outside_link, &nested);

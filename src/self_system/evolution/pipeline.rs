@@ -12,7 +12,9 @@ use crate::self_system::evolution::record::{
 };
 use crate::self_system::evolution::rollback::RollbackManager;
 use crate::self_system::evolution::run_engine_cycle;
-use crate::self_system::evolution::safety_utils::{acquire_file_lock, validate_path_in_workspace};
+use crate::self_system::evolution::safety_utils::{
+    acquire_file_lock, resolve_path_in_workspace, validate_path_in_workspace,
+};
 use crate::self_system::evolution::storage::AsyncJsonlWriter;
 use crate::self_system::evolution::trace::generate_experiment_id;
 use anyhow::Result;
@@ -360,12 +362,7 @@ impl EvolutionPipeline {
             | crate::self_system::evolution::ChangeTarget::CronFile { path }
             | crate::self_system::evolution::ChangeTarget::WorkspaceFile { path } => path,
         };
-        let target_rel = if Path::new(raw_target).is_absolute() {
-            Path::new(raw_target).strip_prefix(&self.workspace_root)?
-        } else {
-            Path::new(raw_target)
-        };
-        let target_path = validate_path_in_workspace(&self.workspace_root, target_rel)?;
+        let target_path = resolve_path_in_workspace(&self.workspace_root, Path::new(raw_target))?;
 
         let rollback_dir = infer_rollback_dir(&self.workspace_root, &layer)?;
         let max_versions = self.shared_config.load_full().rollback.max_versions;
@@ -1115,7 +1112,7 @@ mod tests {
             .rollback_cycle(EvolutionLayer::Prompt, Some(&proposal))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("parent traversal"));
+        assert!(err.to_string().contains("outside workspace"));
     }
 
     #[tokio::test]

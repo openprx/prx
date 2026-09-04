@@ -210,7 +210,7 @@ pub(super) async fn kill_process_group(pgid: i32) -> Result<()> {
     if term != 0 {
         let err = std::io::Error::last_os_error();
         // ESRCH = the group already exited; treat as success (idempotent kill).
-        if err.raw_os_error() == Some(libc::ESRCH) {
+        if err.raw_os_error() == Some(libc::ESRCH) || process_group_leader_is_gone(pgid) {
             return Ok(());
         }
         return Err(anyhow!("killpg(SIGTERM, {pgid}) failed: {err}"));
@@ -229,7 +229,7 @@ pub(super) async fn kill_process_group(pgid: i32) -> Result<()> {
     let kill = unsafe { libc::killpg(pgid, libc::SIGKILL) };
     if kill != 0 {
         let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::ESRCH) {
+        if err.raw_os_error() != Some(libc::ESRCH) && !process_group_leader_is_gone(pgid) {
             return Err(anyhow!("killpg(SIGKILL, {pgid}) failed: {err}"));
         }
     }
@@ -249,9 +249,24 @@ fn process_group_alive(pgid: i32) -> bool {
     if rc == 0 {
         return true;
     }
-    // ESRCH = no such group (gone). Any other errno (e.g. EPERM) means the group
-    // still exists; treat as alive so we still attempt the SIGKILL escalation.
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    // macOS reports `EPERM` for an already-empty session group after its leader
+    // has exited. Verify that the leader PID is gone before accepting that
+    // platform-specific result; a live but unsignalable group remains alive.
+    let error = std::io::Error::last_os_error();
+    error.raw_os_error() != Some(libc::ESRCH) && !process_group_leader_is_gone(pgid)
+}
+
+/// macOS can return `EPERM` rather than `ESRCH` when probing or re-signalling a
+/// session group whose leader has already exited. Only use this as a benign
+/// condition after proving that the leader PID itself no longer resolves.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub(super) fn process_group_leader_is_gone(pgid: i32) -> bool {
+    // SAFETY: `getpgid` only queries kernel process-group metadata.
+    if unsafe { libc::getpgid(pgid) } != -1 {
+        return false;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 /// Spawn a background non-interactive shell command.

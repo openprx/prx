@@ -2452,17 +2452,41 @@ mod tests {
     async fn buffered_response_survives_past_the_old_two_minute_deadline() {
         use axum::Json;
         use axum::Router;
+        use axum::extract::State;
         use axum::routing::post;
+        use std::sync::Arc;
         use tokio::net::TcpListener;
+        use tokio::sync::Notify;
 
-        async fn slow_but_healthy() -> Json<serde_json::Value> {
-            tokio::time::sleep(std::time::Duration::from_secs(121)).await;
+        #[derive(Clone)]
+        struct SlowServerState {
+            request_started: Arc<Notify>,
+            delay_armed: Arc<Notify>,
+        }
+
+        async fn slow_but_healthy(State(state): State<SlowServerState>) -> Json<serde_json::Value> {
+            state.request_started.notify_one();
+            let delay = tokio::time::sleep(std::time::Duration::from_secs(121));
+            tokio::pin!(delay);
+            std::future::poll_fn(|context| {
+                // Signal only after polling the timer once, which registers it
+                // with Tokio's paused clock before the test advances time.
+                state.delay_armed.notify_one();
+                delay.as_mut().poll(context)
+            })
+            .await;
             Json(serde_json::json!({
                 "choices": [{"message": {"content": "slow but healthy"}}]
             }))
         }
 
-        let app = Router::new().route("/chat/completions", post(slow_but_healthy));
+        let state = SlowServerState {
+            request_started: Arc::new(Notify::new()),
+            delay_armed: Arc::new(Notify::new()),
+        };
+        let app = Router::new()
+            .route("/chat/completions", post(slow_but_healthy))
+            .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("test: bind");
         let addr = listener.local_addr().expect("test: addr");
         tokio::spawn(async move {
@@ -2470,9 +2494,16 @@ mod tests {
         });
 
         let provider = make_provider("custom", &format!("http://{addr}"), Some("test-key"));
-        let response = provider
-            .chat_with_system(None, "hello", "test-model", 0.0)
+        let request = tokio::spawn(async move { provider.chat_with_system(None, "hello", "test-model", 0.0).await });
+        // Let the client task start its local connection before waiting on the
+        // server-side rendezvous under Tokio's paused clock.
+        tokio::task::yield_now().await;
+        state.request_started.notified().await;
+        state.delay_armed.notified().await;
+        tokio::time::advance(std::time::Duration::from_secs(121)).await;
+        let response = request
             .await
+            .expect("test: buffered request task joins")
             .expect("test: a healthy buffered response has no whole-response deadline");
 
         assert_eq!(response, "slow but healthy");

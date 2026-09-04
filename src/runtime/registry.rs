@@ -1032,7 +1032,43 @@ fn probe_process(pid: u32) -> ProcessLiveness {
     }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn probe_process(pid: u32) -> ProcessLiveness {
+    let Ok(pid) = i32::try_from(pid) else {
+        return ProcessLiveness::Gone;
+    };
+
+    // Darwin has no procfs, but libproc exposes the BSD process state without
+    // reaping the child.  `kill(pid, 0)` alone reports success for a zombie,
+    // which made a completed child appear to be an indefinitely running one.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let expected = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).unwrap_or(i32::MAX);
+    let received = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), expected) };
+    if received == expected {
+        return if info.pbi_status == libc::SZOMB {
+            ProcessLiveness::Zombie
+        } else {
+            ProcessLiveness::Running
+        };
+    }
+
+    // Darwin's libproc returns ESRCH for a zombie, while `kill(pid, 0)` still
+    // succeeds until the owner reaps it. That pair is the non-procfs equivalent
+    // of Linux's `/proc/<pid>/stat` `Z` state.
+    let proc_error = std::io::Error::last_os_error();
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        if proc_error.raw_os_error() == Some(libc::ESRCH) {
+            ProcessLiveness::Zombie
+        } else {
+            ProcessLiveness::Running
+        }
+    } else {
+        ProcessLiveness::Gone
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 #[allow(unsafe_code)]
 fn probe_process(pid: u32) -> ProcessLiveness {
     let Ok(pid) = i32::try_from(pid) else {

@@ -505,11 +505,15 @@ fn read_workspace_source_bounded_unix(
 
     let requested = Path::new(source);
     let relative = if requested.is_absolute() {
-        requested
-            .strip_prefix(workspace_dir)
-            .map_err(|_| ArtifactError::OutsideWorkspace(source.to_string()))?
+        match requested.strip_prefix(workspace_dir) {
+            Ok(relative) => relative.to_path_buf(),
+            Err(_) => canonicalize_source_parent(requested)?
+                .strip_prefix(workspace_dir)
+                .map(Path::to_path_buf)
+                .map_err(|_| ArtifactError::OutsideWorkspace(source.to_string()))?,
+        }
     } else {
-        requested
+        requested.to_path_buf()
     };
     let mut components = Vec::<OsString>::new();
     let mut normalized = PathBuf::new();
@@ -559,6 +563,41 @@ fn read_workspace_source_bounded_unix(
     let display_path = workspace_dir.join(normalized);
     let bytes = read_open_file_bounded(file, &display_path, max_bytes)?;
     Ok((bytes, display_path))
+}
+
+/// Canonicalize the ancestors of an absolute source while preserving its final
+/// component.  This accepts platform aliases such as macOS `/var` and
+/// `/private/var` without following a final-file symlink: `openat` below still
+/// uses `O_NOFOLLOW`, which preserves the admission race protection.
+#[cfg(unix)]
+fn canonicalize_source_parent(path: &Path) -> Result<PathBuf, ArtifactError> {
+    use std::ffi::OsString;
+
+    let leaf = path
+        .file_name()
+        .map(OsString::from)
+        .ok_or_else(|| ArtifactError::InvalidLocalFile(path.display().to_string()))?;
+    let mut parent = path
+        .parent()
+        .ok_or_else(|| ArtifactError::InvalidLocalFile(path.display().to_string()))?;
+    let mut missing = Vec::new();
+    while parent.canonicalize().is_err() {
+        let name = parent
+            .file_name()
+            .map(OsString::from)
+            .ok_or_else(|| ArtifactError::InvalidLocalFile(path.display().to_string()))?;
+        missing.push(name);
+        parent = parent
+            .parent()
+            .ok_or_else(|| ArtifactError::InvalidLocalFile(path.display().to_string()))?;
+    }
+
+    let mut resolved = parent.canonicalize().map_err(|error| io_error(parent, error))?;
+    while let Some(segment) = missing.pop() {
+        resolved.push(segment);
+    }
+    resolved.push(leaf);
+    Ok(resolved)
 }
 
 pub(crate) async fn read_response_bounded(
@@ -719,7 +758,7 @@ mod tests {
         std::fs::write(&source, [7_u8; 16]).unwrap();
         let hint = TypeHint::new();
         let artifact = owner.import_channel_file(&source, &hint, 16).await.unwrap();
-        assert!(artifact.path.starts_with(temp.path()));
+        assert!(artifact.path.starts_with(owner.artifact_dir()));
         assert_eq!(artifact.size_bytes, 16);
         assert_eq!(std::fs::read(&artifact.path).unwrap(), [7_u8; 16]);
         // Unrecognised bytes keep the source file's own suffix rather than

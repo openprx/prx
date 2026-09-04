@@ -702,9 +702,18 @@ mod tests {
         let temp = TempDir::new().expect("temp dir");
         let process = adapter();
         let started = tokio::time::Instant::now();
+        // macOS does not ship the util-linux `setsid` executable.  Its system
+        // Python exposes the same POSIX syscall, so keep the test's detached
+        // descendant contract without making the suite Linux-command dependent.
+        let detached = if cfg!(target_os = "macos") {
+            "python3 -c 'import os; os.setsid(); open(\"setsid.pid\", \"w\").write(str(os.getpid())); os.execvp(\"sleep\", [\"sleep\", \"30\"])'"
+        } else {
+            "setsid sh -c 'echo $$ > setsid.pid; exec sleep 30'"
+        };
+        let command = format!("{detached} >&2 & while [ ! -s setsid.pid ]; do :; done; exit 0");
         let result = process
             .execute(ShellProcessRequest {
-                command: "setsid sh -c 'echo $$ > setsid.pid; exec sleep 30' >&2 & while [ ! -s setsid.pid ]; do :; done; exit 0",
+                command: &command,
                 workspace_dir: temp.path(),
                 timeout: Some(Duration::from_millis(100)),
                 cancellation: None,

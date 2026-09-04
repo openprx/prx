@@ -999,7 +999,7 @@ impl PtyShellSession {
                     let errno = std::io::Error::last_os_error();
                     // `ESRCH` (no such process group) is the expected, benign
                     // outcome when the child already exited — not worth warning.
-                    if errno.raw_os_error() != Some(libc::ESRCH) {
+                    if errno.raw_os_error() != Some(libc::ESRCH) && !super::shell::process_group_leader_is_gone(pgid) {
                         tracing::warn!(
                             pgid,
                             hup_rc = hup,

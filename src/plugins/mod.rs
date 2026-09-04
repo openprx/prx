@@ -37,8 +37,8 @@ pub mod runtime;
 pub use runtime::{PluginRuntime, init_plugin_runtime};
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use error::{PluginError, PluginResult};
@@ -50,6 +50,38 @@ use crate::tools::Tool;
 
 const MAX_PLUGIN_WASM_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_PLUGIN_COUNT: usize = 256;
+
+/// Wasmtime's macOS trap handler owns process-global Mach port state. Creating
+/// independent engines concurrently can let one engine tear down that state
+/// while another still uses it, which aborts the process from Wasmtime's
+/// handler thread. All PRX plugin managers use identical engine settings, so
+/// one shared engine is both the safe and the intended ownership model.
+static WASM_ENGINE: LazyLock<Result<wasmtime::Engine, String>> = LazyLock::new(|| {
+    let mut config = wasmtime::Config::new();
+    config.wasm_component_model(true);
+    config.consume_fuel(true);
+    // Wasmtime's default Mach-port trap handler is process-global and cannot
+    // safely cross the fork-heavy process model used by PRX for shell and
+    // session workers. Keep WASM traps in the supported POSIX-signal backend
+    // on macOS so a child process cannot make the parent's handler abort.
+    #[cfg(target_os = "macos")]
+    config.macos_use_mach_ports(false);
+    #[cfg(target_has_atomic = "64")]
+    config.epoch_interruption(true);
+
+    let engine = wasmtime::Engine::new(&config).map_err(|error| error.to_string())?;
+    spawn_epoch_ticker(&engine);
+    Ok(engine)
+});
+
+fn shared_wasm_engine() -> PluginResult<wasmtime::Engine> {
+    match &*WASM_ENGINE {
+        Ok(engine) => Ok(engine.clone()),
+        Err(error) => Err(PluginError::Compilation(format!(
+            "failed to create shared wasmtime engine: {error}"
+        ))),
+    }
+}
 
 /// Aggregated performance metrics for the plugin system.
 #[derive(Debug, Default)]
@@ -146,15 +178,7 @@ impl PluginManager {
     /// A `PrecompileCache` is created at `<plugins_dir>/.cwasm-cache/` to
     /// avoid recompiling unchanged plugins on every restart.
     pub fn new(plugins_dir: PathBuf) -> PluginResult<Self> {
-        let mut config = wasmtime::Config::new();
-        config.wasm_component_model(true);
-        config.consume_fuel(true);
-        #[cfg(target_has_atomic = "64")]
-        config.epoch_interruption(true);
-
-        let engine = wasmtime::Engine::new(&config)
-            .map_err(|e| PluginError::Compilation(format!("failed to create wasmtime engine: {e}")))?;
-        spawn_epoch_ticker(&engine);
+        let engine = shared_wasm_engine()?;
 
         let cache_dir = plugins_dir.join(".cwasm-cache");
         let precompile_cache = PrecompileCache::new(cache_dir).map_err(PluginError::Io)?;
@@ -1015,6 +1039,16 @@ mod tests {
         let tmp = tempfile::tempdir().expect("test: tempdir");
         let manager = PluginManager::new(tmp.path().to_path_buf());
         assert!(manager.is_ok());
+    }
+
+    #[test]
+    fn managers_share_the_process_wasm_engine() {
+        let first_dir = tempfile::tempdir().expect("test: first tempdir");
+        let second_dir = tempfile::tempdir().expect("test: second tempdir");
+        let first = PluginManager::new(first_dir.path().to_path_buf()).expect("test: first manager");
+        let second = PluginManager::new(second_dir.path().to_path_buf()).expect("test: second manager");
+
+        assert!(wasmtime::Engine::same(&first.engine, &second.engine));
     }
 
     #[test]
