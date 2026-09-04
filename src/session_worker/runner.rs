@@ -29,6 +29,21 @@ You are a sub-agent handling a specific delegated task. \
 Complete the task thoroughly and report results concisely. \
 Focus only on the assigned task; do not ask clarifying questions.";
 
+/// Resolve credentials for the worker's LLM provider without leaking the
+/// gateway's default credentials or base URL into an explicitly overridden
+/// provider.  A worker can carry an explicit per-agent key in its manifest;
+/// otherwise only the configured default provider inherits root credentials.
+fn worker_provider_credentials<'a>(
+    manifest: &'a WorkerManifest,
+    config: &'a Config,
+) -> (Option<&'a str>, Option<&'a str>) {
+    let uses_default_provider = config.default_provider.as_deref() == Some(manifest.provider_name.as_str());
+    let inherited_api_key = uses_default_provider.then_some(config.api_key.as_deref()).flatten();
+    let api_key = manifest.api_key.as_deref().or(inherited_api_key);
+    let api_url = uses_default_provider.then_some(config.api_url.as_deref()).flatten();
+    (api_key, api_url)
+}
+
 fn write_worker_result(result: &WorkerResult) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     let json = serde_json::to_string(result).context("serialize worker result")?;
@@ -631,10 +646,11 @@ async fn run_validated_manifest(
             None
         };
 
+    let (provider_api_key, provider_api_url) = worker_provider_credentials(&manifest, &config);
     let provider: Arc<dyn Provider> = Arc::from(crate::providers::create_resilient_provider_with_options(
         &manifest.provider_name,
-        manifest.api_key.as_deref().or(config.api_key.as_deref()),
-        config.api_url.as_deref(),
+        provider_api_key,
+        provider_api_url,
         &config.reliability,
         &provider_runtime_options,
     )?);
@@ -1409,6 +1425,31 @@ mod tests {
             parent_run_id: None,
             compaction_config: None,
         }
+    }
+
+    #[test]
+    fn worker_keeps_gateway_credentials_out_of_an_overridden_provider() {
+        let mut manifest = base_manifest(Path::new("/tmp/worker-credentials"), "capability");
+        let mut config = Config::default();
+        config.default_provider = Some("qwen-gateway".to_string());
+        config.api_key = Some("gateway-key".to_string());
+        config.api_url = Some("http://gateway.invalid/v1".to_string());
+
+        manifest.provider_name = "kimi-code".to_string();
+        let (api_key, api_url) = worker_provider_credentials(&manifest, &config);
+        assert_eq!(api_key, None);
+        assert_eq!(api_url, None);
+
+        manifest.api_key = Some("kimi-key".to_string());
+        let (api_key, api_url) = worker_provider_credentials(&manifest, &config);
+        assert_eq!(api_key, Some("kimi-key"));
+        assert_eq!(api_url, None);
+
+        manifest.provider_name = "qwen-gateway".to_string();
+        manifest.api_key = None;
+        let (api_key, api_url) = worker_provider_credentials(&manifest, &config);
+        assert_eq!(api_key, Some("gateway-key"));
+        assert_eq!(api_url, Some("http://gateway.invalid/v1"));
     }
 
     #[test]

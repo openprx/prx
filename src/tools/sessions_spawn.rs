@@ -897,6 +897,59 @@ pub struct SessionsSpawnTool {
     batch_rosters: Arc<RwLock<Vec<BatchRoster>>>,
 }
 
+/// Select a credential for a child provider. The gateway fallback is scoped to
+/// the gateway provider and must not override another provider's auth profile.
+fn resolve_child_provider_api_key(
+    selected_agent_api_key: Option<String>,
+    fallback_api_key: Option<String>,
+    child_provider_name: &str,
+    gateway_provider_name: &str,
+) -> Option<String> {
+    if selected_agent_api_key.is_some() {
+        selected_agent_api_key
+    } else if child_provider_name == gateway_provider_name {
+        fallback_api_key
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::resolve_child_provider_api_key;
+
+    #[test]
+    fn gateway_fallback_is_not_forwarded_to_an_overridden_provider() {
+        assert_eq!(
+            resolve_child_provider_api_key(
+                None,
+                Some("qwen-key".to_string()),
+                "kimi-code",
+                "custom:http://127.0.0.1:18082/v1",
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_child_provider_api_key(
+                Some("kimi-key".to_string()),
+                Some("qwen-key".to_string()),
+                "kimi-code",
+                "custom:http://127.0.0.1:18082/v1",
+            ),
+            Some("kimi-key".to_string())
+        );
+        assert_eq!(
+            resolve_child_provider_api_key(
+                None,
+                Some("qwen-key".to_string()),
+                "custom:http://127.0.0.1:18082/v1",
+                "custom:http://127.0.0.1:18082/v1",
+            ),
+            Some("qwen-key".to_string())
+        );
+    }
+}
+
 /// One member of a fan-out, as it was launched.
 #[derive(Debug, Clone)]
 struct BatchMember {
@@ -3075,16 +3128,24 @@ impl SessionsSpawnTool {
             .as_ref()
             .and_then(|(_, cfg)| cfg.temperature)
             .unwrap_or(self.temperature);
-        let resolved_api_key = selected_agent
-            .as_ref()
-            .and_then(|(_, cfg)| {
-                cfg.api_key
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string)
-            })
-            .or_else(|| self.fallback_api_key.clone());
+        let selected_agent_api_key = selected_agent.as_ref().and_then(|(_, cfg)| {
+            cfg.api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+        // A gateway key is only meaningful for the gateway provider.  Passing
+        // it to an explicitly selected provider overrides that provider's own
+        // auth-profile lookup and reliably produces an authentication failure
+        // when the vendors differ (for example, Qwen gateway -> Kimi child).
+        // A named agent key remains an explicit credential for that agent.
+        let resolved_api_key = resolve_child_provider_api_key(
+            selected_agent_api_key,
+            self.fallback_api_key.clone(),
+            &resolved_provider_name,
+            &self.provider_name,
+        );
         let memory_fabric = self.memory.as_ref().map(|memory| {
             MemoryFabric::new(memory.clone(), self.workspace_dir.to_string_lossy())
                 .with_event_recording(self.event_recording)

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.99] - 4 September 2026
+
+### Fixed
+
+- Publish structurally valid WASM tool schemas so strict function-calling
+  providers, including K3, can call `wasm_plugins_manage`.
+- Keep default-provider credentials and base URLs out of process-mode child
+  agents that explicitly select a different provider. Qwen-parent/K3-child
+  runs now use the K3 auth profile instead of receiving the Qwen key.
+
+### Tests
+
+- Cover WASM schema validity and process-worker credential isolation, then
+  verify a full-screen Chat Qwen-to-K3 OS-process delegation end to end.
+
 ## [0.8.98] - 3 September 2026
 
 ### Fixed
