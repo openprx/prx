@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.100] - 4 September 2026
+
+### Fixed
+
+- Preserve a named delegate agent's non-empty system prompt when a
+  `sessions_spawn(mode="process")` worker is created. The signed worker
+  manifest now carries the same execution contract as task-mode delegation.
+
+### Tests
+
+- Assert that a process worker manifest retains the resolved agent prompt.
+
 ## [0.8.99] - 4 September 2026
 
 ### Fixed

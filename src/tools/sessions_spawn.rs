@@ -3257,6 +3257,17 @@ impl SessionsSpawnTool {
                     .filter(|value| !value.is_empty())
                     .map(str::to_string)
             });
+            // Process workers need the same explicit agent contract as task-mode
+            // children.  Without carrying this prompt into the signed manifest,
+            // a named agent's tool-use and completion instructions silently vanish
+            // at the OS-process boundary.
+            let process_system_prompt = selected_agent.as_ref().and_then(|(_, cfg)| {
+                cfg.system_prompt
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            });
             let task_owned = task.to_string();
             let rid = run_id.clone();
             let process_scope = spawn_scope.clone();
@@ -3331,6 +3342,7 @@ impl SessionsSpawnTool {
                                 &workspace_root,
                                 &worker_workspace_root,
                                 identity_dir.as_deref(),
+                                process_system_prompt.as_deref(),
                                 &allowed_tools,
                                 keep_workspace,
                                 process_scope.as_ref(),
@@ -5224,6 +5236,7 @@ fn build_session_worker_manifest(
     config_dir: std::path::PathBuf,
     config_generation: &str,
     agent_id: Option<&str>,
+    agent_system_prompt: Option<&str>,
     event_recording: MemoryEventRecording,
     allowed_tools: &[String],
     identity_dir: Option<String>,
@@ -5257,7 +5270,7 @@ fn build_session_worker_manifest(
         persona_id: None,
         memory_event_recording: event_recording,
         allowed_tools: allowed_tools.to_vec(),
-        system_prompt: None,
+        system_prompt: agent_system_prompt.map(str::to_string),
         identity_dir,
         scope_sender: scope.map(|ctx| ctx.sender.clone()),
         scope_channel: scope.map(|ctx| ctx.channel.clone()),
@@ -5884,6 +5897,7 @@ async fn run_sub_agent_process(
     workspace_root: &std::path::Path,
     worker_workspace_root: &std::path::Path,
     agent_identity_dir: Option<&str>,
+    agent_system_prompt: Option<&str>,
     allowed_tools: &[String],
     keep_workspace: bool,
     scope: Option<&SpawnScope>,
@@ -5964,6 +5978,7 @@ async fn run_sub_agent_process(
         config_dir.to_path_buf(),
         config_generation,
         agent_id,
+        agent_system_prompt,
         event_recording,
         allowed_tools,
         identity_dir,
@@ -6868,6 +6883,7 @@ mod tests {
             temp.path().join("config"),
             &"0".repeat(64),
             None,
+            Some("Use tools before reporting completion."),
             MemoryEventRecording::default(),
             &[],
             None,
@@ -6883,6 +6899,10 @@ mod tests {
         let manifest_config = manifest.compaction_config.expect("manifest compaction config");
         assert_eq!(manifest_config.max_context_tokens, 200_000);
         assert_eq!(manifest.model, "small-child");
+        assert_eq!(
+            manifest.system_prompt.as_deref(),
+            Some("Use tools before reporting completion.")
+        );
         assert_ne!(manifest_config.max_context_tokens, 1_000_000);
         assert_eq!(manifest.runtime_config_generation_id, Some(17));
         assert_eq!(manifest.runtime_config_source_revision.as_deref(), Some("revision-17"));
