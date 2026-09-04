@@ -16,7 +16,7 @@ use crate::session_worker::protocol::{WorkerControlFrame, WorkerManifest, Worker
 use crate::tools::sessions_spawn::{
     SPAWN_EXECUTION_CONTEXT, STEER_CHANNEL_CAPACITY, SpawnExecutionContext, steering_instruction,
 };
-use crate::tools::{self, Tool};
+use crate::tools::{self, Tool, tool_name_is_exposed};
 use anyhow::{Context, Result};
 use std::future::Future;
 use std::io::{BufRead, Write};
@@ -226,6 +226,50 @@ fn resolve_system_prompt(manifest: &WorkerManifest) -> String {
     }
 
     DEFAULT_SUB_AGENT_SYSTEM_PROMPT.to_string()
+}
+
+/// Build the worker's leading system message from the same runtime prompt
+/// builder used by interactive chat and channel turns.
+///
+/// A process worker used to receive only the short delegated-agent instruction.
+/// That omitted the normal Chat contract (available tools, working directory,
+/// native-tool guidance, safety, skills, and runtime context). Native-tool
+/// models could then produce a plausible prose completion without ever calling
+/// the ToolSpecs that were present on the request. Keep an explicit agent
+/// prompt as the final, task-specific section, but make the common execution
+/// contract identical to the other agentic entrypoints.
+fn build_worker_system_prompt(
+    manifest: &WorkerManifest,
+    config: &Config,
+    tools_registry: &[Box<dyn Tool>],
+    native_tools: bool,
+) -> String {
+    // The worker may use an isolated workspace. Prompt rendering must describe
+    // that workspace (and load its skills), rather than the parent process's
+    // configured workspace path.
+    let mut worker_config = config.clone();
+    worker_config.workspace_dir = manifest.workspace_dir.clone();
+
+    let skills = crate::skills::load_skills_with_config(&manifest.workspace_dir, &worker_config);
+    let tool_descs = tools_registry
+        .iter()
+        .filter(|tool| tool_name_is_exposed(tool.name(), false))
+        .map(|tool| (tool.name(), tool.description()))
+        .collect::<Vec<_>>();
+    let runtime_prompt = crate::agent::loop_::build_runtime_system_prompt(
+        &worker_config,
+        &manifest.model,
+        &tool_descs,
+        &skills,
+        native_tools,
+        tools_registry,
+        Some(&manifest.task),
+    );
+    let delegated_prompt = resolve_system_prompt(manifest);
+
+    format!(
+        "{runtime_prompt}\n\n## Delegated Agent Instructions\n\n{delegated_prompt}\n\n## Execution Integrity\n\nWhen the delegated task requires reading, writing, running, or verifying files, perform those operations with the provided tools before reporting completion. Never claim that a file, command, or check succeeded unless the corresponding tool actually produced the result."
+    )
 }
 
 fn parse_tools_override(tools_json: &str) -> Result<Vec<String>> {
@@ -760,7 +804,13 @@ async fn run_validated_manifest(
     .tools;
 
     let tools_registry = select_tools_for_worker(full_tools, &manifest.allowed_tools)?;
-    let system_prompt = resolve_system_prompt(&manifest);
+    let native_tools = provider
+        .capabilities_for(
+            &manifest.model,
+            crate::providers::traits::ProviderRequestMode::NonStreaming,
+        )
+        .native_tool_calling;
+    let system_prompt = build_worker_system_prompt(&manifest, &config, &tools_registry, native_tools);
     let shared_context = load_worker_shared_context(&manifest, &config, memory.as_ref()).await;
     let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
         manifest.provider_name.clone(),
@@ -1468,6 +1518,27 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("exclusively"));
+    }
+
+    #[test]
+    fn worker_system_prompt_keeps_chat_tool_contract_and_agent_instructions() {
+        let workspace = tempfile::TempDir::new().expect("workspace");
+        let mut config = Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        let mut manifest = base_manifest(workspace.path(), "capability");
+        manifest.model = "k3".to_string();
+        manifest.system_prompt = Some("Use file tools and verify every artifact.".to_string());
+        let tools_registry = crate::tools::default_tools(Arc::new(crate::security::SecurityPolicy::default()));
+
+        let prompt = build_worker_system_prompt(&manifest, &config, &tools_registry, true);
+
+        assert!(prompt.contains("## Tools"));
+        assert!(prompt.contains("file_read"));
+        assert!(prompt.contains("Working directory: `"));
+        assert!(prompt.contains("Use tools when the request requires action"));
+        assert!(prompt.contains("## Delegated Agent Instructions"));
+        assert!(prompt.contains("Use file tools and verify every artifact."));
+        assert!(prompt.contains("Never claim that a file, command, or check succeeded"));
     }
 
     /// A fake agent-loop segment: parks until cancelled for its first

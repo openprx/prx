@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.101] - 4 September 2026
+
+### Fixed
+
+- Give `sessions_spawn(mode="process")` workers the same runtime system
+  prompt contract as Chat: exposed tools, workspace, skills, safety, and
+  native-tool guidance are now present before agent-specific instructions.
+  Workers no longer rely on a short generic delegate prompt that allowed a
+  tool-capable model to return an unverified prose-only completion.
+
+### Tests
+
+- Assert that a worker prompt retains both the Chat tool contract and its named
+  agent instructions.
+
 ## [0.8.100] - 4 September 2026
 
 ### Fixed
