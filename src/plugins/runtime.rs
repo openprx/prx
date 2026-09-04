@@ -1063,7 +1063,18 @@ impl Tool for PluginManageTool {
                 "stage": {"type": "string", "enum": ["inbound", "outbound", "llm_request", "llm_response"]},
                 "data": {"description": "JSON envelope for middleware_test"},
                 "message": {"type": "string", "description": "Single user message for provider_chat"},
-                "messages": {"type": "array", "items": {"type": "object", "required": ["role", "content"]}},
+                "messages": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "role": {"type": "string", "enum": ["system", "user", "assistant", "tool"]},
+                            "content": {"type": "string"}
+                        },
+                        "required": ["role", "content"],
+                        "additionalProperties": false
+                    }
+                },
                 "model": {"type": "string"},
                 "temperature": {"type": "number"},
                 "key": {"type": "string"},
@@ -1262,10 +1273,19 @@ impl Tool for PluginToolRouter {
             .collect::<Vec<_>>();
         names.sort();
         names.dedup();
+        let mut tool_schema = serde_json::json!({
+            "type": "string",
+            "description": "Tool name exported by the active WASM plugin generation"
+        });
+        if !names.is_empty()
+            && let Some(object) = tool_schema.as_object_mut()
+        {
+            object.insert("enum".to_string(), serde_json::json!(names));
+        }
         serde_json::json!({
             "type": "object",
             "properties": {
-                "tool": {"type": "string", "enum": names},
+                "tool": tool_schema,
                 "arguments": {"type": "object", "default": {}}
             },
             "required": ["tool"],
@@ -1486,6 +1506,10 @@ optional = []
             Some("wasm_plugin_call")
         );
         assert!(router.supports_name("wasm_plugin_call"));
+        assert!(
+            router.parameters_schema()["properties"]["tool"].get("enum").is_none(),
+            "an empty plugin generation must not publish an invalid empty enum"
+        );
 
         let result = status.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
@@ -1518,6 +1542,23 @@ optional = []
                 .is_some_and(|actions| actions.contains(&serde_json::json!("storage_forget")))
                 && condition.pointer("/then/required") == Some(&serde_json::json!(["name"]))
         }));
+
+        let message_items = schema
+            .pointer("/properties/messages/items")
+            .and_then(serde_json::Value::as_object)
+            .expect("messages items should be an object schema");
+        let message_properties = message_items
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("messages items should define its required properties");
+        for required in ["role", "content"] {
+            assert!(
+                message_properties.contains_key(required),
+                "required message property '{required}' must be defined"
+            );
+        }
+        assert_eq!(message_properties["role"]["type"], "string");
+        assert_eq!(message_properties["content"]["type"], "string");
     }
 
     #[tokio::test]
