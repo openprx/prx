@@ -502,7 +502,7 @@ async fn run_quick_setup_with_home(
     } else {
         config.save().await?;
     }
-    persist_workspace_selection(&config.config_path).await?;
+    persist_workspace_selection_at(&config.config_path, &default_user_config_dir(home)).await?;
 
     // Scaffold minimal workspace files
     let default_ctx = ProjectContext {
@@ -1739,6 +1739,20 @@ async fn persist_workspace_selection(config_path: &Path) -> Result<()> {
         .parent()
         .context("Config path must have a parent directory")?;
     crate::config::schema::persist_active_workspace_config_dir(config_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to persist active workspace selection for {}",
+                config_dir.display()
+            )
+        })
+}
+
+async fn persist_workspace_selection_at(config_path: &Path, default_config_dir: &Path) -> Result<()> {
+    let config_dir = config_path
+        .parent()
+        .context("Config path must have a parent directory")?;
+    crate::config::schema::persist_active_workspace_config_dir_at(config_dir, default_config_dir)
         .await
         .with_context(|| {
             format!(
@@ -4647,7 +4661,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "environment-coupled (global HOME/config side effects)"]
     async fn quick_setup_model_override_persists_to_config_toml() {
         let tmp = TempDir::new().unwrap();
 
@@ -4672,7 +4685,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "environment-coupled (global HOME/config side effects)"]
     async fn quick_setup_without_model_uses_provider_default_model() {
         let tmp = TempDir::new().unwrap();
 

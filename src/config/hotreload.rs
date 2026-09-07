@@ -23,7 +23,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -41,6 +41,7 @@ pub struct HotReloadManager {
     /// in which case hot-reload is inactive and the failure was logged.
     _handle: Option<std::thread::JoinHandle<()>>,
     reload_version: Arc<AtomicU64>,
+    ready: Arc<AtomicBool>,
 }
 
 impl HotReloadManager {
@@ -51,13 +52,15 @@ impl HotReloadManager {
     pub fn spawn(config_path: PathBuf, shared: SharedConfig) -> Self {
         let reload_version = Arc::new(AtomicU64::new(0));
         let rv_clone = Arc::clone(&reload_version);
+        let ready = Arc::new(AtomicBool::new(false));
+        let ready_clone = Arc::clone(&ready);
 
         // Dedicated OS thread, not the tokio blocking pool: the watcher blocks
         // on `notify` events until process exit, so a pool slot handed to it is
         // never returned. With no ceiling on concurrent agent work, permanently
         // retired slots are exactly what drives the pool into deadlock.
         let handle = match crate::runtime::blocking::spawn_detached_thread("prx-config-watch", move || {
-            if let Err(e) = run_watcher(config_path, shared, rv_clone) {
+            if let Err(e) = run_watcher(config_path, shared, rv_clone, ready_clone) {
                 tracing::error!("Config hot-reload watcher exited: {e}");
             }
         }) {
@@ -71,6 +74,7 @@ impl HotReloadManager {
         Self {
             _handle: handle,
             reload_version,
+            ready,
         }
     }
 
@@ -78,11 +82,22 @@ impl HotReloadManager {
     pub fn reload_version(&self) -> u64 {
         self.reload_version.load(Ordering::Relaxed)
     }
+
+    /// Whether the OS watcher is installed and its initial content fingerprint
+    /// has been captured. Callers may use this as a startup/readiness signal.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
 }
 
 // ── watcher implementation ────────────────────────────────────────────────────
 
-fn run_watcher(config_path: PathBuf, shared: SharedConfig, reload_version: Arc<AtomicU64>) -> anyhow::Result<()> {
+fn run_watcher(
+    config_path: PathBuf,
+    shared: SharedConfig,
+    reload_version: Arc<AtomicU64>,
+    ready: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
     use notify::RecursiveMode;
     use notify_debouncer_mini::{DebounceEventResult, new_debouncer};
 
@@ -97,6 +112,7 @@ fn run_watcher(config_path: PathBuf, shared: SharedConfig, reload_version: Arc<A
     debouncer.watcher().watch(&watch_root, RecursiveMode::Recursive)?;
 
     let mut last_content_hash = compute_config_fingerprint_gated(&config_path).ok();
+    ready.store(true, Ordering::Release);
 
     tracing::info!(
         path = %config_path.display(),
@@ -165,6 +181,7 @@ fn run_watcher(config_path: PathBuf, shared: SharedConfig, reload_version: Arc<A
         }
     }
 
+    ready.store(false, Ordering::Release);
     Ok(())
 }
 

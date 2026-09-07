@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.103] - 4 September 2026
+
+### Fixed
+
+- Register interruptible Telegram turns in receive order so an older task can
+  never cancel a newer message because of Tokio scheduling order. Completion
+  now also wakes the successor if a turn exits unexpectedly.
+- Keep `HEARTBEAT.md` out of interactive channel prompts, preventing spurious
+  heartbeat acknowledgements in normal conversations.
+- Classify `openprx`, `prx`, and `vano` topics as PRX before checking the
+  overlapping `openpr` alias.
+- Persist quick-setup workspace selection beneath the explicitly supplied home
+  directory instead of leaking state into the process user's real home.
+- Preserve config-generation audit events emitted by filesystem watcher threads
+  by scheduling them on the gateway's captured Tokio runtime.
+- Normalize filesystem-watcher paths before config relevance checks and expose
+  watcher readiness, so macOS `/var` aliases cannot drop hot-reload events.
+
+### Tests
+
+- Restore auto-save, workspace prompt injection, project inference, quick setup,
+  webhook key uniqueness, and Chat session resume regressions to the default
+  test suites.
+
 ## [0.8.102] - 4 September 2026
 
 ### Fixed

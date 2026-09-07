@@ -833,20 +833,14 @@ pub struct TurnRuntimeGeneration {
 struct ConfigGenerationMessageAuditSink {
     memory: Arc<dyn Memory>,
     workspace_id: String,
+    runtime_handle: tokio::runtime::Handle,
 }
 
 impl crate::config::ConfigGenerationAuditSink for ConfigGenerationMessageAuditSink {
     fn record(&self, event: crate::config::ConfigGenerationAuditEvent) {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            tracing::warn!(
-                event_type = %event.event_type,
-                "config generation audit event could not be scheduled outside a Tokio runtime"
-            );
-            return;
-        };
         let memory = Arc::clone(&self.memory);
         let workspace_id = self.workspace_id.clone();
-        handle.spawn(async move {
+        self.runtime_handle.spawn(async move {
             let source_revision = event
                 .source_revision
                 .as_ref()
@@ -1596,6 +1590,7 @@ pub async fn run_gateway(
     shared_config_for_reload.register_audit_sink(Arc::new(ConfigGenerationMessageAuditSink {
         memory: Arc::clone(&mem),
         workspace_id: config.workspace_dir.to_string_lossy().to_string(),
+        runtime_handle: tokio::runtime::Handle::current(),
     }));
 
     let state = AppState {
@@ -3168,6 +3163,59 @@ mod tests {
     struct TestConfigParticipant;
     struct TestPreparedConfig;
 
+    #[tokio::test]
+    async fn config_audit_sink_accepts_events_from_non_runtime_threads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let workspace_id = tmp.path().to_string_lossy().to_string();
+        let sink = Arc::new(ConfigGenerationMessageAuditSink {
+            memory: Arc::clone(&memory),
+            workspace_id: workspace_id.clone(),
+            runtime_handle: tokio::runtime::Handle::current(),
+        });
+        let event = crate::config::ConfigGenerationAuditEvent {
+            event_type: "config.reload.test".to_string(),
+            generation_id: Some(crate::config::ConfigGenerationId(7)),
+            source_revision: None,
+            trigger: crate::config::ConfigReloadTrigger::Test,
+            payload: serde_json::json!({ "source": "watcher-thread" }),
+        };
+
+        std::thread::spawn(move || {
+            crate::config::ConfigGenerationAuditSink::record(sink.as_ref(), event);
+        })
+        .join()
+        .unwrap();
+
+        let principal = MemoryPrincipal {
+            workspace_id,
+            agent_id: Some("config-generation-manager".to_string()),
+            persona_id: None,
+            session_key: Some("config-generation".to_string()),
+            channel: Some("daemon".to_string()),
+            sender: Some("system".to_string()),
+            owner_id: Some("system".to_string()),
+            legacy_session_key: None,
+        };
+        let recorded = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let events = memory.list_message_events_since(&principal, 0, 10).await.unwrap();
+                if let Some(event) = events
+                    .into_iter()
+                    .find(|event| event.event_type == "config.reload.test")
+                {
+                    break event;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("config audit event should be persisted");
+
+        assert_eq!(recorded.config_generation_id, Some(7));
+        assert_eq!(recorded.content, r#"{"source":"watcher-thread"}"#);
+    }
+
     impl crate::config::ConfigGenerationParticipant for TestConfigParticipant {
         fn name(&self) -> &'static str {
             "gateway_test_runtime"
@@ -4710,7 +4758,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "known failure — webhook autosave key dedup needs fix"]
     async fn webhook_autosave_stores_distinct_keys_per_request() {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
@@ -4757,7 +4804,7 @@ mod tests {
             test_connect_info(),
             test_uri(),
             headers.clone(),
-            Bytes::from_static(br#"{"message":"hello one"}"#),
+            Bytes::from_static(br#"{"message":"Remember webhook autosave message number one for later"}"#),
         )
         .await
         .into_response();
@@ -4768,7 +4815,7 @@ mod tests {
             test_connect_info(),
             test_uri(),
             headers,
-            Bytes::from_static(br#"{"message":"hello two"}"#),
+            Bytes::from_static(br#"{"message":"Remember webhook autosave message number two for later"}"#),
         )
         .await
         .into_response();

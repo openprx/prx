@@ -105,7 +105,7 @@ const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
     "src/tools/sessions_spawn.rs::owned_child_panic_cleanup_signals_once_and_reaps_before_return::let mut child = command.spawn().unwrap();",
     "src/tools/sessions_spawn.rs::owner_keeps_child_after_requester_timeout_until_reap::let child = command.spawn().unwrap();",
     "src/tools/sessions_spawn.rs::owner_mediated_process_kill_reaps_leader_and_terminates_group::let child = command.spawn().expect(\"test child should spawn\");",
-    "src/tools/sessions_spawn.rs::process_mode_parent_timeout_kills_stuck_process::let mut child = command.spawn().unwrap();",
+    "src/tools/sessions_spawn.rs::process_mode_waits_for_natural_completion_without_a_deadline::let mut child = command.spawn().unwrap();",
     "src/tools/sessions_spawn.rs::run_sub_agent_process::let mut child = command.spawn()?;",
     // Test-only: the steer wire is only proved by a real pipe to a real child,
     // so these two stand in for a session-worker (one echoes stdin, one never
@@ -121,6 +121,11 @@ const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
     // drop) would hide the very thing under test.
     "src/agent/idle.rs::hung_turn_is_terminated_and_its_child_process_group_is_killed::let child = command.spawn().unwrap();",
     "src/runtime/shell_process.rs::spawn_managed_shell_child::let child = cmd.spawn()?;",
+    // MCP stdio transports must hand the raw child pipes to rmcp. Both sites
+    // create a process group and register the child in the shared runtime
+    // ledger; discovery closes immediately and call sessions close on reset.
+    "src/tools/mcp.rs::call_stdio::let (transport, _stderr) = TokioChildProcess::builder(cmd).stderr(Stdio::null()).spawn()?;",
+    "src/tools/mcp.rs::discover_server_tools_stdio::let (transport, _stderr) = TokioChildProcess::builder(cmd).stderr(Stdio::null()).spawn()?;",
     "src/tunnel/cloudflare.rs::start::.spawn()?;",
     "src/tunnel/custom.rs::start::.spawn()?;",
     "src/tunnel/mod.rs::kill_shared_terminates_and_clears_child::.spawn()",
@@ -312,7 +317,7 @@ fn shell_entrypoints_delegate_process_execution_to_shared_adapter() {
         (
             "src/cron/scheduler.rs",
             "run_job_command_with_timeout_authorization",
-            "run_job_command_with_timeout_and_adapter",
+            "run_job_command_with_adapter",
         ),
         (
             "src/xin/runner.rs",

@@ -222,16 +222,19 @@ fn watcher_shared_config_gateway_authz_e2e() {
         // _watcher keeps the HotReloadManager alive for the duration of the test.
         // (Rust: `let _watcher = X` binds the value until end-of-scope. `let _ = X`
         // would drop immediately — the named binding is intentional.)
-        let _watcher = HotReloadManager::spawn(config_path.clone(), Arc::clone(&shared));
+        let watcher = HotReloadManager::spawn(config_path.clone(), Arc::clone(&shared));
 
-        // Give the spawn_blocking thread time to fully start and capture the initial
-        // content hash of the Supervised TOML. If we write ReadOnly before the thread
-        // has read the initial hash, it will use ReadOnly as its baseline, then the
-        // subsequent inotify event will report the same hash → watcher skips reload.
-        //
-        // `spawn_blocking` uses a thread pool; scheduling can take a few hundred ms.
-        // 2 s gives ample headroom for CI environments.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Wait for the production readiness signal rather than guessing how long
+        // the OS needs to install the watcher under concurrent test load. Writing
+        // before its baseline fingerprint is captured can otherwise make the new
+        // file become the baseline and suppress the reload event as unchanged.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !watcher.is_ready() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("config watcher should become ready");
 
         // ── Phase 4: trigger watcher — overwrite config.toml with ReadOnly ───────
         //

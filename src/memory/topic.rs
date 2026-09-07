@@ -299,6 +299,11 @@ pub fn needs_topic(content: &str) -> bool {
 
 pub fn infer_project(content: &str) -> Option<String> {
     let lower = content.to_lowercase();
+    // Match the more specific OpenPRX aliases before OpenPR: `openprx`
+    // contains `openpr`, so the reverse order misclassifies PRX topics.
+    if lower.contains("prx") || lower.contains("openprx") || lower.contains("vano") {
+        return Some("prx".to_string());
+    }
     if lower.contains("openpr") || lower.contains("治理") {
         return Some("openpr".to_string());
     }
@@ -307,9 +312,6 @@ pub fn infer_project(content: &str) -> Option<String> {
     }
     if lower.contains("sm") || lower.contains("量表") || lower.contains("心理") {
         return Some("sm".to_string());
-    }
-    if lower.contains("prx") || lower.contains("openprx") || lower.contains("vano") {
-        return Some("prx".to_string());
     }
     None
 }
@@ -643,7 +645,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known failure — project inference rules outdated"]
     fn needs_topic_and_infer_project_rules() {
         assert!(!needs_topic("ok"));
         assert!(!needs_topic("谢谢"));

@@ -5568,6 +5568,10 @@ async fn load_persisted_workspace_dirs(default_config_dir: &Path) -> Result<Opti
 
 pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Result<()> {
     let default_config_dir = default_config_dir()?;
+    persist_active_workspace_config_dir_at(config_dir, &default_config_dir).await
+}
+
+pub(crate) async fn persist_active_workspace_config_dir_at(config_dir: &Path, default_config_dir: &Path) -> Result<()> {
     let state_path = active_workspace_state_path(&default_config_dir);
 
     if config_dir == default_config_dir {

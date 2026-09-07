@@ -78,11 +78,20 @@ pub fn config_dir_path(config_path: &Path) -> PathBuf {
 }
 
 pub fn is_relevant_config_path(config_path: &Path, candidate: &Path) -> bool {
-    let config_dir = config_dir_path(config_path);
+    // Filesystem watchers may report a canonical spelling that differs from
+    // the configured path (notably `/private/var` versus `/var` on macOS).
+    // Normalize existing paths before comparing so valid reload events are not
+    // silently discarded as unrelated.
+    let config_path = config_path.canonicalize().unwrap_or_else(|_| config_path.to_path_buf());
+    let candidate = candidate.canonicalize().unwrap_or_else(|_| candidate.to_path_buf());
+    let config_dir = config_dir_path(&config_path)
+        .canonicalize()
+        .unwrap_or_else(|_| config_dir_path(&config_path));
     let generation_path = config_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(CONFIG_GENERATION_FILE);
+    let generation_path = generation_path.canonicalize().unwrap_or(generation_path);
     candidate == config_path
         || candidate == generation_path
         || candidate == config_dir
@@ -1164,6 +1173,16 @@ backend = "sqlite"
             &config_path,
             Path::new("/tmp/prx-config/.config-generation")
         ));
+    }
+
+    #[test]
+    fn existing_config_event_matches_its_canonical_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "default_temperature = 0.7\n").unwrap();
+        let canonical_event_path = config_path.canonicalize().unwrap();
+
+        assert!(is_relevant_config_path(&config_path, &canonical_event_path));
     }
 
     #[cfg(unix)]

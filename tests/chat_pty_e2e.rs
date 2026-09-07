@@ -1195,7 +1195,6 @@ fn p4a_event_pump_two_sequential_turns_complete_and_exit() {
 }
 
 #[test]
-#[ignore = "expectrl/scripted harness does not observe saved sessions reliably in this environment; manual deployed chat-demo and lower-level session tests cover resume persistence"]
 #[serial(prx_chat_pty)]
 fn test_chat_session_resume_last_restores_saved_turns() {
     let first_response = "[MOCK-RESUME-FIRST]";

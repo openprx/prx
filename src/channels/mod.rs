@@ -325,6 +325,14 @@ struct InFlightTaskCompletion {
     notify: tokio::sync::Notify,
 }
 
+struct InFlightTaskCompletionGuard(Arc<InFlightTaskCompletion>);
+
+impl Drop for InFlightTaskCompletionGuard {
+    fn drop(&mut self) {
+        self.0.mark_done();
+    }
+}
+
 impl InFlightTaskCompletion {
     fn new() -> Self {
         Self {
@@ -335,7 +343,9 @@ impl InFlightTaskCompletion {
 
     fn mark_done(&self) {
         self.done.store(true, Ordering::Release);
-        self.notify.notify_waiters();
+        // There is exactly one successor for each replaced map entry. `notify_one`
+        // retains a permit if completion lands between the done check and await.
+        self.notify.notify_one();
     }
 
     async fn wait(&self) {
@@ -4434,9 +4444,7 @@ async fn run_message_dispatch_loop(
     shutdown: CancellationToken,
 ) {
     let mut workers = tokio::task::JoinSet::new();
-    let in_flight_by_sender = Arc::new(tokio::sync::Mutex::new(
-        HashMap::<String, InFlightSenderTaskState>::new(),
-    ));
+    let in_flight_by_sender = Arc::new(Mutex::new(HashMap::<String, InFlightSenderTaskState>::new()));
     let task_sequence = Arc::new(AtomicU64::new(1));
     let mut health_heartbeat = tokio::time::interval(std::time::Duration::from_mins(1));
     health_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -4470,44 +4478,46 @@ async fn run_message_dispatch_loop(
             },
         };
 
+        // Register interruptible turns in receive order, before spawning. If
+        // registration happens inside independently scheduled tasks, an older
+        // message can run second and incorrectly cancel the newer one.
+        let interrupt_enabled = ctx.interrupt_on_new_message && msg.channel == "telegram";
+        let sender_scope_key = interruption_scope_key(&msg);
+        let cancellation_token = CancellationToken::new();
+        let completion = Arc::new(InFlightTaskCompletion::new());
+        let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
+        let previous = if interrupt_enabled {
+            in_flight_by_sender.lock().insert(
+                sender_scope_key.clone(),
+                InFlightSenderTaskState {
+                    task_id,
+                    cancellation: cancellation_token.clone(),
+                    completion: Arc::clone(&completion),
+                },
+            )
+        } else {
+            None
+        };
+
         let worker_ctx = Arc::clone(&ctx);
         let in_flight = Arc::clone(&in_flight_by_sender);
-        let task_sequence = Arc::clone(&task_sequence);
         workers.spawn(async move {
-            let interrupt_enabled = worker_ctx.interrupt_on_new_message && msg.channel == "telegram";
-            let sender_scope_key = interruption_scope_key(&msg);
-            let cancellation_token = CancellationToken::new();
-            let completion = Arc::new(InFlightTaskCompletion::new());
-            let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
+            let _completion_guard = InFlightTaskCompletionGuard(Arc::clone(&completion));
 
-            if interrupt_enabled {
-                let previous = {
-                    let mut active = in_flight.lock().await;
-                    active.insert(
-                        sender_scope_key.clone(),
-                        InFlightSenderTaskState {
-                            task_id,
-                            cancellation: cancellation_token.clone(),
-                            completion: Arc::clone(&completion),
-                        },
-                    )
-                };
-
-                if let Some(previous) = previous {
-                    tracing::info!(
-                        channel = %msg.channel,
-                        sender = %msg.sender,
-                        "Interrupting previous in-flight request for sender"
-                    );
-                    previous.cancellation.cancel();
-                    previous.completion.wait().await;
-                }
+            if let Some(previous) = previous {
+                tracing::info!(
+                    channel = %msg.channel,
+                    sender = %msg.sender,
+                    "Interrupting previous in-flight request for sender"
+                );
+                previous.cancellation.cancel();
+                previous.completion.wait().await;
             }
 
             process_channel_message(worker_ctx, msg, cancellation_token).await;
 
             if interrupt_enabled {
-                let mut active = in_flight.lock().await;
+                let mut active = in_flight.lock();
                 if active
                     .get(&sender_scope_key)
                     .is_some_and(|state| state.task_id == task_id)
@@ -4515,8 +4525,6 @@ async fn run_message_dispatch_loop(
                     active.remove(&sender_scope_key);
                 }
             }
-
-            completion.mark_done();
         });
 
         while let Some(result) = workers.try_join_next() {
@@ -4546,7 +4554,8 @@ fn load_openclaw_bootstrap_files(prompt: &mut String, workspace_dir: &std::path:
 
 /// Build identity prompt content from workspace identity files.
 ///
-/// Loads (if present): SOUL.md, AGENTS.md, IDENTITY.md, USER.md, TOOLS.md, MEMORY.md, THINKING.md, HEARTBEAT.md.
+/// Loads (if present): SOUL.md, AGENTS.md, IDENTITY.md, USER.md, TOOLS.md, MEMORY.md, THINKING.md.
+/// HEARTBEAT.md is worker-only and must not leak into interactive channel prompts.
 /// Missing files are skipped.
 pub fn build_identity_prompt(workspace_dir: &Path) -> String {
     build_identity_prompt_with_limit(workspace_dir, BOOTSTRAP_MAX_CHARS)
@@ -4562,7 +4571,6 @@ fn build_identity_prompt_with_limit(workspace_dir: &Path, max_chars: usize) -> S
         "TOOLS.md",
         "MEMORY.md",
         "THINKING.md",
-        "HEARTBEAT.md",
     ];
 
     for filename in files {
@@ -11570,6 +11578,7 @@ BTC is currently around $65,000 based on latest tool output."#
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
+        let provider_for_send = Arc::clone(&provider_impl);
         let send_task = tokio::spawn(async move {
             tx.send(traits::ChannelMessage {
                 id: "msg-1".to_string(),
@@ -11589,7 +11598,16 @@ BTC is currently around $65,000 based on latest tool output."#
             })
             .await
             .unwrap();
-            tokio::time::sleep(Duration::from_millis(40)).await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if !provider_for_send.calls.lock().is_empty() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("first request should enter the provider before interruption");
             tx.send(traits::ChannelMessage {
                 id: "msg-2".to_string(),
                 sender: "alice".to_string(),
@@ -11925,7 +11943,6 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    #[ignore = "known failure — workspace file injection logic needs update"]
     fn prompt_injects_workspace_files() {
         let ws = make_workspace();
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
