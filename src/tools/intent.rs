@@ -229,10 +229,10 @@ pub fn select_tools_for_intent<'a>(
 /// Keeping this as a second-stage intersection preserves the global
 /// `always_exclude` boundary and prevents a model allowlist from enabling a
 /// capability that intent tiering or operator policy already removed.
-pub fn apply_model_tool_allowlist<'a>(
+pub fn apply_model_tool_allowlist<'a, S: std::hash::BuildHasher>(
     selected: Vec<&'a dyn Tool>,
     model: &str,
-    model_allowlists: &std::collections::HashMap<String, Vec<String>>,
+    model_allowlists: &std::collections::HashMap<String, Vec<String>, S>,
 ) -> Vec<&'a dyn Tool> {
     let Some(allowlist) = model_allowlists.get(model) else {
         return selected;
@@ -249,10 +249,10 @@ pub fn apply_model_tool_allowlist<'a>(
 
 /// Return whether a named prompt/catalog entry is visible to this model.
 /// Models without a configured allowlist retain the ordinary tool surface.
-pub fn model_allows_tool_name(
+pub fn model_allows_tool_name<S: std::hash::BuildHasher>(
     model: &str,
     tool_name: &str,
-    model_allowlists: &std::collections::HashMap<String, Vec<String>>,
+    model_allowlists: &std::collections::HashMap<String, Vec<String>, S>,
 ) -> bool {
     model_allowlists
         .get(model)

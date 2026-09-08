@@ -1042,8 +1042,12 @@ fn probe_process(pid: u32) -> ProcessLiveness {
     // Darwin has no procfs, but libproc exposes the BSD process state without
     // reaping the child.  `kill(pid, 0)` alone reports success for a zombie,
     // which made a completed child appear to be an indefinitely running one.
+    // SAFETY: `proc_bsdinfo` is a C plain-data output structure whose all-zero
+    // representation is valid; `proc_pidinfo` initializes the returned fields.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let expected = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).unwrap_or(i32::MAX);
+    // SAFETY: `info` is writable for exactly `expected` bytes, the pointer and
+    // size match `PROC_PIDTBSDINFO`, and Darwin validates the integer PID.
     let received = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), expected) };
     if received == expected {
         return if info.pbi_status == libc::SZOMB {
@@ -1057,6 +1061,8 @@ fn probe_process(pid: u32) -> ProcessLiveness {
     // succeeds until the owner reaps it. That pair is the non-procfs equivalent
     // of Linux's `/proc/<pid>/stat` `Z` state.
     let proc_error = std::io::Error::last_os_error();
+    // SAFETY: signal zero performs an OS liveness/permission probe only; it
+    // neither delivers a signal nor dereferences memory in this process.
     if unsafe { libc::kill(pid, 0) } == 0 {
         if proc_error.raw_os_error() == Some(libc::ESRCH) {
             ProcessLiveness::Zombie

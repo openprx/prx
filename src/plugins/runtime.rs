@@ -1507,7 +1507,7 @@ optional = []
         );
         assert!(router.supports_name("wasm_plugin_call"));
         assert!(
-            router.parameters_schema()["properties"]["tool"].get("enum").is_none(),
+            router.parameters_schema().pointer("/properties/tool/enum").is_none(),
             "an empty plugin generation must not publish an invalid empty enum"
         );
 
@@ -1557,8 +1557,14 @@ optional = []
                 "required message property '{required}' must be defined"
             );
         }
-        assert_eq!(message_properties["role"]["type"], "string");
-        assert_eq!(message_properties["content"]["type"], "string");
+        assert_eq!(
+            message_properties.get("role").and_then(|value| value.get("type")),
+            Some(&serde_json::json!("string"))
+        );
+        assert_eq!(
+            message_properties.get("content").and_then(|value| value.get("type")),
+            Some(&serde_json::json!("string"))
+        );
     }
 
     #[tokio::test]

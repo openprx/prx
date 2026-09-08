@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.107] - 8 September 2026
+
+### Fixed
+
+- Satisfy the strict CI lint gate for model allowlist helpers and WASM schema
+  regression assertions without weakening the project-wide Clippy policy.
+
 ## [0.8.106] - 8 September 2026
 
 ### Security
