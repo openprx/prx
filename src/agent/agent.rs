@@ -852,6 +852,11 @@ impl Agent {
                 &self.tool_tiering.always_include,
                 &self.tool_tiering.always_exclude,
             );
+            let selected_tools = crate::tools::intent::apply_model_tool_allowlist(
+                selected_tools,
+                &effective_model,
+                &self.tool_tiering.model_allowlists,
+            );
             for tool in &selected_tools {
                 let _ = tool.refresh().await;
             }

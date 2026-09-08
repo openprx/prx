@@ -230,6 +230,12 @@ priority_scheduling_enabled = false
 # listed here — adding it would demote every cron action, not just background runs.
 low_priority_tools = ["sessions_spawn", "delegate"]
 
+# Optional exact-model tool allowlists are applied after normal intent tiering.
+# Models without an entry keep the ordinary tool set. An empty list deliberately
+# exposes no tools. Quote model names containing `/` or `:` in TOML.
+[tool_tiering.model_allowlists]
+"gemma4-e2b" = ["shell", "file_read", "file_write"]
+
 # Secure autonomous defaults. `full` skips confirmation prompts but remains
 # workspace-scoped and bounded unless the operator explicitly widens it.
 [autonomy]

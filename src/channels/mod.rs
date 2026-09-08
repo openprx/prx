@@ -3455,6 +3455,7 @@ async fn run_channel_turn(
                 &ctx.tools_registry,
                 &msg.content,
                 &message_runtime.tool_tiering,
+                &runtime_defaults.model,
                 smart_group,
             ));
         }
@@ -3469,6 +3470,7 @@ async fn run_channel_turn(
                 &ctx.tools_registry,
                 &msg.content,
                 &message_runtime.tool_tiering,
+                &runtime_defaults.model,
                 smart_group,
             ));
         }
@@ -5570,6 +5572,12 @@ pub async fn start_channels_with_config(
         "subagents",
         "Manage sub-agent runs spawned by sessions_spawn. Actions: list active/recent runs, kill a running run, or steer a running run with a new instruction.",
     ));
+    let tool_descs = tool_descs
+        .into_iter()
+        .filter(|(name, _)| {
+            crate::tools::intent::model_allows_tool_name(&model, name, &config.tool_tiering.model_allowlists)
+        })
+        .collect::<Vec<_>>();
 
     let bootstrap_max_chars = if config.agent.compact_context { Some(6000) } else { None };
     let native_tools = provider

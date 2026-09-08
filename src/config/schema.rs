@@ -5261,6 +5261,9 @@ pub struct ToolTieringConfig {
     pub always_include: Vec<String>,
     /// Tool names to always exclude regardless of intent classification.
     pub always_exclude: Vec<String>,
+    /// Optional exact-model tool allowlists. When a model key is present, only
+    /// matching tools from the ordinary intent-selected set are exposed.
+    pub model_allowlists: HashMap<String, Vec<String>>,
 }
 
 impl Default for ToolTieringConfig {
@@ -5268,6 +5271,7 @@ impl Default for ToolTieringConfig {
         Self {
             always_include: Vec::new(),
             always_exclude: Vec::new(),
+            model_allowlists: HashMap::new(),
         }
     }
 }
@@ -6291,6 +6295,15 @@ impl Config {
             }
         }
 
+        for (model, tools) in &self.tool_tiering.model_allowlists {
+            if model.trim().is_empty() {
+                anyhow::bail!("tool_tiering.model_allowlists model key must not be empty");
+            }
+            if let Some((index, _)) = tools.iter().enumerate().find(|(_, tool)| tool.trim().is_empty()) {
+                anyhow::bail!("tool_tiering.model_allowlists[{model:?}][{index}] must not be empty");
+            }
+        }
+
         self.router.validate()?;
 
         // Embedding routes
@@ -6625,6 +6638,31 @@ mod tests {
 
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("agents.worker.allowed_tools must not be empty"));
+    }
+
+    #[test]
+    async fn config_validates_model_tool_allowlists() {
+        let mut config = Config::default();
+        config
+            .tool_tiering
+            .model_allowlists
+            .insert("gemma4-e2b".into(), vec!["shell".into(), "file_read".into()]);
+        config.validate().expect("a named model and non-empty tools are valid");
+
+        config
+            .tool_tiering
+            .model_allowlists
+            .insert(" ".into(), vec!["shell".into()]);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("model key must not be empty"), "{error}");
+
+        config.tool_tiering.model_allowlists.remove(" ");
+        config
+            .tool_tiering
+            .model_allowlists
+            .insert("broken-model".into(), vec!["".into()]);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("broken-model"), "{error}");
     }
 
     #[test]

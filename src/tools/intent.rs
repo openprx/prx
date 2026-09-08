@@ -224,6 +224,41 @@ pub fn select_tools_for_intent<'a>(
     selected
 }
 
+/// Apply an optional exact-model allowlist after ordinary intent tiering.
+///
+/// Keeping this as a second-stage intersection preserves the global
+/// `always_exclude` boundary and prevents a model allowlist from enabling a
+/// capability that intent tiering or operator policy already removed.
+pub fn apply_model_tool_allowlist<'a>(
+    selected: Vec<&'a dyn Tool>,
+    model: &str,
+    model_allowlists: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<&'a dyn Tool> {
+    let Some(allowlist) = model_allowlists.get(model) else {
+        return selected;
+    };
+
+    let filtered = selected
+        .into_iter()
+        .filter(|tool| allowlist.iter().any(|name| tool.supports_name(name)))
+        .collect::<Vec<_>>();
+
+    tracing::debug!(model, allowed = ?allowlist, filtered = filtered.len(), "model tool allowlist applied");
+    filtered
+}
+
+/// Return whether a named prompt/catalog entry is visible to this model.
+/// Models without a configured allowlist retain the ordinary tool surface.
+pub fn model_allows_tool_name(
+    model: &str,
+    tool_name: &str,
+    model_allowlists: &std::collections::HashMap<String, Vec<String>>,
+) -> bool {
+    model_allowlists
+        .get(model)
+        .is_none_or(|allowlist| allowlist.iter().any(|allowed| allowed == tool_name))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -324,5 +359,44 @@ mod tests {
             "chat_profile_update must be visible even when the message has no memory keywords"
         );
         assert_eq!(tools[0].tier(), ToolTier::Core);
+    }
+
+    #[test]
+    fn model_allowlist_intersects_intent_selected_tools() {
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(ChatProfileUpdateTool::new(
+                Arc::clone(&memory),
+                Arc::new(SecurityPolicy::default()),
+            )),
+            Box::new(crate::tools::ShellTool::new(
+                Arc::new(crate::runtime::NativeRuntime::new()),
+                std::path::PathBuf::from("."),
+            )),
+        ];
+        let selected = select_tools_for_intent(&tools, "run shell", &[], &[]);
+        let allowlists = std::collections::HashMap::from([("small-model".to_string(), vec!["shell".to_string()])]);
+
+        let filtered = apply_model_tool_allowlist(selected, "small-model", &allowlists);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name(), "shell");
+
+        let unconfigured = select_tools_for_intent(&tools, "run shell", &[], &[]);
+        assert_eq!(
+            apply_model_tool_allowlist(unconfigured, "other-model", &allowlists).len(),
+            2
+        );
+        assert!(model_allows_tool_name("small-model", "shell", &allowlists));
+        assert!(!model_allows_tool_name(
+            "small-model",
+            "chat_profile_update",
+            &allowlists
+        ));
+        assert!(model_allows_tool_name(
+            "other-model",
+            "chat_profile_update",
+            &allowlists
+        ));
     }
 }

@@ -2659,10 +2659,17 @@ pub(crate) fn build_runtime_system_prompt(
     user_query: Option<&str>,
 ) -> String {
     let bootstrap_max_chars = if config.agent.compact_context { Some(6000) } else { None };
+    let tool_descs = tool_descs
+        .iter()
+        .copied()
+        .filter(|(name, _)| {
+            crate::tools::intent::model_allows_tool_name(model_name, name, &config.tool_tiering.model_allowlists)
+        })
+        .collect::<Vec<_>>();
     let mut system_prompt = crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
         model_name,
-        tool_descs,
+        &tool_descs,
         skills,
         Some(&config.identity),
         bootstrap_max_chars,
@@ -2676,6 +2683,7 @@ pub(crate) fn build_runtime_system_prompt(
             tools_registry,
             user_query.unwrap_or_default(),
             &config.tool_tiering,
+            model_name,
             false,
         ));
     }
@@ -6023,6 +6031,11 @@ async fn run_tool_call_loop_outcome_unguarded(
                 )
             },
         );
+        let selected_tools = if let Some(cfg) = tool_tiering {
+            crate::tools::intent::apply_model_tool_allowlist(selected_tools, model, &cfg.model_allowlists)
+        } else {
+            selected_tools
+        };
         for tool in &selected_tools {
             if let Err(err) = tool.refresh().await {
                 let message = format!("refresh failed for tool {}: {err}", tool.name());
@@ -6750,6 +6763,7 @@ pub(crate) fn build_tool_instructions_for_intent(
     tools_registry: &[Box<dyn Tool>],
     user_message: &str,
     config: &crate::config::ToolTieringConfig,
+    model: &str,
     expose_stay_silent: bool,
 ) -> String {
     let selected = crate::tools::intent::select_tools_for_intent(
@@ -6758,6 +6772,7 @@ pub(crate) fn build_tool_instructions_for_intent(
         &config.always_include,
         &config.always_exclude,
     );
+    let selected = crate::tools::intent::apply_model_tool_allowlist(selected, model, &config.model_allowlists);
     build_tool_instructions_from_tools(selected, expose_stay_silent)
 }
 
@@ -11778,11 +11793,44 @@ ls -la
         ))];
         let config = crate::config::ToolTieringConfig::default();
 
-        let greeting = build_tool_instructions_for_intent(&tools, "hello", &config, false);
+        let greeting = build_tool_instructions_for_intent(&tools, "hello", &config, "test-model", false);
         assert!(!greeting.contains("**http_request**"));
 
-        let web_task = build_tool_instructions_for_intent(&tools, "call this HTTP API", &config, false);
+        let web_task = build_tool_instructions_for_intent(&tools, "call this HTTP API", &config, "test-model", false);
         assert!(web_task.contains("**http_request**"));
+    }
+
+    #[test]
+    fn prompt_guided_instructions_apply_model_tool_allowlist() {
+        use crate::security::SecurityPolicy;
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(crate::tools::HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Vec::new(),
+            1024,
+            5,
+        ))];
+        let mut config = crate::config::ToolTieringConfig::default();
+        config.model_allowlists.insert("small-model".to_string(), Vec::new());
+
+        let instructions =
+            build_tool_instructions_for_intent(&tools, "call this HTTP API", &config, "small-model", false);
+        assert!(!instructions.contains("**http_request**"));
+    }
+
+    #[test]
+    fn runtime_prompt_applies_model_tool_allowlist_to_text_catalog() {
+        let workspace = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        config
+            .tool_tiering
+            .model_allowlists
+            .insert("small-model".to_string(), vec!["shell".to_string()]);
+        let tool_descs = [("shell", "Run commands"), ("file_read", "Read files")];
+
+        let prompt = build_runtime_system_prompt(&config, "small-model", &tool_descs, &[], true, &[], None);
+        assert!(prompt.contains("**shell**"));
+        assert!(!prompt.contains("**file_read**"));
     }
 
     #[test]

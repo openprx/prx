@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.105] - 8 September 2026
+
+### Added
+
+- Add exact-model tool allowlists under `tool_tiering.model_allowlists`, so
+  smaller local models receive a bounded native-tool schema and matching
+  prompt catalog without reducing the tool surface available to larger models.
+
 ## [0.8.104] - 8 September 2026
 
 ### Security
