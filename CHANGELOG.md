@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.108] - 8 September 2026
+
+### Fixed
+
+- Declare the generated-binding `wit-bindgen` dependencies in all Rust PDK
+  examples as intentional cargo-machete false positives, restoring the unused
+  dependency CI gate without removing dependencies required to rebuild them.
+
 ## [0.8.107] - 8 September 2026
 
 ### Fixed
