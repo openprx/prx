@@ -91,6 +91,9 @@ impl WasmToolAdapter {
         store
             .set_fuel(manifest.resources.max_fuel)
             .map_err(|e| PluginError::Instantiation(format!("failed to set fuel: {e}")))?;
+        // Stores with epoch interruption enabled start with an already-expired
+        // deadline. Arm the store before component initialization can execute.
+        apply_store_epoch_deadline(&mut store, timeout_ms);
 
         // Create linker and register host functions
         let mut linker = wasmtime::component::Linker::<HostState>::new(engine);

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.106] - 8 September 2026
+
+### Security
+
+- Upgrade `wasmtime` and `wasmtime-wasi` from 45.0.3 to 46.0.3 to resolve
+  RUSTSEC-2026-0269, a high-severity WASI filesystem sandbox escape involving
+  paths or symbolic links with trailing slashes.
+- Refresh `chacha20` from the yanked 0.10.0 release to 0.10.2.
+- Remove obsolete audit suppressions for advisories already resolved by the
+  `lettre` and `wasmtime` upgrades.
+
 ## [0.8.105] - 8 September 2026
 
 ### Added

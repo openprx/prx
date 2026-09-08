@@ -95,6 +95,7 @@ impl WasmMiddleware {
         store
             .set_fuel(manifest.resources.max_fuel)
             .map_err(|e| PluginError::Instantiation(format!("failed to set fuel: {e}")))?;
+        apply_store_epoch_deadline(&mut store, timeout_ms);
 
         let mut linker = wasmtime::component::Linker::<HostState>::new(engine);
         Self::register_host_functions(&mut linker)?;

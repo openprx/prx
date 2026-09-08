@@ -2,16 +2,10 @@
 ignore = [
     # bincode v2.0.1 via probe-rs — project considered complete
     "RUSTSEC-2025-0141",
-    # lettre 0.11.19 boring-tls path 未启用 (rustls-tls used) — 详见 SECURITY.md
-    "RUSTSEC-2026-0141",
     # derivative unmaintained — matrix-sdk-indexeddb transitive，仅 wasm 路径 (cargo-audit denies unmaintained; cargo-deny does not match this, so deny.toml omits it)
     "RUSTSEC-2024-0388",
     # proc-macro-error2 unmaintained — transitive via matrix-sdk (vodozemac/aquamarine), no maintained alternative
     "RUSTSEC-2026-0173",
-    # wasmtime 45.0.3 cross-engine type-index confusion — unreachable: PRX creates a
-    # single Engine (plugins/mod.rs) and every Store is built from it; the CVE needs
-    # Stores mixed across two Engines. Revisit when upgrading to wasmtime >=46.
-    "RUSTSEC-2026-0222",
     # bitmaps unmaintained — transitive via matrix-sdk -> imbl -> bitmaps, no direct dep
     "RUSTSEC-2026-0247",
 ]

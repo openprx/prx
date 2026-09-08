@@ -1562,6 +1562,30 @@ optional = []
     }
 
     #[tokio::test]
+    async fn plugin_instantiation_arms_epoch_deadline_after_engine_has_advanced() {
+        let temp = TempDir::new().unwrap();
+        install_example_fixture(temp.path(), "pipeline-middleware");
+
+        // A Store created with epoch interruption starts with deadline zero.
+        // Advancing the shared engine makes a missing pre-instantiation deadline
+        // fail deterministically with `wasm trap: interrupt`.
+        crate::plugins::shared_wasm_engine()
+            .expect("test: shared wasm engine")
+            .increment_epoch();
+
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+        let output = runtime
+            .middleware()
+            .process(
+                super::super::capabilities::middleware::MiddlewareStage::Outbound,
+                r#"{"text":"epoch-ready"}"#,
+            )
+            .await;
+        assert!(output.contains("[wasm-middleware] epoch-ready"), "{output}");
+    }
+
+    #[tokio::test]
     async fn manage_tool_runs_install_call_disable_enable_remove_lifecycle() {
         let temp = TempDir::new().unwrap();
         let source = temp.path().join("plugin-sources/voice-talk-realtime");

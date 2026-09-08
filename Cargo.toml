@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "openprx"
-version = "0.8.105"
+version = "0.8.106"
 edition = "2024"
 rust-version = "1.97.1"
 authors = ["g1e2x87"]
@@ -182,8 +182,8 @@ skillratings = { version = "0.27", optional = true }
 tiktoken-rs = { version = "0.5", optional = true }
 
 # WASM Plugin System (optional)
-wasmtime = { version = "45.0.3", optional = true, default-features = false, features = ["async", "component-model", "cranelift", "cache"] }
-wasmtime-wasi = { version = "45.0.3", optional = true }
+wasmtime = { version = "46.0.3", optional = true, default-features = false, features = ["async", "component-model", "cranelift", "cache"] }
+wasmtime-wasi = { version = "46.0.3", optional = true }
 
 # email
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
