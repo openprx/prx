@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "openprx"
-version = "0.8.103"
+version = "0.8.104"
 edition = "2024"
 rust-version = "1.97.1"
 authors = ["g1e2x87"]
@@ -186,7 +186,7 @@ wasmtime = { version = "45.0.3", optional = true, default-features = false, feat
 wasmtime-wasi = { version = "45.0.3", optional = true }
 
 # email
-lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
 mail-parser = "0.11.2"
 async-imap = { version = "0.11",features = ["runtime-tokio"], default-features = false }
 

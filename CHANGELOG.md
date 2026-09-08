@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.104] - 8 September 2026
+
+### Security
+
+- Upgrade `lettre` from 0.11.19 to 0.11.23, removing the dependency version
+  affected by RUSTSEC-2026-0141 while preserving the Rustls-only SMTP backend.
+
 ## [0.8.103] - 4 September 2026
 
 ### Fixed
