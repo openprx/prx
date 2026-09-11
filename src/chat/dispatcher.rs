@@ -2089,9 +2089,14 @@ fn chat_tool_execution_context(
         || format!("chat:redux:{draft_id}"),
         |context| context.session_scope_key.clone(),
     );
-    let mut envelope = crate::runtime::envelope::RuntimeEnvelope::chat_terminal(
+    // Message events are written under the recipient-aware canonical chat key.
+    // Build the Redux tool/compaction envelope from the same constructor so
+    // exact transcript provenance can see those events after a session resume;
+    // `chat_canonical` also carries `chat:{id}` for pre-migration read-merge.
+    let chat_session_id = super::chat_session_id_from_key(&session_key);
+    let mut envelope = crate::runtime::envelope::RuntimeEnvelope::chat_canonical(
         workspace_id,
-        session_key,
+        chat_session_id,
         crate::memory::MemoryVisibility::Workspace,
     )
     .with_sender("user")
@@ -4015,6 +4020,24 @@ mod tests {
     #[test]
     fn dispatcher_tool_specs_empty_when_no_registry() {
         assert!(build_dispatcher_tool_specs(None).is_empty());
+    }
+
+    #[test]
+    fn redux_turn_uses_same_canonical_session_scope_as_chat_messages() {
+        let policy = full_tool_security_policy();
+        let spawn_context = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
+            "turn-run".to_string(),
+            "chat:chat-stable".to_string(),
+        );
+
+        let context = chat_tool_execution_context(policy.as_ref(), Some(&spawn_context), None, "draft");
+
+        assert_eq!(
+            context.envelope.session_key,
+            crate::runtime::envelope::RuntimeEnvelope::chat_canonical_session_key("chat-stable")
+        );
+        assert_eq!(context.envelope.legacy_session_key.as_deref(), Some("chat:chat-stable"));
+        assert_eq!(context.envelope.run_id.as_deref(), Some("turn-run"));
     }
 
     // ── BUG-07: ModelSlot hot-swap ─────────────────────────────────────
