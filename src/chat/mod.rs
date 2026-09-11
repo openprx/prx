@@ -7087,11 +7087,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
         let selected_skills = select_prompt_skills(&user_input, &skills, &config, skill_embedder.as_ref()).await;
         let system_prompt = build_runtime_system_prompt(&config, model_name, &selected_skills, native_tools);
         let persisted_history_for_turn = persisted_history_for_current_turn(&chat_session, &system_prompt, &user_input);
-        if history.is_empty() {
-            history.push(ChatMessage::system(system_prompt.clone()));
-        } else if let Some(first) = history.first_mut() {
-            *first = ChatMessage::system(system_prompt.clone());
-        }
+        upsert_leading_system_prompt(&mut history, system_prompt.clone());
         // S2-C Step 4: 双写 SetLeadingSystemPrompt 到 reducer — 与 legacy
         // `if empty { push } else { first_mut = ... }` 字节级语义对齐（reducer
         // 内部走同样分支）。每轮 turn 都会跑，append 表达会让 system 堆积。
@@ -13777,6 +13773,42 @@ fn persisted_history_for_current_turn(
     history.extend(session_turns_to_history(session));
     history.push(ChatMessage::user(user_input.to_string()));
     history
+}
+
+fn upsert_leading_system_prompt(history: &mut Vec<ChatMessage>, system_prompt: String) {
+    let system_message = ChatMessage::system(system_prompt);
+    match history.first_mut() {
+        None => history.push(system_message),
+        Some(first) if first.role == "system" => *first = system_message,
+        // Skill-RAG sessions are rebuilt from durable user/assistant turns
+        // without a leading system message. Insert in that case; replacing
+        // index 0 would silently discard the oldest durable user turn and
+        // shift context-switch patch indices away from their audit source.
+        Some(_) => history.insert(0, system_message),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn leading_system_prompt_preserves_skill_rag_resumed_turns() {
+    let mut history = vec![
+        ChatMessage::user("resumed user"),
+        ChatMessage::assistant("resumed assistant"),
+    ];
+
+    upsert_leading_system_prompt(&mut history, "runtime system".to_string());
+
+    assert_eq!(
+        history
+            .iter()
+            .map(|message| (message.role.as_str(), message.content.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("system", "runtime system"),
+            ("user", "resumed user"),
+            ("assistant", "resumed assistant"),
+        ]
+    );
 }
 
 fn history_for_session_with_system(

@@ -1834,6 +1834,50 @@ fn build_dispatcher_tool_specs(
     specs
 }
 
+/// The detached Redux driver receives a provider/guard snapshot that already
+/// contains the pending user message. Reducer state intentionally does not add
+/// that message until ordered commit, so the patch sent back to the reducer
+/// guards the pre-turn reducer history and replaces it with the exact compacted
+/// durable target minus that pending turn. Ordered commit then appends the user
+/// message without shifting patch indices or weakening stale-state detection.
+fn compaction_patch_for_reducer_without_pending_user(
+    patch: &crate::agent::loop_::CompactionPatch,
+    source_history: &[crate::providers::traits::ChatMessage],
+    compacted_history: &[crate::providers::traits::ChatMessage],
+) -> crate::agent::loop_::CompactionPatch {
+    let Some(pending_index) = source_history.len().checked_sub(1) else {
+        return patch.clone();
+    };
+    if source_history
+        .get(pending_index)
+        .is_none_or(|message| message.role != "user")
+        || patch.range_end > pending_index
+    {
+        return patch.clone();
+    }
+    let Some(reducer_source) = source_history.get(..pending_index) else {
+        return patch.clone();
+    };
+    let Some(guard) = crate::agent::loop_::compaction_patch_guard_for(reducer_source, 0, reducer_source.len()) else {
+        return patch.clone();
+    };
+    let mut reducer_target_with_pending = compacted_history.to_vec();
+    if reducer_target_with_pending
+        .last()
+        .is_none_or(|message| message.role != "user")
+    {
+        return patch.clone();
+    }
+    reducer_target_with_pending.pop();
+    crate::agent::loop_::CompactionPatch {
+        range_start: 0,
+        range_end: reducer_source.len(),
+        replacement: reducer_target_with_pending,
+        append_after: Vec::new(),
+        guard,
+    }
+}
+
 async fn apply_redux_context_rollover(
     provider: &dyn Provider,
     history: &mut Vec<crate::providers::traits::ChatMessage>,
@@ -1897,6 +1941,7 @@ async fn apply_redux_context_rollover(
     };
 
     let replacement_len = patch.replacement.len();
+    let reducer_source_history = compaction_guard_history.clone();
     crate::agent::loop_::apply_compaction_patch_exact(history, &patch);
     crate::agent::loop_::apply_compaction_patch_exact(compaction_guard_history, &patch);
     let budget =
@@ -1928,10 +1973,12 @@ async fn apply_redux_context_rollover(
             "redux driver context rollover applied preserving trim"
         );
     }
+    let reducer_patch =
+        compaction_patch_for_reducer_without_pending_user(&patch, &reducer_source_history, compaction_guard_history);
     if let Err(error) = action_tx
         .send(Action::HistoryCompactionPatchApplied {
             reason,
-            patch,
+            patch: reducer_patch,
             compaction_config: config.clone(),
         })
         .await
@@ -9401,9 +9448,13 @@ mod real_mode_tests {
             Action::HistoryCompactionPatchApplied { patch, .. } => patch,
             other => panic!("expected summary patch action, got {other:?}"),
         };
+        let reducer_history = original_history
+            .get(..original_history.len() - 1)
+            .expect("reducer history fixture")
+            .to_vec();
         assert!(
-            crate::agent::loop_::compaction_patch_guard_matches(&original_history, &patch.guard),
-            "patch guard must validate against persisted/original history"
+            crate::agent::loop_::compaction_patch_guard_matches(&reducer_history, &patch.guard),
+            "patch guard must validate against reducer history before ordered user-turn commit"
         );
         assert!(
             !crate::agent::loop_::compaction_patch_guard_matches(&enriched_before_compaction, &patch.guard),
@@ -9411,7 +9462,7 @@ mod real_mode_tests {
         );
 
         let mut reducer_state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
-        reducer_state.session.history = original_history;
+        reducer_state.session.history = reducer_history;
         let effects = reducer_state.reduce(Action::HistoryCompactionPatchApplied {
             reason: crate::chat::action::CompactReason::ContextOverflow,
             patch,
@@ -9433,6 +9484,7 @@ mod real_mode_tests {
             }),
             "persisted guard source must not log a guard mismatch"
         );
+        let _ = reducer_state.reduce(Action::RecordUserTurn("current visible user".to_string()));
         assert_eq!(
             driver_history
                 .iter()
@@ -9544,19 +9596,24 @@ mod real_mode_tests {
             Action::HistoryCompactionPatchApplied { patch, .. } => patch,
             other => panic!("expected summary patch action, got {other:?}"),
         };
+        let reducer_history = original_history
+            .get(..original_history.len() - 1)
+            .expect("reducer history fixture")
+            .to_vec();
         assert!(
-            crate::agent::loop_::compaction_patch_guard_matches(&original_history, &patch.guard),
-            "empty-enrichment path should keep the existing guard behavior"
+            crate::agent::loop_::compaction_patch_guard_matches(&reducer_history, &patch.guard),
+            "empty-enrichment path should guard reducer history before ordered user-turn commit"
         );
 
         let mut reducer_state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
-        reducer_state.session.history = original_history;
+        reducer_state.session.history = reducer_history;
         let effects = reducer_state.reduce(Action::HistoryCompactionPatchApplied {
             reason: crate::chat::action::CompactReason::ContextOverflow,
             patch,
             compaction_config: config,
         });
         assert!(effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_))));
+        let _ = reducer_state.reduce(Action::RecordUserTurn("current user".to_string()));
         assert_eq!(
             driver_history
                 .iter()
@@ -9666,9 +9723,13 @@ mod real_mode_tests {
             Action::HistoryCompactionPatchApplied { patch, .. } => patch,
             other => panic!("expected summary patch action, got {other:?}"),
         };
+        let reducer_history = original_history
+            .get(..original_history.len() - 1)
+            .expect("reducer history fixture")
+            .to_vec();
         assert!(
-            crate::agent::loop_::compaction_patch_guard_matches(&original_history, &patch.guard),
-            "fallback-preserving patch must still be guarded by persisted source"
+            crate::agent::loop_::compaction_patch_guard_matches(&reducer_history, &patch.guard),
+            "fallback-preserving patch must still be guarded by reducer persisted source"
         );
         assert!(
             !driver_history
@@ -9793,12 +9854,17 @@ mod real_mode_tests {
         };
         let mut reducer_state =
             crate::chat::state::ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
-        reducer_state.session.history = original_history;
+        reducer_state.session.history = original_history
+            .get(..original_history.len() - 1)
+            .expect("reducer history fixture")
+            .to_vec();
         let _ = reducer_state.reduce(Action::HistoryCompactionPatchApplied {
             reason: crate::chat::action::CompactReason::ContextOverflow,
             patch,
             compaction_config: config,
         });
+        let pending_user = original_history.last().expect("pending user fixture").content.clone();
+        let _ = reducer_state.reduce(Action::RecordUserTurn(pending_user));
 
         assert!(
             driver_history
@@ -9925,33 +9991,36 @@ mod real_mode_tests {
         };
         let mut reducer_state =
             crate::chat::state::ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
-        reducer_state.session.history = original_history;
-        let _ = reducer_state.reduce(Action::HistoryCompactionPatchApplied {
+        reducer_state.session.history = original_history
+            .get(..original_history.len() - 1)
+            .expect("reducer history fixture")
+            .to_vec();
+        let effects = reducer_state.reduce(Action::HistoryCompactionPatchApplied {
             reason: crate::chat::action::CompactReason::ContextOverflow,
             patch,
             compaction_config: config.clone(),
         });
-        let reducer_budget = crate::agent::loop_::plan_context_budget(
-            &reducer_state.session.history,
-            &config,
-            crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
-        );
         assert!(
-            !reducer_budget.over_hard_limit,
-            "reducer replay must also enforce the floor"
+            effects.iter().all(|effect| {
+                !matches!(
+                    effect,
+                    crate::chat::state::Effect::LogTrace {
+                        level: tracing::Level::WARN,
+                        msg
+                    } if msg.contains("guard mismatch")
+                )
+            }),
+            "pending-user timing must not turn an exact rollover into a stale-patch fallback"
         );
-        assert_eq!(
-            driver_history
-                .iter()
-                .map(|message| (message.role.clone(), message.content.clone()))
-                .collect::<Vec<_>>(),
+        let pending_user = original_history.last().expect("pending user fixture").content.clone();
+        let _ = reducer_state.reduce(Action::RecordUserTurn(pending_user.clone()));
+        assert!(
             reducer_state
                 .session
                 .history
-                .iter()
-                .map(|message| (message.role.clone(), message.content.clone()))
-                .collect::<Vec<_>>(),
-            "driver and reducer floor fallback histories must match"
+                .last()
+                .is_some_and(|message| message.role == "user" && message.content == pending_user),
+            "ordered commit must preserve the durable user turn even when it cannot fit provider context"
         );
     }
 
