@@ -3,7 +3,6 @@ use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use std::fmt::Write;
 
 /// A single message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -777,27 +776,7 @@ pub trait Provider: Send + Sync {
 /// invoke them using XML-style tags. This is used as a fallback when the
 /// provider doesn't support native tool calling.
 pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
-    let mut instructions = String::new();
-
-    instructions.push_str("## Tool Use Protocol\n\n");
-    instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
-    instructions.push_str("<tool_call>\n");
-    instructions.push_str(r#"{"name": "tool_name", "arguments": {"param": "value"}}"#);
-    instructions.push_str("\n</tool_call>\n\n");
-    instructions.push_str("You may use multiple tool calls in a single response. ");
-    instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
-    instructions.push_str("Continue reasoning with the results until you can give a final answer.\n\n");
-    instructions.push_str("### Available Tools\n\n");
-
-    for tool in tools {
-        let _ = writeln!(&mut instructions, "**{}**: {}", tool.name, tool.description);
-
-        let parameters = serde_json::to_string(&tool.parameters).unwrap_or_else(|_| "{}".to_string());
-        let _ = writeln!(&mut instructions, "Parameters: `{parameters}`");
-        instructions.push('\n');
-    }
-
-    instructions
+    crate::tools::prompt::render_prompt_guided_tool_protocol(tools)
 }
 
 #[cfg(test)]

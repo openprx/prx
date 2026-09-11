@@ -338,6 +338,8 @@ async fn run_chat_fixture_with_history(
         registry,
         service,
         context,
+        crate::memory::MemoryFabric::new(Arc::clone(&ledger), ledger_dir.path().to_string_lossy()),
+        None,
         crate::agent::loop_::ChatMode::Edit,
         Arc::new(crate::observability::noop::NoopObserver),
         Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),

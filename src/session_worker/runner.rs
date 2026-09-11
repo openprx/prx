@@ -16,7 +16,7 @@ use crate::session_worker::protocol::{WorkerControlFrame, WorkerManifest, Worker
 use crate::tools::sessions_spawn::{
     SPAWN_EXECUTION_CONTEXT, STEER_CHANNEL_CAPACITY, SpawnExecutionContext, steering_instruction,
 };
-use crate::tools::{self, Tool, tool_name_is_exposed};
+use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
 use std::future::Future;
 use std::io::{BufRead, Write};
@@ -200,6 +200,16 @@ fn select_tools_for_worker(source: Vec<Box<dyn Tool>>, allowed_tools: &[String])
         }
     }
 
+    if !selected
+        .iter()
+        .any(|tool| tool.supports_name(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME))
+        && let Some(index) = remaining
+            .iter()
+            .position(|tool| tool.supports_name(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME))
+    {
+        selected.push(remaining.remove(index));
+    }
+
     Ok(selected)
 }
 
@@ -238,12 +248,7 @@ fn resolve_system_prompt(manifest: &WorkerManifest) -> String {
 /// the ToolSpecs that were present on the request. Keep an explicit agent
 /// prompt as the final, task-specific section, but make the common execution
 /// contract identical to the other agentic entrypoints.
-fn build_worker_system_prompt(
-    manifest: &WorkerManifest,
-    config: &Config,
-    tools_registry: &[Box<dyn Tool>],
-    native_tools: bool,
-) -> String {
+fn build_worker_system_prompt(manifest: &WorkerManifest, config: &Config, native_tools: bool) -> String {
     // The worker may use an isolated workspace. Prompt rendering must describe
     // that workspace (and load its skills), rather than the parent process's
     // configured workspace path.
@@ -251,20 +256,8 @@ fn build_worker_system_prompt(
     worker_config.workspace_dir = manifest.workspace_dir.clone();
 
     let skills = crate::skills::load_skills_with_config(&manifest.workspace_dir, &worker_config);
-    let tool_descs = tools_registry
-        .iter()
-        .filter(|tool| tool_name_is_exposed(tool.name(), false))
-        .map(|tool| (tool.name(), tool.description()))
-        .collect::<Vec<_>>();
-    let runtime_prompt = crate::agent::loop_::build_runtime_system_prompt(
-        &worker_config,
-        &manifest.model,
-        &tool_descs,
-        &skills,
-        native_tools,
-        tools_registry,
-        Some(&manifest.task),
-    );
+    let runtime_prompt =
+        crate::agent::loop_::build_runtime_system_prompt(&worker_config, &manifest.model, &skills, native_tools);
     let delegated_prompt = resolve_system_prompt(manifest);
 
     format!(
@@ -810,7 +803,7 @@ async fn run_validated_manifest(
             crate::providers::traits::ProviderRequestMode::NonStreaming,
         )
         .native_tool_calling;
-    let system_prompt = build_worker_system_prompt(&manifest, &config, &tools_registry, native_tools);
+    let system_prompt = build_worker_system_prompt(&manifest, &config, native_tools);
     let shared_context = load_worker_shared_context(&manifest, &config, memory.as_ref()).await;
     let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
         manifest.provider_name.clone(),
@@ -887,10 +880,12 @@ async fn run_validated_manifest(
         let priority_scheduling_enabled = config.agent.priority_scheduling_enabled;
         let tools_registry = Arc::new(tools_registry);
         let tools_registry_ref = &tools_registry;
+        let memory_fabric_ref = &memory_fabric;
         let (history, loop_result) =
             run_segments_with_steering(initial_history, &mut steer_rx, |mut segment_history, cancel| {
                 let tools_registry = Arc::clone(tools_registry_ref);
                 let memory = Arc::clone(memory_ref);
+                let request_event_fabric = memory_fabric_ref.clone();
                 async move {
                     let loop_result = run_tool_call_loop_traced(
                         provider_ref,
@@ -923,6 +918,7 @@ async fn run_validated_manifest(
                             workspace_dir_ref,
                             scope_ctx_ref.map(|ctx| DocumentIngestRuntime::from_scope(Arc::clone(&memory), ctx)),
                         )
+                        .with_event_fabric(request_event_fabric)
                         .with_routing_input(routing_input_ref),
                         crate::agent::loop_::ChatMode::default(),
                     )
@@ -1521,19 +1517,29 @@ mod tests {
     }
 
     #[test]
-    fn worker_system_prompt_keeps_chat_tool_contract_and_agent_instructions() {
+    fn worker_explicit_allowlist_inherits_transcript_recovery_dependency() {
+        let mut source = crate::tools::default_tools(Arc::new(crate::security::SecurityPolicy::default()));
+        source.push(Box::new(crate::tools::TranscriptHistoryLookupTool::new(Arc::new(
+            crate::memory::NoneMemory::new(),
+        ))));
+
+        let selected = select_tools_for_worker(source, &["shell".to_string()]).expect("restricted selection");
+        let names = selected.iter().map(|tool| tool.name()).collect::<Vec<_>>();
+        assert_eq!(names, vec!["shell", crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME]);
+    }
+
+    #[test]
+    fn worker_system_prompt_keeps_agent_instructions_without_a_static_tool_catalog() {
         let workspace = tempfile::TempDir::new().expect("workspace");
         let mut config = Config::default();
         config.workspace_dir = workspace.path().to_path_buf();
         let mut manifest = base_manifest(workspace.path(), "capability");
         manifest.model = "k3".to_string();
         manifest.system_prompt = Some("Use file tools and verify every artifact.".to_string());
-        let tools_registry = crate::tools::default_tools(Arc::new(crate::security::SecurityPolicy::default()));
 
-        let prompt = build_worker_system_prompt(&manifest, &config, &tools_registry, true);
+        let prompt = build_worker_system_prompt(&manifest, &config, true);
 
-        assert!(prompt.contains("## Tools"));
-        assert!(prompt.contains("file_read"));
+        assert!(!prompt.contains("## Tools"));
         assert!(prompt.contains("Working directory: `"));
         assert!(prompt.contains("Use tools when the request requires action"));
         assert!(prompt.contains("## Delegated Agent Instructions"));

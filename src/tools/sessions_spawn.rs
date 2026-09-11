@@ -3615,6 +3615,7 @@ impl SessionsSpawnTool {
         let announce_history = history_arc.clone();
         let task_scope = spawn_scope.clone();
         let task_memory = self.memory.clone();
+        let task_event_recording = self.event_recording;
         let compaction_config = resolved_compaction.config.clone();
         let cost_config = self.cost_config.clone();
         let task_execution_ctx = SpawnExecutionContext {
@@ -3759,6 +3760,7 @@ impl SessionsSpawnTool {
                 history_arc,
                 task_scope,
                 task_memory,
+                task_event_recording,
                 run_on_delta,
                 run_on_tool,
                 run_approval_resolver,
@@ -4604,6 +4606,13 @@ fn resolve_tools_for_agent(
             }
         }
     }
+    if !selected_names.contains(&crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME)
+        && source
+            .iter()
+            .any(|tool| tool.supports_name(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME))
+    {
+        selected_names.push(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME);
+    }
 
     let memory_prefix = if memory_scope == MemoryScope::Isolated {
         Some(agent_name.to_string())
@@ -4880,6 +4889,7 @@ async fn run_sub_agent_task(
     history_out: Arc<RwLock<Vec<HistoryEntry>>>,
     scope: Option<SpawnScope>,
     memory: Option<Arc<dyn Memory>>,
+    event_recording: MemoryEventRecording,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     on_tool_call: Option<tokio::sync::mpsc::Sender<crate::agent::loop_::ToolCallNotification>>,
     approval_resolver: Option<Arc<dyn crate::agent::loop_::ApprovalResolver>>,
@@ -5081,6 +5091,10 @@ async fn run_sub_agent_task(
                             scope_ctx
                                 .as_ref()
                                 .map(|ctx| DocumentIngestRuntime::from_scope(memory.clone(), ctx)),
+                        )
+                        .with_event_fabric(
+                            MemoryFabric::new(memory.clone(), workspace_dir_owned.to_string_lossy().to_string())
+                                .with_event_recording(event_recording),
                         )
                     },
                 ),
@@ -6243,6 +6257,24 @@ mod tests {
         assert_eq!(result.output, "capability__dynamic");
     }
 
+    #[test]
+    fn restricted_spawn_allowlist_inherits_transcript_recovery_dependency() {
+        let source: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+            Box::new(DynamicCapabilityTool),
+            Box::new(crate::tools::TranscriptHistoryLookupTool::new(Arc::new(
+                crate::memory::NoneMemory::new(),
+            ))),
+        ]);
+        let allowed = vec!["capability_call".to_string()];
+
+        let tools = resolve_tools_for_agent(source, "worker", MemoryScope::Shared, Some(&allowed));
+        let names = tools.iter().map(|tool| tool.name()).collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["capability_call", crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME]
+        );
+    }
+
     // ── Sub-agent provider override: resilience evidence ─────────
 
     /// Serializes the tests that drive the mock provider through
@@ -6994,6 +7026,7 @@ mod tests {
             Arc::clone(&history_out),
             None,
             None,
+            MemoryEventRecording::default(),
             None,
             None,
             None,
@@ -12815,13 +12848,15 @@ mod tests {
         }
     }
 
-    /// The one-line summary the channel tool list carries has to mention chat
-    /// assignment too. It is the only thing the model reads while *choosing* a
-    /// tool: the schema above is never consulted for a capability the summary
-    /// gave no reason to look for.
+    /// The canonical tool description has to mention chat assignment too. It
+    /// is the only description every entry point renders while the model is
+    /// choosing a tool: the schema is never consulted for a capability the
+    /// description gave no reason to look for.
     #[test]
-    fn the_channel_tool_summary_advertises_chat_assignment() {
-        let summary = crate::channels::SESSIONS_SPAWN_TOOL_SUMMARY;
+    fn the_tool_description_advertises_chat_assignment() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+        let summary = tool.description();
         for action in ["spawn", "chat_sessions", "chat_assign"] {
             assert!(
                 mentions_action(summary, action),

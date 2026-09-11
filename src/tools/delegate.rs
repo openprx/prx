@@ -952,7 +952,7 @@ impl DelegateTool {
             }
         }
 
-        let sub_tools: Vec<Box<dyn Tool>> = if inherit_all {
+        let mut sub_tools: Vec<Box<dyn Tool>> = if inherit_all {
             eligible_parent_tools
                 .iter()
                 .map(|tool| Box::new(ToolArcRef::new(Arc::clone(tool))) as Box<dyn Tool>)
@@ -972,6 +972,19 @@ impl DelegateTool {
                 .map(|tool| Box::new(tool) as Box<dyn Tool>)
                 .collect()
         };
+
+        if !sub_tools
+            .iter()
+            .any(|tool| tool.supports_name(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME))
+            && let Some(tool) = eligible_parent_tools
+                .iter()
+                .find(|tool| tool.supports_name(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME))
+                .and_then(|tool| {
+                    ToolArcRef::for_name(Arc::clone(tool), crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME)
+                })
+        {
+            sub_tools.push(Box::new(tool));
+        }
 
         if sub_tools.is_empty() {
             return Ok(DelegateAgenticExecution {
@@ -1053,6 +1066,13 @@ impl DelegateTool {
                         scope_ctx
                             .as_ref()
                             .map(|ctx| DocumentIngestRuntime::from_scope(memory.clone(), ctx)),
+                    )
+                    .with_event_fabric(
+                        MemoryFabric::new(
+                            memory.clone(),
+                            self.security.workspace_dir.to_string_lossy().to_string(),
+                        )
+                        .with_event_recording(self.event_recording),
                     )
                 },
             ),

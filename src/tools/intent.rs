@@ -224,6 +224,14 @@ pub fn select_tools_for_intent<'a>(
     selected
 }
 
+/// Return whether a core dependency may be exposed under the turn's explicit
+/// exclusion and model-allowlist policy. This is used by prompt compilers to
+/// avoid advertising capabilities whose required tool cannot be selected.
+pub fn core_dependency_is_available(name: &str, model: &str, config: &crate::config::ToolTieringConfig) -> bool {
+    !config.always_exclude.iter().any(|excluded| excluded == name)
+        && model_allows_tool_name(model, name, &config.model_allowlists)
+}
+
 /// Apply an optional exact-model allowlist after ordinary intent tiering.
 ///
 /// Keeping this as a second-stage intersection preserves the global
@@ -398,5 +406,21 @@ mod tests {
             "chat_profile_update",
             &allowlists
         ));
+    }
+
+    #[test]
+    fn core_dependency_availability_honors_exclusion_and_model_allowlist() {
+        let mut config = crate::config::ToolTieringConfig::default();
+        assert!(core_dependency_is_available("skill_read", "model", &config));
+
+        config.always_exclude.push("skill_read".to_string());
+        assert!(!core_dependency_is_available("skill_read", "model", &config));
+
+        config.always_exclude.clear();
+        config
+            .model_allowlists
+            .insert("small-model".to_string(), vec!["shell".to_string()]);
+        assert!(!core_dependency_is_available("skill_read", "small-model", &config));
+        assert!(core_dependency_is_available("skill_read", "other-model", &config));
     }
 }

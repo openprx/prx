@@ -293,14 +293,19 @@ impl Agent {
     /// was rendered for, the prompt must be rebuilt with the new model so the
     /// model-specific guidance and identity are correct.
     fn build_system_prompt_for_model(&self, model_name: &str) -> Result<String> {
-        let instructions = self.tool_dispatcher.prompt_instructions(&self.tools);
+        let skills = if crate::tools::intent::core_dependency_is_available("skill_read", model_name, &self.tool_tiering)
+        {
+            self.skills.as_slice()
+        } else {
+            &[]
+        };
         let ctx = PromptContext {
             workspace_dir: &self.workspace_dir,
             model_name,
-            tools: &self.tools,
-            skills: &self.skills,
+            skills,
             identity_config: Some(&self.identity_config),
-            dispatcher_instructions: &instructions,
+            bootstrap_max_chars: None,
+            native_tools: self.tool_dispatcher.should_send_tool_specs(),
         };
         self.prompt_builder.build(&ctx)
     }
@@ -336,7 +341,11 @@ impl Agent {
         }
     }
 
-    async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
+    async fn execute_tool_call(
+        &self,
+        call: &ParsedToolCall,
+        compiled_tools: &crate::agent::turn_context::CompiledToolContext,
+    ) -> ToolExecutionResult {
         let start = Instant::now();
         self.hooks
             .emit(
@@ -366,8 +375,36 @@ impl Agent {
             obj.insert("_prx_scope_trusted".to_string(), serde_json::Value::Bool(false));
         }
 
-        let (result, success) = if let Some(tool) = self.tools.iter().find(|t| t.supports_name(&call.name)) {
-            match tool.execute_named(&call.name, sanitized_args).await {
+        let Some(registered_tool) = self.tools.iter().find(|tool| tool.supports_name(&call.name)) else {
+            let available_names: Vec<&str> = self.tools.iter().map(|tool| tool.name()).collect();
+            let suggestion = crate::tools::error_hints::suggest_tool_name(&call.name, &available_names);
+            let hint = suggestion
+                .map(|suggestion| format!(" Did you mean '{suggestion}'?"))
+                .unwrap_or_default();
+            let message = format!(
+                "Error: unknown tool '{}'.{hint}\nAvailable tools: {}",
+                call.name,
+                available_names.join(", ")
+            );
+            self.hooks.emit(HookEvent::Error, payload_error("tool", &message)).await;
+            return ToolExecutionResult {
+                name: call.name.clone(),
+                output: message,
+                success: false,
+                tool_call_id: call.tool_call_id.clone(),
+            };
+        };
+
+        let (result, success) = if !compiled_tools.allows(&call.name) {
+            (
+                format!(
+                    "Error: tool '{}' was not exposed for this turn and was not executed",
+                    call.name
+                ),
+                false,
+            )
+        } else {
+            match registered_tool.execute_named(&call.name, sanitized_args).await {
                 Ok(r) => {
                     self.hooks
                         .emit(
@@ -417,17 +454,6 @@ impl Agent {
                     (message, false)
                 }
             }
-        } else {
-            let available_names: Vec<&str> = self.tools.iter().map(|t| t.name()).collect();
-            let suggestion = crate::tools::error_hints::suggest_tool_name(&call.name, &available_names);
-            let hint = suggestion.map(|s| format!(" Did you mean '{s}'?")).unwrap_or_default();
-            let message = format!(
-                "Error: unknown tool '{}'.{hint}\nAvailable tools: {}",
-                call.name,
-                available_names.join(", ")
-            );
-            self.hooks.emit(HookEvent::Error, payload_error("tool", &message)).await;
-            (message, false)
         };
 
         ToolExecutionResult {
@@ -442,8 +468,15 @@ impl Agent {
     /// switch that forces them back to serial: unbounded concurrency is the
     /// runtime contract, and serialization used to be the only lane that also
     /// dropped the execution deadline.
-    async fn execute_tools(&self, calls: &[ParsedToolCall]) -> Vec<ToolExecutionResult> {
-        let futs: Vec<_> = calls.iter().map(|call| self.execute_tool_call(call)).collect();
+    async fn execute_tools(
+        &self,
+        calls: &[ParsedToolCall],
+        compiled_tools: &crate::agent::turn_context::CompiledToolContext,
+    ) -> Vec<ToolExecutionResult> {
+        let futs: Vec<_> = calls
+            .iter()
+            .map(|call| self.execute_tool_call(call, compiled_tools))
+            .collect();
         futures::future::join_all(futs).await
     }
 
@@ -829,7 +862,7 @@ impl Agent {
         // Context-overflow retries on this direct path are progress-based: each
         // retry must remove history, so a minimal history cannot spin forever.
         loop {
-            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let mut messages = self.tool_dispatcher.to_provider_messages(&self.history);
             // Select first, then refresh only the capabilities this turn will
             // expose. Otherwise an unrelated direct-agent request is blocked by
             // cold dynamic backends (notably stdio MCP servers started by npx).
@@ -875,17 +908,18 @@ impl Agent {
             // Agent::turn is never a smart-group-reply turn; stay_silent must not be
             // advertised to the model on this path (expose_stay_silent = false).
             filter_tool_specs_for_exposure(&mut dynamic_tool_specs, false);
+            let compiled_tools = crate::agent::turn_context::CompiledToolContext::new(
+                self.tool_dispatcher.should_send_tool_specs(),
+                dynamic_tool_specs,
+            );
+            compiled_tools.apply_to_messages(&mut messages);
             #[allow(unused_mut)]
             let mut response = match self
                 .provider
                 .chat(
                     ChatRequest {
                         messages: &messages,
-                        tools: if self.tool_dispatcher.should_send_tool_specs() {
-                            Some(&dynamic_tool_specs)
-                        } else {
-                            None
-                        },
+                        tools: compiled_tools.native_tool_specs(),
                     },
                     &effective_model,
                     self.temperature,
@@ -975,11 +1009,7 @@ impl Agent {
                                     .chat(
                                         ChatRequest {
                                             messages: &messages,
-                                            tools: if self.tool_dispatcher.should_send_tool_specs() {
-                                                Some(&dynamic_tool_specs)
-                                            } else {
-                                                None
-                                            },
+                                            tools: compiled_tools.native_tool_specs(),
                                         },
                                         &premium_model,
                                         self.temperature,
@@ -1097,7 +1127,7 @@ impl Agent {
                 tool_calls: response.tool_calls.clone(),
             });
 
-            let results = self.execute_tools(&calls).await;
+            let results = self.execute_tools(&calls, &compiled_tools).await;
             let formatted = self.tool_dispatcher.format_results(&results);
             self.history.push(formatted);
         }
@@ -1293,7 +1323,11 @@ mod tests {
             tool_call_id: None,
         };
 
-        let result = agent.execute_tool_call(&call).await;
+        let compiled_tools = crate::agent::turn_context::CompiledToolContext::new(
+            false,
+            crate::tools::ToolCatalog::from_boxed_registry(&agent.tools).tool_specs(),
+        );
+        let result = agent.execute_tool_call(&call, &compiled_tools).await;
 
         assert!(result.success, "tool should execute: {}", result.output);
         assert!(

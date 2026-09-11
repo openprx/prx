@@ -8,7 +8,7 @@ use crate::memory::principal::{MemoryWriteContext, OwnerPrincipal, Role};
 use crate::memory::{
     self, CompactionRunInput, CompactionSourceEventRange, ConversationTurn, DocumentIngestInput, DocumentSearchResult,
     Memory, MemoryCategory, MemoryFabric, MemoryPrincipal, MemoryStoreMetadata, MemoryVisibility, MessageEvent,
-    RetrievalTraceInput, RetrievedContextItem, SessionContextQuery, SharedContextQuery,
+    MessageEventScope, RetrievalTraceInput, RetrievedContextItem, SessionContextQuery, SharedContextQuery,
 };
 use crate::multimodal;
 use crate::observability::{self, Observer, ObserverEvent};
@@ -24,7 +24,7 @@ use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
 use sha2::Digest;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 use std::io::Write as _;
 use std::path::Path;
@@ -291,6 +291,13 @@ pub(crate) struct ScopeContext<'a> {
 pub(crate) struct ToolLoopMemory {
     ledger: Option<Arc<dyn Memory>>,
     ingest: Option<DocumentIngestRuntime>,
+    /// Optional durable event sink for request-context provenance. Callers
+    /// attach their already-configured fabric so recording honors the same
+    /// event policy as user, assistant, tool, and terminal events.
+    event_fabric: Option<MemoryFabric>,
+    /// Exact message-fabric lineage for entrypoints whose tool execution scope
+    /// is synthetic (notably the local CLI compatibility paths).
+    request_event_scope: Option<MessageEventScope>,
     /// Exact user-authored input used for capability routing. Provider history
     /// may prepend recalled memory or other context to the user message; using
     /// that enriched payload here can activate capabilities the user did not
@@ -304,8 +311,25 @@ impl ToolLoopMemory {
         Self {
             ledger: crate::memory::tool_execution_ledger(memory, workspace_dir),
             ingest,
+            event_fabric: None,
+            request_event_scope: None,
             routing_input: None,
         }
+    }
+
+    /// Attach the entrypoint's configured event fabric. This deliberately
+    /// travels with the other per-turn memory handles so every ingress reaches
+    /// the same request-context persistence point inside the shared loop.
+    pub(crate) fn with_event_fabric(mut self, event_fabric: MemoryFabric) -> Self {
+        self.event_fabric = Some(event_fabric);
+        self
+    }
+
+    /// Override the request event's lineage when it cannot be recovered from
+    /// the tool execution envelope.
+    pub(crate) fn with_request_event_scope(mut self, scope: MessageEventScope) -> Self {
+        self.request_event_scope = Some(scope);
+        self
     }
 
     /// Pin the exact user-authored input before memory/context enrichment.
@@ -326,6 +350,8 @@ impl ToolLoopMemory {
         Self {
             ledger: crate::memory::serves_tool_execution_ledger(memory.name()).then_some(memory),
             ingest: Some(ingest),
+            event_fabric: None,
+            request_event_scope: None,
             routing_input: None,
         }
     }
@@ -336,6 +362,8 @@ impl ToolLoopMemory {
         Self {
             ledger: crate::memory::dedicated_tool_execution_ledger(workspace_dir),
             ingest: None,
+            event_fabric: None,
+            request_event_scope: None,
             routing_input: None,
         }
     }
@@ -1347,6 +1375,8 @@ fn build_compaction_audit_source(source_messages: &[ChatMessage]) -> CompactionA
 }
 
 const COMPACTION_SOURCE_EVENT_WINDOW: usize = 500;
+const CONTEXT_HANDOFF_START: &str = "[context_handoff]";
+const CONTEXT_HANDOFF_END: &str = "[/context_handoff]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompactionEventProvenance {
@@ -1358,6 +1388,35 @@ fn source_message_matches_event(message: &ChatMessage, event: &MessageEvent) -> 
     message.role == event.role
         && (message.content == event.content
             || crate::chat::sanitize::sanitize_for_persistence(&message.content) == event.content)
+}
+
+fn is_context_handoff_message(message: &ChatMessage) -> bool {
+    message.role == "assistant" && message.content.starts_with(CONTEXT_HANDOFF_START)
+}
+
+fn context_handoff_lineage(history: &[ChatMessage]) -> (u64, Option<String>) {
+    history
+        .iter()
+        .rev()
+        .find(|message| is_context_handoff_message(message))
+        .and_then(|message| {
+            let json = message
+                .content
+                .strip_prefix(CONTEXT_HANDOFF_START)?
+                .strip_suffix(CONTEXT_HANDOFF_END)?
+                .trim();
+            serde_json::from_str::<serde_json::Value>(json).ok()
+        })
+        .map_or((0, None), |note| {
+            (
+                note.get("to_generation")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                note.get("handoff_event_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            )
+        })
 }
 
 pub(crate) async fn resolve_compaction_event_provenance(
@@ -1387,28 +1446,65 @@ pub(crate) async fn resolve_compaction_event_provenance(
         .iter()
         .filter(|event| event.event_type == "message.created")
         .collect::<Vec<_>>();
-    if source_messages.len() > message_events.len() {
-        return Ok(None);
+    let mut matched = Vec::new();
+    let mut used_event_ids = HashSet::new();
+    let mut source_index = 0usize;
+    while source_index < source_messages.len() {
+        let Some(message) = source_messages.get(source_index) else {
+            return Ok(None);
+        };
+        if is_context_handoff_message(message) {
+            let candidates = events
+                .iter()
+                .filter(|event| {
+                    event.event_type == "context.switch.created"
+                        && !used_event_ids.contains(&event.event_id)
+                        && source_message_matches_event(message, event)
+                })
+                .collect::<Vec<_>>();
+            let [event] = candidates.as_slice() else {
+                return Ok(None);
+            };
+            used_event_ids.insert(event.event_id.clone());
+            matched.push(*event);
+            source_index = source_index.saturating_add(1);
+            continue;
+        }
+
+        let Some(remaining_messages) = source_messages.get(source_index..) else {
+            return Ok(None);
+        };
+        let segment_end = remaining_messages
+            .iter()
+            .position(is_context_handoff_message)
+            .map_or(source_messages.len(), |offset| source_index + offset);
+        let Some(segment) = source_messages.get(source_index..segment_end) else {
+            return Ok(None);
+        };
+        let matching_windows = message_events
+            .windows(segment.len())
+            .filter(|window| {
+                window.iter().all(|event| !used_event_ids.contains(&event.event_id))
+                    && segment
+                        .iter()
+                        .zip(window.iter())
+                        .all(|(segment_message, event)| source_message_matches_event(segment_message, event))
+            })
+            .collect::<Vec<_>>();
+        let [window] = matching_windows.as_slice() else {
+            return Ok(None);
+        };
+        for event in *window {
+            used_event_ids.insert(event.event_id.clone());
+            matched.push(*event);
+        }
+        source_index = segment_end;
     }
 
-    let matching_windows = message_events
-        .windows(source_messages.len())
-        .filter(|window| {
-            source_messages
-                .iter()
-                .zip(window.iter())
-                .all(|(message, event)| source_message_matches_event(message, event))
-        })
-        .collect::<Vec<_>>();
-    let [matched] = matching_windows.as_slice() else {
-        // No match means the bounded event window cannot prove coverage;
-        // multiple matches are ambiguous and must not pick arbitrary IDs.
+    let Some(first) = matched.iter().min_by_key(|event| event.id) else {
         return Ok(None);
     };
-    let Some(first) = matched.first() else {
-        return Ok(None);
-    };
-    let Some(last) = matched.last() else {
+    let Some(last) = matched.iter().max_by_key(|event| event.id) else {
         return Ok(None);
     };
     let source_event_ids = matched.iter().map(|event| event.event_id.clone()).collect::<Vec<_>>();
@@ -1441,6 +1537,61 @@ async fn attach_compaction_event_provenance(
             tracing::debug!(error = %error, "failed to resolve compaction MessageEvent provenance");
         }
     }
+}
+
+async fn persist_context_switch(
+    audit: &DocumentIngestRuntime,
+    trigger: &str,
+    source: &CompactionAuditSource,
+    handoff_event_id: &str,
+    handoff_message: &str,
+    note_json: &str,
+) -> Result<()> {
+    let Some(range) = source.source_event_range.as_ref() else {
+        return Ok(());
+    };
+    audit
+        .memory
+        .append_message_event(crate::memory::MessageEventInput {
+            event_id: Some(handoff_event_id.to_string()),
+            idempotency_key: Some(format!("context-switch:{handoff_event_id}")),
+            workspace_id: audit.workspace_id.clone(),
+            owner_id: audit.owner_id.clone(),
+            source: "context_switch".into(),
+            channel: audit.channel.clone(),
+            session_key: audit.session_key.clone(),
+            parent_session_key: audit.legacy_session_key.clone(),
+            run_id: None,
+            parent_run_id: None,
+            agent_id: audit.agent_id.clone(),
+            persona_id: audit.persona_id.clone(),
+            sender: Some("context_switch".to_string()),
+            recipient: audit.sender.clone(),
+            role: "assistant".to_string(),
+            event_type: "context.switch.created".to_string(),
+            subject: audit
+                .session_key
+                .as_ref()
+                .map(|key| crate::memory::MessageEventSubject::Conversation(key.clone())),
+            goal_id: None,
+            causation_event_id: Some(range.last_event_id.clone()),
+            correlation_id: audit.source_message_event_id.clone(),
+            attempt_id: None,
+            lease_epoch: None,
+            config_generation_id: audit.config_generation_id,
+            config_source_revision: audit.config_source_revision.clone(),
+            content: handoff_message.to_string(),
+            raw_payload_json: Some(
+                serde_json::json!({
+                    "trigger": trigger,
+                    "handoff_note": serde_json::from_str::<serde_json::Value>(note_json).unwrap_or_default()
+                })
+                .to_string(),
+            ),
+            visibility: audit.visibility.clone(),
+        })
+        .await?;
+    Ok(())
 }
 
 async fn persist_compaction_audit(
@@ -1648,6 +1799,76 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     {
         attach_compaction_event_provenance(audit, source_messages, source).await;
     }
+    let Some(guard) = compaction_patch_guard_for(source_history, start, compact_end) else {
+        return Ok(None);
+    };
+    let timestamp = chrono::Utc::now().to_rfc3339();
+
+    if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
+        let Some(audit) = audit else {
+            tracing::warn!(
+                trigger,
+                "context switch skipped because durable transcript scope is unavailable"
+            );
+            return Ok(None);
+        };
+        let Some(source) = audit_source.as_ref().filter(|source| {
+            source.source_event_provenance_status == "exact"
+                && source.source_event_ids.len() == source.message_count
+                && source.source_event_ids.len() <= crate::tools::transcript_history_lookup::MAX_REFERENCED_EVENTS
+                && source.source_event_range.is_some()
+                && source.source_event_range.as_ref().is_some_and(|range| {
+                    range.last_row_id.saturating_sub(range.first_row_id)
+                        <= crate::tools::transcript_history_lookup::MAX_ROW_SPAN
+                })
+        }) else {
+            tracing::warn!(
+                trigger,
+                "context switch skipped because exact transcript provenance is unavailable"
+            );
+            return Ok(None);
+        };
+        let Some(range) = source.source_event_range.as_ref() else {
+            return Ok(None);
+        };
+        let (from_generation, parent_handoff_event_id) = context_handoff_lineage(source_history);
+        let to_generation = from_generation.saturating_add(1);
+        let handoff_event_id = Uuid::new_v4().to_string();
+        let note = serde_json::json!({
+            "schema_version": 1,
+            "kind": "context_handoff",
+            "strategy": "hard_switch",
+            "handoff_event_id": handoff_event_id,
+            "parent_handoff_event_id": parent_handoff_event_id,
+            "from_generation": from_generation,
+            "to_generation": to_generation,
+            "created_at": timestamp,
+            "trigger": trigger,
+            "source_message_count": source.message_count,
+            "source_token_estimate": source.token_estimate,
+            "source_event_range": range,
+            "retained_recent_message_count": keep_recent,
+            "lookup": {
+                "tool": crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME,
+                "arguments": {
+                    "event_ids": source.source_event_ids,
+                    "first_row_id": range.first_row_id,
+                    "last_row_id": range.last_row_id
+                }
+            }
+        });
+        let note_json = serde_json::to_string(&note)?;
+        let handoff_message = format!("{CONTEXT_HANDOFF_START}\n{note_json}\n{CONTEXT_HANDOFF_END}");
+        persist_context_switch(audit, trigger, source, &handoff_event_id, &handoff_message, &note_json).await?;
+        return Ok(Some(CompactionPatch {
+            range_start: start,
+            range_end: compact_end,
+            replacement: vec![ChatMessage::assistant(handoff_message)],
+            append_after: Vec::new(),
+            guard,
+        }));
+    }
+
     let source_projection = source_history
         .get(start..compact_end)
         .map(bounded_compaction_projection)
@@ -1655,10 +1876,6 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     if source_projection.is_empty() {
         return Ok(None);
     }
-    let Some(guard) = compaction_patch_guard_for(source_history, start, compact_end) else {
-        return Ok(None);
-    };
-    let timestamp = chrono::Utc::now().to_rfc3339();
 
     let mut replacement = Vec::new();
     if config.memory_flush {
@@ -1763,7 +1980,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
             }
             truncate_with_ellipsis(&summary, COMPACTION_MAX_SUMMARY_CHARS)
         }
-        crate::config::AgentCompactionMode::Off => return Ok(None),
+        crate::config::AgentCompactionMode::Switch | crate::config::AgentCompactionMode::Off => return Ok(None),
     };
     let original_source = source_history.get(start..compact_end).unwrap_or(&[]);
     let fidelity_status = compaction_summary_fidelity_status(&summary, config.mode, original_source);
@@ -1871,6 +2088,11 @@ async fn preflight_context_budget_before_provider_call(
 
     budget = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
     if budget.over_hard_limit {
+        if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
+            anyhow::bail!(
+                "context switch could not reduce the provider window below its hard limit without lossy trimming"
+            );
+        }
         let trimmed = if let Some(replacement_len) = replacement_len {
             trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
                 history,
@@ -1905,6 +2127,10 @@ const OS_PAGING_RECALL_MARKER: &str = "[Recalled context from earlier in this se
 /// `source_kind` used when persisting evicted context pages into the document
 /// store. Distinguishes paged context from tool-output documents.
 const OS_PAGING_SOURCE_KIND: &str = "context_page";
+
+const fn context_mode_uses_os_paging(config: &crate::config::AgentCompactionConfig) -> bool {
+    !matches!(config.mode, crate::config::AgentCompactionMode::Switch)
+}
 
 /// Render evicted messages into a durable, searchable transcript. Unlike
 /// compaction this is non-destructive: the full content of every paged message
@@ -2652,43 +2878,23 @@ pub(crate) async fn select_prompt_skills(
 pub(crate) fn build_runtime_system_prompt(
     config: &Config,
     model_name: &str,
-    tool_descs: &[(&str, &str)],
     skills: &[crate::skills::Skill],
     native_tools: bool,
-    tools_registry: &[Box<dyn Tool>],
-    user_query: Option<&str>,
 ) -> String {
     let bootstrap_max_chars = if config.agent.compact_context { Some(6000) } else { None };
-    let tool_descs = tool_descs
-        .iter()
-        .copied()
-        .filter(|(name, _)| {
-            crate::tools::intent::model_allows_tool_name(model_name, name, &config.tool_tiering.model_allowlists)
-        })
-        .collect::<Vec<_>>();
-    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
+    let skills = if crate::tools::intent::core_dependency_is_available("skill_read", model_name, &config.tool_tiering) {
+        skills
+    } else {
+        &[]
+    };
+    crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
         model_name,
-        &tool_descs,
         skills,
         Some(&config.identity),
         bootstrap_max_chars,
         native_tools,
-    );
-
-    if !native_tools {
-        // These callers (chat REPL, gateway sessions, loop one-shots) are never
-        // smart group-reply turns, so `stay_silent` is never advertised here.
-        system_prompt.push_str(&build_tool_instructions_for_intent(
-            tools_registry,
-            user_query.unwrap_or_default(),
-            &config.tool_tiering,
-            model_name,
-            false,
-        ));
-    }
-
-    system_prompt
+    )
 }
 
 /// Find a tool by name in the registry.
@@ -3593,6 +3799,7 @@ fn is_write_tool(name: &str) -> bool {
             | "memory_recall"
             | "memory_search"
             | "memory_get"
+            | "transcript_history_lookup"
             | "document_search"
             | "document_get_chunk"
             | "sessions_list"
@@ -4594,6 +4801,10 @@ pub(crate) struct ToolLoopRuntimeAdapter {
     pub stream_provider: bool,
     pub tool_execution_service: Option<Arc<crate::tools::ToolExecutionService>>,
     pub tool_execution_context: crate::tools::ToolExecutionContext,
+    /// Request-local execution allowlist compiled from the exact ToolSpecs
+    /// advertised to the model. `None` is retained for direct scheduler tests;
+    /// the production loop always replaces it with the current turn snapshot.
+    pub allowed_tool_names: Option<Arc<HashSet<String>>>,
 }
 
 #[derive(Debug)]
@@ -5356,6 +5567,49 @@ async fn execute_one_unrecorded(
         .filter(|id| !id.is_empty())
         .unwrap_or_else(|| Uuid::now_v7().to_string());
 
+    let command = crate::tools::ToolExecutionCommand::new(&call.name, call.arguments.clone())
+        .with_operation_id(tool_call_id.clone())
+        .with_idempotency_key(tool_call_id.clone());
+    let Some(service) = adapter.tool_execution_service.as_ref() else {
+        let result = "Error: ToolExecutionService is unavailable; tool rejected for safety".to_string();
+        emit_tool_loop_event(
+            adapter,
+            ToolLoopEvent::ToolFinished {
+                tool_call_id,
+                name: call.name.clone(),
+                success: false,
+                duration_ms: 0,
+                result: result.clone(),
+            },
+        )
+        .await?;
+        return Ok(result);
+    };
+
+    if adapter
+        .allowed_tool_names
+        .as_ref()
+        .is_some_and(|allowed| !allowed.contains(&call.name))
+        && service.supports_public_name(&call.name)
+    {
+        let result = format!(
+            "Error: tool '{}' was not exposed for this turn and was not executed",
+            call.name
+        );
+        emit_tool_loop_event(
+            adapter,
+            ToolLoopEvent::ToolFinished {
+                tool_call_id,
+                name: call.name.clone(),
+                success: false,
+                duration_ms: 0,
+                result: result.clone(),
+            },
+        )
+        .await?;
+        return Ok(result);
+    }
+
     if chat_mode.intercepts_writes() && is_write_tool(&call.name) {
         let preview = preview_tool_arguments(&call.arguments);
         emit_tool_loop_event(
@@ -5381,25 +5635,6 @@ async fn execute_one_unrecorded(
         .await?;
         return Ok(result);
     }
-
-    let command = crate::tools::ToolExecutionCommand::new(&call.name, call.arguments.clone())
-        .with_operation_id(tool_call_id.clone())
-        .with_idempotency_key(tool_call_id.clone());
-    let Some(service) = adapter.tool_execution_service.as_ref() else {
-        let result = "Error: ToolExecutionService is unavailable; tool rejected for safety".to_string();
-        emit_tool_loop_event(
-            adapter,
-            ToolLoopEvent::ToolFinished {
-                tool_call_id,
-                name: call.name.clone(),
-                success: false,
-                duration_ms: 0,
-                result: result.clone(),
-            },
-        )
-        .await?;
-        return Ok(result);
-    };
 
     let _barrier = if let Some(key) = tool_barrier_key(&call.name) {
         acquire_tool_barrier(key, &call.name).await
@@ -5808,6 +6043,8 @@ async fn run_tool_call_loop_outcome_unguarded(
     let ToolLoopMemory {
         ledger,
         ingest: document_ingest,
+        event_fabric,
+        request_event_scope,
         routing_input,
     } = memory_runtime;
     // Capture routing intent once from the unmodified turn input. The provider
@@ -5848,6 +6085,7 @@ async fn run_tool_call_loop_outcome_unguarded(
             stream_provider: false,
             tool_execution_service: Some(Arc::new(service)),
             tool_execution_context,
+            allowed_tool_names: None,
         }
     });
 
@@ -5880,16 +6118,34 @@ async fn run_tool_call_loop_outcome_unguarded(
     };
     let mode_capabilities = provider.capabilities_for(model, provider_mode);
 
-    // FIX-P3-05: Letta/MemGPT-style OS-paging. Opt-in (`os_paging.enabled`);
-    // when off this whole block is a no-op and the legacy compaction path below
-    // runs unchanged (zero regression on the hot path). When on:
+    // FIX-P3-05: Letta/MemGPT-style OS-paging for legacy compaction modes.
+    // Exact context switching bypasses this block so the durable handoff owns
+    // every cold message before the provider projection changes. When active:
     //   1. Recall — semantically retrieve relevant evicted pages and inject them
     //      (proactive_retrieval) so the model can see paged-out history again.
     //   2. Evict — page the oldest cold context out to the durable document
     //      store (non-destructively), shrinking the hot window before the turn.
-    // Legacy compaction below still runs as a backstop if paging left the
-    // context above the 0.85 threshold.
+    // Legacy compaction below still runs as a backstop if paging left a legacy
+    // mode above the 0.85 threshold.
     if let Some(config) = compaction_config {
+        let switch_needs_lookup = matches!(config.mode, crate::config::AgentCompactionMode::Switch)
+            && (history.iter().any(is_context_handoff_message)
+                || plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD).over_warning);
+        if switch_needs_lookup
+            && !tools_registry
+                .iter()
+                .any(|tool| tool.supports_name(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME))
+        {
+            anyhow::bail!(
+                "context switch requires the '{}' recovery tool, but it is not registered",
+                crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME
+            );
+        }
+    }
+
+    if let Some(config) = compaction_config
+        && context_mode_uses_os_paging(config)
+    {
         if let Some(query) = latest_user_query(history).map(ToString::to_string) {
             if let Some(recalled) = recall_context_pages(&query, config, document_ingest.as_ref()).await {
                 inject_recalled_context(history, recalled);
@@ -6031,11 +6287,30 @@ async fn run_tool_call_loop_outcome_unguarded(
                 )
             },
         );
-        let selected_tools = if let Some(cfg) = tool_tiering {
+        let mut selected_tools = if let Some(cfg) = tool_tiering {
             crate::tools::intent::apply_model_tool_allowlist(selected_tools, model, &cfg.model_allowlists)
         } else {
             selected_tools
         };
+        let context_lookup_required = compaction_config
+            .is_some_and(|config| matches!(config.mode, crate::config::AgentCompactionMode::Switch))
+            && history.iter().any(is_context_handoff_message);
+        if context_lookup_required
+            && !selected_tools
+                .iter()
+                .any(|tool| tool.supports_name(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME))
+        {
+            let lookup = tools_registry
+                .iter()
+                .find(|tool| tool.supports_name(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "context switch recovery tool '{}' disappeared from the registry",
+                        crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME
+                    )
+                })?;
+            selected_tools.push(lookup.as_ref());
+        }
         for tool in &selected_tools {
             if let Err(err) = tool.refresh().await {
                 let message = format!("refresh failed for tool {}: {err}", tool.name());
@@ -6059,6 +6334,14 @@ async fn run_tool_call_loop_outcome_unguarded(
         let mut tool_specs: Vec<crate::tools::ToolSpec> =
             crate::tools::ToolCatalog::from_tools(selected_tools.iter().copied()).tool_specs();
         crate::tools::filter_tool_specs_for_exposure(&mut tool_specs, expose_stay_silent);
+        let required_lookup_spec = context_lookup_required
+            .then(|| {
+                tool_specs
+                    .iter()
+                    .find(|spec| spec.name == crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME)
+                    .cloned()
+            })
+            .flatten();
 
         #[cfg(feature = "wasm-plugins")]
         {
@@ -6087,13 +6370,77 @@ async fn run_tool_call_loop_outcome_unguarded(
                 tool_specs = candidate;
             }
         }
+        // Middleware may narrow or reshape schemas, but it must not bypass the
+        // entrypoint exposure boundary. Reapply the gate to the final snapshot
+        // that drives both prompt/native advertisement and execution.
+        crate::tools::filter_tool_specs_for_exposure(&mut tool_specs, expose_stay_silent);
+        if let Some(required) = required_lookup_spec {
+            tool_specs.retain(|spec| spec.name != crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME);
+            tool_specs.push(required);
+        }
+        let compiled_tool_context =
+            crate::agent::turn_context::CompiledToolContext::new(mode_capabilities.native_tool_calling, tool_specs);
+        compiled_tool_context.apply_to_messages(&mut prepared_messages.messages);
+        let mut execution_adapter = runtime_adapter.clone();
+        execution_adapter.allowed_tool_names = Some(compiled_tool_context.allowed_tool_names());
+
         // Some provider templates (including the deployed Qwen template)
         // reject any system message that is not the first transcript item.
         // Corrective retries, recalled pages, and middleware are all allowed to
         // contribute request-local system context, so canonicalize only the
         // prepared request after every contributor has run.
         coalesce_system_messages_at_front(&mut prepared_messages.messages);
-        let use_native_tools = mode_capabilities.native_tool_calling && !tool_specs.is_empty();
+        let final_system_prompt = prepared_messages
+            .messages
+            .iter()
+            .find(|message| message.role == "system");
+        let system_prompt_sha256 =
+            final_system_prompt.map(|message| crate::agent::prompt::prompt_sha256(&message.content));
+        let system_prompt_chars = final_system_prompt.map_or(0, |message| message.content.chars().count());
+        let tool_snapshot = compiled_tool_context.fingerprint();
+        tracing::debug!(
+            target: "openprx::prompt",
+            system_prompt_sha256 = system_prompt_sha256.as_deref().unwrap_or("none"),
+            system_prompt_chars,
+            tool_snapshot_sha256 = %tool_snapshot.sha256,
+            tool_count = tool_snapshot.count,
+            "final request system prompt compiled"
+        );
+
+        let request_context_payload = serde_json::json!({
+            "schema_version": 1,
+            "iteration": iteration,
+            "provider": provider_name,
+            "model": model,
+            "messages_count": prepared_messages.messages.len(),
+            "system_prompt": {
+                "sha256": system_prompt_sha256.as_deref(),
+                "chars": system_prompt_chars,
+            },
+            "tool_snapshot": &tool_snapshot,
+        });
+        if let Some(fabric) = event_fabric.as_ref() {
+            let scope = request_event_scope
+                .clone()
+                .unwrap_or_else(|| execution_adapter.tool_execution_context.envelope.message_scope());
+            let scope = scope.with_recipient(format!("{provider_name}/{model}"));
+            let content = format!(
+                "system_prompt_sha256={} tool_snapshot_sha256={} iteration={iteration}",
+                system_prompt_sha256.as_deref().unwrap_or("none"),
+                tool_snapshot.sha256
+            );
+            if let Err(error) = fabric
+                .record_runtime_event(
+                    scope,
+                    "llm.request.context.compiled",
+                    content,
+                    Some(request_context_payload.to_string()),
+                )
+                .await
+            {
+                tracing::warn!(error = %error, "Failed to persist compiled LLM request context");
+            }
+        }
 
         hooks
             .emit(
@@ -6102,6 +6449,10 @@ async fn run_tool_call_loop_outcome_unguarded(
                     "provider": provider_name,
                     "model": model,
                     "messages_count": history.len(),
+                    "system_prompt_sha256": system_prompt_sha256.as_deref(),
+                    "system_prompt_chars": system_prompt_chars,
+                    "tool_snapshot_sha256": tool_snapshot.sha256,
+                    "tool_count": tool_snapshot.count,
                 }),
             )
             .await;
@@ -6115,11 +6466,7 @@ async fn run_tool_call_loop_outcome_unguarded(
 
         // Unified path via Provider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
-        let request_tools = if use_native_tools {
-            Some(tool_specs.as_slice())
-        } else {
-            None
-        };
+        let request_tools = compiled_tool_context.native_tool_specs();
 
         // FIX-P0-30/31: use the trace-returning provider entrypoint so this
         // turn's real serving provider/model and failover attempts flow back
@@ -6343,11 +6690,20 @@ async fn run_tool_call_loop_outcome_unguarded(
                                 Ok(Some(patch)) => {
                                     let replacement_len = patch.replacement.len();
                                     apply_compaction_patch_exact(history, &patch);
-                                    trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
-                                        history,
-                                        config,
-                                        replacement_len,
-                                    );
+                                    if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
+                                        let budget = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
+                                        if budget.over_hard_limit {
+                                            anyhow::bail!(
+                                                "context switch retry remained above the hard limit; refusing lossy trim"
+                                            );
+                                        }
+                                    } else {
+                                        trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
+                                            history,
+                                            config,
+                                            replacement_len,
+                                        );
+                                    }
                                     let turns_after = history.len().saturating_sub(usize::from(
                                         history.first().is_some_and(|message| message.role == "system"),
                                     ));
@@ -6369,10 +6725,18 @@ async fn run_tool_call_loop_outcome_unguarded(
                                     .await?;
                                     emitted_exact_patch = true;
                                 }
+                                Ok(None) if matches!(config.mode, crate::config::AgentCompactionMode::Switch) => {
+                                    anyhow::bail!(
+                                        "context switch retry could not create an exact handoff; refusing lossy trim"
+                                    );
+                                }
                                 Ok(None) => {
                                     trim_history_to_context_budget(history, config);
                                 }
                                 Err(error) => {
+                                    if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
+                                        return Err(error);
+                                    }
                                     tracing::warn!("Overflow retry compaction failed: {error}");
                                     apply_aggressive_trim(history, config.keep_recent_messages);
                                 }
@@ -6387,6 +6751,9 @@ async fn run_tool_call_loop_outcome_unguarded(
                         )
                         .await
                         {
+                            if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
+                                return Err(error);
+                            }
                             tracing::warn!("Overflow retry compaction failed: {error}");
                             apply_aggressive_trim(history, config.keep_recent_messages);
                         }
@@ -6530,7 +6897,7 @@ async fn run_tool_call_loop_outcome_unguarded(
         // when the caller advertised the tool (`expose_stay_silent`), which is
         // restricted to smart group turns; this keeps DMs / non-smart turns from
         // ever short-circuiting to Silent even if a model hallucinates the name.
-        if expose_stay_silent {
+        if expose_stay_silent && compiled_tool_context.allows(crate::tools::STAY_SILENT_TOOL_NAME) {
             if let Some(silent_call) = tool_calls
                 .iter()
                 .find(|call| call.name == crate::tools::STAY_SILENT_TOOL_NAME)
@@ -6590,7 +6957,7 @@ async fn run_tool_call_loop_outcome_unguarded(
         let individual_results = execute_tools_with_service(
             &tool_calls,
             &native_tool_calls,
-            &runtime_adapter,
+            &execution_adapter,
             read_only_schedule.clone(),
             cancellation_token.as_ref(),
             chat_mode,
@@ -6744,68 +7111,6 @@ async fn run_tool_call_loop_outcome_unguarded(
             );
         }
     }
-}
-
-/// Build the tool instruction block for the system prompt so the LLM knows
-/// how to invoke tools (prompt-guided / non-native provider path).
-///
-/// `expose_stay_silent` gates the smart group-reply `stay_silent` tool exactly
-/// like the native spec path: it is advertised only on smart group turns. Every
-/// non-native construction site (channels static prompt, skill-RAG rebuild,
-/// `build_runtime_system_prompt`) passes its own smart-turn context here so DMs
-/// / non-smart turns never learn the tool exists.
-#[cfg(test)]
-pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>], expose_stay_silent: bool) -> String {
-    build_tool_instructions_from_tools(tools_registry.iter().map(Box::as_ref), expose_stay_silent)
-}
-
-pub(crate) fn build_tool_instructions_for_intent(
-    tools_registry: &[Box<dyn Tool>],
-    user_message: &str,
-    config: &crate::config::ToolTieringConfig,
-    model: &str,
-    expose_stay_silent: bool,
-) -> String {
-    let selected = crate::tools::intent::select_tools_for_intent(
-        tools_registry,
-        user_message,
-        &config.always_include,
-        &config.always_exclude,
-    );
-    let selected = crate::tools::intent::apply_model_tool_allowlist(selected, model, &config.model_allowlists);
-    build_tool_instructions_from_tools(selected, expose_stay_silent)
-}
-
-fn build_tool_instructions_from_tools<'a>(
-    tools: impl IntoIterator<Item = &'a dyn Tool>,
-    expose_stay_silent: bool,
-) -> String {
-    let tool_specs = crate::tools::ToolCatalog::from_tools(tools).tool_specs();
-    let mut instructions = String::new();
-    instructions.push_str("\n## Tool Use Protocol\n\n");
-    instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
-    instructions.push_str(
-        "```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n",
-    );
-    instructions.push_str("CRITICAL: Output actual <tool_call> tags—never describe steps or give examples.\n\n");
-    instructions.push_str("Example: User says \"what's the date?\". You MUST respond with:\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}\n</tool_call>\n\n");
-    instructions.push_str("You may use multiple tool calls in a single response. ");
-    instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
-    instructions.push_str("Continue reasoning with the results until you can give a final answer.\n\n");
-    instructions.push_str("### Available Tools\n\n");
-
-    for spec in tool_specs {
-        if !crate::tools::tool_name_is_exposed(&spec.name, expose_stay_silent) {
-            continue;
-        }
-        let _ = writeln!(
-            instructions,
-            "**{}**: {}\nParameters: `{}`\n",
-            spec.name, spec.description, spec.parameters
-        );
-    }
-
-    instructions
 }
 
 // ── CausalTree (CTE) speculative branch prediction — experimental, opt-in ──
@@ -7112,56 +7417,7 @@ pub(crate) async fn run_with_runtime_envelope(
         )
         .await;
 
-    // ── Build system prompt from workspace MD files (OpenClaw framework) ──
-    let mut tool_descs: Vec<(&str, &str)> = vec![
-        (
-            "shell",
-            "Execute terminal commands. Use when: running local checks, build/test commands, diagnostics. Don't use when: a safer dedicated tool exists, or command is destructive without approval.",
-        ),
-        (
-            "file_read",
-            "Read file contents. Use when: inspecting project files, configs, logs. Don't use when: a targeted search is enough.",
-        ),
-        (
-            "file_write",
-            "Write file contents. Use when: applying focused edits, scaffolding files, updating docs/code. Don't use when: side effects are unclear or file ownership is uncertain.",
-        ),
-        (
-            "memory_store",
-            "Save to memory. Use when: preserving durable preferences, decisions, key context. Don't use when: information is transient/noisy/sensitive without need.",
-        ),
-        (
-            "memory_recall",
-            "Search memory. Use when: retrieving prior decisions, user preferences, historical context. Don't use when: answer is already in current context.",
-        ),
-        (
-            "memory_forget",
-            "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
-        ),
-    ];
-    tool_descs.push((
-        "cron",
-        "Unified scheduler. Set `action`: add/schedule (create job — shell via expression+command, \
-         or agent via schedule object + payload/job_type/prompt), once (one-shot via delay/run_at), \
-         list, get, remove/cancel, update/patch, run (force-run now), runs/history, events, pause, \
-         resume, status.",
-    ));
-    tool_descs.push((
-        "image_info",
-        "Read image file metadata (format, dimensions, size) and optionally base64-encode it. Use when: inspecting images, preparing visual data for analysis.",
-    ));
-    if config.composio.configured() {
-        tool_descs.push((
-            "composio",
-            "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run (optionally with connected_account_id), 'connect' to OAuth.",
-        ));
-    }
-    if !config.agents.is_empty() {
-        tool_descs.push((
-            "delegate",
-            "Delegate a sub-task to a specialized agent. Use when: task needs different model/capability, or to parallelize work.",
-        ));
-    }
+    // ── Build system prompt from the canonical prompt context ──
     let native_tools = provider
         .capabilities_for(model_name, crate::providers::traits::ProviderRequestMode::NonStreaming)
         .native_tool_calling;
@@ -7220,15 +7476,7 @@ pub(crate) async fn run_with_runtime_envelope(
             };
 
             let selected_skills = select_prompt_skills(&msg, &skills, &config, skill_embedder.as_ref()).await;
-            let system_prompt = build_runtime_system_prompt(
-                &config,
-                model_name,
-                &tool_descs,
-                &selected_skills,
-                native_tools,
-                &tools_registry,
-                Some(&msg),
-            );
+            let system_prompt = build_runtime_system_prompt(&config, model_name, &selected_skills, native_tools);
 
             // Auto-save user message to memory (skip short/trivial messages)
             if config.memory.should_auto_promote_user_message(&msg) {
@@ -7254,7 +7502,13 @@ pub(crate) async fn run_with_runtime_envelope(
                     DocumentIngestRuntime::from_envelope(mem.clone(), &runtime_envelope)
                         .with_source_message_event_id(agent_user_event.as_ref().map(|event| event.event_id.clone())),
                 ),
-            );
+            )
+            .with_event_fabric(memory_fabric.clone())
+            .with_request_event_scope({
+                let mut scope = fabric_scope.clone();
+                scope.causation_event_id = agent_user_event.as_ref().map(|event| event.event_id.clone());
+                scope
+            });
             let semantic_scope = runtime_envelope.memory_write_context("private");
             let mem_context = build_context_with_shared_events_and_scope(
                 mem.as_ref(),
@@ -7501,11 +7755,8 @@ pub(crate) async fn run_with_runtime_envelope(
             vec![ChatMessage::system(build_runtime_system_prompt(
                 &config,
                 model_name,
-                &tool_descs,
                 &skills,
                 native_tools,
-                &tools_registry,
-                None,
             ))]
         };
 
@@ -7556,11 +7807,8 @@ pub(crate) async fn run_with_runtime_envelope(
                         history.push(ChatMessage::system(build_runtime_system_prompt(
                             &config,
                             model_name,
-                            &tool_descs,
                             &skills,
                             native_tools,
-                            &tools_registry,
-                            None,
                         )));
                     }
                     // Clear conversation and daily memory
@@ -7634,7 +7882,13 @@ pub(crate) async fn run_with_runtime_envelope(
                     DocumentIngestRuntime::from_envelope(mem.clone(), &runtime_envelope)
                         .with_source_message_event_id(agent_user_event.as_ref().map(|event| event.event_id.clone())),
                 ),
-            );
+            )
+            .with_event_fabric(memory_fabric.clone())
+            .with_request_event_scope({
+                let mut scope = fabric_scope.clone();
+                scope.causation_event_id = agent_user_event.as_ref().map(|event| event.event_id.clone());
+                scope
+            });
             let semantic_scope = runtime_envelope.memory_write_context("private");
             let mem_context = build_context_with_shared_events_and_scope(
                 mem.as_ref(),
@@ -7652,15 +7906,7 @@ pub(crate) async fn run_with_runtime_envelope(
             };
 
             let selected_skills = select_prompt_skills(&user_input, &skills, &config, skill_embedder.as_ref()).await;
-            let system_prompt = build_runtime_system_prompt(
-                &config,
-                model_name,
-                &tool_descs,
-                &selected_skills,
-                native_tools,
-                &tools_registry,
-                Some(&user_input),
-            );
+            let system_prompt = build_runtime_system_prompt(&config, model_name, &selected_skills, native_tools);
             if history.is_empty() {
                 history.push(ChatMessage::system(system_prompt));
             } else if let Some(first) = history.first_mut() {
@@ -8009,18 +8255,6 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &provider_runtime_options,
     )?;
 
-    let mut tool_descs: Vec<(&str, &str)> = vec![
-        ("shell", "Execute terminal commands."),
-        ("file_read", "Read file contents."),
-        ("file_write", "Write file contents."),
-        ("memory_store", "Save to memory."),
-        ("memory_recall", "Search memory."),
-        ("memory_forget", "Delete a memory entry."),
-        ("image_info", "Read image metadata."),
-    ];
-    if config.composio.configured() {
-        tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
-    }
     let native_tools = provider
         .capabilities_for(&model_name, crate::providers::traits::ProviderRequestMode::NonStreaming)
         .native_tool_calling;
@@ -8028,15 +8262,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let skills =
         crate::skills::load_skills_with_embeddings(&config.workspace_dir, &config, skill_embedder.as_ref()).await?;
     let selected_skills = select_prompt_skills(message, &skills, &config, skill_embedder.as_ref()).await;
-    let system_prompt = build_runtime_system_prompt(
-        &config,
-        &model_name,
-        &tool_descs,
-        &selected_skills,
-        native_tools,
-        tools_registry.as_ref(),
-        Some(message),
-    );
+    let system_prompt = build_runtime_system_prompt(&config, &model_name, &selected_skills, native_tools);
 
     let runtime_envelope =
         RuntimeEnvelope::agent_process_message(memory_fabric.workspace_id().to_string(), agent_session_key.clone())
@@ -8106,7 +8332,9 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
             &mem,
             &config.workspace_dir,
             Some(DocumentIngestRuntime::from_envelope(mem.clone(), &runtime_envelope)),
-        ),
+        )
+        .with_event_fabric(memory_fabric.clone())
+        .with_request_event_scope(fabric_scope.clone()),
     )
     .await;
     let (response, turn_trace) = match turn_result {
@@ -9360,6 +9588,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compiled_request_context_is_persisted_with_transcript_lineage_without_prompt_content() {
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let fabric = MemoryFabric::new(memory.clone(), "workspace-request-context");
+        let mut request_scope = MessageEventScope::new("chat", MemoryVisibility::Workspace)
+            .with_session_key("chat:request-context")
+            .with_run_id("run-request-context")
+            .with_channel("terminal")
+            .with_sender("local-user");
+        request_scope.causation_event_id = Some("user-event-request-context".to_string());
+        let runtime = ToolLoopMemory::new(&memory, tmp.path(), None)
+            .with_event_fabric(fabric)
+            .with_request_event_scope(request_scope);
+        let mut history = vec![
+            ChatMessage::system("private system instructions"),
+            ChatMessage::user("hello"),
+        ];
+
+        let result = run_tool_call_loop(
+            &ScriptedProvider::from_text_responses(vec!["done"]),
+            &mut history,
+            Arc::new(Vec::new()),
+            &NoopObserver,
+            &HookManager::new(tmp.path().to_path_buf()),
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "terminal",
+            &crate::config::MultimodalConfig::default(),
+            1,
+            false,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            runtime,
+            ChatMode::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, "done");
+
+        let principal = MemoryPrincipal {
+            workspace_id: "workspace-request-context".to_string(),
+            agent_id: None,
+            persona_id: None,
+            session_key: Some("chat:request-context".to_string()),
+            channel: Some("terminal".to_string()),
+            sender: Some("local-user".to_string()),
+            owner_id: None,
+            legacy_session_key: None,
+        };
+        let events = memory.list_message_events_since(&principal, 0, 10).await.unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.event_type == "llm.request.context.compiled")
+            .expect("compiled request context event");
+        assert_eq!(event.session_key.as_deref(), Some("chat:request-context"));
+        assert_eq!(event.run_id.as_deref(), Some("run-request-context"));
+        assert_eq!(event.causation_event_id.as_deref(), Some("user-event-request-context"));
+        let payload: serde_json::Value =
+            serde_json::from_str(event.raw_payload_json.as_deref().expect("request context payload")).unwrap();
+        assert_eq!(payload["schema_version"], 1);
+        assert_eq!(payload["iteration"], 1);
+        assert_eq!(payload["tool_snapshot"]["count"], 0);
+        assert_eq!(payload["system_prompt"]["sha256"].as_str().map(str::len), Some(64));
+        assert!(
+            !event
+                .raw_payload_json
+                .as_deref()
+                .unwrap_or_default()
+                .contains("private system instructions"),
+            "durable provenance must not duplicate system prompt content"
+        );
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = NonVisionProvider {
@@ -10282,6 +10592,177 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn prompt_guided_provider_receives_only_the_compiled_turn_tool_snapshot() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let provider = PayloadCapturingProvider {
+            captured: Arc::clone(&captured),
+        };
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(RefreshCountingTool {
+                name: "skill_probe",
+                category: ToolCategory::System,
+                refreshes: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(RefreshCountingTool {
+                name: "mcp_probe",
+                category: ToolCategory::Automation,
+                refreshes: Arc::new(AtomicUsize::new(0)),
+            }),
+        ];
+        let routing_input = "use the skill to create a PDF file. Do not use browser, MCP, HTTP, plugins, or WASM.";
+        let mut history = vec![ChatMessage::system("base-system"), ChatMessage::user(routing_input)];
+        let config = crate::config::ToolTieringConfig::default();
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            Arc::new(tools_registry),
+            &NoopObserver,
+            &HookManager::new(std::env::temp_dir()),
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "gateway",
+            &crate::config::MultimodalConfig::default(),
+            2,
+            false,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&config),
+            ToolLoopMemory::none().with_routing_input(routing_input),
+            ChatMode::default(),
+        )
+        .await
+        .expect("prompt-guided turn should complete");
+
+        assert_eq!(result, "answered");
+        let payload = captured.lock().expect("captured payload should be available");
+        let system = payload
+            .iter()
+            .find(|message| message.role == "system")
+            .expect("request should contain a system message");
+        assert_eq!(system.content.matches("## Tool Use Protocol").count(), 1);
+        assert!(system.content.contains("**skill_probe**"));
+        assert!(
+            !system.content.contains("**mcp_probe**"),
+            "prompt-guided instructions must not advertise a tool excluded by turn intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_loop_rejects_a_registered_tool_not_exposed_for_the_turn() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "<tool_call>\n{\"name\":\"mcp_probe\",\"arguments\":{}}\n</tool_call>",
+            "done",
+        ]);
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RefreshCountingTool {
+            name: "mcp_probe",
+            category: ToolCategory::Automation,
+            refreshes: Arc::new(AtomicUsize::new(0)),
+        })];
+        let routing_input = "use the skill to create a PDF file. Do not use browser, MCP, HTTP, plugins, or WASM.";
+        let mut history = vec![ChatMessage::system("base-system"), ChatMessage::user(routing_input)];
+        let config = crate::config::ToolTieringConfig::default();
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            Arc::new(tools_registry),
+            &NoopObserver,
+            &HookManager::new(std::env::temp_dir()),
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "gateway",
+            &crate::config::MultimodalConfig::default(),
+            2,
+            false,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&config),
+            ToolLoopMemory::none().with_routing_input(routing_input),
+            ChatMode::default(),
+        )
+        .await
+        .expect("turn should recover after rejecting an unexposed tool");
+
+        assert_eq!(result, "done");
+        assert!(history.iter().any(|message| {
+            message
+                .content
+                .contains("tool 'mcp_probe' was not exposed for this turn and was not executed")
+        }));
+    }
+
+    #[tokio::test]
+    async fn turn_exposure_guard_preserves_unknown_tool_diagnostics() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "<tool_call>\n{\"name\":\"invented_probe\",\"arguments\":{}}\n</tool_call>",
+            "done",
+        ]);
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RefreshCountingTool {
+            name: "skill_probe",
+            category: ToolCategory::System,
+            refreshes: Arc::new(AtomicUsize::new(0)),
+        })];
+        let routing_input = "use the skill to create a PDF file";
+        let mut history = vec![ChatMessage::system("base-system"), ChatMessage::user(routing_input)];
+        let config = crate::config::ToolTieringConfig::default();
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            Arc::new(tools_registry),
+            &NoopObserver,
+            &HookManager::new(std::env::temp_dir()),
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "gateway",
+            &crate::config::MultimodalConfig::default(),
+            2,
+            false,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&config),
+            ToolLoopMemory::none().with_routing_input(routing_input),
+            ChatMode::default(),
+        )
+        .await
+        .expect("turn should recover after reporting an unknown tool");
+
+        assert_eq!(result, "done");
+        assert!(
+            history
+                .iter()
+                .any(|message| message.content.contains("unknown tool 'invented_probe'"))
+        );
+        assert!(history.iter().all(|message| {
+            !message
+                .content
+                .contains("tool 'invented_probe' was not exposed for this turn")
+        }));
+    }
+
     /// A provider whose call never returns and never errors — the exact shape
     /// of the hang the idle detector exists to recover from.
     struct HangingProvider;
@@ -10772,6 +11253,7 @@ mod tests {
             stream_provider: false,
             tool_execution_service: Some(Arc::new(service)),
             tool_execution_context,
+            allowed_tool_names: None,
         }
     }
 
@@ -11745,80 +12227,7 @@ ls -la
     }
 
     #[test]
-    fn build_tool_instructions_includes_all_tools() {
-        use crate::security::SecurityPolicy;
-        let security = Arc::new(SecurityPolicy::from_config(
-            &crate::config::AutonomyConfig::default(),
-            std::path::Path::new("/tmp"),
-        ));
-        let tools = tools::default_tools(security);
-        let instructions = build_tool_instructions(&tools, false);
-
-        assert!(instructions.contains("## Tool Use Protocol"));
-        assert!(instructions.contains("<tool_call>"));
-        assert!(instructions.contains("shell"));
-        assert!(instructions.contains("file_read"));
-        assert!(instructions.contains("file_write"));
-    }
-
-    #[test]
-    fn build_tool_instructions_excludes_stay_silent_unless_exposed() {
-        use crate::tools::{STAY_SILENT_TOOL_NAME, StaySilentTool};
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(StaySilentTool::new())];
-
-        // DM / non-smart (expose_stay_silent = false): the tool must NOT appear in
-        // the prompt-guided instructions, so a non-native model can never learn it.
-        let hidden = build_tool_instructions(&tools, false);
-        assert!(
-            !hidden.contains(STAY_SILENT_TOOL_NAME),
-            "stay_silent must be filtered out of non-smart prompt-guided instructions"
-        );
-
-        // Smart group turn (expose_stay_silent = true): the tool IS advertised.
-        let shown = build_tool_instructions(&tools, true);
-        assert!(
-            shown.contains(STAY_SILENT_TOOL_NAME),
-            "stay_silent must be advertised on smart group turns"
-        );
-    }
-
-    #[test]
-    fn prompt_guided_instructions_use_the_same_intent_filter_as_native_specs() {
-        use crate::security::SecurityPolicy;
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(crate::tools::HttpRequestTool::new(
-            Arc::new(SecurityPolicy::default()),
-            Vec::new(),
-            1024,
-            5,
-        ))];
-        let config = crate::config::ToolTieringConfig::default();
-
-        let greeting = build_tool_instructions_for_intent(&tools, "hello", &config, "test-model", false);
-        assert!(!greeting.contains("**http_request**"));
-
-        let web_task = build_tool_instructions_for_intent(&tools, "call this HTTP API", &config, "test-model", false);
-        assert!(web_task.contains("**http_request**"));
-    }
-
-    #[test]
-    fn prompt_guided_instructions_apply_model_tool_allowlist() {
-        use crate::security::SecurityPolicy;
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(crate::tools::HttpRequestTool::new(
-            Arc::new(SecurityPolicy::default()),
-            Vec::new(),
-            1024,
-            5,
-        ))];
-        let mut config = crate::config::ToolTieringConfig::default();
-        config.model_allowlists.insert("small-model".to_string(), Vec::new());
-
-        let instructions =
-            build_tool_instructions_for_intent(&tools, "call this HTTP API", &config, "small-model", false);
-        assert!(!instructions.contains("**http_request**"));
-    }
-
-    #[test]
-    fn runtime_prompt_applies_model_tool_allowlist_to_text_catalog() {
+    fn runtime_base_prompt_excludes_request_local_tool_catalog() {
         let workspace = TempDir::new().unwrap();
         let mut config = Config::default();
         config.workspace_dir = workspace.path().to_path_buf();
@@ -11826,11 +12235,36 @@ ls -la
             .tool_tiering
             .model_allowlists
             .insert("small-model".to_string(), vec!["shell".to_string()]);
-        let tool_descs = [("shell", "Run commands"), ("file_read", "Read files")];
-
-        let prompt = build_runtime_system_prompt(&config, "small-model", &tool_descs, &[], true, &[], None);
-        assert!(prompt.contains("**shell**"));
+        let prompt = build_runtime_system_prompt(&config, "small-model", &[], true);
+        assert!(!prompt.contains("**shell**"));
         assert!(!prompt.contains("**file_read**"));
+    }
+
+    #[test]
+    fn runtime_prompt_hides_skills_when_skill_read_is_unavailable() {
+        let workspace = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        config
+            .tool_tiering
+            .model_allowlists
+            .insert("small-model".to_string(), vec!["shell".to_string()]);
+        let skills = vec![crate::skills::Skill {
+            name: "release".to_string(),
+            description: "Release the project".to_string(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: Vec::new(),
+            prompts: Vec::new(),
+            location: None,
+            embedding: None,
+        }];
+
+        let prompt = build_runtime_system_prompt(&config, "small-model", &skills, true);
+
+        assert!(!prompt.contains("<available_skills>"));
+        assert!(!prompt.contains("<name>release</name>"));
     }
 
     #[test]
@@ -12046,6 +12480,253 @@ ls -la
             history
                 .iter()
                 .any(|msg| { msg.content.contains("[Context compacted at") && msg.content.contains("Summary:") })
+        );
+    }
+
+    #[tokio::test]
+    async fn configurable_context_switch_emits_exact_handoff_without_summary() {
+        let temp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+        let envelope = RuntimeEnvelope::agent("workspace-switch", "run-switch");
+        let audit = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
+        let fabric = MemoryFabric::new(Arc::clone(&memory), "workspace-switch");
+        let provider = ScriptedProvider::from_text_responses(vec!["MODEL_SUMMARY_MUST_NOT_RUN"]);
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("old user ".repeat(120)),
+            ChatMessage::assistant("old assistant ".repeat(120)),
+            ChatMessage::user("pending user ".repeat(120)),
+            ChatMessage::assistant("recent assistant"),
+        ];
+        let mut persisted_ids = Vec::new();
+        for (index, message) in history.iter().skip(1).enumerate() {
+            let event = if message.role == "user" {
+                fabric
+                    .record_inbound_user_message(
+                        envelope.message_scope(),
+                        message.content.clone(),
+                        Some(format!("switch-source-{index}")),
+                        None,
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                fabric
+                    .record_assistant_message(envelope.message_scope(), message.content.clone())
+                    .await
+                    .unwrap()
+            };
+            persisted_ids.push(event.event_id);
+        }
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Switch,
+            reserve_tokens: 1,
+            keep_recent_messages: 1,
+            memory_flush: true,
+            max_context_tokens: 50,
+            max_context_tokens_explicit: true,
+            os_paging: crate::config::OsPagingConfig::default(),
+        };
+
+        let compacted =
+            apply_configurable_compaction(&mut history, &provider, "model", &config, Some(&audit), "test_switch")
+                .await
+                .unwrap();
+
+        assert!(compacted);
+        let handoff = history
+            .iter()
+            .find(|message| message.content.contains("[context_handoff]"))
+            .expect("handoff note must replace cold history");
+        assert!(!handoff.content.contains("MODEL_SUMMARY_MUST_NOT_RUN"));
+        assert!(!history.iter().any(|message| message.content.contains("Memory flush")));
+        for event_id in persisted_ids.iter().take(3) {
+            assert!(handoff.content.contains(event_id));
+        }
+        assert!(history.iter().any(|message| message.content == "recent assistant"));
+
+        let events = memory
+            .list_message_events_recent(&envelope.memory_principal(), 20)
+            .await
+            .unwrap();
+        let switch_event = events
+            .iter()
+            .find(|event| event.event_type == "context.switch.created")
+            .expect("context switch must be durably observable");
+        assert!(
+            switch_event
+                .raw_payload_json
+                .as_deref()
+                .is_some_and(|payload| payload.contains("transcript_history_lookup"))
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "message.created")
+                .count(),
+            4,
+            "hard switch must not rewrite or delete durable transcript events"
+        );
+    }
+
+    #[tokio::test]
+    async fn configurable_context_switch_can_roll_over_repeatedly_with_generation_lineage() {
+        let temp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+        let envelope = RuntimeEnvelope::agent("workspace-repeat-switch", "run-repeat-switch");
+        let audit = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
+        let fabric = MemoryFabric::new(Arc::clone(&memory), "workspace-repeat-switch");
+        let provider = ScriptedProvider::from_text_responses(vec!["unused"]);
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("first old user ".repeat(120)),
+            ChatMessage::assistant("first old assistant ".repeat(120)),
+            ChatMessage::user("first pending user ".repeat(120)),
+            ChatMessage::assistant("first retained assistant"),
+        ];
+        for (index, message) in history.iter().skip(1).enumerate() {
+            if message.role == "user" {
+                fabric
+                    .record_inbound_user_message(
+                        envelope.message_scope(),
+                        message.content.clone(),
+                        Some(format!("repeat-switch-source-{index}")),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                fabric
+                    .record_assistant_message(envelope.message_scope(), message.content.clone())
+                    .await
+                    .unwrap();
+            }
+        }
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Switch,
+            reserve_tokens: 1,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 50,
+            max_context_tokens_explicit: true,
+            os_paging: crate::config::OsPagingConfig::default(),
+        };
+
+        assert!(
+            apply_configurable_compaction(&mut history, &provider, "model", &config, Some(&audit), "first")
+                .await
+                .unwrap()
+        );
+        let first_note = history
+            .iter()
+            .find(|message| is_context_handoff_message(message))
+            .and_then(|message| message.content.strip_prefix(CONTEXT_HANDOFF_START))
+            .and_then(|content| content.strip_suffix(CONTEXT_HANDOFF_END))
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(json.trim()).ok())
+            .expect("first handoff note");
+        let first_handoff_id = first_note
+            .get("handoff_event_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            first_note.get("to_generation").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+
+        let second_user = ChatMessage::user("second old user ".repeat(120));
+        fabric
+            .record_inbound_user_message(
+                envelope.message_scope(),
+                second_user.content.clone(),
+                Some("repeat-switch-second-user".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        history.push(second_user);
+        let second_assistant = ChatMessage::assistant("second retained assistant");
+        fabric
+            .record_assistant_message(envelope.message_scope(), second_assistant.content.clone())
+            .await
+            .unwrap();
+        history.push(second_assistant);
+
+        assert!(
+            apply_configurable_compaction(&mut history, &provider, "model", &config, Some(&audit), "second")
+                .await
+                .unwrap(),
+            "a prior handoff must remain exact provenance for the next rollover"
+        );
+        let second_note = history
+            .iter()
+            .find(|message| is_context_handoff_message(message))
+            .and_then(|message| message.content.strip_prefix(CONTEXT_HANDOFF_START))
+            .and_then(|content| content.strip_suffix(CONTEXT_HANDOFF_END))
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(json.trim()).ok())
+            .expect("second handoff note");
+        assert_eq!(
+            second_note.get("from_generation").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            second_note.get("to_generation").and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            second_note
+                .get("parent_handoff_event_id")
+                .and_then(serde_json::Value::as_str),
+            Some(first_handoff_id.as_str())
+        );
+
+        let events = memory
+            .list_message_events_recent(&envelope.memory_principal(), 30)
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "context.switch.created")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn configurable_context_switch_fails_closed_without_exact_provenance() {
+        let provider = ScriptedProvider::from_text_responses(vec!["unused"]);
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("old user ".repeat(120)),
+            ChatMessage::assistant("old assistant ".repeat(120)),
+            ChatMessage::user("recent user"),
+        ];
+        let before = history
+            .iter()
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect::<Vec<_>>();
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Switch,
+            reserve_tokens: 1,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 50,
+            max_context_tokens_explicit: true,
+            os_paging: crate::config::OsPagingConfig::default(),
+        };
+
+        let compacted = apply_configurable_compaction(&mut history, &provider, "model", &config, None, "test")
+            .await
+            .unwrap();
+
+        assert!(!compacted);
+        assert_eq!(
+            history
+                .iter()
+                .map(|message| (message.role.clone(), message.content.clone()))
+                .collect::<Vec<_>>(),
+            before
         );
     }
 
@@ -13894,6 +14575,18 @@ Let me check the result."#;
                 keep_recent_messages: 1,
             },
         }
+    }
+
+    #[test]
+    fn switch_mode_bypasses_legacy_os_paging() {
+        let mut config = paging_test_config(true);
+        assert!(context_mode_uses_os_paging(&config));
+
+        config.mode = crate::config::AgentCompactionMode::Switch;
+        assert!(
+            !context_mode_uses_os_paging(&config),
+            "an exact handoff must run before any legacy paging can evict its source messages"
+        );
     }
 
     #[tokio::test]

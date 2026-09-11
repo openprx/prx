@@ -240,7 +240,10 @@ impl Tool for SkillReadTool {
     }
 
     fn tier(&self) -> ToolTier {
-        ToolTier::Standard
+        // Every skill advertised in the system context is lazy-loaded through
+        // this tool. It is therefore part of the core prompt/tool contract, not
+        // an optional intent category.
+        ToolTier::Core
     }
 
     fn categories(&self) -> &'static [ToolCategory] {
@@ -768,6 +771,14 @@ mod tests {
         config.skills.open_skills_dir = Some(workspace.join("missing-open-skills").to_string_lossy().to_string());
         config.skills.openclaw_skills_dir = Some(workspace.join("missing-openclaw").to_string_lossy().to_string());
         config
+    }
+
+    #[test]
+    fn skill_read_is_a_core_prompt_dependency() {
+        let workspace = TempDir::new().unwrap();
+        let tool = SkillReadTool::new(workspace.path().to_path_buf(), test_config(workspace.path()));
+
+        assert_eq!(tool.tier(), ToolTier::Core);
     }
 
     #[tokio::test]

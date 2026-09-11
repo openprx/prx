@@ -1160,30 +1160,6 @@ fn native_dispatcher_converts_tool_results_to_tool_messages() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 23. XML tool instructions generation
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn xml_dispatcher_generates_tool_instructions() {
-    let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-    let dispatcher = XmlToolDispatcher;
-    let instructions = dispatcher.prompt_instructions(&tools);
-
-    assert!(instructions.contains("## Tool Use Protocol"));
-    assert!(instructions.contains("<tool_call>"));
-    assert!(instructions.contains("echo"));
-    assert!(instructions.contains("Echoes the input"));
-}
-
-#[test]
-fn native_dispatcher_returns_empty_instructions() {
-    let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-    let dispatcher = NativeToolDispatcher;
-    let instructions = dispatcher.prompt_instructions(&tools);
-    assert!(instructions.is_empty());
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 // 24. Clear history
 // ═══════════════════════════════════════════════════════════════════════════
 

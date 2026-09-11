@@ -45,6 +45,7 @@ pub mod memory_search;
 pub mod memory_store;
 pub mod message_send;
 pub mod nodes;
+pub mod prompt;
 pub mod proxy_config;
 pub mod pushover;
 pub mod schema;
@@ -60,6 +61,7 @@ pub mod stay_silent;
 pub mod subagents;
 pub(crate) mod tool_diff;
 pub mod traits;
+pub mod transcript_history_lookup;
 pub mod web_fetch;
 pub mod web_search_tool;
 pub mod xin;
@@ -110,6 +112,7 @@ pub use stay_silent::{STAY_SILENT_TOOL_NAME, StaySilentTool};
 pub use subagents::SubagentsTool;
 pub use traits::Tool;
 pub use traits::{ToolCategory, ToolResult, ToolSpec, ToolTier};
+pub use transcript_history_lookup::{TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME, TranscriptHistoryLookupTool};
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
 pub use xin::XinTool;
@@ -448,6 +451,7 @@ pub fn all_tools_with_runtime_ext_and_extensions(
             memory.clone(),
             config.memory.acl_enabled,
         )));
+        tool_arcs.push(Arc::new(TranscriptHistoryLookupTool::new(memory.clone())));
         tool_arcs.push(Arc::new(DocumentSearchTool::new(
             workspace_dir.to_path_buf(),
             memory.clone(),

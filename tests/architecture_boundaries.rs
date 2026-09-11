@@ -591,3 +591,145 @@ fn every_config_reload_entrypoint_routes_through_generation_manager() {
         );
     }
 }
+
+#[test]
+fn prompt_guided_tool_protocol_has_one_production_owner() {
+    let owners = rust_source_files()
+        .into_iter()
+        .filter_map(|path| {
+            let relative = relative_path(&path);
+            let source = fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {relative}: {error}"));
+            let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+            production.contains("## Tool Use Protocol").then_some(relative)
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        owners,
+        vec!["src/tools/prompt.rs"],
+        "the prompt-guided protocol must be rendered by one canonical production module"
+    );
+}
+
+#[test]
+fn channel_system_prompt_delegates_to_the_canonical_agent_builder() {
+    let channels = fs::read_to_string(repository_root().join("src/channels/mod.rs")).expect("read src/channels/mod.rs");
+    let body = function_body(&channels, "build_system_prompt_with_mode");
+
+    assert!(body.contains("crate::agent::prompt::SystemPromptBuilder::with_defaults()"));
+    for duplicated_section in [
+        "## Your Task",
+        "## Safety",
+        "## Workspace",
+        "## Project Context",
+        "## Current Date & Time",
+        "## Runtime",
+    ] {
+        assert!(
+            !body.contains(duplicated_section),
+            "channels must not rebuild canonical prompt section {duplicated_section}"
+        );
+    }
+}
+
+#[test]
+fn runtime_prompt_has_no_parallel_tool_description_catalog() {
+    for relative in [
+        "src/agent/loop_.rs",
+        "src/channels/mod.rs",
+        "src/chat/mod.rs",
+        "src/gateway/api/sessions.rs",
+        "src/gateway/mod.rs",
+        "src/session_worker/runner.rs",
+    ] {
+        let source = fs::read_to_string(repository_root().join(relative))
+            .unwrap_or_else(|error| panic!("read {relative}: {error}"));
+        assert!(
+            !source.contains("tool_descs"),
+            "{relative} must derive prompt tool descriptions from the compiled ToolSpec snapshot"
+        );
+    }
+}
+
+#[test]
+fn compiled_request_context_event_has_one_production_owner() {
+    let owners = rust_source_files()
+        .into_iter()
+        .filter_map(|path| {
+            let relative = relative_path(&path);
+            let source = fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {relative}: {error}"));
+            source.contains("llm.request.context.compiled").then_some(relative)
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        owners,
+        vec!["src/agent/loop_.rs"],
+        "request-context provenance must be emitted once by the shared provider loop"
+    );
+}
+
+#[test]
+fn production_tool_loop_memory_is_wired_to_request_context_events() {
+    for relative in [
+        "src/agent/loop_.rs",
+        "src/channels/mod.rs",
+        "src/chat/mod.rs",
+        "src/gateway/api/sessions.rs",
+        "src/gateway/mod.rs",
+        "src/session_worker/runner.rs",
+        "src/tools/delegate.rs",
+        "src/tools/sessions_spawn.rs",
+    ] {
+        let source = fs::read_to_string(repository_root().join(relative))
+            .unwrap_or_else(|error| panic!("read {relative}: {error}"));
+        assert!(
+            source.contains(".with_event_fabric("),
+            "{relative} must attach request-context event persistence to its ToolLoopMemory"
+        );
+    }
+
+    let dispatcher =
+        fs::read_to_string(repository_root().join("src/chat/dispatcher.rs")).expect("read src/chat/dispatcher.rs");
+    assert!(
+        dispatcher.contains("ToolLoopMemory::none().with_event_fabric(request_event_fabric)"),
+        "the Redux driver must attach request-context persistence to its adapter-owned memory runtime"
+    );
+}
+
+#[test]
+fn context_handoff_has_one_production_owner_and_exact_lookup_is_registered() {
+    let owners = rust_source_files()
+        .into_iter()
+        .filter_map(|path| {
+            let relative = relative_path(&path);
+            let source = fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {relative}: {error}"));
+            source.contains("[context_handoff]").then_some(relative)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(owners, vec!["src/agent/loop_.rs"]);
+
+    let tools = fs::read_to_string(repository_root().join("src/tools/mod.rs")).expect("read src/tools/mod.rs");
+    assert!(tools.contains("TranscriptHistoryLookupTool::new(memory.clone())"));
+    let policy =
+        fs::read_to_string(repository_root().join("src/security/policy.rs")).expect("read src/security/policy.rs");
+    assert!(policy.contains("\"transcript_history_lookup\""));
+
+    for relative in [
+        "src/agent/loop_.rs",
+        "src/session_worker/runner.rs",
+        "src/tools/delegate.rs",
+        "src/tools/sessions_spawn.rs",
+    ] {
+        let source = fs::read_to_string(repository_root().join(relative))
+            .unwrap_or_else(|error| panic!("read {relative}: {error}"));
+        assert!(
+            source.contains("TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME"),
+            "{relative} must preserve the hard-switch recovery dependency"
+        );
+    }
+    let loop_source =
+        fs::read_to_string(repository_root().join("src/agent/loop_.rs")).expect("read src/agent/loop_.rs");
+    assert!(loop_source.contains("context_mode_uses_os_paging"));
+    assert!(loop_source.contains("tool_specs.push(required)"));
+}

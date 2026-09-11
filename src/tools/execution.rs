@@ -986,6 +986,17 @@ impl ToolExecutionService {
         None
     }
 
+    /// Return whether an exact public tool name can currently be resolved.
+    ///
+    /// This includes live dynamic aliases that were discovered after the
+    /// immutable startup catalog was captured. Turn-level exposure guards use
+    /// this distinction to reject a known-but-unexposed capability without
+    /// changing the existing error for a genuinely unknown tool name.
+    #[must_use]
+    pub fn supports_public_name(&self, public_name: &str) -> bool {
+        self.resolve(public_name).is_some()
+    }
+
     #[must_use]
     pub fn descriptors(&self) -> Vec<ToolDescriptor> {
         self.catalog.descriptors().to_vec()

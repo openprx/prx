@@ -3947,19 +3947,6 @@ pub async fn run(
     let skills =
         crate::skills::load_skills_with_embeddings(&config.workspace_dir, &config, skill_embedder.as_ref()).await?;
 
-    // ── Tool descriptions for system prompt ──────────────────────
-    let tool_descs: Vec<(&str, &str)> = vec![
-        ("shell", "Execute terminal commands."),
-        ("file_read", "Read file contents."),
-        ("file_write", "Write file contents."),
-        ("memory_store", "Save to memory."),
-        ("memory_recall", "Search memory."),
-        ("memory_forget", "Delete a memory entry."),
-        (
-            "chat_schedule",
-            "Schedule a future message back into the current chat main session for dispatcher self-wake observation.",
-        ),
-    ];
     let native_tools = provider
         .capabilities_for(&model_name, crate::providers::traits::ProviderRequestMode::Streaming)
         .native_tool_calling;
@@ -4179,15 +4166,7 @@ pub async fn run(
     );
 
     // ── Conversation history ─────────────────────────────────────
-    let mut history = history_for_session_with_system(
-        &chat_session,
-        &config,
-        model_name,
-        &tool_descs,
-        &skills,
-        native_tools,
-        &tools_registry,
-    );
+    let mut history = history_for_session_with_system(&chat_session, &config, model_name, &skills, native_tools);
 
     // ── P3-3: shared TuiState mirror ─────────────────────────────
     //
@@ -4306,6 +4285,7 @@ pub async fn run(
         let deps = dispatcher::EffectDeps {
             provider: Arc::clone(&provider),
             memory: Arc::clone(&mem),
+            memory_event_recording: config.memory.event_recording_config(),
             channel: Arc::clone(&terminal) as Arc<dyn crate::channels::Channel>,
             hooks: Arc::clone(&hooks),
             observer: Arc::clone(&observer),
@@ -4804,7 +4784,6 @@ pub async fn run(
                         config: &config,
                         provider_name,
                         model_name,
-                        tool_descs: &tool_descs,
                         skills: &skills,
                         native_tools,
                         tools_registry: &tools_registry,
@@ -5151,7 +5130,6 @@ pub async fn run(
                             config: &config,
                             provider_name,
                             model_name,
-                            tool_descs: &tool_descs,
                             skills: &skills,
                             native_tools,
                             tools_registry: &tools_registry,
@@ -5813,7 +5791,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     config: &config,
                     provider_name,
                     model_name,
-                    tool_descs: &tool_descs,
                     skills: &skills,
                     native_tools,
                     tools_registry: &tools_registry,
@@ -5843,15 +5820,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
             // skill 列表），reducer 这边的 system 仍是上一轮的。本 S2-C 阶段
             // 不做修正——legacy 仍是 LLM 真上下文源，reducer 是观察账本。
             if !config.skill_rag.available() {
-                let cleared_system = build_runtime_system_prompt(
-                    &config,
-                    model_name,
-                    &tool_descs,
-                    &skills,
-                    native_tools,
-                    &tools_registry,
-                    None,
-                );
+                let cleared_system = build_runtime_system_prompt(&config, model_name, &skills, native_tools);
                 history.push(ChatMessage::system(cleared_system.clone()));
                 // S2-C Step 4 (Codex P0 修正): 用 SetLeadingSystemPrompt 而非
                 // RecordSystemMessage。reducer 的 HistoryCleared 是 "drain 非 system
@@ -6070,7 +6039,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     config: &config,
                                     provider_name,
                                     model_name,
-                                    tool_descs: &tool_descs,
                                     skills: &skills,
                                     native_tools,
                                     tools_registry: &tools_registry,
@@ -6159,7 +6127,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     config: &config,
                                     provider_name,
                                     model_name,
-                                    tool_descs: &tool_descs,
                                     skills: &skills,
                                     native_tools,
                                     tools_registry: &tools_registry,
@@ -6246,7 +6213,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     config: &config,
                                     provider_name,
                                     model_name,
-                                    tool_descs: &tool_descs,
                                     skills: &skills,
                                     native_tools,
                                     tools_registry: &tools_registry,
@@ -7082,6 +7048,12 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     .with_source_message_event_id(chat_user_event.as_ref().map(|event| event.event_id.clone())),
             ),
         )
+        .with_event_fabric(memory_fabric.clone())
+        .with_request_event_scope({
+            let mut scope = chat_message_event_scope(&chat_session_key, &turn_run_id, provider_name, model_name);
+            scope.causation_event_id = chat_user_event.as_ref().map(|event| event.event_id.clone());
+            scope
+        })
         .with_routing_input(user_input_for_prompt.clone());
         let semantic_scope = chat_runtime_write_context(&runtime_envelope);
         let mem_context = build_context_with_shared_events_and_scope(
@@ -7101,15 +7073,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
 
         // Build system prompt with skill selection
         let selected_skills = select_prompt_skills(&user_input, &skills, &config, skill_embedder.as_ref()).await;
-        let system_prompt = build_runtime_system_prompt(
-            &config,
-            model_name,
-            &tool_descs,
-            &selected_skills,
-            native_tools,
-            &tools_registry,
-            Some(&user_input),
-        );
+        let system_prompt = build_runtime_system_prompt(&config, model_name, &selected_skills, native_tools);
         let persisted_history_for_turn = persisted_history_for_current_turn(&chat_session, &system_prompt, &user_input);
         if history.is_empty() {
             history.push(ChatMessage::system(system_prompt.clone()));
@@ -13807,10 +13771,8 @@ fn history_for_session_with_system(
     session: &session::ChatSession,
     config: &Config,
     model_name: &str,
-    tool_descs: &[(&str, &str)],
     skills: &[crate::skills::Skill],
     native_tools: bool,
-    tools_registry: &[Box<dyn Tool>],
 ) -> Vec<ChatMessage> {
     let resumed_history = session_turns_to_history(session);
     if config.skill_rag.available() {
@@ -13819,11 +13781,8 @@ fn history_for_session_with_system(
     let mut history = vec![ChatMessage::system(build_runtime_system_prompt(
         config,
         model_name,
-        tool_descs,
         skills,
         native_tools,
-        tools_registry,
-        None,
     ))];
     history.extend(resumed_history);
     history
@@ -13979,7 +13938,6 @@ struct ChatSwitchCtx<'a> {
     config: &'a Config,
     provider_name: &'a str,
     model_name: &'a str,
-    tool_descs: &'a [(&'a str, &'a str)],
     skills: &'a [crate::skills::Skill],
     native_tools: bool,
     tools_registry: &'a [Box<dyn Tool>],
@@ -14247,10 +14205,8 @@ async fn apply_chat_session_switch(mut ctx: ChatSwitchCtx<'_>, mut loaded_sessio
         ctx.chat_session,
         ctx.config,
         ctx.model_name,
-        ctx.tool_descs,
         ctx.skills,
         ctx.native_tools,
-        ctx.tools_registry,
     );
 
     let _ = ctx.chat_dispatcher.dispatch_or_log(
@@ -21228,7 +21184,6 @@ mod regfix_approval_switch_tests {
         let mut attached_follow = None;
         let mut attached_follow_seq = Some(7);
         let config = Config::default();
-        let tool_descs: Vec<(&str, &str)> = Vec::new();
         let skills: Vec<crate::skills::Skill> = Vec::new();
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let chat_mirror = Arc::new(parking_lot::Mutex::new(tui::TuiState::new("p", "m")));
@@ -21272,7 +21227,6 @@ mod regfix_approval_switch_tests {
                 config: &config,
                 provider_name: "p",
                 model_name: "m",
-                tool_descs: &tool_descs,
                 skills: &skills,
                 native_tools: false,
                 tools_registry: &tools_registry,

@@ -383,6 +383,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "memory_recall",
     "memory_search",
     "memory_get",
+    "transcript_history_lookup",
     // Document retrieval (RAG) reads.
     "document_search",
     "document_get_chunk",

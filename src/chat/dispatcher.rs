@@ -40,7 +40,7 @@ use crate::chat::action::Action;
 use crate::chat::state::{ChatState, Effect};
 use crate::hooks::HookManager;
 use crate::llm::route_decision::{ProviderUsageAccumulator, TokenUsage};
-use crate::memory::Memory;
+use crate::memory::{Memory, MemoryEventRecording, MemoryFabric};
 use crate::observability::Observer;
 use crate::providers::Provider;
 use crate::tools::{
@@ -892,6 +892,9 @@ pub struct EffectDeps {
     pub provider: Arc<dyn Provider>,
     /// memory backend（SaveSession / PersistToMemory）
     pub memory: Arc<dyn Memory>,
+    /// Message-event policy shared with the chat ingress. Request-context
+    /// provenance must obey the same persistence switch as the transcript.
+    pub memory_event_recording: MemoryEventRecording,
     /// 当前 channel（EmitChannelMessage / SendDraftFinalize / CancelDraft）
     pub channel: Arc<dyn Channel>,
     /// hook 管理器（NotifyHook）
@@ -1161,6 +1164,15 @@ impl EffectExecutor {
                     provider_turn_task_id,
                     &draft_id,
                 );
+                let request_event_fabric = MemoryFabric::new(
+                    Arc::clone(&deps.memory),
+                    tool_execution_context.envelope.workspace_id.clone(),
+                )
+                .with_event_recording(deps.memory_event_recording);
+                let compaction_audit = Some(crate::agent::loop_::DocumentIngestRuntime::from_envelope(
+                    Arc::clone(&deps.memory),
+                    &tool_execution_context.envelope,
+                ));
                 let tool_execution_service = tools_registry.as_ref().map(|registry| {
                     Arc::new(chat_tool_execution_service(
                         Arc::clone(registry),
@@ -1228,6 +1240,8 @@ impl EffectExecutor {
                         tools_registry,
                         tool_execution_service,
                         tool_execution_context,
+                        request_event_fabric,
+                        compaction_audit,
                         chat_mode,
                         observer,
                         hooks,
@@ -1820,13 +1834,15 @@ fn build_dispatcher_tool_specs(
     specs
 }
 
-async fn apply_redux_summary_compaction(
+async fn apply_redux_context_rollover(
     provider: &dyn Provider,
     history: &mut Vec<crate::providers::traits::ChatMessage>,
     compaction_guard_history: &mut Vec<crate::providers::traits::ChatMessage>,
     model: &str,
     config: &crate::config::AgentCompactionConfig,
+    audit: Option<&crate::agent::loop_::DocumentIngestRuntime>,
     action_tx: &mpsc::Sender<Action>,
+    draft_id: Option<&str>,
     reason: crate::chat::action::CompactReason,
     trigger: &str,
 ) -> Result<Option<usize>, ()> {
@@ -1840,15 +1856,42 @@ async fn apply_redux_summary_compaction(
         provider,
         model,
         config,
-        None,
+        audit,
         trigger,
     )
     .await
     {
         Ok(Some(patch)) => patch,
+        Ok(None) if matches!(config.mode, crate::config::AgentCompactionMode::Switch) => {
+            let message = "context switch could not create an exact transcript handoff; refusing lossy trim";
+            if let Some(draft_id) = draft_id {
+                let _ = action_tx
+                    .send(Action::StreamFailed {
+                        draft_id: draft_id.to_string(),
+                        err: message.to_string(),
+                        retryable: false,
+                    })
+                    .await;
+            }
+            tracing::warn!(trigger, "{message}");
+            return Err(());
+        }
         Ok(None) => return Ok(None),
         Err(error) => {
-            tracing::warn!(error = %error, trigger, "redux driver summary compaction failed; falling back to trim");
+            if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
+                if let Some(draft_id) = draft_id {
+                    let _ = action_tx
+                        .send(Action::StreamFailed {
+                            draft_id: draft_id.to_string(),
+                            err: format!("context switch failed: {error}"),
+                            retryable: false,
+                        })
+                        .await;
+                }
+                tracing::warn!(error = %error, trigger, "redux driver context switch failed closed");
+                return Err(());
+            }
+            tracing::warn!(error = %error, trigger, "redux driver context rollover failed; falling back to trim");
             return Ok(None);
         }
     };
@@ -1859,6 +1902,20 @@ async fn apply_redux_summary_compaction(
     let budget =
         crate::agent::loop_::plan_context_budget(history, config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
     if budget.over_hard_limit {
+        if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
+            let message = "context switch remained above the hard limit; refusing lossy trim";
+            if let Some(draft_id) = draft_id {
+                let _ = action_tx
+                    .send(Action::StreamFailed {
+                        draft_id: draft_id.to_string(),
+                        err: message.to_string(),
+                        retryable: false,
+                    })
+                    .await;
+            }
+            tracing::warn!(trigger, "{message}");
+            return Err(());
+        }
         let trimmed = crate::agent::loop_::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
             history,
             config,
@@ -1868,7 +1925,7 @@ async fn apply_redux_summary_compaction(
             used_tokens = budget.used_tokens,
             hard_limit = budget.available_input_tokens,
             trimmed,
-            "redux driver summary compaction applied preserving trim"
+            "redux driver context rollover applied preserving trim"
         );
     }
     if let Err(error) = action_tx
@@ -1995,7 +2052,7 @@ async fn send_redux_context_window_update(
     Ok(())
 }
 
-fn trim_redux_driver_context_budget_after_summary(
+fn trim_redux_driver_context_budget_after_rollover(
     history: &mut Vec<crate::providers::traits::ChatMessage>,
     compaction_guard_history: &mut Vec<crate::providers::traits::ChatMessage>,
     config: &crate::config::AgentCompactionConfig,
@@ -2208,6 +2265,8 @@ async fn drive_start_turn_stream(
     tools_registry: Option<Arc<Vec<Box<dyn crate::tools::Tool>>>>,
     tool_execution_service: Option<Arc<ToolExecutionService>>,
     tool_execution_context: ToolExecutionContext,
+    request_event_fabric: MemoryFabric,
+    compaction_audit: Option<crate::agent::loop_::DocumentIngestRuntime>,
     chat_mode: crate::agent::loop_::ChatMode,
     observer: Arc<dyn Observer>,
     hooks: Arc<HookManager>,
@@ -2228,13 +2287,15 @@ async fn drive_start_turn_stream(
             let replacement_len = if compaction_off {
                 None
             } else {
-                match apply_redux_summary_compaction(
+                match apply_redux_context_rollover(
                     provider.as_ref(),
                     &mut history,
                     &mut compaction_guard_history,
                     &model,
                     config,
+                    compaction_audit.as_ref(),
                     &action_tx,
+                    Some(&draft_id),
                     crate::chat::action::CompactReason::ContextOverflow,
                     "redux_preflight",
                 )
@@ -2250,7 +2311,7 @@ async fn drive_start_turn_stream(
                 crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
             );
             if compaction_off || after_compact.over_hard_limit {
-                trim_redux_driver_context_budget_after_summary(
+                trim_redux_driver_context_budget_after_rollover(
                     &mut history,
                     &mut compaction_guard_history,
                     config,
@@ -2306,6 +2367,7 @@ async fn drive_start_turn_stream(
         stream_provider: true,
         tool_execution_service,
         tool_execution_context,
+        allowed_tool_names: None,
     };
     let tools = tools_registry.unwrap_or_else(|| Arc::new(Vec::new()));
 
@@ -2332,7 +2394,7 @@ async fn drive_start_turn_stream(
         None,
         None,
         // The adapter's ToolExecutionService already carries the resolved ledger.
-        crate::agent::loop_::ToolLoopMemory::none(),
+        crate::agent::loop_::ToolLoopMemory::none().with_event_fabric(request_event_fabric),
         chat_mode,
         None,
         false,
@@ -2472,13 +2534,15 @@ async fn drive_start_turn_stream_legacy(
                 let summary_replacement_len = if compaction_off {
                     None
                 } else {
-                    match apply_redux_summary_compaction(
+                    match apply_redux_context_rollover(
                         provider.as_ref(),
                         &mut history,
                         &mut compaction_guard_history,
                         &model,
                         config,
+                        None,
                         &action_tx,
+                        Some(&draft_id),
                         crate::chat::action::CompactReason::ContextOverflow,
                         "redux_preflight",
                     )
@@ -2494,7 +2558,7 @@ async fn drive_start_turn_stream_legacy(
                     crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
                 );
                 if compaction_off || after_compact.over_hard_limit {
-                    let trimmed = trim_redux_driver_context_budget_after_summary(
+                    let trimmed = trim_redux_driver_context_budget_after_rollover(
                         &mut history,
                         &mut compaction_guard_history,
                         config,
@@ -2596,13 +2660,15 @@ async fn drive_start_turn_stream_legacy(
                         );
                     }
                     Some(config) => {
-                        let summary_replacement_len = match apply_redux_summary_compaction(
+                        let summary_replacement_len = match apply_redux_context_rollover(
                             provider.as_ref(),
                             &mut history,
                             &mut compaction_guard_history,
                             &model,
                             config,
+                            None,
                             &action_tx,
+                            Some(&draft_id),
                             crate::chat::action::CompactReason::ContextOverflow,
                             "redux_overflow_retry",
                         )
@@ -2612,7 +2678,7 @@ async fn drive_start_turn_stream_legacy(
                             Err(()) => return,
                         };
                         if summary_replacement_len.is_none() {
-                            let trimmed = trim_redux_driver_context_budget_after_summary(
+                            let trimmed = trim_redux_driver_context_budget_after_rollover(
                                 &mut history,
                                 &mut compaction_guard_history,
                                 config,
@@ -4450,6 +4516,8 @@ mod tests {
             None,
             None,
             tool_context,
+            MemoryFabric::new(Arc::new(crate::memory::NoneMemory::new()), "test"),
+            None,
             crate::agent::loop_::ChatMode::Edit,
             Arc::new(crate::observability::noop::NoopObserver),
             Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),
@@ -5119,6 +5187,7 @@ mod real_mode_tests {
         let deps = EffectDeps {
             provider,
             memory,
+            memory_event_recording: MemoryEventRecording::default(),
             channel,
             hooks: Arc::clone(&hooks),
             observer,
@@ -5565,6 +5634,7 @@ mod real_mode_tests {
             let deps = EffectDeps {
                 provider,
                 memory,
+                memory_event_recording: MemoryEventRecording::default(),
                 channel,
                 hooks,
                 observer,
@@ -5633,6 +5703,7 @@ mod real_mode_tests {
         let deps = EffectDeps {
             provider,
             memory,
+            memory_event_recording: MemoryEventRecording::default(),
             channel,
             hooks,
             observer,
@@ -6610,6 +6681,7 @@ mod real_mode_tests {
         let deps = EffectDeps {
             provider,
             memory,
+            memory_event_recording: MemoryEventRecording::default(),
             channel,
             hooks,
             observer,
@@ -6759,6 +6831,7 @@ mod real_mode_tests {
         let deps = EffectDeps {
             provider,
             memory,
+            memory_event_recording: MemoryEventRecording::default(),
             channel,
             hooks: Arc::clone(&hooks),
             observer,
@@ -6912,6 +6985,7 @@ mod real_mode_tests {
         let deps = EffectDeps {
             provider,
             memory,
+            memory_event_recording: MemoryEventRecording::default(),
             channel,
             hooks,
             observer,
@@ -9141,6 +9215,64 @@ mod real_mode_tests {
     }
 
     #[tokio::test]
+    async fn redux_switch_failure_emits_terminal_error_instead_of_trimming() {
+        let provider = MockEnvProvider::from_env();
+        let mut history = vec![
+            crate::providers::ChatMessage::system("sys"),
+            crate::providers::ChatMessage::user("old user ".repeat(120)),
+            crate::providers::ChatMessage::assistant("old assistant ".repeat(120)),
+            crate::providers::ChatMessage::user("current user"),
+        ];
+        let original = history
+            .iter()
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect::<Vec<_>>();
+        let mut guard_history = history.clone();
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Switch,
+            reserve_tokens: 1,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 50,
+            max_context_tokens_explicit: true,
+            os_paging: crate::config::OsPagingConfig::default(),
+        };
+        let (action_tx, mut action_rx) = mpsc::channel(2);
+
+        let result = apply_redux_context_rollover(
+            &provider,
+            &mut history,
+            &mut guard_history,
+            "model",
+            &config,
+            None,
+            &action_tx,
+            Some("draft-switch-failure"),
+            crate::chat::action::CompactReason::ContextOverflow,
+            "test_switch_failure",
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            history
+                .iter()
+                .map(|message| (message.role.clone(), message.content.clone()))
+                .collect::<Vec<_>>(),
+            original,
+            "failed exact switch must leave history unchanged"
+        );
+        assert!(matches!(
+            action_rx.recv().await,
+            Some(Action::StreamFailed {
+                draft_id,
+                retryable: false,
+                ..
+            }) if draft_id == "draft-switch-failure"
+        ));
+    }
+
+    #[tokio::test]
     async fn redux_compaction_guard_uses_persisted_source_when_provider_history_is_enriched() {
         use crate::chat::state::{ChatState, Effect};
         use crate::providers::traits::{
@@ -9225,13 +9357,15 @@ mod real_mode_tests {
         };
         let (action_tx, mut action_rx) = mpsc::channel::<Action>(4);
 
-        let replacement_len = apply_redux_summary_compaction(
+        let replacement_len = apply_redux_context_rollover(
             &SummaryProvider,
             &mut driver_history,
             &mut compaction_guard_history,
             "model",
             &config,
+            None,
             &action_tx,
+            None,
             crate::chat::action::CompactReason::ContextOverflow,
             "test_persisted_guard_source",
         )
@@ -9367,13 +9501,15 @@ mod real_mode_tests {
         };
         let (action_tx, mut action_rx) = mpsc::channel::<Action>(4);
 
-        let replacement_len = apply_redux_summary_compaction(
+        let replacement_len = apply_redux_context_rollover(
             &SummaryProvider,
             &mut driver_history,
             &mut compaction_guard_history,
             "model",
             &config,
+            None,
             &action_tx,
+            None,
             crate::chat::action::CompactReason::ContextOverflow,
             "test_empty_enrichment_guard_source",
         )
@@ -9487,13 +9623,15 @@ mod real_mode_tests {
         };
         let (action_tx, mut action_rx) = mpsc::channel::<Action>(4);
 
-        let replacement_len = apply_redux_summary_compaction(
+        let replacement_len = apply_redux_context_rollover(
             &SummaryProvider,
             &mut driver_history,
             &mut compaction_guard_history,
             "model",
             &config,
+            None,
             &action_tx,
+            None,
             crate::chat::action::CompactReason::ContextOverflow,
             "test_enrichment_only_fallback",
         )
@@ -9594,13 +9732,15 @@ mod real_mode_tests {
         };
         let (action_tx, mut action_rx) = mpsc::channel::<Action>(4);
 
-        let replacement_len = apply_redux_summary_compaction(
+        let replacement_len = apply_redux_context_rollover(
             &provider,
             &mut driver_history,
             &mut compaction_guard_history,
             "model",
             &config,
+            None,
             &action_tx,
+            None,
             crate::chat::action::CompactReason::ContextOverflow,
             "test_second_trim",
         )
@@ -9617,7 +9757,7 @@ mod real_mode_tests {
             !after_compact.over_hard_limit,
             "preserve-trim floor should fully remediate when the protected replacement fits"
         );
-        let _ = trim_redux_driver_context_budget_after_summary(
+        let _ = trim_redux_driver_context_budget_after_rollover(
             &mut driver_history,
             &mut compaction_guard_history,
             &config,
@@ -9723,13 +9863,15 @@ mod real_mode_tests {
         };
         let (action_tx, mut action_rx) = mpsc::channel::<Action>(4);
 
-        let replacement_len = apply_redux_summary_compaction(
+        let replacement_len = apply_redux_context_rollover(
             &HugeSummaryProvider,
             &mut driver_history,
             &mut compaction_guard_history,
             "model",
             &config,
+            None,
             &action_tx,
+            None,
             crate::chat::action::CompactReason::ContextOverflow,
             "test_floor_drops_unfit_summary",
         )
@@ -11494,6 +11636,7 @@ mod real_mode_tests {
         let deps = EffectDeps {
             provider,
             memory,
+            memory_event_recording: MemoryEventRecording::default(),
             channel,
             hooks: Arc::clone(&hooks),
             observer,

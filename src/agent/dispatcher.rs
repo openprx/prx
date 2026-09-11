@@ -1,5 +1,4 @@
 use crate::providers::{ChatMessage, ChatResponse, ConversationMessage, ToolResultMessage};
-use crate::tools::{Tool, ToolSpec, tool_name_is_exposed};
 use serde_json::Value;
 use std::fmt::Write;
 
@@ -21,7 +20,6 @@ pub struct ToolExecutionResult {
 pub trait ToolDispatcher: Send + Sync {
     fn parse_response(&self, response: &ChatResponse) -> (String, Vec<ParsedToolCall>);
     fn format_results(&self, results: &[ToolExecutionResult]) -> ConversationMessage;
-    fn prompt_instructions(&self, tools: &[Box<dyn Tool>]) -> String;
     fn to_provider_messages(&self, history: &[ConversationMessage]) -> Vec<ChatMessage>;
     fn should_send_tool_specs(&self) -> bool;
 }
@@ -76,10 +74,6 @@ impl XmlToolDispatcher {
 
         (text_parts.join("\n"), calls)
     }
-
-    pub fn tool_specs(tools: &[Box<dyn Tool>]) -> Vec<ToolSpec> {
-        crate::tools::ToolCatalog::from_boxed_registry(tools).tool_specs()
-    }
 }
 
 impl ToolDispatcher for XmlToolDispatcher {
@@ -99,33 +93,6 @@ impl ToolDispatcher for XmlToolDispatcher {
             );
         }
         ConversationMessage::Chat(ChatMessage::user(format!("[Tool results]\n{content}")))
-    }
-
-    fn prompt_instructions(&self, tools: &[Box<dyn Tool>]) -> String {
-        let mut instructions = String::new();
-        instructions.push_str("## Tool Use Protocol\n\n");
-        instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
-        instructions.push_str(
-            "```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n",
-        );
-        instructions.push_str("### Available Tools\n\n");
-
-        for tool in tools {
-            // Agent::turn path never uses smart-group reply; stay_silent must not
-            // appear in prompt-guided tool listings (expose_stay_silent = false).
-            if !tool_name_is_exposed(tool.name(), false) {
-                continue;
-            }
-            let _ = writeln!(
-                instructions,
-                "- **{}**: {}\n  Parameters: `{}`",
-                tool.name(),
-                tool.description(),
-                tool.parameters_schema()
-            );
-        }
-
-        instructions
     }
 
     fn to_provider_messages(&self, history: &[ConversationMessage]) -> Vec<ChatMessage> {
@@ -189,10 +156,6 @@ impl ToolDispatcher for NativeToolDispatcher {
             })
             .collect();
         ConversationMessage::ToolResults(messages)
-    }
-
-    fn prompt_instructions(&self, _tools: &[Box<dyn Tool>]) -> String {
-        String::new()
     }
 
     fn to_provider_messages(&self, history: &[ConversationMessage]) -> Vec<ChatMessage> {
@@ -313,45 +276,5 @@ mod tests {
             }
             _ => panic!("expected ToolResults variant"),
         }
-    }
-
-    #[test]
-    fn xml_prompt_instructions_excludes_stay_silent() {
-        // Agent::turn uses XmlToolDispatcher; stay_silent must never appear in its
-        // prompt_instructions listing regardless of what tools are passed.
-        struct FakeTool {
-            n: &'static str,
-        }
-        #[async_trait::async_trait]
-        impl crate::tools::Tool for FakeTool {
-            fn name(&self) -> &str {
-                self.n
-            }
-            fn description(&self) -> &str {
-                "desc"
-            }
-            fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({})
-            }
-            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
-                Ok(crate::tools::ToolResult {
-                    success: true,
-                    output: "ok".into(),
-                    error: None,
-                })
-            }
-        }
-
-        let tools: Vec<Box<dyn crate::tools::Tool>> = vec![
-            Box::new(crate::tools::StaySilentTool::new()),
-            Box::new(FakeTool { n: "shell" }),
-        ];
-        let dispatcher = XmlToolDispatcher;
-        let instructions = dispatcher.prompt_instructions(&tools);
-        assert!(
-            !instructions.contains(crate::tools::STAY_SILENT_TOOL_NAME),
-            "stay_silent must not appear in XmlToolDispatcher prompt instructions"
-        );
-        assert!(instructions.contains("shell"), "normal tools must still be listed");
     }
 }

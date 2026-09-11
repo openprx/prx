@@ -948,8 +948,11 @@ pub struct AgentConfig {
 pub enum AgentCompactionMode {
     /// Disable proactive compaction.
     Off,
-    /// Conservative compaction that prefers summary replacement.
+    /// Replace cold context with an exact transcript reference and keep the
+    /// durable transcript unchanged.
     #[default]
+    Switch,
+    /// Conservative compaction that prefers summary replacement.
     Safeguard,
     /// Aggressive truncation mode for tighter contexts.
     Aggressive,
@@ -958,7 +961,7 @@ pub enum AgentCompactionMode {
 /// Agent context compaction configuration (`[agent.compaction]`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentCompactionConfig {
-    /// Compaction strategy (`off`, `safeguard`, `aggressive`).
+    /// Context rollover strategy (`off`, `switch`, `safeguard`, `aggressive`).
     #[serde(default)]
     pub mode: AgentCompactionMode,
     /// Tokens reserved for the next model response.
@@ -967,7 +970,8 @@ pub struct AgentCompactionConfig {
     /// Number of recent non-system messages to keep after compaction.
     #[serde(default = "default_agent_compaction_keep_recent_messages")]
     pub keep_recent_messages: usize,
-    /// Run memory flush extraction before compacting.
+    /// Run memory flush extraction before legacy summary/truncation modes.
+    /// Exact `switch` handoffs never invoke a summarizer.
     #[serde(default = "default_true")]
     pub memory_flush: bool,
     /// Total model context window in tokens. This uses the same unit as
@@ -994,7 +998,7 @@ pub struct AgentCompactionConfig {
 impl Default for AgentCompactionConfig {
     fn default() -> Self {
         Self {
-            mode: AgentCompactionMode::Safeguard,
+            mode: AgentCompactionMode::Switch,
             reserve_tokens: default_agent_compaction_reserve_tokens(),
             keep_recent_messages: default_agent_compaction_keep_recent_messages(),
             memory_flush: true,
@@ -1018,8 +1022,9 @@ pub enum RetrievalInjectionRole {
 
 /// Letta/MemGPT-style OS-paging configuration (`[agent.compaction.os_paging]`).
 ///
-/// OS-paging is an additive layer on top of the existing compaction pipeline.
-/// Always active; configuration controls its thresholds and recall behavior.
+/// OS-paging is an additive layer for the legacy compaction modes. The exact
+/// `switch` mode bypasses it so paging cannot evict history before a durable
+/// handoff is created. Configuration controls paging thresholds and recall.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct OsPagingConfig {
     /// Token capacity ratio (0.0-1.0, relative to the input window after

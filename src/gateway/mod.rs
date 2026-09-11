@@ -1976,7 +1976,7 @@ async fn run_gateway_chat_with_multimodal(
             .to_string();
         anyhow::anyhow!(error)
     })?;
-    if let Err(error) = fabric
+    let gateway_user_event = match fabric
         .record_inbound_user_message(
             base_scope.clone(),
             message.to_string(),
@@ -1985,12 +1985,16 @@ async fn run_gateway_chat_with_multimodal(
         )
         .await
     {
-        tracing::warn!(
-            channel = %fabric_ctx.channel,
-            session_key = %fabric_ctx.session_key,
-            "Failed to append gateway user message event: {error}"
-        );
-    }
+        Ok(event) => Some(event),
+        Err(error) => {
+            tracing::warn!(
+                channel = %fabric_ctx.channel,
+                session_key = %fabric_ctx.session_key,
+                "Failed to append gateway user message event: {error}"
+            );
+            None
+        }
+    };
 
     let min_relevance_score = config_snapshot.memory.min_relevance_score;
     let semantic_scope = runtime_envelope.memory_write_context(if fabric_ctx.channel == "webhook" {
@@ -2053,19 +2057,19 @@ async fn run_gateway_chat_with_multimodal(
         skills.clone()
     };
     let system_prompt = {
-        let tool_descs: Vec<(&str, &str)> = vec![
-            ("shell", "Execute terminal commands"),
-            ("file_read", "Read file contents"),
-            ("file_write", "Write file contents"),
-            ("memory_store", "Save to memory"),
-            ("memory_recall", "Search memory"),
-            ("memory_forget", "Delete a memory entry"),
-        ];
+        let selected_skills = if crate::tools::intent::core_dependency_is_available(
+            "skill_read",
+            &turn_runtime.model,
+            &config_snapshot.tool_tiering,
+        ) {
+            selected_skills.as_slice()
+        } else {
+            &[]
+        };
         crate::channels::build_system_prompt_with_mode(
             &config_snapshot.workspace_dir,
             &turn_runtime.model,
-            &tool_descs,
-            &selected_skills,
+            selected_skills,
             Some(&config_snapshot.identity),
             None,
             native_tools,
@@ -2158,6 +2162,15 @@ async fn run_gateway_chat_with_multimodal(
                     &runtime_envelope,
                 )),
             )
+            .with_event_fabric(
+                MemoryFabric::new(state.mem.clone(), runtime_envelope.workspace_id.clone())
+                    .with_event_recording(config_snapshot.memory.event_recording_config()),
+            )
+            .with_request_event_scope({
+                let mut scope = base_scope.clone();
+                scope.causation_event_id = gateway_user_event.as_ref().map(|event| event.event_id.clone());
+                scope
+            })
             .with_routing_input(message.to_string()),
             crate::agent::loop_::ChatMode::default(),
         ),
@@ -4753,7 +4766,7 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
-            5
+            6
         );
     }
 

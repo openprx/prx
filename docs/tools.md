@@ -2,13 +2,15 @@
 
 Built-in and dynamically discovered tools are organized by category. The exact
 provider-visible count is selected per turn from intent, configuration, runtime
-health, MCP discovery, and the active WASM generation.
+health, MCP discovery, and the active WASM generation. The resulting immutable
+`ToolSpec` snapshot controls provider representation and execution for that
+iteration; see [Unified turn context](unified-turn-context.md).
 
 | Category | Tools |
 |----------|-------|
 | **Shell & Files** | `shell`, `file_read`, `file_write`, `file_edit`, `git_operations` |
 | **Web** | `web_search_tool`, `web_fetch`, `http_request` |
-| **Memory & Documents** | `memory_store`, `memory_recall`, `memory_search`, `memory_get`, `memory_forget`, `memory_reindex`, `document_search`, `document_get_chunk`, `document_ingest`, `document_sync` |
+| **Memory & Documents** | `memory_store`, `memory_recall`, `memory_search`, `memory_get`, `transcript_history_lookup`, `memory_forget`, `memory_reindex`, `document_search`, `document_get_chunk`, `document_ingest`, `document_sync` |
 | **Skills** | `skills_list`, `skill_read`, `skills_manage`, `skill_execute`, plus up to 32 declared skill-tool aliases |
 | **Messaging** | `message_send` |
 | **Sessions** | `sessions_spawn`, `sessions_send`, `sessions_list`, `sessions_history`, `session_status`, `subagents`, `delegate` |

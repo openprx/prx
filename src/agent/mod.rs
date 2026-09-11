@@ -9,6 +9,7 @@ pub mod prompt;
 pub mod sanitize;
 pub mod stream_buffer;
 pub mod terminal;
+pub(crate) mod turn_context;
 
 #[cfg(test)]
 mod tests;

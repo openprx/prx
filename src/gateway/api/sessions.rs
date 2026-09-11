@@ -208,26 +208,6 @@ struct ConsoleTurnResult {
     envelope: RuntimeEnvelope,
 }
 
-fn console_tool_descriptions(config: &crate::config::Config) -> Vec<(&'static str, &'static str)> {
-    let mut tool_descs = vec![
-        ("shell", "Execute terminal commands"),
-        ("file_read", "Read file contents"),
-        ("file_write", "Write file contents"),
-        ("memory_store", "Save to memory"),
-        ("memory_recall", "Search memory"),
-        ("memory_forget", "Delete a memory entry"),
-        ("document_search", "Search stored document chunks with source anchors"),
-        ("document_get_chunk", "Read a stored document chunk by id"),
-    ];
-    if config.composio.configured() {
-        tool_descs.push(("composio", "Execute configured Composio app actions"));
-    }
-    if !config.agents.is_empty() {
-        tool_descs.push(("delegate", "Delegate a sub-task to a specialized agent"));
-    }
-    tool_descs
-}
-
 async fn run_console_runtime_turn(
     state: &AppState,
     envelope: &RuntimeEnvelope,
@@ -265,16 +245,8 @@ async fn run_console_runtime_turn(
     .await?;
     let selected_skills =
         select_prompt_skills(visible_message, &skills, &config_snapshot, skill_embedder.as_ref()).await;
-    let tool_descs = console_tool_descriptions(&config_snapshot);
-    let system_prompt = build_runtime_system_prompt(
-        &config_snapshot,
-        &turn_runtime.model,
-        &tool_descs,
-        &selected_skills,
-        native_tools,
-        turn_runtime.tools_registry.as_ref(),
-        Some(visible_message),
-    );
+    let system_prompt =
+        build_runtime_system_prompt(&config_snapshot, &turn_runtime.model, &selected_skills, native_tools);
 
     let mut turn_envelope = envelope
         .clone()
@@ -372,6 +344,11 @@ async fn run_console_runtime_turn(
                     .with_source_message_event_id(source_message_event_id),
             ),
         )
+        .with_event_fabric(
+            MemoryFabric::new(state.mem.clone(), turn_envelope.workspace_id.clone())
+                .with_event_recording(config_snapshot.memory.event_recording_config()),
+        )
+        .with_request_event_scope(turn_envelope.message_scope())
         .with_routing_input(visible_message.to_string()),
         crate::agent::loop_::ChatMode::default(),
     )
