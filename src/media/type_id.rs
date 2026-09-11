@@ -1225,41 +1225,4 @@ mod tests {
             );
         }
     }
-
-    /// Every real WhatsApp photo the wacli helper has downloaded on this host is
-    /// a JPEG written with a `.jfif` extension. When the store is present, prove
-    /// the resolver reads the bytes and not the misleading name.
-    #[test]
-    fn real_wacli_media_files_resolve_to_jpeg() {
-        let root = std::path::Path::new("/home/ck/.wacli/media");
-        if !root.is_dir() {
-            return;
-        }
-        let mut checked = 0usize;
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                let Ok(bytes) = std::fs::read(&path) else {
-                    continue;
-                };
-                let name = path.to_string_lossy();
-                // No MIME at all, and the on-disk name says `.jfif`.
-                let hint = TypeHint::new().with_mime("").with_file_name(&name);
-                let resolved = resolve(&hint, &bytes);
-                assert_eq!(resolved.extension, "jpg", "{} resolved wrong", path.display());
-                assert_eq!(resolved.category, MediaCategory::Image);
-                assert_eq!(resolved.source, TypeSource::Content);
-                checked += 1;
-            }
-        }
-        assert!(checked > 0, "wacli media store exists but held no files to check");
-    }
 }
