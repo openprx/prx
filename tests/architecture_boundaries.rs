@@ -24,7 +24,14 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     "src/cron/store.rs::cron_write_waits_past_the_old_five_second_deadline_and_warns::let conn = Connection::open(&db_path).expect(\"test: holder connection\");",
     "src/cron/store.rs::legacy_cron_schema_migrates_lineage_columns_and_events_table::let conn = Connection::open(&db_path).unwrap();",
     "src/cron/store.rs::with_connection::Connection::open(&db_path).with_context(|| format!(\"Failed to open cron DB: {}\", db_path.display()))?;",
+    // Read-only doctor probes must not initialize the memory repository merely
+    // to count legacy rows in an existing database.
+    "src/doctor/mod.rs::read_only_sqlite_key_prefix_count::let connection = rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;",
     "src/doctor/mod.rs::read_only_sqlite_session_count::let conn = rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;",
+    // Test-only legacy rows intentionally bypass the new public write guard so
+    // the migration and doctor can prove they repair pre-guard data.
+    "src/doctor/mod.rs::doctor_reports_legacy_fitness_counts_and_repair_command::let connection = rusqlite::Connection::open(config.workspace_dir.join(\"memory/brain.db\")).unwrap();",
+    "src/fitness_cli.rs::migration_exports_then_removes_legacy_rows_and_projections::let connection = rusqlite::Connection::open(db_path).unwrap();",
     "src/gateway/compat.rs::mcp_agent_identity_binding_upserts_sqlite_row::let conn = Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
     "src/gateway/compat.rs::upsert_agent_identity_binding::let conn = Connection::open(db_path)?;",
     "src/main.rs::open_approval_ledger::Connection::open(&db_path).with_context(|| format!(\"Failed to open approval ledger: {}\", db_path.display()))?;",
