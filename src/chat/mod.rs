@@ -3813,6 +3813,21 @@ fn ensure_chat_tracing_to_file() -> Result<Option<TracingChatGuard>> {
     setup_chat_tracing_to_file().map(Some)
 }
 
+/// Seed the reducer with the exact durable chat session before any turn can be
+/// admitted. This must also run for a brand-new session with zero turns: leaving
+/// `ChatState::new`'s placeholder id in place lets the first Redux save rename
+/// the conversation, which splits message-event provenance across session keys.
+fn initial_chat_dispatcher_state(
+    provider_name: &str,
+    model_name: &str,
+    shutdown: CancellationToken,
+    chat_session: &session::ChatSession,
+) -> state::ChatState {
+    let mut state = state::ChatState::new(Arc::from(provider_name), Arc::from(model_name), shutdown);
+    let _ = state.reduce(crate::chat::action::Action::SessionLoaded(chat_session.clone()));
+    state
+}
+
 /// Run the interactive chat session with rich terminal UI.
 #[allow(clippy::too_many_lines)]
 pub async fn run(
@@ -4238,10 +4253,7 @@ pub async fn run(
     // 避免无界增长导致 OOM。
     let (chat_dispatcher, chat_action_rx) = dispatcher::ChatDispatcher::new();
     let mut dispatcher_shadow_state =
-        state::ChatState::new(Arc::from(provider_name), Arc::from(model_name), shutdown.clone());
-    if chat_session.turn_count() > 0 {
-        let _ = dispatcher_shadow_state.reduce(crate::chat::action::Action::SessionLoaded(chat_session.clone()));
-    }
+        initial_chat_dispatcher_state(provider_name, model_name, shutdown.clone(), &chat_session);
     #[cfg(feature = "terminal-tui")]
     {
         dispatcher_shadow_state.ui.chat_mode = chat_session.mode;
@@ -14556,6 +14568,18 @@ mod session_runtime_binding_tests {
         assert_eq!(session.model, "kimi-k2.5");
         assert_eq!(session.title, "resumed");
         assert_eq!(session.turn_count(), 1);
+    }
+
+    #[test]
+    fn brand_new_chat_seeds_redux_with_durable_session_id() {
+        let session = session::ChatSession::new("mock", "mock-model");
+        assert_eq!(session.turn_count(), 0);
+
+        let state = initial_chat_dispatcher_state("mock", "mock-model", CancellationToken::new(), &session);
+
+        assert_eq!(state.session.id, session.id);
+        assert_eq!(state.session.provider.as_ref(), session.provider);
+        assert_eq!(state.session.model.as_ref(), session.model);
     }
 
     #[tokio::test]
