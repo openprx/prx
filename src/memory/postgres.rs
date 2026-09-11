@@ -661,6 +661,77 @@ impl PostgresMemory {
         ))
     }
 
+    /// Inspect a key namespace without initializing or mutating the configured
+    /// PostgreSQL schema. Identifiers are validated before interpolation and
+    /// the prefix remains a bound query parameter.
+    pub fn read_key_prefix_read_only(
+        db_url: &str,
+        schema: &str,
+        table: &str,
+        connect_timeout_secs: Option<u64>,
+        prefix: &str,
+    ) -> Result<Vec<(String, String)>> {
+        validate_identifier(schema, "storage schema")?;
+        validate_identifier(table, "storage table")?;
+        let qualified_table = format!("{}.{}", quote_identifier(schema), quote_identifier(table));
+        let mut config = db_url
+            .parse::<postgres::Config>()
+            .context("invalid postgres connection URL")?;
+        config.connect_timeout(Duration::from_secs(
+            connect_timeout_secs
+                .unwrap_or(POSTGRES_DEFAULT_CONNECT_TIMEOUT_SECS)
+                .min(POSTGRES_CONNECT_TIMEOUT_CAP_SECS),
+        ));
+        let mut client = config
+            .connect(NoTls)
+            .context("connect to postgres memory for fitness inspection")?;
+        let mut transaction = client
+            .build_transaction()
+            .read_only(true)
+            .start()
+            .context("start read-only fitness inspection")?;
+        transaction.execute("SELECT set_config('prx.rls_bypass', 'on', true)", &[])?;
+        let escaped = prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("{escaped}%");
+        let statement =
+            format!("SELECT key, content FROM {qualified_table} WHERE key LIKE $1 ESCAPE '\\' ORDER BY key");
+        let rows = transaction.query(&statement, &[&pattern])?;
+        transaction.rollback()?;
+        Ok(rows.into_iter().map(|row| (row.get(0), row.get(1))).collect())
+    }
+
+    /// Delete an exact key namespace in one PostgreSQL transaction.
+    pub fn delete_key_prefix_transactional(
+        db_url: &str,
+        schema: &str,
+        table: &str,
+        connect_timeout_secs: Option<u64>,
+        prefix: &str,
+    ) -> Result<usize> {
+        validate_identifier(schema, "storage schema")?;
+        validate_identifier(table, "storage table")?;
+        let qualified_table = format!("{}.{}", quote_identifier(schema), quote_identifier(table));
+        let mut config = db_url
+            .parse::<postgres::Config>()
+            .context("invalid postgres connection URL")?;
+        config.connect_timeout(Duration::from_secs(
+            connect_timeout_secs
+                .unwrap_or(POSTGRES_DEFAULT_CONNECT_TIMEOUT_SECS)
+                .min(POSTGRES_CONNECT_TIMEOUT_CAP_SECS),
+        ));
+        let mut client = config
+            .connect(NoTls)
+            .context("connect to postgres memory for fitness migration")?;
+        let mut transaction = client.transaction()?;
+        transaction.execute("SELECT set_config('prx.rls_bypass', 'on', true)", &[])?;
+        let escaped = prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("{escaped}%");
+        let statement = format!("DELETE FROM {qualified_table} WHERE key LIKE $1 ESCAPE '\\'");
+        let affected = transaction.execute(&statement, &[&pattern])?;
+        transaction.commit()?;
+        usize::try_from(affected).context("PostgreSQL returned an invalid deleted fitness row count")
+    }
+
     pub fn new(db_url: &str, schema: &str, table: &str, connect_timeout_secs: Option<u64>) -> Result<Self> {
         Self::with_embedder(
             db_url,
@@ -4323,7 +4394,12 @@ impl Memory for PostgresMemory {
             format!("{escaped}{}%", std::path::MAIN_SEPARATOR)
         });
         let legacy_session_keys = Self::legacy_session_key_params(&principal);
-        let session_indices = Self::session_indices(4, 12, &principal, &legacy_session_keys);
+        let mut session_indices = Self::session_indices(4, 12, &principal, &legacy_session_keys);
+        // This query has fixed placeholders after the session key. Keep $4 in
+        // the predicate even when it is NULL so PostgreSQL can infer its type.
+        if session_indices.is_empty() {
+            session_indices.push(4);
+        }
         let session_fragment =
             crate::memory::session_predicate::session_visibility_or_fragment(PG_DIALECT, &session_indices);
 
@@ -6112,6 +6188,188 @@ mod tests {
             outcome.unwrap().is_err(),
             "PostgresMemory::new should return a connect error for an unreachable endpoint"
         );
+    }
+
+    fn fitness_message_input(workspace_id: &str, content: &str) -> MessageEventInput {
+        MessageEventInput {
+            event_id: Some(format!("fitness-event-{}", Uuid::new_v4())),
+            idempotency_key: None,
+            workspace_id: workspace_id.to_string(),
+            owner_id: None,
+            source: crate::memory::MessageEventSource::Other("fitness-postgres-test".to_string()),
+            channel: None,
+            session_key: Some("fitness-session".to_string()),
+            parent_session_key: None,
+            run_id: None,
+            parent_run_id: None,
+            agent_id: None,
+            persona_id: None,
+            sender: None,
+            recipient: None,
+            role: "system".to_string(),
+            event_type: "turn.finalized".to_string(),
+            subject: None,
+            goal_id: None,
+            causation_event_id: None,
+            correlation_id: None,
+            attempt_id: None,
+            lease_epoch: None,
+            config_generation_id: None,
+            config_source_revision: None,
+            content: content.to_string(),
+            raw_payload_json: Some(r#"{"status":"completed"}"#.to_string()),
+            visibility: MemoryVisibility::Workspace,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_time_range_query_includes_only_configured_worker_descendants_from_env() {
+        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let schema = format!("prx_fitness_events_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).unwrap();
+        for (workspace, content) in [
+            ("/workspace", "root event"),
+            ("/workspace/workers/run-1", "worker event"),
+            ("/workspace/workers-old/run-2", "prefix sibling hidden"),
+            ("/other/workers/run-3", "other workspace hidden"),
+        ] {
+            mem.append_message_event(fitness_message_input(workspace, content))
+                .await
+                .unwrap();
+        }
+        let principal = MemoryPrincipal {
+            workspace_id: "/workspace".to_string(),
+            agent_id: Some("self_system".to_string()),
+            ..MemoryPrincipal::default()
+        };
+        let start = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let end = (Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
+
+        let visible = mem
+            .list_message_events_time_range(&principal, Some("/workspace/workers"), &start, &end, 20)
+            .await
+            .unwrap();
+        let contents = visible.iter().map(|event| event.content.as_str()).collect::<Vec<_>>();
+        assert_eq!(contents, vec!["root event", "worker event"]);
+
+        let non_system = MemoryPrincipal {
+            agent_id: Some("regular-agent".to_string()),
+            ..principal
+        };
+        assert!(
+            mem.list_message_events_time_range(&non_system, Some("/workspace/workers"), &start, &end, 20)
+                .await
+                .is_err()
+        );
+
+        drop(mem);
+        tokio::task::spawn_blocking(move || {
+            let mut client = db_url.parse::<postgres::Config>().unwrap().connect(NoTls).unwrap();
+            client
+                .batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_identifier(&schema)))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_fitness_prefix_migration_sql_is_exact_and_transactional_from_env() {
+        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let schema = format!("prx_fitness_migration_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).unwrap();
+        let table = mem.qualified_table.clone();
+        let insert_url = db_url.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut client = insert_url.parse::<postgres::Config>().unwrap().connect(NoTls).unwrap();
+            let mut transaction = client.transaction().unwrap();
+            transaction
+                .execute("SELECT set_config('prx.rls_bypass', 'on', true)", &[])
+                .unwrap();
+            for (id, key) in [
+                ("legacy-one", "self/fitness/daily/2026-09-10"),
+                ("legacy-two", "self/fitness/daily/2026-09-11"),
+                ("keep", "self/fitness/daily_extra/keep"),
+            ] {
+                transaction
+                    .execute(
+                        &format!(
+                            "INSERT INTO {table} (id, key, content, category, created_at, updated_at) \
+                             VALUES ($1, $2, 'payload', 'core', NOW(), NOW())"
+                        ),
+                        &[&id, &key],
+                    )
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+        })
+        .await
+        .unwrap();
+
+        let query_url = db_url.clone();
+        let query_schema = schema.clone();
+        let rows = tokio::task::spawn_blocking(move || {
+            PostgresMemory::read_key_prefix_read_only(
+                &query_url,
+                &query_schema,
+                "memories",
+                Some(5),
+                "self/fitness/daily/",
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(),
+            vec!["self/fitness/daily/2026-09-10", "self/fitness/daily/2026-09-11"]
+        );
+        let delete_url = db_url.clone();
+        let delete_schema = schema.clone();
+        let deleted = tokio::task::spawn_blocking(move || {
+            PostgresMemory::delete_key_prefix_transactional(
+                &delete_url,
+                &delete_schema,
+                "memories",
+                Some(5),
+                "self/fitness/daily/",
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(deleted, 2);
+        let verify_url = db_url.clone();
+        let verify_schema = schema.clone();
+        let remaining = tokio::task::spawn_blocking(move || {
+            PostgresMemory::read_key_prefix_read_only(
+                &verify_url,
+                &verify_schema,
+                "memories",
+                Some(5),
+                "self/fitness/daily/",
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(remaining.is_empty());
+        assert!(mem.get("self/fitness/daily_extra/keep").await.unwrap().is_some());
+
+        drop(mem);
+        tokio::task::spawn_blocking(move || {
+            let mut client = db_url.parse::<postgres::Config>().unwrap().connect(NoTls).unwrap();
+            client
+                .batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_identifier(&schema)))
+                .unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     /// Exercises the connection pool against a live PostgreSQL instance:

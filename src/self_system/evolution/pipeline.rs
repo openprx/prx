@@ -478,42 +478,53 @@ impl EvolutionPipeline {
             return Ok(None);
         };
         let reports = FitnessStore::new(&self.workspace_root).history(365)?;
-        let mut before = Vec::new();
-        let mut after = Vec::new();
-        for report in reports {
-            let Some(score) = report.final_score else {
-                continue;
-            };
-            let Some(start) = parse_rfc3339(&report.window.start) else {
-                continue;
-            };
-            let Some(end) = parse_rfc3339(&report.window.end) else {
-                continue;
-            };
-            if end <= changed_at && before.len() < 3 {
-                before.push(score);
-            } else if start >= changed_at && after.len() < 3 {
-                after.push(score);
-            }
-        }
-        if before.is_empty() || after.len() < 3 {
-            return Ok(None);
-        }
-        let before_average = before.iter().sum::<f64>() / before.len() as f64;
-        let after_average = after.iter().sum::<f64>() / after.len() as f64;
-        let delta = after_average - before_average;
-        Ok(Some(if delta > 0.01 {
-            EvolutionResult::Improved
-        } else if delta < -0.01 {
-            EvolutionResult::Regressed
-        } else {
-            EvolutionResult::Neutral
-        }))
+        Ok(infer_fitness_result(reports, changed_at))
     }
 
     fn writer_root(&self) -> PathBuf {
         self.shared_config.load_full().runtime.storage_dir.to_string().into()
     }
+}
+
+fn infer_fitness_result(
+    reports: Vec<crate::self_system::fitness::FitnessReport>,
+    changed_at: DateTime<Utc>,
+) -> Option<EvolutionResult> {
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    for report in reports {
+        let Some(score) = report.final_score else {
+            continue;
+        };
+        let Some(start) = parse_rfc3339(&report.window.start) else {
+            continue;
+        };
+        let Some(end) = parse_rfc3339(&report.window.end) else {
+            continue;
+        };
+        if end <= changed_at {
+            before.push((end, score));
+        } else if start >= changed_at {
+            after.push((start, score));
+        }
+    }
+    before.sort_by_key(|item| std::cmp::Reverse(item.0));
+    after.sort_by_key(|item| item.0);
+    let before = before.into_iter().take(3).map(|(_, score)| score).collect::<Vec<_>>();
+    let after = after.into_iter().take(3).map(|(_, score)| score).collect::<Vec<_>>();
+    if before.is_empty() || after.len() < 3 {
+        return None;
+    }
+    let before_average = before.iter().sum::<f64>() / before.len() as f64;
+    let after_average = after.iter().sum::<f64>() / after.len() as f64;
+    let delta = after_average - before_average;
+    Some(if delta > 0.01 {
+        EvolutionResult::Improved
+    } else if delta < -0.01 {
+        EvolutionResult::Regressed
+    } else {
+        EvolutionResult::Neutral
+    })
 }
 
 /// Derived, append-only backfill outcome record.
@@ -697,6 +708,7 @@ mod tests {
         FitnessWindow,
     };
     use async_trait::async_trait;
+    use chrono::TimeZone;
     use std::collections::BTreeMap;
     use tempfile::tempdir;
 
@@ -712,28 +724,76 @@ mod tests {
             "2026-02-22",
             "2026-02-23",
         ] {
-            let parsed = day.parse::<chrono::NaiveDate>().unwrap();
-            let start = DateTime::<Utc>::from_naive_utc_and_offset(parsed.and_hms_opt(0, 0, 0).unwrap(), Utc);
-            let report = FitnessReport {
-                version: "2".to_string(),
-                status: FitnessReportStatus::Final,
-                window: FitnessWindow {
-                    date: day.to_string(),
-                    timezone: "UTC".to_string(),
-                    start: start.to_rfc3339(),
-                    end: (start + Duration::days(1)).to_rfc3339(),
-                },
-                subscores: FitnessSubscores::default(),
-                metric_status: FitnessMetricStatus::default(),
-                weights: FitnessWeights::default(),
-                final_score: Some(0.5),
-                confidence: 0.8,
-                coverage: 0.8,
-                evidence: FitnessEvidence::default(),
-                generated_at: Utc::now().to_rfc3339(),
-            };
+            let report = fitness_report(day, 0.5);
             store.store(&report, 180).unwrap();
         }
+    }
+
+    fn fitness_report(day: &str, score: f64) -> FitnessReport {
+        let parsed = day.parse::<chrono::NaiveDate>().unwrap();
+        let start = DateTime::<Utc>::from_naive_utc_and_offset(parsed.and_hms_opt(0, 0, 0).unwrap(), Utc);
+        FitnessReport {
+            version: "2".to_string(),
+            status: FitnessReportStatus::Final,
+            window: FitnessWindow {
+                date: day.to_string(),
+                timezone: "UTC".to_string(),
+                start: start.to_rfc3339(),
+                end: (start + Duration::days(1)).to_rfc3339(),
+            },
+            subscores: FitnessSubscores::default(),
+            metric_status: FitnessMetricStatus::default(),
+            weights: FitnessWeights::default(),
+            final_score: Some(score),
+            confidence: 0.8,
+            coverage: 0.8,
+            evidence: FitnessEvidence::default(),
+            generated_at: Utc::now().to_rfc3339(),
+        }
+    }
+
+    #[test]
+    fn fitness_backfill_uses_three_days_immediately_after_change() {
+        let changed_at = Utc.with_ymd_and_hms(2026, 2, 20, 0, 0, 0).unwrap();
+        let reports = vec![
+            fitness_report("2026-09-10", 0.1),
+            fitness_report("2026-09-09", 0.1),
+            fitness_report("2026-09-08", 0.1),
+            fitness_report("2026-02-23", 0.8),
+            fitness_report("2026-02-22", 0.8),
+            fitness_report("2026-02-21", 0.8),
+            fitness_report("2026-02-19", 0.5),
+            fitness_report("2026-02-18", 0.5),
+            fitness_report("2026-02-17", 0.5),
+        ];
+
+        assert_eq!(
+            infer_fitness_result(reports, changed_at),
+            Some(EvolutionResult::Improved)
+        );
+    }
+
+    #[test]
+    fn fitness_backfill_reports_regression_and_requires_three_after_samples() {
+        let changed_at = Utc.with_ymd_and_hms(2026, 2, 20, 0, 0, 0).unwrap();
+        let before = [
+            fitness_report("2026-02-19", 0.8),
+            fitness_report("2026-02-18", 0.8),
+            fitness_report("2026-02-17", 0.8),
+        ];
+        let two_after = [fitness_report("2026-02-21", 0.4), fitness_report("2026-02-22", 0.4)];
+        let incomplete = before.iter().chain(&two_after).cloned().collect();
+        assert_eq!(infer_fitness_result(incomplete, changed_at), None);
+
+        let complete = before
+            .into_iter()
+            .chain(two_after)
+            .chain([fitness_report("2026-02-23", 0.4)])
+            .collect();
+        assert_eq!(
+            infer_fitness_result(complete, changed_at),
+            Some(EvolutionResult::Regressed)
+        );
     }
 
     #[async_trait]

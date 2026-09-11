@@ -1095,6 +1095,17 @@ async fn run_fitness_if_due(config: &Config) {
                 return;
             }
         };
+    run_fitness_backfill(config, latest, |window| run_fitness_window_if_missing(config, window)).await;
+}
+
+async fn run_fitness_backfill<F, Fut>(
+    config: &Config,
+    latest: crate::self_system::fitness::WindowBounds,
+    mut run_window: F,
+) where
+    F: FnMut(crate::self_system::fitness::WindowBounds) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
     let backfill_days = config.self_system.fitness.max_backfill_days.max(1);
     for offset in (0..backfill_days).rev() {
         let Some(day) = latest.day.checked_sub_days(chrono::Days::new(u64::from(offset))) else {
@@ -1108,7 +1119,7 @@ async fn run_fitness_if_due(config: &Config) {
                 return;
             }
         };
-        if !run_fitness_window_if_missing(config, window).await {
+        if !run_window(window).await {
             return;
         }
     }
@@ -1682,6 +1693,83 @@ mod tests {
         std::fs::write(&path, b"not-a-pid").unwrap();
 
         assert_eq!(lock_holder_pid(&path), None);
+    }
+
+    #[tokio::test]
+    async fn fitness_daemon_backfills_closed_days_oldest_first_and_skips_existing_reports() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.self_system.fitness.timezone = "UTC".to_string();
+        config.self_system.fitness.max_backfill_days = 3;
+        config.self_system.fitness.min_samples = 1;
+
+        run_fitness_if_due(&config).await;
+
+        let store = crate::self_system::fitness_store::FitnessStore::new(&config.workspace_dir);
+        let latest_window =
+            crate::self_system::fitness::latest_closed_window(Utc::now(), &config.self_system.fitness).unwrap();
+        let reports = store.history(10).unwrap();
+        assert_eq!(reports.len(), 3, "fixture must cross the max_backfill_days boundary");
+        assert_eq!(reports[0].window.date, latest_window.day.to_string());
+        assert_eq!(
+            reports[2].window.date,
+            (latest_window.day - chrono::Duration::days(2)).to_string()
+        );
+        assert_eq!(
+            store.latest().unwrap().unwrap().window.date,
+            latest_window.day.to_string()
+        );
+        assert!(
+            store.load(Utc::now().date_naive()).unwrap().is_none(),
+            "startup catch-up must not create a partial current-day report"
+        );
+        let generated_at = reports
+            .iter()
+            .map(|report| report.generated_at.clone())
+            .collect::<Vec<_>>();
+
+        run_fitness_if_due(&config).await;
+
+        let rerun = store.history(10).unwrap();
+        assert_eq!(rerun.len(), 3);
+        assert_eq!(
+            rerun
+                .iter()
+                .map(|report| report.generated_at.clone())
+                .collect::<Vec<_>>(),
+            generated_at,
+            "existing reports must be skipped rather than regenerated"
+        );
+    }
+
+    #[tokio::test]
+    async fn fitness_daemon_stops_backfill_after_the_first_failed_day() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.self_system.fitness.timezone = "UTC".to_string();
+        config.self_system.fitness.max_backfill_days = 4;
+        let latest =
+            crate::self_system::fitness::latest_closed_window(Utc::now(), &config.self_system.fitness).unwrap();
+        let failed_day = latest.day - chrono::Duration::days(2);
+        let attempted = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        run_fitness_backfill(&config, latest, {
+            let attempted = std::sync::Arc::clone(&attempted);
+            move |window| {
+                let attempted = std::sync::Arc::clone(&attempted);
+                async move {
+                    attempted.lock().push(window.day);
+                    window.day != failed_day
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            *attempted.lock(),
+            vec![latest.day - chrono::Duration::days(3), failed_day],
+            "newer days must not run after the first failed backfill"
+        );
     }
 
     #[test]

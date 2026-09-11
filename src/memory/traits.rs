@@ -94,6 +94,11 @@ pub enum MemoryCategory {
 pub fn validate_memory_write_target(key: &str, session_id: Option<&str>) -> anyhow::Result<()> {
     const RESERVED_PREFIXES: &[&str] = &["self/", "router/"];
 
+    anyhow::ensure!(
+        !key.starts_with("self/fitness/"),
+        "refusing to write fitness telemetry into conversational memory; use FitnessStore"
+    );
+
     if RESERVED_PREFIXES.iter().any(|prefix| key.starts_with(prefix))
         && session_id != Some(crate::self_system::SELF_SYSTEM_SESSION_ID)
     {
@@ -1769,6 +1774,21 @@ mod tests {
         assert_eq!(core, "\"core\"");
         assert_eq!(daily, "\"daily\"");
         assert_eq!(conversation, "\"conversation\"");
+    }
+
+    #[test]
+    fn memory_write_target_rejects_fitness_even_for_self_system() {
+        let error = validate_memory_write_target(
+            "self/fitness/daily/2026-09-11",
+            Some(crate::self_system::SELF_SYSTEM_SESSION_ID),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("use FitnessStore"));
+        assert!(
+            validate_memory_write_target("self/decisions/item", Some(crate::self_system::SELF_SYSTEM_SESSION_ID))
+                .is_ok()
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use crate::config::Config;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -168,6 +168,7 @@ pub fn diagnose(config: &Config) -> DoctorReport {
 
     check_config_semantics(config, &mut items);
     check_workspace(config, &mut items);
+    check_legacy_fitness_telemetry(config, &mut items);
     check_daemon_state(config, &mut items);
     check_environment(&mut items);
 
@@ -183,7 +184,113 @@ pub fn run_memory(config: &Config) -> Result<()> {
 pub fn diagnose_memory(config: &Config) -> DoctorReport {
     let mut items: Vec<DiagItem> = Vec::new();
     check_memory_diagnostics(config, &mut items);
+    check_legacy_fitness_telemetry(config, &mut items);
     DoctorReport::new("OpenPRX Doctor - Memory", items)
+}
+
+fn check_legacy_fitness_telemetry(config: &Config, items: &mut Vec<DiagItem>) {
+    const PREFIX: &str = "self/fitness/daily/";
+    let category = "fitness";
+    match legacy_fitness_counts(config, PREFIX) {
+        Ok((database, memory_projection, snapshot_projection)) => {
+            let total = database + memory_projection + snapshot_projection;
+            if total == 0 {
+                items.push(DiagItem::healthy(
+                    category,
+                    "legacy fitness telemetry absent from memory storage and projections",
+                ));
+            } else {
+                items.push(DiagItem::warn(
+                    category,
+                    format!(
+                        "legacy fitness telemetry detected: database={database}, MEMORY.md={memory_projection}, \
+                         MEMORY_SNAPSHOT.md={snapshot_projection}; run `prx fitness migrate-legacy --apply`"
+                    ),
+                ));
+            }
+        }
+        Err(error) => items.push(DiagItem::warn(
+            category,
+            format!("legacy fitness telemetry inspection failed: {error}"),
+        )),
+    }
+}
+
+fn legacy_fitness_counts(config: &Config, prefix: &str) -> Result<(usize, usize, usize)> {
+    let backend =
+        crate::memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
+    let database = match crate::memory::classify_memory_backend(&backend) {
+        crate::memory::MemoryBackendKind::Sqlite | crate::memory::MemoryBackendKind::Lucid => {
+            read_only_sqlite_key_prefix_count(&crate::schema_migration::memory_db_path(config), prefix)?
+        }
+        crate::memory::MemoryBackendKind::Postgres => {
+            let storage = &config.storage.provider.config;
+            let db_url = storage
+                .db_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .context("postgres fitness inspection requires storage.provider.config.db_url")?;
+            crate::memory::PostgresMemory::read_key_prefix_read_only(
+                db_url,
+                &storage.schema,
+                &storage.table,
+                storage.connect_timeout_secs,
+                prefix,
+            )?
+            .len()
+        }
+        crate::memory::MemoryBackendKind::Markdown | crate::memory::MemoryBackendKind::None => 0,
+        crate::memory::MemoryBackendKind::Unknown => {
+            anyhow::bail!("unsupported configured memory backend '{backend}'")
+        }
+    };
+    let memory_projection = count_projection_lines(&config.workspace_dir.join("MEMORY.md"), |line| {
+        line.strip_prefix("- [")
+            .and_then(|rest| rest.split_once("] **"))
+            .and_then(|(_, rest)| rest.split_once("**:"))
+            .is_some_and(|(key, _)| key.starts_with(prefix))
+    })?;
+    let snapshot_projection = count_projection_lines(
+        &config.workspace_dir.join(crate::memory::snapshot::SNAPSHOT_FILENAME),
+        |line| {
+            line.strip_prefix("### 🔑 `")
+                .and_then(|rest| rest.strip_suffix('`'))
+                .is_some_and(|key| key.starts_with(prefix))
+        },
+    )?;
+    Ok((database, memory_projection, snapshot_projection))
+}
+
+fn read_only_sqlite_key_prefix_count(db_path: &Path, prefix: &str) -> Result<usize> {
+    if !db_path.is_file() {
+        return Ok(0);
+    }
+    let connection = rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let table_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memories')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table_exists {
+        return Ok(0);
+    }
+    let escaped = prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let pattern = format!("{escaped}%");
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM memories WHERE key LIKE ?1 ESCAPE '\\'",
+        [pattern],
+        |row| row.get(0),
+    )?;
+    usize::try_from(count).context("SQLite returned a negative legacy fitness count")
+}
+
+fn count_projection_lines(path: &Path, matches: impl Fn(&str) -> bool) -> Result<usize> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(content.lines().filter(|line| matches(line)).count()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub async fn run_runtime(config: &Config) -> Result<()> {
@@ -1863,6 +1970,60 @@ mod tests {
         ] {
             assert!(states.contains(&expected), "missing diagnostic state {expected:?}");
         }
+    }
+
+    #[test]
+    fn doctor_reports_legacy_fitness_counts_and_repair_command() {
+        let temp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(config.workspace_dir.join("memory")).unwrap();
+        let connection = rusqlite::Connection::open(config.workspace_dir.join("memory/brain.db")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE memories (key TEXT NOT NULL, content TEXT NOT NULL);
+                 INSERT INTO memories VALUES ('self/fitness/daily/2026-09-10', 'one');
+                 INSERT INTO memories VALUES ('self/fitness/daily/2026-09-11', 'two');
+                 INSERT INTO memories VALUES ('keep/key', 'keep');",
+            )
+            .unwrap();
+        std::fs::write(
+            config.workspace_dir.join("MEMORY.md"),
+            "- [t] **self/fitness/daily/2026-09-10**: legacy\n- [t] **keep/key**: keep\n",
+        )
+        .unwrap();
+        std::fs::write(
+            config.workspace_dir.join("MEMORY_SNAPSHOT.md"),
+            "### 🔑 `self/fitness/daily/2026-09-10`\n\nlegacy\n\n---\n",
+        )
+        .unwrap();
+        let mut items = Vec::new();
+
+        check_legacy_fitness_telemetry(&config, &mut items);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].severity, Severity::Warn);
+        assert!(items[0].message.contains("database=2"));
+        assert!(items[0].message.contains("MEMORY.md=1"));
+        assert!(items[0].message.contains("MEMORY_SNAPSHOT.md=1"));
+        assert!(items[0].message.contains("prx fitness migrate-legacy --apply"));
+    }
+
+    #[test]
+    fn doctor_clean_fitness_probe_is_read_only_on_missing_database() {
+        let temp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let db_path = config.workspace_dir.join("memory/brain.db");
+        let mut items = Vec::new();
+
+        check_legacy_fitness_telemetry(&config, &mut items);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].severity, Severity::Ok);
+        assert!(items[0].message.contains("absent"));
+        assert!(!db_path.exists());
     }
 
     #[test]

@@ -12,11 +12,15 @@ const FITNESS_REPORT_VERSION: &str = "2";
 const MAX_EVENT_SCAN: usize = 100_000;
 const BASELINE_DAYS: i64 = 30;
 
-const WEIGHT_TASK_QUALITY: f64 = 0.35;
-const WEIGHT_NO_REPEAT: f64 = 0.25;
-const WEIGHT_PROACTIVE: f64 = 0.20;
-const WEIGHT_LEARNING: f64 = 0.10;
-const WEIGHT_EFFICIENCY: f64 = 0.10;
+// Learning is deliberately excluded until PRX records a durable retrieval
+// outcome linked to a later terminal result. The remaining v2 weights preserve
+// their original relative importance and normalize to 1.0, so missing learning
+// evidence cannot impose a permanent coverage ceiling.
+const WEIGHT_TASK_QUALITY: f64 = 7.0 / 18.0;
+const WEIGHT_NO_REPEAT: f64 = 5.0 / 18.0;
+const WEIGHT_PROACTIVE: f64 = 2.0 / 9.0;
+const WEIGHT_LEARNING: f64 = 0.0;
+const WEIGHT_EFFICIENCY: f64 = 1.0 / 9.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FitnessWindow {
@@ -218,6 +222,8 @@ async fn build_fitness_report(memory: &dyn Memory, config: &Config, window: Wind
         .filter(|(metric, _)| metric.score.is_some())
         .map(|(_, weight)| *weight)
         .sum();
+    // `Iterator::sum::<f64>()` may produce negative zero for an empty input;
+    // canonicalize it so serialized coverage has one stable representation.
     let coverage = if coverage == 0.0 { 0.0 } else { coverage };
     let weighted_score: f64 = metrics
         .iter()
@@ -238,13 +244,7 @@ async fn build_fitness_report(memory: &dyn Memory, config: &Config, window: Wind
     } else {
         0.0
     };
-    let status = if final_score.is_none() {
-        FitnessReportStatus::InsufficientData
-    } else if coverage >= 0.80 {
-        FitnessReportStatus::Final
-    } else {
-        FitnessReportStatus::Provisional
-    };
+    let status = report_status(coverage, min_coverage);
 
     Ok(FitnessReport {
         version: FITNESS_REPORT_VERSION.to_string(),
@@ -592,6 +592,16 @@ fn sample_confidence(samples: usize, min_samples: usize) -> f64 {
     (samples as f64 / min_samples.saturating_mul(2).max(1) as f64).clamp(0.0, 1.0)
 }
 
+fn report_status(coverage: f64, min_coverage: f64) -> FitnessReportStatus {
+    if coverage <= f64::EPSILON {
+        FitnessReportStatus::InsufficientData
+    } else if coverage + f64::EPSILON >= min_coverage {
+        FitnessReportStatus::Final
+    } else {
+        FitnessReportStatus::Provisional
+    }
+}
+
 pub(crate) fn validate_fitness_config(config: &FitnessConfig) -> Result<()> {
     config
         .timezone
@@ -726,6 +736,39 @@ mod tests {
         }
     }
 
+    fn cron_job(name: Option<&str>, command: &str, prompt: Option<&str>, enabled: bool) -> cron::CronJob {
+        cron::CronJob {
+            id: "fitness-test-job".to_string(),
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
+            expression: "0 0 * * *".to_string(),
+            schedule: cron::Schedule::Cron {
+                expr: "0 0 * * *".to_string(),
+                tz: Some("UTC".to_string()),
+            },
+            command: command.to_string(),
+            prompt: prompt.map(str::to_string),
+            name: name.map(str::to_string),
+            job_type: cron::JobType::Shell,
+            session_target: cron::SessionTarget::Isolated,
+            model: None,
+            enabled,
+            delivery: cron::DeliveryConfig::default(),
+            delete_after_run: false,
+            created_at: Utc::now(),
+            next_run: Utc::now(),
+            last_run: None,
+            last_status: None,
+            last_output: None,
+            claim: None,
+            terminal_state: None,
+            approval_grant_json: None,
+            delivery_principal: cron::DeliveryPrincipal::default(),
+        }
+    }
+
     #[test]
     fn task_quality_uses_terminal_outcomes_and_excludes_cancellation() {
         let at = Utc.with_ymd_and_hms(2026, 9, 10, 1, 0, 0).unwrap();
@@ -763,10 +806,104 @@ mod tests {
     }
 
     #[test]
+    fn efficiency_compares_successful_turn_medians_across_the_window_boundary() {
+        let current_at = Utc.with_ymd_and_hms(2026, 9, 10, 1, 0, 0).unwrap();
+        let baseline_at = current_at - Duration::days(1);
+        let efficiency_payload = |tokens: u64, start: &str, finish: &str| {
+            serde_json::json!({
+                "status": "completed",
+                "usage_settlement": {"total_tokens": tokens},
+                "telemetry": {"started_at": start, "finished_at": finish}
+            })
+        };
+        let current = [
+            event(
+                1,
+                "turn.finalized",
+                current_at,
+                efficiency_payload(200, "2026-09-10T01:00:00Z", "2026-09-10T01:00:02Z"),
+            ),
+            event(
+                2,
+                "turn.finalized",
+                current_at,
+                efficiency_payload(200, "2026-09-10T02:00:00Z", "2026-09-10T02:00:02Z"),
+            ),
+        ];
+        let baseline = [
+            event(
+                3,
+                "turn.finalized",
+                baseline_at,
+                efficiency_payload(100, "2026-09-09T01:00:00Z", "2026-09-09T01:00:01Z"),
+            ),
+            event(
+                4,
+                "turn.finalized",
+                baseline_at,
+                efficiency_payload(100, "2026-09-09T02:00:00Z", "2026-09-09T02:00:01Z"),
+            ),
+        ];
+        let current_refs = current.iter().collect::<Vec<_>>();
+        let baseline_refs = baseline.iter().collect::<Vec<_>>();
+
+        let metric = efficiency_from_events(&current_refs, &baseline_refs, 2);
+
+        assert_eq!(metric.status, MetricStatus::Available);
+        assert_eq!(metric.score, Some(0.5));
+        assert_eq!(
+            metric.evidence.get("current_median_tokens"),
+            Some(&serde_json::json!(200.0))
+        );
+        assert_eq!(
+            metric.evidence.get("baseline_median_latency_ms"),
+            Some(&serde_json::json!(1000.0))
+        );
+        assert_eq!(relative_efficiency(10.0, 0.0), 0.0);
+        assert_eq!(relative_efficiency(10.0, 10.0), 1.0);
+    }
+
+    #[test]
+    fn proactive_job_detection_requires_enabled_matching_work() {
+        assert!(is_proactive_job(&cron_job(
+            Some("daily heartbeat"),
+            "echo ok",
+            None,
+            true
+        )));
+        assert!(is_proactive_job(&cron_job(None, "run proactive scan", None, true)));
+        assert!(is_proactive_job(&cron_job(None, "echo ok", Some("xin review"), true)));
+        assert!(!is_proactive_job(&cron_job(
+            Some("daily heartbeat"),
+            "echo ok",
+            None,
+            false
+        )));
+        assert!(!is_proactive_job(&cron_job(
+            Some("daily report"),
+            "echo ok",
+            None,
+            true
+        )));
+    }
+
+    #[test]
     fn missing_metric_is_not_replaced_by_a_fallback_score() {
         let metric = task_quality_from_events(&[], 5);
         assert_eq!(metric.status, MetricStatus::InsufficientData);
         assert_eq!(metric.score, None);
+    }
+
+    #[test]
+    fn learning_is_outside_weights_and_final_threshold_tracks_configuration() {
+        let weights = FitnessWeights::default();
+        let active_total = weights.task_quality + weights.no_repeat + weights.proactive + weights.efficiency;
+
+        assert_eq!(weights.learning, 0.0);
+        assert!((active_total - 1.0).abs() < f64::EPSILON);
+        assert_eq!(report_status(0.74, 0.75), FitnessReportStatus::Provisional);
+        assert_eq!(report_status(0.75, 0.75), FitnessReportStatus::Final);
+        assert_eq!(report_status(1.0, 1.0), FitnessReportStatus::Final);
     }
 
     #[test]

@@ -391,7 +391,7 @@ mod tests {
     async fn markdown_restores_structured_key_and_content() {
         let (_tmp, mem) = temp_workspace();
         mem.store(
-            "self/fitness/daily/2026-03-10",
+            "self/decisions/2026-03-10/proposal_1",
             r#"{"score":0.9,"note":"legacy"}"#,
             MemoryCategory::Core,
             Some(crate::self_system::SELF_SYSTEM_SESSION_ID),
@@ -402,11 +402,28 @@ mod tests {
         let entries = mem.list(Some(&MemoryCategory::Core), None).await.unwrap();
         let entry = entries
             .into_iter()
-            .find(|entry| entry.key == "self/fitness/daily/2026-03-10")
+            .find(|entry| entry.key == "self/decisions/2026-03-10/proposal_1")
             .expect("structured entry");
 
         assert_eq!(entry.content, r#"{"score":0.9,"note":"legacy"}"#);
-        assert!(mem.get("self/fitness/daily/2026-03-10").await.unwrap().is_some());
+        assert!(mem.get("self/decisions/2026-03-10/proposal_1").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn markdown_rejects_fitness_telemetry_without_creating_projection() {
+        let (_tmp, mem) = temp_workspace();
+        let error = mem
+            .store(
+                "self/fitness/daily/2026-03-10",
+                r#"{"score":0.9}"#,
+                MemoryCategory::Core,
+                Some(crate::self_system::SELF_SYSTEM_SESSION_ID),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("use FitnessStore"));
+        assert!(!mem.core_path().exists());
     }
 
     #[tokio::test]

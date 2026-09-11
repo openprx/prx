@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.112] - 13 September 2026
+
+### Changed
+
+- Remove the learning subscore from fitness weighting until PRX records a
+  durable retrieval outcome linked to a later terminal result. Normalize the
+  remaining four weights to full coverage and derive Final status from the
+  configured `min_coverage`, so Final reports are structurally reachable.
+
+### Fixed
+
+- Reject `self/fitness/*` at the shared memory-write validator for SQLite,
+  Lucid, Markdown, PostgreSQL, and WASM-backed persistent stores.
+- Report legacy fitness row and projection counts in `prx doctor`, and support
+  equivalent export-plus-transactional-delete migration for PostgreSQL.
+- Attribute delayed evolution outcomes to the three closed fitness windows
+  immediately after a change instead of the newest three reports in storage.
+
 ## [0.8.111] - 12 September 2026
 
 ### Changed
@@ -72,6 +90,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stop fitness telemetry from entering general recall, `MEMORY.md`, and
   `MEMORY_SNAPSHOT.md`; add a backed-up transactional migration command for
   existing `self/fitness/daily/*` memory rows and Markdown projections.
+
+### Tests
+
+- Cover daemon catch-up and idempotent skip behavior, efficiency medians,
+  proactive job classification, fitness aggregation thresholds, PostgreSQL
+  descendant event visibility, and PostgreSQL legacy migration SQL.
 
 ## [0.8.108] - 8 September 2026
 
