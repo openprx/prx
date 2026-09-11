@@ -187,18 +187,14 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
     handles.push(xin_handle);
     generation_controllers.push(xin_controller);
 
-    let fitness_ttl = config
-        .self_system
-        .fitness_interval_hours
-        .saturating_mul(7200)
-        .max(OPTIONAL_HEALTH_TTL_SECONDS);
+    let fitness_ttl = 48_u64.saturating_mul(3600).max(OPTIONAL_HEALTH_TTL_SECONDS);
     let (fitness_handle, fitness_controller) = spawn_config_generation_supervisor(
         "self_system_fitness",
         "self-system",
         fitness_ttl,
         Arc::clone(&initial_generation),
         Arc::new(|field| field == "self_system"),
-        Arc::new(|_| true),
+        Arc::new(|config| config.self_system.fitness.auto_run),
         {
             let shared = Arc::clone(&shared_config);
             Arc::new(move |generation, shutdown| {
@@ -1067,33 +1063,89 @@ async fn run_fitness_worker(
     manager: crate::config::SharedConfig,
     generation_id: crate::config::ConfigGenerationId,
 ) -> Result<()> {
-    let interval_hours = config.self_system.fitness_interval_hours.max(1);
-    let mut interval = tokio::time::interval(Duration::from_secs(interval_hours.saturating_mul(3600)));
+    crate::self_system::fitness::validate_fitness_config(&config.self_system.fitness)?;
     let mut health_heartbeat = tokio::time::interval(Duration::from_mins(1));
     crate::health::mark_component_ok("self_system_fitness");
     wait_for_active_generation(&manager, generation_id).await;
 
+    // Catch up the latest closed day exactly once. Unlike `tokio::interval`,
+    // this does not manufacture a partial-day report immediately on startup.
+    run_fitness_if_due(&config).await;
+
     loop {
+        let next_run =
+            crate::self_system::fitness::next_scheduled_run(chrono::Utc::now(), &config.self_system.fitness)?;
+        let wait = (next_run - chrono::Utc::now())
+            .to_std()
+            .unwrap_or_else(|_| Duration::from_secs(1));
         tokio::select! {
             _ = health_heartbeat.tick() => crate::health::touch_component("self_system_fitness"),
-            _ = interval.tick() => {
-                match crate::self_system::run_fitness_report_with_config(&config).await {
-                    Ok(report) => {
-                        crate::health::mark_component_ok("self_system_fitness");
-                        tracing::info!(
-                            target: "self_system",
-                            "fitness report stored: score={:.3}, confidence={:.3}, date={}",
-                            report.final_score,
-                            report.confidence,
-                            report.window.date
-                        );
-                    }
-                    Err(error) => {
-                        crate::health::mark_component_error("self_system_fitness", error.to_string());
-                        tracing::warn!(target: "self_system", "fitness report failed: {error}");
-                    }
-                }
+            () = tokio::time::sleep(wait) => run_fitness_if_due(&config).await,
+        }
+    }
+}
+
+async fn run_fitness_if_due(config: &Config) {
+    let latest =
+        match crate::self_system::fitness::latest_closed_window(chrono::Utc::now(), &config.self_system.fitness) {
+            Ok(window) => window,
+            Err(error) => {
+                crate::health::mark_component_error("self_system_fitness", error.to_string());
+                tracing::warn!(target: "self_system", "fitness schedule failed: {error}");
+                return;
             }
+        };
+    let backfill_days = config.self_system.fitness.max_backfill_days.max(1);
+    for offset in (0..backfill_days).rev() {
+        let Some(day) = latest.day.checked_sub_days(chrono::Days::new(u64::from(offset))) else {
+            continue;
+        };
+        let window = match crate::self_system::fitness::configured_window_for_day(day, &config.self_system.fitness) {
+            Ok(window) => window,
+            Err(error) => {
+                crate::health::mark_component_error("self_system_fitness", error.to_string());
+                tracing::warn!(target: "self_system", "fitness backfill window failed: {error}");
+                return;
+            }
+        };
+        if !run_fitness_window_if_missing(config, window).await {
+            return;
+        }
+    }
+}
+
+async fn run_fitness_window_if_missing(config: &Config, window: crate::self_system::fitness::WindowBounds) -> bool {
+    let store = crate::self_system::fitness_store::FitnessStore::new(&config.workspace_dir);
+    match store.load(window.day) {
+        Ok(Some(_)) => {
+            crate::health::mark_component_ok("self_system_fitness");
+            return true;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            crate::health::mark_component_error("self_system_fitness", error.to_string());
+            tracing::warn!(target: "self_system", "fitness store read failed: {error}");
+            return false;
+        }
+    }
+    match crate::self_system::fitness::run_fitness_report_for_window(config, window).await {
+        Ok(report) => {
+            crate::health::mark_component_ok("self_system_fitness");
+            tracing::info!(
+                target: "self_system",
+                score = report.final_score,
+                confidence = report.confidence,
+                coverage = report.coverage,
+                status = ?report.status,
+                date = report.window.date,
+                "fitness report stored"
+            );
+            true
+        }
+        Err(error) => {
+            crate::health::mark_component_error("self_system_fitness", error.to_string());
+            tracing::warn!(target: "self_system", "fitness report failed: {error}");
+            false
         }
     }
 }

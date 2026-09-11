@@ -1,5 +1,6 @@
 use crate::security::SideEffectGate;
 use crate::security::policy::{ResourceRiskLevel, SecurityPolicy};
+use crate::self_system::evolution::FitnessTrend;
 use crate::self_system::evolution::analyzer::{
     CandidatePriority, DailyDigest, EvolutionAnalyzer, EvolutionCandidate, TrendAnalysis,
 };
@@ -7,9 +8,7 @@ use crate::self_system::evolution::config::SharedEvolutionConfig;
 use crate::self_system::evolution::engine::EvolutionEngine;
 use crate::self_system::evolution::gate::{EvolutionGate, GateMetrics, GateRejection, GateResult};
 use crate::self_system::evolution::judge::{JudgeConfig, JudgeEngine, JudgeResult, JudgeScoringModel, MockJudgeModel};
-use crate::self_system::evolution::record::{
-    ChangeType, DataBasis, EvolutionLayer, EvolutionLog, EvolutionResult, Outcome,
-};
+use crate::self_system::evolution::record::{ChangeType, DataBasis, EvolutionLayer, EvolutionLog, EvolutionResult};
 use crate::self_system::evolution::rollback::RollbackManager;
 use crate::self_system::evolution::run_engine_cycle;
 use crate::self_system::evolution::safety_utils::{
@@ -17,6 +16,7 @@ use crate::self_system::evolution::safety_utils::{
 };
 use crate::self_system::evolution::storage::AsyncJsonlWriter;
 use crate::self_system::evolution::trace::generate_experiment_id;
+use crate::self_system::fitness_store::FitnessStore;
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -280,7 +280,14 @@ impl EvolutionPipeline {
             });
         }
 
-        let cycle_result = run_engine_cycle(engine, experiment_id.clone(), vec![selected_candidate.clone()]).await?;
+        let fitness_trend = load_fitness_trend(&self.workspace_root)?;
+        let cycle_result = run_engine_cycle(
+            engine,
+            experiment_id.clone(),
+            vec![selected_candidate.clone()],
+            fitness_trend,
+        )
+        .await?;
 
         let mut evolution_log = cycle_result.evolution_log.clone().unwrap_or_else(|| {
             build_log(
@@ -315,11 +322,11 @@ impl EvolutionPipeline {
             evolution_log.change_type = ChangeType::Rollback;
             evolution_log.result = Some(EvolutionResult::Regressed);
         } else {
-            evolution_log.result = Some(match cycle_result.cycle.outcome {
-                crate::self_system::evolution::CycleOutcome::Applied => EvolutionResult::Improved,
-                crate::self_system::evolution::CycleOutcome::Failed => EvolutionResult::Regressed,
-                _ => EvolutionResult::Neutral,
-            });
+            evolution_log.result = match cycle_result.cycle.outcome {
+                crate::self_system::evolution::CycleOutcome::Applied => None,
+                crate::self_system::evolution::CycleOutcome::Failed => Some(EvolutionResult::Regressed),
+                _ => Some(EvolutionResult::Neutral),
+            };
         }
 
         // FIX-P0-40: the side-effect gate has already authorized this commit
@@ -423,7 +430,9 @@ impl EvolutionPipeline {
                         continue;
                     }
 
-                    let result = self.infer_backfill_result(&parsed, now).await?;
+                    let Some(result) = self.infer_backfill_result(&parsed, now)? else {
+                        continue;
+                    };
                     pending.push(BackfillResultRecord {
                         experiment_id: parsed.experiment_id.clone(),
                         layer: parsed.layer.clone(),
@@ -459,34 +468,47 @@ impl EvolutionPipeline {
         Ok(updated)
     }
 
-    async fn infer_backfill_result(&self, log: &EvolutionLog, now: DateTime<Utc>) -> Result<EvolutionResult> {
-        let since = parse_rfc3339(&log.timestamp).unwrap_or_else(|| {
-            tracing::debug!(
+    fn infer_backfill_result(&self, log: &EvolutionLog, _now: DateTime<Utc>) -> Result<Option<EvolutionResult>> {
+        let Some(changed_at) = parse_rfc3339(&log.timestamp) else {
+            tracing::warn!(
                 timestamp = %log.timestamp,
                 experiment_id = %log.experiment_id,
-                "failed to parse evolution timestamp; using fallback backfill window"
+                "fitness backfill skipped invalid evolution timestamp"
             );
-            now - Duration::days(BACKFILL_DAYS)
-        });
-        let decisions = self.writer.read_decisions_since(since).await?;
-        let mut success = 0u32;
-        let mut failure = 0u32;
-        for row in decisions.iter().filter(|item| item.experiment_id == log.experiment_id) {
-            match row.outcome {
-                Outcome::Success => success = success.saturating_add(1),
-                Outcome::Failure | Outcome::RolledBack => failure = failure.saturating_add(1),
-                _ => {}
+            return Ok(None);
+        };
+        let reports = FitnessStore::new(&self.workspace_root).history(365)?;
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        for report in reports {
+            let Some(score) = report.final_score else {
+                continue;
+            };
+            let Some(start) = parse_rfc3339(&report.window.start) else {
+                continue;
+            };
+            let Some(end) = parse_rfc3339(&report.window.end) else {
+                continue;
+            };
+            if end <= changed_at && before.len() < 3 {
+                before.push(score);
+            } else if start >= changed_at && after.len() < 3 {
+                after.push(score);
             }
         }
-
-        let result = if success > failure {
+        if before.is_empty() || after.len() < 3 {
+            return Ok(None);
+        }
+        let before_average = before.iter().sum::<f64>() / before.len() as f64;
+        let after_average = after.iter().sum::<f64>() / after.len() as f64;
+        let delta = after_average - before_average;
+        Ok(Some(if delta > 0.01 {
             EvolutionResult::Improved
-        } else if failure > success {
+        } else if delta < -0.01 {
             EvolutionResult::Regressed
         } else {
             EvolutionResult::Neutral
-        };
-        Ok(result)
+        }))
     }
 
     fn writer_root(&self) -> PathBuf {
@@ -613,6 +635,25 @@ fn infer_rollback_dir(workspace_root: &Path, layer: &EvolutionLayer) -> Result<P
     )
 }
 
+/// Convert dedicated, publishable fitness snapshots into the trend carried by
+/// an evolution cycle. Missing or provisional snapshots remain explicit and do
+/// not become synthetic 0.5/0.6 values.
+fn load_fitness_trend(workspace_root: &Path) -> Result<Option<FitnessTrend>> {
+    let reports = FitnessStore::new(workspace_root).history(4)?;
+    let scores: Vec<f64> = reports.into_iter().filter_map(|report| report.final_score).collect();
+    let Some((&latest, previous)) = scores.split_first() else {
+        return Ok(None);
+    };
+    let previous_average = (!previous.is_empty()).then(|| previous.iter().sum::<f64>() / previous.len() as f64);
+    Ok(Some(FitnessTrend {
+        window: scores.len(),
+        previous_average,
+        latest_score: Some(latest),
+        is_declining: previous_average.map(|average| latest < average),
+        source: "fitness_store.daily".to_string(),
+    }))
+}
+
 fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
     match DateTime::parse_from_rfc3339(raw) {
         Ok(item) => Some(item.with_timezone(&Utc)),
@@ -642,18 +683,58 @@ mod tests {
     use super::*;
     use crate::self_system::evolution::config::{EvolutionConfig, EvolutionMode, new_shared_evolution_config};
     use crate::self_system::evolution::engine::{CycleResult, EngineCycleInput};
-    use crate::self_system::evolution::record::{Actor, AnnotationSource, DecisionType, MemoryAction, TaskType};
+    use crate::self_system::evolution::record::{
+        Actor, AnnotationSource, DecisionType, MemoryAction, Outcome, TaskType,
+    };
     use crate::self_system::evolution::safety_utils::acquire_file_lock;
     use crate::self_system::evolution::storage::{JsonlRetentionPolicy, JsonlStoragePaths};
     use crate::self_system::evolution::{
         CycleOutcome, EvolutionCycle, EvolutionProposal, EvolutionSignals, EvolutionValidation, FitnessTrend,
         RiskLevel, ValidationStatus,
     };
+    use crate::self_system::fitness::{
+        FitnessEvidence, FitnessMetricStatus, FitnessReport, FitnessReportStatus, FitnessSubscores, FitnessWeights,
+        FitnessWindow,
+    };
     use async_trait::async_trait;
     use std::collections::BTreeMap;
     use tempfile::tempdir;
 
     struct MockEngine;
+
+    fn store_neutral_fitness_backfill(workspace: &Path) {
+        let store = FitnessStore::new(workspace);
+        for day in [
+            "2026-02-17",
+            "2026-02-18",
+            "2026-02-19",
+            "2026-02-21",
+            "2026-02-22",
+            "2026-02-23",
+        ] {
+            let parsed = day.parse::<chrono::NaiveDate>().unwrap();
+            let start = DateTime::<Utc>::from_naive_utc_and_offset(parsed.and_hms_opt(0, 0, 0).unwrap(), Utc);
+            let report = FitnessReport {
+                version: "2".to_string(),
+                status: FitnessReportStatus::Final,
+                window: FitnessWindow {
+                    date: day.to_string(),
+                    timezone: "UTC".to_string(),
+                    start: start.to_rfc3339(),
+                    end: (start + Duration::days(1)).to_rfc3339(),
+                },
+                subscores: FitnessSubscores::default(),
+                metric_status: FitnessMetricStatus::default(),
+                weights: FitnessWeights::default(),
+                final_score: Some(0.5),
+                confidence: 0.8,
+                coverage: 0.8,
+                evidence: FitnessEvidence::default(),
+                generated_at: Utc::now().to_rfc3339(),
+            };
+            store.store(&report, 180).unwrap();
+        }
+    }
 
     #[async_trait]
     impl EvolutionEngine for MockEngine {
@@ -693,16 +774,17 @@ mod tests {
                     },
                     trend: FitnessTrend {
                         window: 1,
-                        previous_average: 0.5,
-                        latest_score: 0.6,
-                        is_declining: false,
+                        previous_average: Some(0.5),
+                        latest_score: Some(0.6),
+                        is_declining: Some(false),
+                        source: "test".to_string(),
                     },
                     proposal: None,
                     validation: EvolutionValidation {
                         status: ValidationStatus::Improved,
-                        before_score: 0.5,
-                        after_score: 0.6,
-                        delta: 0.1,
+                        before_score: Some(0.5),
+                        after_score: Some(0.6),
+                        delta: Some(0.1),
                         notes: "success".to_string(),
                     },
                     outcome: CycleOutcome::Applied,
@@ -1133,6 +1215,7 @@ mod tests {
         cfg.runtime.storage_dir = storage_root.to_string_lossy().to_string();
         let shared = new_shared_evolution_config(cfg);
         let pipeline = EvolutionPipeline::new(shared, analyzer, writer, dir.path());
+        store_neutral_fitness_backfill(dir.path());
 
         let path = storage_root.join("evolution/hot/2026-02-20.jsonl");
         fs::create_dir_all(path.parent().unwrap()).await.unwrap();
@@ -1186,6 +1269,7 @@ mod tests {
         cfg.runtime.storage_dir = storage_root.to_string_lossy().to_string();
         let shared = new_shared_evolution_config(cfg);
         let pipeline = EvolutionPipeline::new(shared, analyzer, writer, dir.path());
+        store_neutral_fitness_backfill(dir.path());
 
         let path = storage_root.join("evolution/hot/2026-02-20.jsonl");
         fs::create_dir_all(path.parent().unwrap()).await.unwrap();

@@ -137,9 +137,12 @@ async fn handle_memory_evolution(config: Config) -> Result<String> {
 
 async fn handle_fitness_report(config: Config) -> Result<String> {
     let report = crate::self_system::fitness::run_fitness_report_with_config(&config).await?;
+    let score = report
+        .final_score
+        .map_or_else(|| "unavailable".to_string(), |score| format!("{score:.3}"));
     Ok(format!(
-        "fitness report: score={:.3}, confidence={:.3}, date={}",
-        report.final_score, report.confidence, report.window.date
+        "fitness report: score={score}, confidence={:.3}, coverage={:.3}, status={:?}, date={}",
+        report.confidence, report.coverage, report.status, report.window.date
     ))
 }
 

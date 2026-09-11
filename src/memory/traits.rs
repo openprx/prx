@@ -1340,6 +1340,50 @@ pub trait Memory: Send + Sync {
         ))
     }
 
+    /// List message events in an RFC 3339 half-open time range.
+    ///
+    /// The default preserves compatibility for external backends by paging the
+    /// existing cursor API. Indexed backends should override this to avoid a
+    /// lifetime scan for daily analytics. Supplying
+    /// `descendant_workspace_root` requests a privileged system-only query over
+    /// every visibility in the principal workspace and that descendant tree;
+    /// backends that cannot enforce that boundary must reject it.
+    async fn list_message_events_time_range(
+        &self,
+        principal: &MemoryPrincipal,
+        descendant_workspace_root: Option<&str>,
+        start: &str,
+        end: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        anyhow::ensure!(
+            descendant_workspace_root.is_none(),
+            "this memory backend does not support system-scoped descendant workspace event queries"
+        );
+        let start = chrono::DateTime::parse_from_rfc3339(start)?.with_timezone(&chrono::Utc);
+        let end = chrono::DateTime::parse_from_rfc3339(end)?.with_timezone(&chrono::Utc);
+        let mut cursor = 0_i64;
+        let mut output = Vec::new();
+        loop {
+            let page = self.list_message_events_since(principal, cursor, 500).await?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map_or(cursor, |event| event.id);
+            let page_len = page.len();
+            output.extend(page.into_iter().filter(|event| {
+                chrono::DateTime::parse_from_rfc3339(&event.created_at)
+                    .ok()
+                    .is_some_and(|time| time >= start && time < end)
+            }));
+            if output.len() >= limit || page_len < 500 {
+                break;
+            }
+        }
+        output.truncate(limit);
+        Ok(output)
+    }
+
     /// Load recent shared context events visible to an agent turn.
     async fn load_recent_shared_context(&self, query: SharedContextQuery) -> anyhow::Result<Vec<MessageEvent>> {
         let _ = query;

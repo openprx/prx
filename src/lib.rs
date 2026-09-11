@@ -101,6 +101,7 @@ pub mod cron;
 pub mod daemon;
 pub mod doctor;
 pub mod evolution_cli;
+pub mod fitness_cli;
 pub mod gateway;
 pub(crate) mod health;
 pub mod heartbeat;
@@ -484,6 +485,7 @@ mod module_ownership_tests {
             "mod daemon;",
             "mod doctor;",
             "mod evolution_cli;",
+            "mod fitness_cli;",
             "mod gateway;",
             "mod health;",
             "mod heartbeat;",
@@ -532,6 +534,7 @@ mod module_ownership_tests {
             "enum XinGoalCommands",
             "enum XinStepCommands",
             "enum EvolutionCommands",
+            "enum FitnessCommands",
             "enum EvolutionLayerArg",
             "enum IntegrationCommands",
         ] {
@@ -584,6 +587,27 @@ pub enum EvolutionCommands {
         /// Layer choice: L1 (memory), L2 (prompt), L3 (strategy/policy)
         #[arg(long, value_enum)]
         layer: Option<EvolutionLayerArg>,
+    },
+}
+
+/// Fitness snapshot and migration subcommands.
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FitnessCommands {
+    /// Show the active schedule, store path, and latest report.
+    Status,
+    /// Score the most recently closed calendar day.
+    Run,
+    /// Show v2 daily reports, newest first.
+    History {
+        /// Maximum reports to display.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Export and remove legacy memory-backed fitness rows.
+    MigrateLegacy {
+        /// Apply the migration. Without this flag the command is read-only.
+        #[arg(long)]
+        apply: bool,
     },
 }
 

@@ -43,12 +43,14 @@ pub struct EvolutionSignals {
     pub cron_failure_ratio: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FitnessTrend {
     pub window: usize,
-    pub previous_average: f64,
-    pub latest_score: f64,
-    pub is_declining: bool,
+    pub previous_average: Option<f64>,
+    pub latest_score: Option<f64>,
+    pub is_declining: Option<bool>,
+    #[serde(default)]
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,9 +77,9 @@ pub enum CycleOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvolutionValidation {
     pub status: ValidationStatus,
-    pub before_score: f64,
-    pub after_score: f64,
-    pub delta: f64,
+    pub before_score: Option<f64>,
+    pub after_score: Option<f64>,
+    pub delta: Option<f64>,
     pub notes: String,
 }
 

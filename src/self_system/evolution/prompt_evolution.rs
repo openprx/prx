@@ -9,7 +9,7 @@ use crate::self_system::evolution::safety_utils::{
 use crate::self_system::evolution::storage::AsyncJsonlWriter;
 use crate::self_system::evolution::{
     ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal, EvolutionSignals,
-    EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
+    EvolutionValidation, RiskLevel, ValidationStatus,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -223,6 +223,7 @@ impl EvolutionEngine for PromptEvolutionEngine {
 
     async fn run_cycle(&mut self, input: EngineCycleInput) -> Result<CycleResult> {
         let started_at = Utc::now().to_rfc3339();
+        let fitness_trend = input.fitness_trend.clone().unwrap_or_default();
         let cycle_id = if input.cycle_id.is_empty() {
             Uuid::now_v7().to_string()
         } else {
@@ -280,7 +281,6 @@ impl EvolutionEngine for PromptEvolutionEngine {
         };
 
         let mut outcome = CycleOutcome::NoAction;
-        let mut validation_status = ValidationStatus::Skipped;
         let mut notes = "shadow mode: prompt mutation recorded only".to_string();
 
         if mode.allows_target_mutation() {
@@ -292,7 +292,6 @@ impl EvolutionEngine for PromptEvolutionEngine {
                     .await?;
                 atomic_write(&self.workspace_root, &target_path, after.as_bytes()).await?;
                 outcome = CycleOutcome::Applied;
-                validation_status = ValidationStatus::Improved;
                 notes = "prompt mutation applied".to_string();
             }
         }
@@ -315,13 +314,13 @@ impl EvolutionEngine for PromptEvolutionEngine {
                 key_metrics: HashMap::from([("severity".to_string(), f64::from(severity))]),
                 patterns_found: vec![format!("mutation_type={:?}", mutation_type)],
             },
-            result: Some(if needs_human_approval {
-                EvolutionResult::Rejected
+            result: if needs_human_approval {
+                Some(EvolutionResult::Rejected)
             } else if matches!(outcome, CycleOutcome::Applied) {
-                EvolutionResult::Improved
+                None
             } else {
-                EvolutionResult::Neutral
-            }),
+                Some(EvolutionResult::Neutral)
+            },
         };
 
         // FIX-P1-09 (single audit source): the engine no longer appends the evolution log
@@ -341,31 +340,14 @@ impl EvolutionEngine for PromptEvolutionEngine {
                 cron_runs: 0,
                 cron_failure_ratio: 0.0,
             },
-            trend: FitnessTrend {
-                window: 1,
-                previous_average: 0.5,
-                latest_score: if matches!(outcome, CycleOutcome::Applied) {
-                    0.6
-                } else {
-                    0.5
-                },
-                is_declining: false,
-            },
+            trend: fitness_trend.clone(),
             proposal: Some(proposal.clone()),
             validation: EvolutionValidation {
-                status: validation_status,
-                before_score: 0.5,
-                after_score: if matches!(outcome, CycleOutcome::Applied) {
-                    0.6
-                } else {
-                    0.5
-                },
-                delta: if matches!(outcome, CycleOutcome::Applied) {
-                    0.1
-                } else {
-                    0.0
-                },
-                notes,
+                status: ValidationStatus::Skipped,
+                before_score: fitness_trend.latest_score,
+                after_score: None,
+                delta: None,
+                notes: format!("{notes}; fitness validation pending a later closed window"),
             },
             outcome,
             alert: if needs_human_approval {
@@ -410,6 +392,7 @@ mod tests {
             .run_cycle(EngineCycleInput {
                 cycle_id: "x".to_string(),
                 analyzer_candidates: Vec::new(),
+                fitness_trend: None,
             })
             .await
             .unwrap_err();
@@ -432,6 +415,7 @@ mod tests {
             .run_cycle(EngineCycleInput {
                 cycle_id: "x".to_string(),
                 analyzer_candidates: Vec::new(),
+                fitness_trend: None,
             })
             .await
             .unwrap();
@@ -453,6 +437,7 @@ mod tests {
             .run_cycle(EngineCycleInput {
                 cycle_id: "x".to_string(),
                 analyzer_candidates: Vec::new(),
+                fitness_trend: None,
             })
             .await
             .unwrap_err();
@@ -479,6 +464,7 @@ mod tests {
             .run_cycle(EngineCycleInput {
                 cycle_id: "x".to_string(),
                 analyzer_candidates: Vec::new(),
+                fitness_trend: None,
             })
             .await
             .unwrap();
@@ -519,6 +505,7 @@ mod tests {
             .run_cycle(EngineCycleInput {
                 cycle_id: "x".to_string(),
                 analyzer_candidates: Vec::new(),
+                fitness_trend: None,
             })
             .await
             .unwrap();

@@ -789,6 +789,15 @@ max_recalled_pages = 10
 # process_memory_strategy = "shared_fabric" # shared_fabric | isolated_private
 
 [self_system]
+
+[self_system.fitness]
+auto_run = true
+timezone = "UTC"
+run_at = "00:10"
+retention_days = 180
+max_backfill_days = 7
+min_samples = 5
+min_coverage = 0.60
 "#
         .into(),
 
@@ -812,6 +821,15 @@ process_memory_strategy = "shared_fabric"
 
 # Self-system for autonomous behavior
 [self_system]
+
+[self_system.fitness]
+auto_run = true
+timezone = "UTC"                     # IANA timezone for closed daily windows
+run_at = "00:10"                     # local HH:MM; scores the previous day
+retention_days = 180
+max_backfill_days = 7
+min_samples = 5
+min_coverage = 0.60
 
 # Causal tree (CTE) — experimental, opt-in. When enabled, the agent loop runs
 # speculative multi-branch prediction (in-memory rehearsal, no extra LLM calls)

@@ -374,6 +374,66 @@ impl SqliteMemory {
         )
     }
 
+    /// Inspect one key namespace through a byte-for-byte read-only connection.
+    /// This is used by migration dry-runs that must not initialize or mutate
+    /// the configured database.
+    pub async fn read_key_prefix_read_only(
+        workspace_dir: &Path,
+        prefix: &str,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let db_path = workspace_dir.join("memory/brain.db");
+        if !db_path.exists() {
+            return Ok(Vec::new());
+        }
+        let prefix = prefix.to_string();
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<(String, String)>> {
+            let connection = Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .with_context(|| format!("failed to open {} read-only", db_path.display()))?;
+            let escaped = prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            let pattern = format!("{escaped}%");
+            let mut statement =
+                connection.prepare("SELECT key, content FROM memories WHERE key LIKE ?1 ESCAPE '\\'")?;
+            let rows = statement.query_map([pattern], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+        })
+        .await?
+    }
+
+    /// Create a consistent SQLite backup without stopping readers or copying a
+    /// live WAL file set byte-for-byte.
+    pub async fn backup_database_to(&self, target: &Path) -> anyhow::Result<()> {
+        let pool = self.pool.clone();
+        let target = target.to_path_buf();
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            anyhow::ensure!(!target.exists(), "backup target already exists: {}", target.display());
+            let conn = pool.write();
+            conn.execute("VACUUM INTO ?1", params![target.to_string_lossy().to_string()])?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Delete an exact key namespace in one transaction. SQLite FTS triggers
+    /// remove the corresponding search rows in the same commit.
+    pub async fn delete_key_prefix_transactional(&self, prefix: &str) -> anyhow::Result<usize> {
+        let pool = self.pool.clone();
+        let escaped = prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("{escaped}%");
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<usize> {
+            let mut conn = pool.write();
+            let tx = conn.transaction()?;
+            let affected = tx.execute("DELETE FROM memories WHERE key LIKE ?1 ESCAPE '\\'", params![pattern])?;
+            tx.commit()?;
+            Ok(affected)
+        })
+        .await?
+    }
+
     /// Build SQLite memory with optional open timeout.
     ///
     /// If `open_timeout_secs` is `Some(n)`, opening the database is limited to `n` seconds
@@ -4815,6 +4875,97 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn list_message_events_time_range(
+        &self,
+        principal: &MemoryPrincipal,
+        descendant_workspace_root: Option<&str>,
+        start: &str,
+        end: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        let pool = self.pool.clone();
+        let principal = principal.clone();
+        let descendant_workspace_root = descendant_workspace_root.map(str::to_string);
+        let start = start.to_string();
+        let end = end.to_string();
+        let limit = i64::try_from(limit.min(100_000)).unwrap_or(100_000);
+        let system_allowed = Self::is_system_principal(&principal);
+        anyhow::ensure!(
+            descendant_workspace_root.is_none() || system_allowed,
+            "descendant workspace event queries require a system principal"
+        );
+        let descendant_pattern = descendant_workspace_root.as_ref().map(|root| {
+            let escaped = root.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            format!("{escaped}{}%", std::path::MAIN_SEPARATOR)
+        });
+        let legacy_session_keys = Self::legacy_session_key_params(&principal);
+        let session_indices = Self::session_indices(4, 12, &principal, &legacy_session_keys);
+        let session_fragment =
+            crate::memory::session_predicate::session_visibility_or_fragment(SQLITE_DIALECT, &session_indices);
+
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
+                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                        sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
+                        content, content_hash, raw_payload_json, visibility, created_at, updated_at
+                 FROM message_events
+                 WHERE created_at >= ?9 AND created_at < ?10
+                   AND (
+                       visibility = 'global'
+                       OR (
+                           (
+                               workspace_id = ?1
+                               OR (?6 AND ?7 IS NOT NULL AND (
+                                   workspace_id = ?7 OR workspace_id LIKE ?8 ESCAPE '\\'
+                               ))
+                           )
+                           AND (
+                               (?6 AND ?7 IS NOT NULL)
+                               OR visibility = 'workspace'
+                               OR (visibility = 'agent' AND (
+                                   (?2 IS NOT NULL AND agent_id = ?2)
+                                   OR (?3 IS NOT NULL AND persona_id = ?3)
+                               ))
+                               OR (visibility = 'session' AND {session_fragment})
+                               OR (visibility = 'private' AND (
+                                   (?2 IS NOT NULL AND agent_id = ?2)
+                                   OR (?3 IS NOT NULL AND persona_id = ?3)
+                                   OR (?5 IS NOT NULL AND sender = ?5)
+                               ))
+                               OR (visibility = 'system' AND ?6)
+                           )
+                       )
+                 )
+                 ORDER BY created_at ASC, id ASC
+                 LIMIT ?11",
+                session_fragment = session_fragment.sql,
+            ))?;
+            let mut bind: Vec<&dyn rusqlite::types::ToSql> = vec![
+                &principal.workspace_id,
+                &principal.agent_id,
+                &principal.persona_id,
+                &principal.session_key,
+                &principal.sender,
+                &system_allowed,
+                &descendant_workspace_root,
+                &descendant_pattern,
+                &start,
+                &end,
+                &limit,
+            ];
+            for key in &legacy_session_keys {
+                bind.push(key);
+            }
+            let rows = stmt.query_map(bind.as_slice(), Self::message_event_from_row)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+        .await?
+    }
+
     async fn load_recent_shared_context(&self, query: SharedContextQuery) -> anyhow::Result<Vec<MessageEvent>> {
         let pool = self.pool.clone();
         let principal = query.principal;
@@ -7526,6 +7677,81 @@ source: tool_output\n\
         let contents = visible.iter().map(|event| event.content.as_str()).collect::<Vec<_>>();
 
         assert_eq!(contents, vec!["global visible everywhere"]);
+    }
+
+    #[tokio::test]
+    async fn time_range_system_query_includes_configured_worker_descendants_only() {
+        let (_tmp, mem) = temp_sqlite();
+        for (workspace, content) in [
+            ("/workspace", "root event"),
+            ("/workspace/workers/run-1", "worker event"),
+            ("/workspace/workers-old/run-2", "prefix sibling hidden"),
+            ("/other/workers/run-3", "other workspace hidden"),
+        ] {
+            mem.append_message_event(message_input(
+                workspace,
+                content,
+                MemoryVisibility::Workspace,
+                None,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        }
+        let mut private_root = message_input(
+            "/workspace",
+            "private root event",
+            MemoryVisibility::Private,
+            Some("other-agent"),
+            None,
+            None,
+        );
+        private_root.sender = Some("other-sender".to_string());
+        mem.append_message_event(private_root).await.unwrap();
+        mem.append_message_event(message_input(
+            "/workspace/workers/run-1",
+            "private worker event",
+            MemoryVisibility::Private,
+            Some("other-agent"),
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+        let principal = MemoryPrincipal {
+            workspace_id: "/workspace".to_string(),
+            agent_id: Some("self_system".to_string()),
+            ..MemoryPrincipal::default()
+        };
+        let start = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let end = (Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
+
+        let visible = mem
+            .list_message_events_time_range(&principal, Some("/workspace/workers"), &start, &end, 20)
+            .await
+            .unwrap();
+        let contents = visible.iter().map(|event| event.content.as_str()).collect::<Vec<_>>();
+
+        assert_eq!(
+            contents,
+            vec![
+                "root event",
+                "worker event",
+                "private root event",
+                "private worker event"
+            ]
+        );
+
+        let non_system = MemoryPrincipal {
+            agent_id: Some("regular-agent".to_string()),
+            ..principal
+        };
+        assert!(
+            mem.list_message_events_time_range(&non_system, Some("/workspace/workers"), &start, &end, 20,)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

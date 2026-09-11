@@ -18,7 +18,7 @@ pub use schema::{
     A2aConfig, AgentCompactionConfig, AgentCompactionMode, AgentConfig, AuditConfig, AuthConfig, AutomixConfig,
     AutonomyConfig, BrowserComputerUseConfig, BrowserConfig, ChannelsConfig, ChatConfig, ClassificationRule,
     ComposioConfig, Config, CostConfig, CronConfig, DelegateAgentConfig, DiscordConfig, DmPolicy, DockerRuntimeConfig,
-    EmbeddingRouteConfig, GatewayConfig, GroupPolicy, GroupReplyMode, HYBRID_PROCESS_MEMORY_UNAVAILABLE,
+    EmbeddingRouteConfig, FitnessConfig, GatewayConfig, GroupPolicy, GroupReplyMode, HYBRID_PROCESS_MEMORY_UNAVAILABLE,
     HeartbeatConfig, HttpRequestConfig, IMessageConfig, IdentityBindingConfig, IdentityConfig, LarkConfig,
     MatrixConfig, McpConfig, McpServerConfig, McpServerRuntimeConfig, McpTransport, MediaConfig, MemoryConfig,
     MemoryEventsConfig, MemorySemanticConfig, MemoryWebhookConfig, ModelRouteConfig, MultimodalConfig,

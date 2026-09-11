@@ -4298,6 +4298,100 @@ impl Memory for PostgresMemory {
         .await?
     }
 
+    async fn list_message_events_time_range(
+        &self,
+        principal: &MemoryPrincipal,
+        descendant_workspace_root: Option<&str>,
+        start: &str,
+        end: &str,
+        limit: usize,
+    ) -> Result<Vec<MessageEvent>> {
+        let client = self.client.clone();
+        let qualified_message_events_table = self.qualified_message_events_table.clone();
+        let principal = principal.clone();
+        let descendant_workspace_root = descendant_workspace_root.map(str::to_string);
+        let start = chrono::DateTime::parse_from_rfc3339(start)?.with_timezone(&chrono::Utc);
+        let end = chrono::DateTime::parse_from_rfc3339(end)?.with_timezone(&chrono::Utc);
+        let limit_i64 = i64::try_from(limit.clamp(1, 100_000)).unwrap_or(100_000);
+        let system_allowed = Self::is_system_principal(&principal);
+        anyhow::ensure!(
+            descendant_workspace_root.is_none() || system_allowed,
+            "descendant workspace event queries require a system principal"
+        );
+        let descendant_pattern = descendant_workspace_root.as_ref().map(|root| {
+            let escaped = root.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            format!("{escaped}{}%", std::path::MAIN_SEPARATOR)
+        });
+        let legacy_session_keys = Self::legacy_session_key_params(&principal);
+        let session_indices = Self::session_indices(4, 12, &principal, &legacy_session_keys);
+        let session_fragment =
+            crate::memory::session_predicate::session_visibility_or_fragment(PG_DIALECT, &session_indices);
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
+            let stmt = format!(
+                "
+                SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
+                       parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                       sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                       goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
+                       content, content_hash, raw_payload_json, visibility, created_at, updated_at
+                FROM {qualified_message_events_table}
+                WHERE created_at >= $9 AND created_at < $10
+                  AND (
+                      visibility = 'global'
+                      OR (
+                          (
+                              workspace_id = $1
+                              OR ($6::BOOLEAN AND $7::TEXT IS NOT NULL AND (
+                                  workspace_id = $7 OR workspace_id LIKE $8 ESCAPE '\\'
+                              ))
+                          )
+                          AND (
+                              ($6::BOOLEAN AND $7::TEXT IS NOT NULL)
+                              OR visibility = 'workspace'
+                              OR (visibility = 'agent' AND (
+                                  ($2::TEXT IS NOT NULL AND agent_id = $2)
+                                  OR ($3::TEXT IS NOT NULL AND persona_id = $3)
+                              ))
+                              OR (visibility = 'session' AND {session_fragment})
+                              OR (visibility = 'private' AND (
+                                  ($2::TEXT IS NOT NULL AND agent_id = $2)
+                                  OR ($3::TEXT IS NOT NULL AND persona_id = $3)
+                                  OR ($5::TEXT IS NOT NULL AND sender = $5)
+                              ))
+                              OR (visibility = 'system' AND $6::BOOLEAN)
+                          )
+                      )
+                )
+                ORDER BY created_at ASC, id ASC
+                LIMIT $11
+                ",
+                session_fragment = session_fragment.sql,
+            );
+            let rows = client.with_client(|client| {
+                let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
+                    &principal.workspace_id,
+                    &principal.agent_id,
+                    &principal.persona_id,
+                    &principal.session_key,
+                    &principal.sender,
+                    &system_allowed,
+                    &descendant_workspace_root,
+                    &descendant_pattern,
+                    &start,
+                    &end,
+                    &limit_i64,
+                ];
+                for key in &legacy_session_keys {
+                    bind.push(key);
+                }
+                Ok(client.query(&stmt, &bind)?)
+            })?;
+            rows.iter().map(Self::row_to_message_event).collect::<Result<Vec<_>>>()
+        })
+        .await?
+    }
+
     async fn load_recent_shared_context(&self, query: SharedContextQuery) -> Result<Vec<MessageEvent>> {
         let client = self.client.clone();
         let qualified_message_events_table = self.qualified_message_events_table.clone();

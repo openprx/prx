@@ -244,6 +244,7 @@ async fn gate_rejects_candidate_when_threshold_not_met() -> Result<()> {
                 priority: CandidatePriority::High,
                 backfill_after_days: 3,
             }],
+            fitness_trend: None,
         })
         .await?;
 
@@ -299,16 +300,17 @@ impl EvolutionEngine for RollbackTriggerEngine {
                 },
                 trend: FitnessTrend {
                     window: 1,
-                    previous_average: 0.5,
-                    latest_score: 0.4,
-                    is_declining: true,
+                    previous_average: Some(0.5),
+                    latest_score: Some(0.4),
+                    is_declining: Some(true),
+                    source: "test".to_string(),
                 },
                 proposal: None,
                 validation: EvolutionValidation {
                     status: ValidationStatus::Regressed,
-                    before_score: 0.5,
-                    after_score: 0.4,
-                    delta: -0.1,
+                    before_score: Some(0.5),
+                    after_score: Some(0.4),
+                    delta: Some(-0.1),
                     notes: "unsafe violation timeout".to_string(),
                 },
                 outcome: CycleOutcome::Applied,

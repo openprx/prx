@@ -40,8 +40,8 @@ use crate::{
     ChannelCommands, Commands, ConfigCommands, ConfigShowFormat, DoctorCommands, IntegrationCommands, ModelCommands,
 };
 use crate::{
-    agent, channels, chat, cron, daemon, doctor, evolution_cli, gateway, integrations, memory, migration, onboard,
-    providers, service, skills,
+    agent, channels, chat, cron, daemon, doctor, evolution_cli, fitness_cli, gateway, integrations, memory, migration,
+    onboard, providers, service, skills,
 };
 use crate::{
     handle_approval_command, handle_audit_command, handle_auth_command, handle_memory_command, handle_tasks_command,
@@ -422,6 +422,10 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             json,
             evolution_command,
         } => evolution_cli::handle_command(evolution_command, json, &config).await,
+
+        Commands::Fitness { json, fitness_command } => {
+            fitness_cli::handle_command(fitness_command, json, &config).await
+        }
 
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 

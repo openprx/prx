@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Replace memory-backed fitness reports with versioned, atomic daily snapshots
+  under `workspace/self/fitness`, calendar scheduling over closed local days,
+  evidence-derived optional subscores across root and process-worker events,
+  explicit coverage/confidence, and real fitness trends for delayed evolution
+  validation.
+
+### Fixed
+
+- Stop fitness telemetry from entering general recall, `MEMORY.md`, and
+  `MEMORY_SNAPSHOT.md`; add a backed-up transactional migration command for
+  existing `self/fitness/daily/*` memory rows and Markdown projections.
+
 ## [0.8.108] - 8 September 2026
 
 ### Fixed

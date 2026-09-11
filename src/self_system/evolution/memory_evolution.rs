@@ -11,7 +11,7 @@ use crate::self_system::evolution::safety_utils::atomic_write;
 use crate::self_system::evolution::storage::AsyncJsonlWriter;
 use crate::self_system::evolution::{
     ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal, EvolutionSignals,
-    EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
+    EvolutionValidation, RiskLevel, ValidationStatus,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -289,6 +289,7 @@ impl EvolutionEngine for MemoryEvolutionEngine {
 
     async fn run_cycle(&mut self, input: EngineCycleInput) -> Result<CycleResult> {
         let started_at = Utc::now().to_rfc3339();
+        let fitness_trend = input.fitness_trend.clone().unwrap_or_default();
         let cycle_id = if input.cycle_id.is_empty() {
             Uuid::now_v7().to_string()
         } else {
@@ -342,7 +343,6 @@ impl EvolutionEngine for MemoryEvolutionEngine {
 
         let mut applied = false;
         let mut outcome = CycleOutcome::NoAction;
-        let mut validation_status = ValidationStatus::Skipped;
         let mut notes = "shadow mode: recommendation only".to_string();
 
         match mode {
@@ -369,11 +369,9 @@ impl EvolutionEngine for MemoryEvolutionEngine {
                     self.shared_config.store(Arc::new(next_cfg));
                     applied = true;
                     outcome = CycleOutcome::Applied;
-                    validation_status = ValidationStatus::Improved;
                     notes = "gate passed and config persisted".to_string();
                 } else {
                     outcome = CycleOutcome::Failed;
-                    validation_status = ValidationStatus::Regressed;
                     notes = "gate rejected mutation".to_string();
                 }
             }
@@ -408,13 +406,13 @@ impl EvolutionEngine for MemoryEvolutionEngine {
                 key_metrics,
                 patterns_found: vec![candidate.current_value.clone()],
             },
-            result: Some(if applied {
-                EvolutionResult::Improved
+            result: if applied {
+                None
             } else if matches!(gate_result, GateResult::Passed) {
-                EvolutionResult::Neutral
+                Some(EvolutionResult::Neutral)
             } else {
-                EvolutionResult::Rejected
-            }),
+                Some(EvolutionResult::Rejected)
+            },
         };
 
         if let Some(writer) = &self.writer {
@@ -432,27 +430,14 @@ impl EvolutionEngine for MemoryEvolutionEngine {
                 cron_runs: 0,
                 cron_failure_ratio: 0.0,
             },
-            trend: FitnessTrend {
-                window: 1,
-                previous_average: 0.5,
-                latest_score: if applied { 0.6 } else { 0.5 },
-                is_declining: false,
-            },
+            trend: fitness_trend.clone(),
             proposal: Some(proposal.clone()),
             validation: EvolutionValidation {
-                status: validation_status.clone(),
-                before_score: 0.5,
-                after_score: if validation_status == ValidationStatus::Improved {
-                    0.6
-                } else {
-                    0.5
-                },
-                delta: if validation_status == ValidationStatus::Improved {
-                    0.1
-                } else {
-                    0.0
-                },
-                notes,
+                status: ValidationStatus::Skipped,
+                before_score: fitness_trend.latest_score,
+                after_score: None,
+                delta: None,
+                notes: format!("{notes}; fitness validation pending a later closed window"),
             },
             outcome,
             alert: match gate_result {
@@ -525,6 +510,7 @@ mod tests {
             .run_cycle(EngineCycleInput {
                 cycle_id: "c1".to_string(),
                 analyzer_candidates: vec![default_candidate()],
+                fitness_trend: None,
             })
             .await
             .unwrap();
@@ -547,6 +533,7 @@ mod tests {
             .run_cycle(EngineCycleInput {
                 cycle_id: "c2".to_string(),
                 analyzer_candidates: vec![default_candidate()],
+                fitness_trend: None,
             })
             .await
             .unwrap();

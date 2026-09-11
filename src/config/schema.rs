@@ -1133,9 +1133,16 @@ const fn default_sessions_spawn_cleanup_on_complete() -> bool {
 /// Self-system experimental automation config (`[self_system]`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SelfSystemConfig {
-    /// Fitness report interval in hours.
+    /// Legacy fitness report interval in hours.
+    ///
+    /// Kept for configuration compatibility. Calendar scheduling is controlled
+    /// by `[self_system.fitness]` and this value is no longer used by the
+    /// daemon worker.
     #[serde(default = "default_self_system_fitness_interval_hours")]
     pub fitness_interval_hours: u64,
+    /// Daily fitness snapshot policy.
+    #[serde(default)]
+    pub fitness: FitnessConfig,
     /// Evolution scheduler interval in hours (daemon mode).
     #[serde(default = "default_self_system_evolution_interval_hours")]
     pub evolution_interval_hours: u32,
@@ -1147,6 +1154,70 @@ pub struct SelfSystemConfig {
     /// Enable debug raw output for evolution (replaces OPENPRX_EVOLUTION_DEBUG_RAW / ZEROCLAW_EVOLUTION_DEBUG_RAW)
     #[serde(default)]
     pub evolution_debug_raw: bool,
+}
+
+/// Calendar schedule, evidence thresholds, and retention for fitness v2.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FitnessConfig {
+    /// Run the daily fitness worker in daemon mode.
+    #[serde(default = "default_true")]
+    pub auto_run: bool,
+    /// IANA timezone used to define closed calendar days.
+    #[serde(default = "default_fitness_timezone")]
+    pub timezone: String,
+    /// Local wall-clock time (`HH:MM`) at which the previous day is scored.
+    #[serde(default = "default_fitness_run_at")]
+    pub run_at: String,
+    /// Number of daily JSON reports retained on disk.
+    #[serde(default = "default_fitness_retention_days")]
+    pub retention_days: u32,
+    /// Maximum number of closed days recovered after downtime.
+    #[serde(default = "default_fitness_max_backfill_days")]
+    pub max_backfill_days: u32,
+    /// Minimum samples required before an evidence-derived subscore is usable.
+    #[serde(default = "default_fitness_min_samples")]
+    pub min_samples: usize,
+    /// Minimum available metric weight required to publish a final score.
+    #[serde(default = "default_fitness_min_coverage")]
+    pub min_coverage: f64,
+}
+
+fn default_fitness_timezone() -> String {
+    "UTC".to_string()
+}
+
+fn default_fitness_run_at() -> String {
+    "00:10".to_string()
+}
+
+const fn default_fitness_retention_days() -> u32 {
+    180
+}
+
+const fn default_fitness_max_backfill_days() -> u32 {
+    7
+}
+
+const fn default_fitness_min_samples() -> usize {
+    5
+}
+
+const fn default_fitness_min_coverage() -> f64 {
+    0.60
+}
+
+impl Default for FitnessConfig {
+    fn default() -> Self {
+        Self {
+            auto_run: true,
+            timezone: default_fitness_timezone(),
+            run_at: default_fitness_run_at(),
+            retention_days: default_fitness_retention_days(),
+            max_backfill_days: default_fitness_max_backfill_days(),
+            min_samples: default_fitness_min_samples(),
+            min_coverage: default_fitness_min_coverage(),
+        }
+    }
 }
 
 const fn default_self_system_fitness_interval_hours() -> u64 {
@@ -1161,6 +1232,7 @@ impl Default for SelfSystemConfig {
     fn default() -> Self {
         Self {
             fitness_interval_hours: default_self_system_fitness_interval_hours(),
+            fitness: FitnessConfig::default(),
             evolution_interval_hours: default_self_system_evolution_interval_hours(),
             evolution_config_path: None,
             evolution_debug_raw: false,
@@ -6156,6 +6228,39 @@ impl Config {
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
+        self.self_system
+            .fitness
+            .timezone
+            .parse::<chrono_tz::Tz>()
+            .with_context(|| {
+                format!(
+                    "invalid self_system.fitness.timezone: {}",
+                    self.self_system.fitness.timezone
+                )
+            })?;
+        chrono::NaiveTime::parse_from_str(self.self_system.fitness.run_at.trim(), "%H:%M").with_context(|| {
+            format!(
+                "invalid self_system.fitness.run_at '{}'; expected HH:MM",
+                self.self_system.fitness.run_at
+            )
+        })?;
+        anyhow::ensure!(
+            self.self_system.fitness.min_samples > 0,
+            "self_system.fitness.min_samples must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.self_system.fitness.retention_days > 0,
+            "self_system.fitness.retention_days must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.self_system.fitness.max_backfill_days > 0,
+            "self_system.fitness.max_backfill_days must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.self_system.fitness.min_coverage.is_finite()
+                && (0.0..=1.0).contains(&self.self_system.fitness.min_coverage),
+            "self_system.fitness.min_coverage must be between 0 and 1"
+        );
         let notice = &self.compliance.interaction_notice;
         if notice.version.trim().is_empty() {
             anyhow::bail!("compliance.interaction_notice.version must not be empty");
@@ -7111,6 +7216,10 @@ default_temperature = 0.7
         assert_eq!(parsed.memory.conversation_retention_days, 3);
         assert_eq!(parsed.memory.daily_retention_days, 7);
         assert_eq!(parsed.self_system.evolution_interval_hours, 24);
+        assert!(parsed.self_system.fitness.auto_run);
+        assert_eq!(parsed.self_system.fitness.timezone, "UTC");
+        assert_eq!(parsed.self_system.fitness.run_at, "00:10");
+        assert_eq!(parsed.self_system.fitness.max_backfill_days, 7);
     }
 
     #[test]
@@ -7123,6 +7232,34 @@ evolution_interval_hours = 12
 "#;
         let parsed: Config = toml::from_str(raw).unwrap();
         assert_eq!(parsed.self_system.evolution_interval_hours, 12);
+    }
+
+    #[test]
+    async fn self_system_fitness_calendar_config_deserializes() {
+        let raw = r#"
+default_temperature = 0.7
+
+[self_system]
+fitness_interval_hours = 8760
+
+[self_system.fitness]
+auto_run = false
+timezone = "Asia/Tbilisi"
+run_at = "00:20"
+retention_days = 90
+max_backfill_days = 3
+min_samples = 8
+min_coverage = 0.75
+"#;
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.self_system.fitness_interval_hours, 8760);
+        assert!(!parsed.self_system.fitness.auto_run);
+        assert_eq!(parsed.self_system.fitness.timezone, "Asia/Tbilisi");
+        assert_eq!(parsed.self_system.fitness.run_at, "00:20");
+        assert_eq!(parsed.self_system.fitness.retention_days, 90);
+        assert_eq!(parsed.self_system.fitness.max_backfill_days, 3);
+        assert_eq!(parsed.self_system.fitness.min_samples, 8);
+        assert!((parsed.self_system.fitness.min_coverage - 0.75).abs() < f64::EPSILON);
     }
 
     #[test]

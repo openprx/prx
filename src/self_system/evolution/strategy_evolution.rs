@@ -10,7 +10,7 @@ use crate::self_system::evolution::safety_utils::{atomic_write, validate_path_in
 use crate::self_system::evolution::storage::AsyncJsonlWriter;
 use crate::self_system::evolution::{
     ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal, EvolutionSignals,
-    EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
+    EvolutionValidation, RiskLevel, ValidationStatus,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -120,6 +120,7 @@ impl EvolutionEngine for StrategyEvolutionEngine {
 
     async fn run_cycle(&mut self, input: EngineCycleInput) -> Result<CycleResult> {
         let started_at = Utc::now().to_rfc3339();
+        let fitness_trend = input.fitness_trend.clone().unwrap_or_default();
         let cycle_id = if input.cycle_id.is_empty() {
             Uuid::now_v7().to_string()
         } else {
@@ -179,7 +180,6 @@ impl EvolutionEngine for StrategyEvolutionEngine {
         let gate_result = gate.evaluate(&candidate, &gate_metrics);
 
         let mut outcome = CycleOutcome::NoAction;
-        let mut status = ValidationStatus::Skipped;
         let mut notes = "shadow mode: strategy mutation recorded only".to_string();
 
         if mode.allows_target_mutation() {
@@ -187,11 +187,9 @@ impl EvolutionEngine for StrategyEvolutionEngine {
                 self.rollback.backup_current_version().await?;
                 atomic_write(&self.workspace_root, &policy_path, serialized.as_bytes()).await?;
                 outcome = CycleOutcome::Applied;
-                status = ValidationStatus::Improved;
                 notes = "gate passed and strategy persisted".to_string();
             } else {
                 outcome = CycleOutcome::Failed;
-                status = ValidationStatus::Regressed;
                 notes = "gate rejected strategy mutation".to_string();
             }
         }
@@ -216,13 +214,13 @@ impl EvolutionEngine for StrategyEvolutionEngine {
                     worst.as_ref().map(|item| item.task_type.as_str()).unwrap_or("unknown")
                 )],
             },
-            result: Some(if matches!(outcome, CycleOutcome::Applied) {
-                EvolutionResult::Improved
+            result: if matches!(outcome, CycleOutcome::Applied) {
+                None
             } else if matches!(gate_result, GateResult::Passed) {
-                EvolutionResult::Neutral
+                Some(EvolutionResult::Neutral)
             } else {
-                EvolutionResult::Rejected
-            }),
+                Some(EvolutionResult::Rejected)
+            },
         };
         self.writer.append_evolution(&evolution_log).await?;
 
@@ -237,31 +235,14 @@ impl EvolutionEngine for StrategyEvolutionEngine {
                 cron_runs: 0,
                 cron_failure_ratio: 0.0,
             },
-            trend: FitnessTrend {
-                window: 1,
-                previous_average: 0.5,
-                latest_score: if matches!(outcome, CycleOutcome::Applied) {
-                    0.6
-                } else {
-                    0.5
-                },
-                is_declining: false,
-            },
+            trend: fitness_trend.clone(),
             proposal: Some(proposal.clone()),
             validation: EvolutionValidation {
-                status,
-                before_score: 0.5,
-                after_score: if matches!(outcome, CycleOutcome::Applied) {
-                    0.6
-                } else {
-                    0.5
-                },
-                delta: if matches!(outcome, CycleOutcome::Applied) {
-                    0.1
-                } else {
-                    0.0
-                },
-                notes,
+                status: ValidationStatus::Skipped,
+                before_score: fitness_trend.latest_score,
+                after_score: None,
+                delta: None,
+                notes: format!("{notes}; fitness validation pending a later closed window"),
             },
             outcome,
             alert: match gate_result {

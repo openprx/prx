@@ -90,10 +90,10 @@ use chrono::Utc;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use dialoguer::{Input, Password};
 use openprx::{
-    CHAT_TRACING_RELOAD, ChannelCommands, ChatFmtLayer, Config, CronCommands, EvolutionCommands, IntegrationCommands,
-    MigrateCommands, ServiceCommands, SkillCommands, XinCommands, acl, agent, auth, channels, chat, config, cron,
-    daemon, doctor, evolution_cli, gateway, handle_xin_command, integrations, memory, migration, onboard, providers,
-    runtime, security, service, session_worker, skills,
+    CHAT_TRACING_RELOAD, ChannelCommands, ChatFmtLayer, Config, CronCommands, EvolutionCommands, FitnessCommands,
+    IntegrationCommands, MigrateCommands, ServiceCommands, SkillCommands, XinCommands, acl, agent, auth, channels,
+    chat, config, cron, daemon, doctor, evolution_cli, fitness_cli, gateway, handle_xin_command, integrations, memory,
+    migration, onboard, providers, runtime, security, service, session_worker, skills,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -700,6 +700,15 @@ Examples:
         json: bool,
         #[command(subcommand)]
         evolution_command: EvolutionCommands,
+    },
+
+    /// Inspect, run, and migrate daily self-system fitness snapshots.
+    Fitness {
+        /// Output machine-readable JSON.
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        fitness_command: FitnessCommands,
     },
 
     /// Configure and manage scheduled tasks

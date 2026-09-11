@@ -1,5 +1,5 @@
 use crate::self_system::evolution::analyzer::EvolutionCandidate;
-use crate::self_system::evolution::cycle_types::{EvolutionCycle, EvolutionProposal};
+use crate::self_system::evolution::cycle_types::{EvolutionCycle, EvolutionProposal, FitnessTrend};
 use crate::self_system::evolution::record::{EvolutionLayer, EvolutionLog};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 pub struct EngineCycleInput {
     pub cycle_id: String,
     pub analyzer_candidates: Vec<EvolutionCandidate>,
+    /// Real closed-window fitness evidence. `None` means no publishable fitness
+    /// snapshot exists; engines must not invent before/after scores.
+    pub fitness_trend: Option<FitnessTrend>,
 }
 
 /// Normalized output from a single evolution engine cycle.
@@ -36,11 +39,13 @@ pub async fn run_engine_cycle(
     engine: &mut dyn EvolutionEngine,
     cycle_id: impl Into<String>,
     analyzer_candidates: Vec<EvolutionCandidate>,
+    fitness_trend: Option<FitnessTrend>,
 ) -> Result<CycleResult> {
     engine
         .run_cycle(EngineCycleInput {
             cycle_id: cycle_id.into(),
             analyzer_candidates,
+            fitness_trend,
         })
         .await
 }

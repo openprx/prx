@@ -70,6 +70,43 @@ watcher and cannot publish the process `Config`. The evolution pipeline may
 atomically update its in-memory adaptive policy during a run, but a disk policy
 change is adopted only through the owning supervisor lifecycle.
 
+## Daily Fitness Snapshots
+
+Fitness v2 scores the most recently closed calendar day from durable runtime
+evidence. Reports are operational telemetry and are stored independently at
+`<workspace>/self/fitness/daily/YYYY-MM-DD.json`; they are never written to the
+memory backend, `MEMORY.md`, or `MEMORY_SNAPSHOT.md`. Evidence includes the
+root workspace and process workers below the configured
+`sessions_spawn.worker_workspace_root`; descendant queries require an internal
+system principal.
+
+```toml
+[self_system.fitness]
+auto_run = true
+timezone = "Asia/Tbilisi" # IANA timezone defining the calendar day
+run_at = "00:10"          # local HH:MM; evaluates the previous day
+retention_days = 180
+max_backfill_days = 7
+min_samples = 5
+min_coverage = 0.60
+```
+
+The five weights remain task quality 35%, no-repeat behavior 25%, proactive
+execution 20%, learning effectiveness 10%, and efficiency 10%. A metric with
+missing or too-small evidence is marked `unavailable` or `insufficient_data`
+and contributes no synthetic fallback value. The available weights are
+renormalized only when `min_coverage` is met; otherwise `final_score` is null.
+Efficiency compares token and latency medians with the preceding 30 days, so a
+local model with zero API price is not automatically assigned a perfect score.
+
+Use `prx fitness status`, `prx fitness run`, and `prx fitness history`. Before
+removing reports created by older releases, inspect
+`prx fitness migrate-legacy`; add `--apply` to create an online SQLite backup,
+archive the old JSON, delete its exact key namespace transactionally, rebuild
+the snapshot, and verify that both database and Markdown projections are clean.
+The old `self_system.fitness_interval_hours` key remains accepted only for
+configuration compatibility and no longer controls scheduling.
+
 ## Example Configuration
 
 ```toml
