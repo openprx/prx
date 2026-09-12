@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
 
 /// Trait for embedding providers — convert text to vectors
 #[async_trait]
@@ -44,6 +46,96 @@ impl EmbeddingProvider for NoopEmbedding {
 
     async fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         Ok(Vec::new())
+    }
+}
+
+// ── Built-in local embedding provider ──────────────────────────
+
+/// Credential-free deterministic feature-hash embeddings.
+///
+/// This lightweight provider keeps vector recall available on a fresh install
+/// without downloading a model or sending memory content over the network. It
+/// captures token and character n-gram similarity; users who need richer
+/// semantic matching can still select an OpenAI-compatible embedding model.
+pub struct LocalHashEmbedding {
+    model: String,
+    dims: usize,
+}
+
+impl LocalHashEmbedding {
+    pub fn new(model: &str, dims: usize) -> Self {
+        Self {
+            model: model.to_string(),
+            dims,
+        }
+    }
+
+    fn add_feature(vector: &mut [f32], feature: &str, weight: f32) {
+        let digest = Sha256::digest(feature.as_bytes());
+        let Some(index_bytes) = digest.get(..8).and_then(|bytes| bytes.try_into().ok()) else {
+            return;
+        };
+        let Some(sign_byte) = digest.get(8).copied() else {
+            return;
+        };
+        let Some(len) = u64::try_from(vector.len()).ok().filter(|len| *len > 0) else {
+            return;
+        };
+        let index = usize::try_from(u64::from_le_bytes(index_bytes) % len).unwrap_or(0);
+        let sign = if sign_byte & 1 == 0 { 1.0 } else { -1.0 };
+        if let Some(value) = vector.get_mut(index) {
+            *value += sign * weight;
+        }
+    }
+
+    fn embed_text(&self, text: &str) -> Vec<f32> {
+        let mut vector = vec![0.0; self.dims];
+        if vector.is_empty() {
+            return vector;
+        }
+
+        let normalized = text.nfkc().flat_map(char::to_lowercase).collect::<String>();
+        for token in normalized
+            .split(|ch: char| !ch.is_alphanumeric())
+            .filter(|token| !token.is_empty())
+        {
+            Self::add_feature(&mut vector, &format!("token:{token}"), 2.0);
+
+            let chars = token.chars().collect::<Vec<_>>();
+            for width in 2..=3 {
+                for gram in chars.windows(width) {
+                    let gram = gram.iter().collect::<String>();
+                    Self::add_feature(&mut vector, &format!("char{width}:{gram}"), 1.0);
+                }
+            }
+        }
+
+        let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for value in &mut vector {
+                *value /= norm;
+            }
+        }
+        vector
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for LocalHashEmbedding {
+    fn name(&self) -> &str {
+        "local"
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dims
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|text| self.embed_text(text)).collect())
     }
 }
 
@@ -176,6 +268,7 @@ pub fn create_embedding_provider(
     dims: usize,
 ) -> Box<dyn EmbeddingProvider> {
     match provider {
+        "local" => Box::new(LocalHashEmbedding::new(model, dims)),
         "openai" => {
             let key = api_key.unwrap_or("");
             Box::new(OpenAiEmbedding::new("https://api.openai.com", key, model, dims))
@@ -215,6 +308,44 @@ mod tests {
     fn factory_none() {
         let p = create_embedding_provider("none", None, "model", 1536);
         assert_eq!(p.name(), "none");
+    }
+
+    #[test]
+    fn factory_local_is_credential_free() {
+        let p = create_embedding_provider("local", None, "prx-local-hash-v1", 384);
+        assert_eq!(p.name(), "local");
+        assert_eq!(p.model(), "prx-local-hash-v1");
+        assert_eq!(p.dimensions(), 384);
+    }
+
+    #[tokio::test]
+    async fn local_embeddings_are_deterministic_normalized_and_similarity_sensitive() {
+        let provider = LocalHashEmbedding::new("prx-local-hash-v1", 384);
+        let vectors = provider
+            .embed(&[
+                "release deployment failed",
+                "deployment failure during release",
+                "garden flowers",
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(vectors.len(), 3);
+        assert!(vectors.iter().all(|vector| vector.len() == 384));
+        for vector in &vectors {
+            let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 0.0001);
+        }
+
+        let first = vectors.first().unwrap();
+        let second = vectors.get(1).unwrap();
+        let third = vectors.get(2).unwrap();
+        let related = crate::memory::vector::cosine_similarity(first, second);
+        let unrelated = crate::memory::vector::cosine_similarity(first, third);
+        assert!(related > unrelated, "related={related}, unrelated={unrelated}");
+
+        let repeated = provider.embed_one("release deployment failed").await.unwrap();
+        assert_eq!(first, &repeated);
     }
 
     #[test]

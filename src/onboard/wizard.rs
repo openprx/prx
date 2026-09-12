@@ -342,6 +342,7 @@ fn backend_key_from_choice(choice: usize) -> &'static str {
 
 fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
     let profile = memory_backend_profile(backend);
+    let embeddings_enabled = !matches!(backend, "markdown" | "none");
 
     MemoryConfig {
         backend: backend.to_string(),
@@ -354,9 +355,14 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         purge_after_days: 30,
         conversation_retention_days: 3,
         daily_retention_days: 7,
-        embedding_provider: "none".to_string(),
-        embedding_model: "text-embedding-3-small".to_string(),
-        embedding_dimensions: 1536,
+        embedding_provider: if embeddings_enabled { "local" } else { "none" }.to_string(),
+        embedding_model: if embeddings_enabled {
+            "prx-local-hash-v1"
+        } else {
+            "none"
+        }
+        .to_string(),
+        embedding_dimensions: if embeddings_enabled { 384 } else { 0 },
         vector_weight: 0.7,
         keyword_weight: 0.3,
         min_relevance_score: 0.4,
@@ -5690,6 +5696,9 @@ mod tests {
         let config = memory_config_defaults_for_backend("lucid");
         assert_eq!(config.backend, "lucid");
         assert!(config.auto_save);
+        assert_eq!(config.embedding_provider, "local");
+        assert_eq!(config.embedding_model, "prx-local-hash-v1");
+        assert_eq!(config.embedding_dimensions, 384);
         assert_eq!(config.archive_after_days, 7);
         assert_eq!(config.purge_after_days, 30);
         assert_eq!(config.embedding_cache_size, 10000);
@@ -5700,6 +5709,8 @@ mod tests {
         let config = memory_config_defaults_for_backend("none");
         assert_eq!(config.backend, "none");
         assert!(!config.auto_save);
+        assert_eq!(config.embedding_provider, "none");
+        assert_eq!(config.embedding_dimensions, 0);
         assert_eq!(config.archive_after_days, 7);
         assert_eq!(config.purge_after_days, 30);
         assert_eq!(config.embedding_cache_size, 0);

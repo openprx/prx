@@ -690,6 +690,28 @@ These files are automatically injected into the agent context at startup.
 | **PostgreSQL** | Scalable, multi-user |
 | **Markdown** | File-based, human-readable |
 
+### Embeddings and vector recall
+
+New installations enable credential-free local embeddings by default:
+
+```toml
+[memory]
+embedding_provider = "local"
+embedding_model = "prx-local-hash-v1"
+embedding_dimensions = 384
+vector_weight = 0.7
+keyword_weight = 0.3
+```
+
+The built-in provider is deterministic, keeps memory content on the host, and
+requires no model download or API key. It combines token and character n-gram
+features, so it improves similarity recall over keyword-only search without
+claiming the semantic quality of a dedicated embedding model. Set
+`embedding_provider = "none"` to opt out explicitly, or configure `openai` or
+`custom:<URL>` with a compatible model for richer semantic matching. Changing
+provider, model, or dimensions requires reindexing existing vector-bearing
+memory rows; stale vectors are not mixed with the active index.
+
 ### SQLite Connection Pool
 
 The SQLite backend is the default. It does **not** use the PostgreSQL pool

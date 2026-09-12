@@ -6354,6 +6354,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_local_embeddings_persist_and_drive_vector_recall() {
+        let tmp = TempDir::new().unwrap();
+        let embedder = Arc::new(crate::memory::embeddings::LocalHashEmbedding::new(
+            "prx-local-hash-v1",
+            384,
+        ));
+        let mem = SqliteMemory::with_embedder(tmp.path(), embedder, 0.7, 0.3, 100, None).unwrap();
+
+        mem.store(
+            "release_failure",
+            "release deployment failed",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store("garden", "garden flowers", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let results = mem.recall("deployment failure during release", 2, None).await.unwrap();
+        assert_eq!(results.first().map(|entry| entry.key.as_str()), Some("release_failure"));
+
+        let conn = mem.pool.write();
+        let embedded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL AND embedding_provider = 'local'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(embedded, 2);
+    }
+
+    #[tokio::test]
     async fn sqlite_acl_enabled_skips_markdown_backup() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("memory").join("brain.db");

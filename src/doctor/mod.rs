@@ -531,11 +531,22 @@ fn check_runtime_readiness(config: &Config, items: &mut Vec<DiagItem>) {
         ));
     }
 
-    // 2. topic readiness: topic/semantic scoping needs embeddings enabled.
-    if embeddings_enabled && mem.embedding_dimensions > 0 {
+    // 2. topic readiness: similarity/semantic scoping needs a persistent
+    // backend and embeddings.
+    if persistent && embeddings_enabled && mem.embedding_dimensions > 0 {
+        let mode = if mem.embedding_provider.trim().eq_ignore_ascii_case("local") {
+            "local similarity"
+        } else {
+            "semantic"
+        };
         items.push(DiagItem::ready(
             cat,
-            format!("topic: semantic topic scoping ready (dim {})", mem.embedding_dimensions),
+            format!("topic: {mode} topic scoping ready (dim {})", mem.embedding_dimensions),
+        ));
+    } else if !persistent {
+        items.push(DiagItem::warn(
+            cat,
+            format!("topic: backend '{backend}' does not persist topic scopes"),
         ));
     } else {
         items.push(DiagItem::warn(
@@ -557,7 +568,12 @@ fn check_runtime_readiness(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // 5. vector readiness: vector recall needs embeddings + a sane dimension.
-    if !embeddings_enabled {
+    if !persistent {
+        items.push(DiagItem::warn(
+            cat,
+            format!("vector: backend '{backend}' does not persist a vector index"),
+        ));
+    } else if !embeddings_enabled {
         items.push(DiagItem::warn(
             cat,
             "vector: embeddings disabled; vector recall unavailable (keyword/FTS only)",
@@ -1306,12 +1322,15 @@ fn model_has_reachable_provider(
 
 fn embedding_provider_validation_error(name: &str) -> Option<String> {
     let normalized = name.trim();
-    if normalized.eq_ignore_ascii_case("none") || normalized.eq_ignore_ascii_case("openai") {
+    if normalized.eq_ignore_ascii_case("local")
+        || normalized.eq_ignore_ascii_case("none")
+        || normalized.eq_ignore_ascii_case("openai")
+    {
         return None;
     }
 
     let Some(url) = normalized.strip_prefix("custom:") else {
-        return Some("supported values: none, openai, custom:<url>".into());
+        return Some("supported values: local, none, openai, custom:<url>".into());
     };
 
     let url = url.trim();
@@ -2429,6 +2448,14 @@ mod tests {
                 "missing readiness sub-check with prefix {prefix}"
             );
         }
+        assert!(items.iter().any(|item| {
+            item.state == DiagnosticState::Ready && item.message.starts_with("topic: local similarity")
+        }));
+        assert!(
+            items.iter().any(|item| {
+                item.state == DiagnosticState::Ready && item.message.starts_with("vector: index ready")
+            })
+        );
     }
 
     #[test]

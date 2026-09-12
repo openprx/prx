@@ -2908,7 +2908,7 @@ pub struct MemoryConfig {
     /// For sqlite backend: prune daily rows older than this many days
     #[serde(default = "default_daily_retention_days")]
     pub daily_retention_days: u32,
-    /// Embedding provider: "none" | "openai" | "custom:URL"
+    /// Embedding provider: "local" | "none" | "openai" | "custom:URL"
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
     /// Embedding model name (e.g. "text-embedding-3-small")
@@ -3012,7 +3012,7 @@ pub struct MemorySemanticConfig {
 }
 
 fn default_embedding_provider() -> String {
-    "none".into()
+    "local".into()
 }
 const fn default_archive_after_days() -> u32 {
     7
@@ -3027,10 +3027,10 @@ const fn default_daily_retention_days() -> u32 {
     7
 }
 fn default_embedding_model() -> String {
-    "text-embedding-3-small".into()
+    "prx-local-hash-v1".into()
 }
 const fn default_embedding_dims() -> usize {
-    1536
+    384
 }
 const fn default_vector_weight() -> f64 {
     0.7
@@ -3168,7 +3168,7 @@ impl MemoryConfig {
             );
         }
 
-        // 2. Embedding provider: "none" | "openai" | "custom:<url>".
+        // 2. Embedding provider: "local" | "none" | "openai" | "custom:<url>".
         //    Empty is invalid (use "none" to disable embeddings explicitly).
         let provider = self.embedding_provider.trim();
         if provider.is_empty() {

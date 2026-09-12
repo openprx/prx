@@ -486,7 +486,11 @@ min_chars = 30
 [memory]
 backend = "sqlite"
 auto_save = true
-# Configure a reachable embedding backend before enabling vector recall.
+# Credential-free local vector recall is enabled by default.
+# embedding_provider = "local"
+# embedding_model = "prx-local-hash-v1"
+# embedding_dimensions = 384
+# To use a richer external model instead:
 # embedding_provider = "custom:http://127.0.0.1:11434/v1"
 # embedding_model = "nomic-embed-text:latest"
 # embedding_dimensions = 768
@@ -1215,7 +1219,9 @@ mod tests {
         let config = crate::config::Config::load_from_path(&dir.join("config.toml"), dir.join("workspace"))
             .expect("test: full template must deserialize without ignored paths");
         assert_eq!(config.http_request.max_response_size, 10_485_760);
-        assert_eq!(config.memory.embedding_provider, "none");
+        assert_eq!(config.memory.embedding_provider, "local");
+        assert_eq!(config.memory.embedding_model, "prx-local-hash-v1");
+        assert_eq!(config.memory.embedding_dimensions, 384);
     }
 
     #[tokio::test]

@@ -73,11 +73,9 @@ fn memory_config_default_backend() {
 #[test]
 fn memory_config_default_embedding_provider() {
     let memory = MemoryConfig::default();
-    // Default embedding_provider should be set (even if "none")
-    assert!(
-        !memory.embedding_provider.is_empty(),
-        "embedding_provider should have a default value"
-    );
+    assert_eq!(memory.embedding_provider, "local");
+    assert_eq!(memory.embedding_model, "prx-local-hash-v1");
+    assert_eq!(memory.embedding_dimensions, 384);
 }
 
 #[test]
