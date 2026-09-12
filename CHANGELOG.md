@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.111] - 12 September 2026
+
+### Changed
+
+- Publish and document one explicit inventory of 54 static public tools plus
+  bounded Skill, MCP, and WASM aliases.
+- Project canonical tool schemas through the shared Gemini schema cleaner on
+  both native serialization paths.
+
+### Fixed
+
+- Align executor and schema contracts for alternative inputs, action-specific
+  messaging, Xin task updates, cron one-shot scheduling, and integration
+  parameter constraints.
+- Validate schema-valued additional properties and exclusive alternatives
+  before executor dispatch.
+
 ## [0.8.110] - 12 September 2026
 
 ### Changed

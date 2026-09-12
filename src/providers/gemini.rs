@@ -10,6 +10,7 @@ use crate::providers::traits::{
 };
 use crate::providers::utf8_stream::SseTextDecoder;
 use crate::tools::ToolSpec;
+use crate::tools::schema::SchemaCleanr;
 use async_trait::async_trait;
 use directories::UserDirs;
 use futures::stream::{self, BoxStream, StreamExt};
@@ -636,7 +637,7 @@ impl GeminiProvider {
             .map(|tool| GeminiFunctionDeclaration {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
-                parameters: tool.parameters.clone(),
+                parameters: SchemaCleanr::clean_for_gemini(tool.parameters.clone()),
             })
             .collect::<Vec<_>>();
         (!declarations.is_empty()).then_some(vec![GeminiToolGroup {
@@ -911,7 +912,7 @@ impl Provider for GeminiProvider {
                 serde_json::json!({
                     "name": tool.name,
                     "description": tool.description,
-                    "parameters": tool.parameters,
+                    "parameters": SchemaCleanr::clean_for_gemini(tool.parameters.clone()),
                 })
             })
             .collect();
@@ -1329,6 +1330,37 @@ mod tests {
             json["tools"][0]["functionDeclarations"][0]["parameters"]["required"][0],
             "city"
         );
+    }
+
+    #[test]
+    fn native_tool_paths_apply_the_gemini_schema_projection() {
+        let tools = vec![ToolSpec {
+            name: "bounded_tool".into(),
+            description: "A tool with canonical constraints".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "string", "minLength": 1}
+                },
+                "required": ["value"],
+                "additionalProperties": false
+            }),
+        }];
+
+        let native = GeminiProvider::native_tools(Some(&tools)).unwrap();
+        let native_schema = &native[0].function_declarations[0].parameters;
+        assert_eq!(native_schema["required"], serde_json::json!(["value"]));
+        assert!(native_schema["properties"]["value"].get("minLength").is_none());
+        assert!(native_schema.get("additionalProperties").is_none());
+
+        let provider = GeminiProvider::new(Some("test-api-key"));
+        let ToolsPayload::Gemini { function_declarations } = provider.convert_tools(&tools) else {
+            panic!("Gemini provider returned a non-Gemini tool payload");
+        };
+        let converted_schema = &function_declarations[0]["parameters"];
+        assert_eq!(converted_schema["required"], serde_json::json!(["value"]));
+        assert!(converted_schema["properties"]["value"].get("minLength").is_none());
+        assert!(converted_schema.get("additionalProperties").is_none());
     }
 
     #[test]

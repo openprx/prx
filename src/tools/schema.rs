@@ -153,6 +153,75 @@ pub fn with_action_alternatives(
     schema
 }
 
+/// Require exactly one complete field set for one discriminator value.
+pub fn with_action_exclusive_alternatives(
+    mut schema: Value,
+    discriminator: &str,
+    action: &str,
+    alternatives: &[&[&str]],
+) -> Value {
+    let Some(root) = schema.as_object_mut() else {
+        return schema;
+    };
+    if let Some(properties) = root.get_mut("properties").and_then(Value::as_object_mut) {
+        for name in alternatives.iter().flat_map(|required| required.iter()) {
+            if let Some(property) = properties.get_mut(*name).and_then(Value::as_object_mut)
+                && property.get("type").and_then(Value::as_str) == Some("string")
+            {
+                property.entry("minLength".to_string()).or_insert_with(|| json!(1));
+            }
+        }
+    }
+    let condition = json!({
+        "if": {
+            "properties": {discriminator: {"const": action}},
+            "required": [discriminator]
+        },
+        "then": {
+            "oneOf": alternatives
+                .iter()
+                .map(|required| json!({"required": required}))
+                .collect::<Vec<_>>()
+        }
+    });
+    let conditions = root
+        .entry("allOf".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Some(conditions) = conditions.as_array_mut() {
+        conditions.push(condition);
+    }
+    schema
+}
+
+/// Require at least one complete field set without an action discriminator.
+///
+/// This covers root contracts such as `path` OR `content` and preserves aliases
+/// without making one spelling artificially mandatory.
+pub fn with_required_alternatives(mut schema: Value, alternatives: &[&[&str]]) -> Value {
+    let Some(root) = schema.as_object_mut() else {
+        return schema;
+    };
+    if let Some(properties) = root.get_mut("properties").and_then(Value::as_object_mut) {
+        for name in alternatives.iter().flat_map(|required| required.iter()) {
+            if let Some(property) = properties.get_mut(*name).and_then(Value::as_object_mut)
+                && property.get("type").and_then(Value::as_str) == Some("string")
+            {
+                property.entry("minLength".to_string()).or_insert_with(|| json!(1));
+            }
+        }
+    }
+    root.insert(
+        "anyOf".to_string(),
+        Value::Array(
+            alternatives
+                .iter()
+                .map(|required| json!({"required": required}))
+                .collect(),
+        ),
+    );
+    schema
+}
+
 /// One deterministic structural problem found before a tool executor runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArgumentValidationIssue {
@@ -285,19 +354,30 @@ fn validate_value(schema: &Value, value: &Value, path: &str, issues: &mut Vec<Ar
 
     if let Some(object) = value.as_object() {
         validate_required(schema, object, path, issues);
-        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        let properties = schema.get("properties").and_then(Value::as_object);
+        if let Some(properties) = properties {
             for (name, property_schema) in properties {
                 if let Some(property_value) = object.get(name) {
                     validate_value(property_schema, property_value, &format!("{path}.{name}"), issues);
                 }
             }
-            if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false) {
-                for name in object.keys().filter(|name| !properties.contains_key(*name)) {
-                    issues.push(ArgumentValidationIssue {
-                        path: format!("{path}.{name}"),
-                        message: "is not an accepted property".to_string(),
-                    });
-                }
+        }
+        if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false) {
+            for name in object
+                .keys()
+                .filter(|name| properties.is_none_or(|properties| !properties.contains_key(*name)))
+            {
+                issues.push(ArgumentValidationIssue {
+                    path: format!("{path}.{name}"),
+                    message: "is not an accepted property".to_string(),
+                });
+            }
+        } else if let Some(additional_schema) = schema.get("additionalProperties").filter(|value| value.is_object()) {
+            for (name, property_value) in object
+                .iter()
+                .filter(|(name, _)| properties.is_none_or(|properties| !properties.contains_key(*name)))
+            {
+                validate_value(additional_schema, property_value, &format!("{path}.{name}"), issues);
             }
         }
         if let Some(conditions) = schema.get("allOf").and_then(Value::as_array) {
@@ -894,6 +974,11 @@ fn validate_schema_node(schema: &Value, path: &str, require_type: bool) -> anyho
     if let Some(items) = object.get("items") {
         validate_schema_node(items, &format!("{path}.items"), false)?;
     }
+    if let Some(additional) = object.get("additionalProperties")
+        && additional.is_object()
+    {
+        validate_schema_node(additional, &format!("{path}.additionalProperties"), false)?;
+    }
     for keyword in ["allOf", "anyOf", "oneOf"] {
         if let Some(branches) = object.get(keyword) {
             let branches = branches
@@ -1268,6 +1353,63 @@ mod tests {
         assert!(validate_tool_arguments(&schema, &json!({"action": "execute", "tool_slug": "x"})).is_empty());
         assert!(validate_tool_arguments(&schema, &json!({"action": "execute", "action_name": "x"})).is_empty());
         assert!(!validate_tool_arguments(&schema, &json!({"action": "execute"})).is_empty());
+    }
+
+    #[test]
+    fn required_alternatives_accept_each_alias_and_reject_empty_input() {
+        let schema = with_required_alternatives(
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "key": {"type": "string"}
+                }
+            }),
+            &[&["path"], &["key"]],
+        );
+
+        assert!(validate_tool_arguments(&schema, &json!({"path": "a"})).is_empty());
+        assert!(validate_tool_arguments(&schema, &json!({"key": "a"})).is_empty());
+        assert!(!validate_tool_arguments(&schema, &json!({})).is_empty());
+        assert!(!validate_tool_arguments(&schema, &json!({"key": ""})).is_empty());
+    }
+
+    #[test]
+    fn exclusive_action_alternatives_reject_both_field_sets() {
+        let schema = with_action_exclusive_alternatives(
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string"},
+                    "delay": {"type": "string"},
+                    "run_at": {"type": "string"}
+                },
+                "required": ["action"]
+            }),
+            "action",
+            "once",
+            &[&["delay"], &["run_at"]],
+        );
+
+        assert!(validate_tool_arguments(&schema, &json!({"action": "once", "delay": "1m"})).is_empty());
+        assert!(validate_tool_arguments(&schema, &json!({"action": "once", "run_at": "time"})).is_empty());
+        assert!(!validate_tool_arguments(&schema, &json!({"action": "once"})).is_empty());
+        assert!(
+            !validate_tool_arguments(&schema, &json!({"action": "once", "delay": "1m", "run_at": "time"})).is_empty()
+        );
+    }
+
+    #[test]
+    fn schema_valued_additional_properties_are_validated() {
+        let schema = json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {"type": "string"}
+        });
+
+        assert!(validate_tool_arguments(&schema, &json!({"header": "value"})).is_empty());
+        let issues = validate_tool_arguments(&schema, &json!({"header": 1}));
+        assert_eq!(issues[0].path, "$.header");
     }
 
     #[test]

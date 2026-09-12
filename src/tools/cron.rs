@@ -323,7 +323,7 @@ impl Tool for CronTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        crate::tools::schema::with_action_alternatives(
+        crate::tools::schema::with_action_exclusive_alternatives(
             crate::tools::schema::with_action_alternatives(
                 crate::tools::schema::with_action_alternatives(
                     crate::tools::schema::with_action_requirements(
@@ -1164,6 +1164,29 @@ mod tests {
                     "action": "schedule",
                     "schedule": {"kind": "cron"},
                     "payload": {"kind": "agentTurn", "message": "inspect state"}
+                })
+            )
+            .is_empty()
+        );
+        assert!(!validate_tool_arguments(&schema, &json!({"action": "once", "command": "date"})).is_empty());
+        assert!(
+            validate_tool_arguments(&schema, &json!({"action": "once", "command": "date", "delay": "5m"})).is_empty()
+        );
+        assert!(
+            validate_tool_arguments(
+                &schema,
+                &json!({"action": "once", "command": "date", "run_at": "2030-01-01T00:00:00Z"})
+            )
+            .is_empty()
+        );
+        assert!(
+            !validate_tool_arguments(
+                &schema,
+                &json!({
+                    "action": "once",
+                    "command": "date",
+                    "delay": "5m",
+                    "run_at": "2030-01-01T00:00:00Z"
                 })
             )
             .is_empty()

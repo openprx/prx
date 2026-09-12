@@ -128,14 +128,20 @@ impl Tool for MemorySearchTool {
                 },
                 "maxResults": {
                     "type": "integer",
-                    "description": "Maximum snippets to return (default: 5, max: 100)"
+                    "minimum": 1,
+                    "maximum": MAX_RESULTS_LIMIT,
+                    "description": "Maximum snippets to return (default: 10, max: 500)"
                 },
                 "max_results": {
                     "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_RESULTS_LIMIT,
                     "description": "Alias of maxResults for compatibility"
                 },
                 "minScore": {
                     "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 1.0,
                     "description": "Minimum match score between 0.0 and 1.0"
                 }
             },
@@ -729,6 +735,10 @@ mod tests {
         assert!(schema["properties"]["maxResults"].is_object());
         assert!(schema["properties"]["max_results"].is_object());
         assert!(schema["properties"]["minScore"].is_object());
+        assert_eq!(schema["properties"]["maxResults"]["minimum"], 1);
+        assert_eq!(schema["properties"]["maxResults"]["maximum"], MAX_RESULTS_LIMIT);
+        assert_eq!(schema["properties"]["minScore"]["minimum"], 0.0);
+        assert_eq!(schema["properties"]["minScore"]["maximum"], 1.0);
     }
 
     #[test]

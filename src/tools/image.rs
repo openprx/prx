@@ -65,27 +65,30 @@ impl Tool for ImageTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "image": {
-                    "type": "string",
-                    "description": "Path to a local image file or an HTTPS URL. Supports jpg, png, gif, webp."
+        crate::tools::schema::with_required_alternatives(
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "image": {
+                        "type": "string",
+                        "description": "Path to a local image file or an HTTPS URL. Supports jpg, png, gif, webp."
+                    },
+                    "images": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "description": "Multiple image paths or URLs (up to 20)."
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "What to analyze or ask about the image(s). Defaults to 'Describe this image in detail.'"
+                    }
                 },
-                "images": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "maxItems": 20,
-                    "description": "Multiple image paths or URLs (up to 20)."
-                },
-                "prompt": {
-                    "type": "string",
-                    "description": "What to analyze or ask about the image(s). Defaults to 'Describe this image in detail.'"
-                }
-            },
-            "required": []
-        })
+            }),
+            &[&["image"], &["images"]],
+        )
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -344,6 +347,9 @@ mod tests {
         assert!(schema["properties"]["image"].is_object());
         assert!(schema["properties"]["images"].is_object());
         assert!(schema["properties"]["prompt"].is_object());
+        assert!(!crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty());
+        assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"image": "image.png"})).is_empty());
+        assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"images": ["image.png"]})).is_empty());
     }
 
     #[tokio::test]

@@ -216,6 +216,8 @@ fn common_schema(require_path: bool) -> serde_json::Value {
         if let Some(object) = schema.as_object_mut() {
             object.insert("required".to_string(), json!(["path"]));
         }
+    } else {
+        schema = crate::tools::schema::with_required_alternatives(schema, &[&["path"], &["content"]]);
     }
     schema
 }
@@ -338,6 +340,14 @@ mod tests {
             serde_json::to_value(grant).unwrap(),
         );
         args
+    }
+
+    #[test]
+    fn ingest_schema_requires_path_or_content() {
+        let schema = common_schema(false);
+        assert!(!crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty());
+        assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"path": "doc.md"})).is_empty());
+        assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"content": "body"})).is_empty());
     }
 
     #[tokio::test]

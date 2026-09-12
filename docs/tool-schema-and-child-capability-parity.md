@@ -19,6 +19,21 @@ Completed in version 0.8.110:
   including orchestration, messaging, image, configuration, Gateway, Skill,
   MCP, WASM, Hook, memory, network, and scheduling surfaces.
 
+Completed in version 0.8.111:
+
+- audited the 54 static public names and the three bounded dynamic alias
+  families, which can produce a maximum of 150 public names;
+- aligned alternative and action-specific contracts for document ingest,
+  image input, profile updates, memory and document identifier aliases,
+  Composio connect/execute, channel and daemon messaging, Xin update, and cron
+  one-shot scheduling;
+- aligned declared bounds and enums for memory search, HTTP requests, Pushover,
+  and proxy configuration;
+- added canonical validation for schema-valued `additionalProperties` and
+  exclusive action alternatives;
+- routed both Gemini native-tool serialization paths through the shared Gemini
+  schema projection.
+
 Remaining architecture work:
 
 - seal the exact parent public capability snapshot and schema hashes into the
@@ -147,9 +162,10 @@ Initial migration covers every multi-action native surface:
 - TUI `managed_session`
 - TUI `chat_schedule`
 
-`proxy_config` has no executor-required action payload: `set` accepts partial
-updates and the remaining actions use no additional input. It therefore needs
-only its root action declaration, not a conditional requirement.
+`proxy_config` accepts partial global updates, but `set` with
+`scope="services"` requires a non-empty `services` object. Its schema also
+rejects the removed `clear_env` field and constrains `scope` to executable
+values.
 
 Future multi-action tools must declare action requirements in the same change
 that introduces executor branches.

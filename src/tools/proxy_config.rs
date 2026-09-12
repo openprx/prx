@@ -322,6 +322,7 @@ impl Tool for ProxyConfigTool {
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "action": {
                     "type": "string",
@@ -330,7 +331,8 @@ impl Tool for ProxyConfigTool {
                 },
                 "scope": {
                     "type": "string",
-                    "description": "Proxy scope: environment | prx | services"
+                    "enum": ["environment", "env", "prx", "internal", "core", "services", "service"],
+                    "description": "Proxy scope. Canonical values: environment, prx, services."
                 },
                 "http_proxy": {
                     "type": "string",
@@ -354,15 +356,21 @@ impl Tool for ProxyConfigTool {
                 "services": {
                     "description": "Comma-separated string or array of service selectors used when scope=services",
                     "oneOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
+                        {"type": "string", "minLength": 1},
+                        {"type": "array", "items": {"type": "string"}, "minItems": 1}
                     ]
-                },
-                "clear_env": {
-                    "type": "boolean",
-                    "description": "When action=disable, clear process proxy environment variables"
                 }
-            }
+            },
+            "allOf": [{
+                "if": {
+                    "properties": {
+                        "action": {"const": "set"},
+                        "scope": {"enum": ["services", "service"]}
+                    },
+                    "required": ["action", "scope"]
+                },
+                "then": {"required": ["services"]}
+            }]
         })
     }
 
@@ -494,6 +502,27 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("proxy.scope='services'"));
+    }
+
+    #[tokio::test]
+    async fn schema_requires_nonempty_services_for_service_scope_aliases() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
+        let schema = tool.parameters_schema();
+
+        for scope in ["services", "service"] {
+            assert!(
+                !crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "set", "scope": scope}))
+                    .is_empty()
+            );
+            assert!(
+                crate::tools::schema::validate_tool_arguments(
+                    &schema,
+                    &json!({"action": "set", "scope": scope, "services": ["provider.openai"]})
+                )
+                .is_empty()
+            );
+        }
     }
 
     #[tokio::test]

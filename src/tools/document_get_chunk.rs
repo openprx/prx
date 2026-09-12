@@ -34,20 +34,23 @@ impl Tool for DocumentGetChunkTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "chunk_id": {
-                    "type": "string",
-                    "description": "Stable document chunk id returned by document_search"
-                },
-                "chunkId": {
-                    "type": "string",
-                    "description": "Alias of chunk_id"
+        crate::tools::schema::with_required_alternatives(
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "chunk_id": {
+                        "type": "string",
+                        "description": "Stable document chunk id returned by document_search"
+                    },
+                    "chunkId": {
+                        "type": "string",
+                        "description": "Alias of chunk_id"
+                    }
                 }
-            },
-            "required": ["chunk_id"]
-        })
+            }),
+            &[&["chunk_id"], &["chunkId"]],
+        )
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -229,6 +232,18 @@ mod tests {
     use crate::memory::principal::{OwnerPrincipal, Role};
     use crate::memory::{DocumentIngestInput, Memory, MemoryVisibility, SqliteMemory};
     use tempfile::TempDir;
+
+    #[test]
+    fn schema_accepts_both_chunk_id_spellings() {
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let tool = DocumentGetChunkTool::new(tmp.path().to_path_buf(), memory);
+        let schema = tool.parameters_schema();
+
+        assert!(!crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty());
+        assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"chunk_id": "id"})).is_empty());
+        assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"chunkId": "id"})).is_empty());
+    }
 
     #[tokio::test]
     async fn document_get_chunk_returns_content_for_visible_owner() {

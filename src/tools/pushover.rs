@@ -88,9 +88,11 @@ impl Tool for PushoverTool {
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "message": {
                     "type": "string",
+                    "minLength": 1,
                     "description": "The notification message to send"
                 },
                 "title": {
@@ -99,6 +101,8 @@ impl Tool for PushoverTool {
                 },
                 "priority": {
                     "type": "integer",
+                    "minimum": -2,
+                    "maximum": 2,
                     "description": "Message priority: -2 (lowest/silent), -1 (low/no sound), 0 (normal), 1 (high), 2 (emergency/repeating)"
                 },
                 "sound": {
@@ -342,6 +346,8 @@ mod tests {
         let tool = PushoverTool::new(test_security(AutonomyLevel::Full), PathBuf::from("/tmp"));
         let schema = tool.parameters_schema();
         assert!(schema["properties"].get("priority").is_some());
+        assert_eq!(schema["properties"]["priority"]["minimum"], -2);
+        assert_eq!(schema["properties"]["priority"]["maximum"], 2);
     }
 
     #[test]

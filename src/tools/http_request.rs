@@ -172,6 +172,7 @@ impl Tool for HttpRequestTool {
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "url": {
                     "type": "string",
@@ -179,11 +180,13 @@ impl Tool for HttpRequestTool {
                 },
                 "method": {
                     "type": "string",
+                    "enum": ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
                     "description": "HTTP method (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS)",
                     "default": "GET"
                 },
                 "headers": {
                     "type": "object",
+                    "additionalProperties": {"type": "string"},
                     "description": "Optional HTTP headers as key-value pairs (e.g., {\"Authorization\": \"Bearer token\", \"Content-Type\": \"application/json\"})",
                     "default": {}
                 },
@@ -522,6 +525,34 @@ mod tests {
         let tool = test_tool(vec!["example.com"]);
         let err = tool.validate_method("INVALID").unwrap_err().to_string();
         assert!(err.contains("Unsupported HTTP method"));
+    }
+
+    #[test]
+    fn schema_constrains_methods_and_header_values() {
+        let tool = test_tool(vec!["example.com"]);
+        let schema = tool.parameters_schema();
+
+        assert!(
+            crate::tools::schema::validate_tool_arguments(
+                &schema,
+                &json!({"url": "https://example.com", "method": "POST", "headers": {"x-id": "1"}})
+            )
+            .is_empty()
+        );
+        assert!(
+            !crate::tools::schema::validate_tool_arguments(
+                &schema,
+                &json!({"url": "https://example.com", "method": "TRACE"})
+            )
+            .is_empty()
+        );
+        assert!(
+            !crate::tools::schema::validate_tool_arguments(
+                &schema,
+                &json!({"url": "https://example.com", "headers": {"x-id": 1}})
+            )
+            .is_empty()
+        );
     }
 
     #[test]

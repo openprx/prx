@@ -6,15 +6,19 @@ health, MCP discovery, and the active WASM generation. The resulting immutable
 `ToolSpec` snapshot controls provider representation and execution for that
 iteration; see [Unified turn context](unified-turn-context.md).
 
+The complete static public inventory contains 54 tool names. Runtime discovery
+can add up to 32 Skill aliases, 32 MCP aliases, and 32 WASM aliases, for a
+maximum catalog of 150 public names before per-turn eligibility filtering.
+
 | Category | Tools |
 |----------|-------|
 | **Shell & Files** | `shell`, `file_read`, `file_write`, `file_edit`, `git_operations` |
 | **Web** | `web_search_tool`, `web_fetch`, `http_request` |
-| **Memory & Documents** | `memory_store`, `memory_recall`, `memory_search`, `memory_get`, `transcript_history_lookup`, `memory_forget`, `memory_reindex`, `document_search`, `document_get_chunk`, `document_ingest`, `document_sync` |
+| **Memory & Documents** | `memory_store`, `memory_recall`, `memory_search`, `memory_get`, `transcript_history_lookup`, `memory_forget`, `memory_reindex`, `chat_profile_update`, `document_search`, `document_get_chunk`, `document_ingest`, `document_sync` |
 | **Skills** | `skills_list`, `skill_read`, `skills_manage`, `skill_execute`, plus up to 32 declared skill-tool aliases |
-| **Messaging** | `message_send` |
-| **Sessions** | `sessions_spawn`, `sessions_send`, `sessions_list`, `sessions_history`, `session_status`, `subagents`, `delegate` |
-| **Scheduling** | `cron` (calendar/time scheduling), `xin` (autonomous task and durable Goal/Step workflows) |
+| **Messaging** | `message_send`, `stay_silent` (smart group-reply turns only) |
+| **Sessions** | `sessions_spawn`, `sessions_send`, `sessions_list`, `sessions_history`, `session_status`, `subagents`, `delegate`, `managed_session` (`prx chat` only) |
+| **Scheduling** | `cron` (calendar/time scheduling), `xin` (autonomous task and durable Goal/Step workflows), `chat_schedule` (`prx chat` only) |
 | **Images** | `image`, `image_info` |
 | **MCP** | `mcp_call`, `mcp_status`, plus up to 32 discovered aliases |
 | **WASM Plugins** | `wasm_plugin_call`, `wasm_plugins_status`, `wasm_plugins_manage`, `wasm_plugin_reload`, plus up to 32 aliases when compiled with `wasm-plugins` |
@@ -165,8 +169,9 @@ refused, because an attachment is a local path owned by the originating channel.
 `action="react"` cannot be redirected — reactions are always delivered by the
 Signal handle — so it rejects a `channel` naming anything else.
 
-In `prx chat` the same tool name and the same schema are registered, but the
-send is performed by the daemon: a chat session opens no IM connection of its
+In `prx chat` the same public tool name is registered with an entrypoint-specific
+schema that exposes only the daemon-supported send operation and requires
+`channel`, `target`, and `message`. The send is performed by the daemon: a chat session opens no IM connection of its
 own, because a second listener would race the daemon for inbound messages. The
 chat variant therefore requires `channel` (there is no conversation to inherit
 one from), offers `action="send"` only, and refuses arguments it cannot carry

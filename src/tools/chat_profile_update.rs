@@ -113,25 +113,31 @@ impl Tool for ChatProfileUpdateTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "purpose": {
-                    "type": "string",
-                    "description": "What the current conversation is for. Max 300 characters."
+        crate::tools::schema::with_required_alternatives(
+            json!({
+                "type": "object",
+                "properties": {
+                    "purpose": {
+                        "type": "string",
+                        "maxLength": PURPOSE_MAX_CHARS,
+                        "description": "What the current conversation is for. Max 300 characters."
+                    },
+                    "notes": {
+                        "type": "string",
+                        "maxLength": NOTES_MAX_CHARS,
+                        "description": "Brief operational notes about the current conversation. Max 1024 characters."
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "maxItems": TAGS_MAX,
+                        "description": "Up to 10 short tags for the current conversation."
+                    }
                 },
-                "notes": {
-                    "type": "string",
-                    "description": "Brief operational notes about the current conversation. Max 1024 characters."
-                },
-                "tags": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Up to 10 short tags for the current conversation."
-                }
-            },
-            "additionalProperties": false
-        })
+                "additionalProperties": false
+            }),
+            &[&["purpose"], &["notes"], &["tags"]],
+        )
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -280,6 +286,23 @@ mod tests {
 
     fn insert_arg(args: &mut serde_json::Value, key: &str, value: serde_json::Value) {
         args.as_object_mut().unwrap().insert(key.to_string(), value);
+    }
+
+    #[test]
+    fn schema_requires_at_least_one_profile_field() {
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let tool = ChatProfileUpdateTool::new(memory, Arc::new(SecurityPolicy::default()));
+        let schema = tool.parameters_schema();
+
+        assert!(!crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty());
+        for arguments in [
+            json!({"purpose": "purpose"}),
+            json!({"notes": "notes"}),
+            json!({"tags": ["tag"]}),
+        ] {
+            assert!(crate::tools::schema::validate_tool_arguments(&schema, &arguments).is_empty());
+        }
     }
 
     #[tokio::test]

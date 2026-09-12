@@ -163,32 +163,38 @@ impl Tool for MemoryGetTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Memory key (preferred) or fallback memory file path"
-                },
-                "key": {
-                    "type": "string",
-                    "description": "Alias of path; memory key or fallback file path"
-                },
-                "from": {
-                    "type": "integer",
-                    "description": "1-based starting line number (default: 1)"
-                },
-                "lines": {
-                    "type": "integer",
-                    "description": "Number of lines to return (default: 50, max: 2000)"
-                },
-                "session_id": {
-                    "type": "string",
-                    "description": "Optional session scope; required as self_system for reserved router/ keys"
+        crate::tools::schema::with_required_alternatives(
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Memory key (preferred) or fallback memory file path"
+                    },
+                    "key": {
+                        "type": "string",
+                        "description": "Alias of path; memory key or fallback file path"
+                    },
+                    "from": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "1-based starting line number (default: 1)"
+                    },
+                    "lines": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_LINE_COUNT,
+                        "description": "Number of lines to return (default: 50, max: 2000)"
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional session scope; required as self_system for reserved router/ keys"
+                    }
                 }
-            },
-            "required": ["path"]
-        })
+            }),
+            &[&["path"], &["key"]],
+        )
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -593,6 +599,9 @@ mod tests {
         assert!(schema["properties"]["from"].is_object());
         assert!(schema["properties"]["lines"].is_object());
         assert!(schema["properties"]["session_id"].is_object());
+        assert!(!crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty());
+        assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"path": "key"})).is_empty());
+        assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"key": "key"})).is_empty());
     }
 
     #[test]

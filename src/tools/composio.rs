@@ -564,9 +564,10 @@ impl Tool for ComposioTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         crate::tools::schema::with_action_alternatives(
-            crate::tools::schema::with_action_requirements(
+            crate::tools::schema::with_action_alternatives(
                 json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "action": {
                             "type": "string",
@@ -605,7 +606,8 @@ impl Tool for ComposioTool {
                     "required": ["action"]
                 }),
                 "action",
-                &[],
+                "connect",
+                &[&["app"], &["auth_config_id"]],
             ),
             "action",
             "execute",
@@ -1202,6 +1204,18 @@ mod tests {
             crate::tools::schema::validate_tool_arguments(
                 &schema,
                 &json!({"action": "execute", "action_name": "legacy"})
+            )
+            .is_empty()
+        );
+        assert!(!crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "connect"})).is_empty());
+        assert!(
+            crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "connect", "app": "github"}))
+                .is_empty()
+        );
+        assert!(
+            crate::tools::schema::validate_tool_arguments(
+                &schema,
+                &json!({"action": "connect", "auth_config_id": "config"})
             )
             .is_empty()
         );

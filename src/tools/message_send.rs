@@ -198,15 +198,16 @@ fn requested_channel(args: &serde_json::Value) -> Option<&str> {
 /// The one tool name both `message_send` entry points answer to.
 ///
 /// `prx chat` holds no channel object of its own, so its variant reaches the
-/// daemon over HTTP — but a model must not have to know which process it is
-/// running in. Name and schema come from here so the two can never drift apart.
+/// daemon over HTTP. The public name remains stable across entrypoints, while
+/// each implementation publishes only the operations it can execute.
 pub(crate) const MESSAGE_SEND_TOOL_NAME: &str = "message_send";
 
-/// The one parameter schema both `message_send` entry points expose.
-fn message_send_parameters_schema() -> serde_json::Value {
-    crate::tools::schema::with_action_requirements(
+/// Parameter schema for a channel-owned `message_send` implementation.
+fn channel_message_send_parameters_schema() -> serde_json::Value {
+    let mut schema = crate::tools::schema::with_action_requirements(
         json!({
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "action": {
                     "type": "string",
@@ -273,12 +274,16 @@ fn message_send_parameters_schema() -> serde_json::Value {
         "action",
         &[
             crate::tools::schema::ActionRequirement {
+                action: "send",
+                required: &["message"],
+            },
+            crate::tools::schema::ActionRequirement {
                 action: "react",
                 required: &["emoji", "target_author", "target_timestamp"],
             },
             crate::tools::schema::ActionRequirement {
                 action: "edit",
-                required: &["message_id"],
+                required: &["message_id", "message"],
             },
             crate::tools::schema::ActionRequirement {
                 action: "delete",
@@ -290,10 +295,57 @@ fn message_send_parameters_schema() -> serde_json::Value {
             },
             crate::tools::schema::ActionRequirement {
                 action: "thread",
-                required: &["thread_id"],
+                required: &["thread_id", "message"],
             },
         ],
-    )
+    );
+    if let Some(all_of) = schema.get_mut("allOf").and_then(serde_json::Value::as_array_mut) {
+        all_of.push(json!({
+            "if": {"required": ["quote_timestamp"]},
+            "then": {"required": ["quote_author"]}
+        }));
+    }
+    schema
+}
+
+/// Parameter schema for chat and process workers that send through the daemon.
+///
+/// These callers have no inbound channel or recipient to inherit and expose
+/// only the daemon HTTP send operation, so their public contract must be
+/// narrower than the channel-owned implementation.
+fn daemon_message_send_parameters_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["send"],
+                "description": "Send text through a configured PRX daemon channel."
+            },
+            "channel": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Configured daemon channel name."
+            },
+            "target": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Recipient identifier for the selected daemon channel."
+            },
+            "message": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Text to send."
+            },
+            "as_voice": {
+                "type": "boolean",
+                "default": false,
+                "description": "Ask the destination channel to deliver the text as voice when supported."
+            }
+        },
+        "required": ["action", "channel", "target", "message"]
+    })
 }
 
 pub struct MessageSendTool {
@@ -562,7 +614,7 @@ impl Tool for MessageSendTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        message_send_parameters_schema()
+        channel_message_send_parameters_schema()
     }
 
     async fn set_active_recipient(&self, recipient: &str) {
@@ -984,9 +1036,8 @@ impl Tool for MessageSendTool {
 /// `prx chat` deliberately opens no IM connection: doing so would put a second
 /// listener on the same account and race the daemon for inbound messages. So
 /// its outbound goes the other way — the daemon, which already owns the channel
-/// objects, is asked to send. The tool name and parameter schema are literally
-/// the ones [`MessageSendTool`] exposes, so a model writes the same call in
-/// either process.
+/// objects, is asked to send. The tool name stays stable, while its schema is
+/// narrowed to the operation and context actually available in this process.
 ///
 /// It performs **no** policy decision of its own beyond the local autonomy
 /// check every tool honours. Destination resolution, outbound authorization and
@@ -1053,7 +1104,7 @@ impl Tool for DaemonMessageSendTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        message_send_parameters_schema()
+        daemon_message_send_parameters_schema()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -1223,6 +1274,38 @@ mod tests {
         assert_eq!(schema["type"], "object");
         let required = schema["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v.as_str() == Some("action")));
+        assert!(!crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "send"})).is_empty());
+        assert!(
+            crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "send", "message": "hello"}))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn daemon_schema_exposes_only_complete_send_calls() {
+        let schema = daemon_message_send_parameters_schema();
+        assert_eq!(schema["properties"]["action"]["enum"], json!(["send"]));
+        assert!(
+            !crate::tools::schema::validate_tool_arguments(
+                &schema,
+                &json!({"action": "send", "channel": "wacli", "target": "owner"})
+            )
+            .is_empty()
+        );
+        assert!(
+            crate::tools::schema::validate_tool_arguments(
+                &schema,
+                &json!({"action": "send", "channel": "wacli", "target": "owner", "message": "hello"})
+            )
+            .is_empty()
+        );
+        assert!(
+            !crate::tools::schema::validate_tool_arguments(
+                &schema,
+                &json!({"action": "react", "channel": "wacli", "target": "owner", "message": "hello"})
+            )
+            .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2221,12 +2304,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn both_message_send_entry_points_expose_the_same_surface() {
+    async fn message_send_entry_points_share_identity_but_publish_process_specific_contracts() {
         let (channel, _sent) = DummyChannel::new();
         let in_process = MessageSendTool::new(channel, test_security(AutonomyLevel::Full));
         let through_daemon = chat_tool_for("http://127.0.0.1:1", AutonomyLevel::Full);
         assert_eq!(in_process.name(), through_daemon.name());
-        assert_eq!(in_process.parameters_schema(), through_daemon.parameters_schema());
+        assert_ne!(in_process.parameters_schema(), through_daemon.parameters_schema());
+        assert_eq!(
+            through_daemon.parameters_schema()["properties"]["action"]["enum"],
+            json!(["send"])
+        );
         assert_eq!(in_process.tier(), through_daemon.tier());
         assert_eq!(in_process.categories(), through_daemon.categories());
     }

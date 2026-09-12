@@ -117,6 +117,66 @@ pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
 pub use xin::XinTool;
 
+/// Complete set of statically defined public tool names before runtime
+/// eligibility filtering. Dynamic Skill, MCP, and WASM aliases are intentionally
+/// excluded because their names come from the active runtime generation.
+pub const STATIC_PUBLIC_TOOL_NAMES: &[&str] = &[
+    "shell",
+    "file_read",
+    "file_write",
+    "file_edit",
+    "git_operations",
+    "web_search_tool",
+    "web_fetch",
+    "http_request",
+    "memory_store",
+    "memory_recall",
+    "memory_search",
+    "memory_get",
+    "transcript_history_lookup",
+    "memory_forget",
+    "memory_reindex",
+    "chat_profile_update",
+    "document_search",
+    "document_get_chunk",
+    "document_ingest",
+    "document_sync",
+    "skills_list",
+    "skill_read",
+    "skills_manage",
+    "skill_execute",
+    "message_send",
+    "stay_silent",
+    "sessions_spawn",
+    "sessions_send",
+    "sessions_list",
+    "sessions_history",
+    "session_status",
+    "subagents",
+    "delegate",
+    "managed_session",
+    "cron",
+    "xin",
+    "chat_schedule",
+    "image",
+    "image_info",
+    "mcp_call",
+    "mcp_status",
+    "wasm_plugin_call",
+    "wasm_plugins_status",
+    "wasm_plugins_manage",
+    "wasm_plugin_reload",
+    "hooks_status",
+    "hooks_manage",
+    "nodes",
+    "gateway",
+    "config_reload",
+    "proxy_config",
+    "agents_list",
+    "composio",
+    "pushover",
+];
+
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
@@ -579,6 +639,7 @@ mod tests {
     )]
     use super::*;
     use crate::config::{BrowserConfig, Config, MemoryConfig};
+    use std::collections::HashSet;
     use tempfile::TempDir;
 
     fn spec(name: &str) -> ToolSpec {
@@ -586,6 +647,21 @@ mod tests {
             name: name.to_string(),
             description: String::new(),
             parameters: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn static_public_tool_inventory_is_complete_unique_and_documented() {
+        assert_eq!(STATIC_PUBLIC_TOOL_NAMES.len(), 54);
+        let unique = STATIC_PUBLIC_TOOL_NAMES.iter().copied().collect::<HashSet<_>>();
+        assert_eq!(unique.len(), STATIC_PUBLIC_TOOL_NAMES.len());
+
+        let documentation = include_str!("../../docs/tools.md");
+        for name in STATIC_PUBLIC_TOOL_NAMES {
+            assert!(
+                documentation.contains(&format!("`{name}`")),
+                "static public tool `{name}` is missing from docs/tools.md"
+            );
         }
     }
 
@@ -901,19 +977,43 @@ mod tests {
         let browser = BrowserConfig::default();
         let http = crate::config::HttpRequestConfig::default();
         let config = test_config(&tmp);
+        let agents = HashMap::from([(
+            "schema-audit".to_string(),
+            DelegateAgentConfig {
+                provider: "ollama".to_string(),
+                model: "test-model".to_string(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 1,
+                agentic: false,
+                allowed_tools: vec!["shell".to_string()],
+                identity_dir: None,
+                memory_scope: None,
+                spawn_enabled: None,
+            },
+        )]);
         let tools = all_tools(
             Arc::new(config.clone()),
             &security,
             memory,
-            None,
+            Some("schema-audit-key"),
             None,
             &browser,
             &http,
             tmp.path(),
-            &HashMap::new(),
-            None,
+            &agents,
+            Some("schema-audit-fallback-key"),
             &config,
         );
+
+        let names = tools.iter().map(|tool| tool.name()).collect::<HashSet<_>>();
+        for conditional in ["composio", "agents_list", "delegate"] {
+            assert!(
+                names.contains(conditional),
+                "conditional tool `{conditional}` was not audited"
+            );
+        }
 
         for tool in &tools {
             for spec in tool.specs() {
