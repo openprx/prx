@@ -72,6 +72,11 @@ successful attempt supplies final PRX provider/model attribution. If an
 aggregator such as OpenRouter performs an additional internal fallback, its
 response `model` is the authoritative upstream-model signal.
 
+CLI `--provider` overrides and named delegates follow the same ownership rule:
+the root `api_key` and `api_url` are reused only for the configured default
+provider. A different provider resolves its route credential or active auth
+profile unless the named delegate supplies an explicit `api_key`.
+
 Static prices are recorded only when the provider publishes token prices for a
 stable model ID. Current Anthropic, OpenAI GPT-5.6, and documented Gemini 3.1
 prices are included. Kimi Code is subscription/quota billed, so PRX deliberately

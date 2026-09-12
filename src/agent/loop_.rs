@@ -10648,6 +10648,9 @@ mod tests {
             .iter()
             .find(|message| message.role == "system")
             .expect("request should contain a system message");
+        assert_eq!(system.content.matches("## Runtime Capabilities").count(), 1);
+        assert!(system.content.contains("`skill_probe`"));
+        assert!(!system.content.contains("`mcp_probe`"));
         assert_eq!(system.content.matches("## Tool Use Protocol").count(), 1);
         assert!(system.content.contains("**skill_probe**"));
         assert!(

@@ -149,6 +149,11 @@ When changing context rollover:
 - Remove static tool catalogs from stable system prompts. Human-facing docs may
   describe categories, but runtime exposure comes only from the current
   `ToolSpec` snapshot.
+- Keep `TOOLS.md` for environment-specific operator notes. The shared tool loop
+  renders the compact runtime capability list from the final request-local
+  `ToolSpec` snapshot for both native and prompt-guided providers.
+- Preserve `BOOTSTRAP.md` as the first-run record, but stop injecting it once
+  `workspace/state/bootstrap.completed` exists.
 - Treat compatibility wrappers as delegates, not alternate sources of truth.
 - Remove transitional fields and parameters once all callers use the compiled
   context; do not silence dead code without recording why it remains.

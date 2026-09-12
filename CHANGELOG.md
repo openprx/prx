@@ -7,8 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.109] - 12 September 2026
+
 ### Changed
 
+- Unify runtime autonomy guidance and request-local tool discovery: `TOOLS.md`
+  now holds only environment notes, while the final `ToolSpec` snapshot supplies
+  the exact executable capability list to every provider request.
+- Stop injecting the preserved first-run `BOOTSTRAP.md` after
+  `workspace/state/bootstrap.completed` is created.
 - Replace memory-backed fitness reports with versioned, atomic daily snapshots
   under `workspace/self/fitness`, calendar scheduling over closed local days,
   evidence-derived optional subscores across root and process-worker events,
@@ -17,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Scope root provider credentials and URLs to their configured provider so CLI
+  overrides and delegated agents resolve the target provider's route credential
+  or active auth profile instead of inheriting an unrelated provider secret.
 - Stop fitness telemetry from entering general recall, `MEMORY.md`, and
   `MEMORY_SNAPSHOT.md`; add a backed-up transactional migration command for
   existing `self/fitness/daily/*` memory rows and Markdown projections.

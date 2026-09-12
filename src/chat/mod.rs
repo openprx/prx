@@ -3828,6 +3828,54 @@ fn initial_chat_dispatcher_state(
     state
 }
 
+/// Return the root credential and URL only when the selected provider is the
+/// provider those values were configured for. A CLI provider override must
+/// resolve its own auth profile instead of inheriting the default provider's
+/// secret (or a local provider's placeholder credential).
+const fn configured_provider_connection<'a>(
+    selected_provider: &str,
+    configured_provider: &str,
+    api_key: Option<&'a str>,
+    api_url: Option<&'a str>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    if selected_provider.eq_ignore_ascii_case(configured_provider) {
+        (api_key, api_url)
+    } else {
+        (None, None)
+    }
+}
+
+#[cfg(test)]
+mod provider_connection_tests {
+    use super::configured_provider_connection;
+
+    #[test]
+    fn cli_provider_override_does_not_inherit_default_provider_connection() {
+        assert_eq!(
+            configured_provider_connection(
+                "kimi-code",
+                "custom:http://127.0.0.1:18083/v1",
+                Some("local-placeholder"),
+                Some("http://127.0.0.1:18083/v1"),
+            ),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn configured_provider_keeps_its_connection() {
+        assert_eq!(
+            configured_provider_connection(
+                "CUSTOM:http://127.0.0.1:18083/v1",
+                "custom:http://127.0.0.1:18083/v1",
+                Some("local-placeholder"),
+                Some("http://127.0.0.1:18083/v1"),
+            ),
+            (Some("local-placeholder"), Some("http://127.0.0.1:18083/v1"))
+        );
+    }
+}
+
 /// Run the interactive chat session with rich terminal UI.
 #[allow(clippy::too_many_lines)]
 pub async fn run(
@@ -3920,10 +3968,8 @@ pub async fn run(
         .ok_or_else(|| anyhow::anyhow!("chat base tool registry was already taken"))?;
 
     // ── Resolve provider ─────────────────────────────────────────
-    let provider_name = provider_override
-        .as_deref()
-        .or(config.default_provider.as_deref())
-        .unwrap_or("openrouter");
+    let configured_provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+    let provider_name = provider_override.as_deref().unwrap_or(configured_provider_name);
 
     let model_name = model_override
         .as_deref()
@@ -3933,10 +3979,16 @@ pub async fn run(
 
     let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
 
-    let provider: Arc<dyn Provider> = Arc::from(providers::create_routed_provider_with_options(
+    let (startup_api_key, startup_api_url) = configured_provider_connection(
         provider_name,
+        configured_provider_name,
         config.api_key.as_deref(),
         config.api_url.as_deref(),
+    );
+    let provider: Arc<dyn Provider> = Arc::from(providers::create_routed_provider_with_options(
+        provider_name,
+        startup_api_key,
+        startup_api_url,
         &config.reliability,
         &config.model_routes,
         model_name,
@@ -4640,9 +4692,6 @@ pub async fn run(
     // （system prompt / fabric 事件 / snapshot / legacy run_tool_call_loop）。初值与启动期
     // 解析出的 `provider_name` 一致。
     let mut current_provider_owned: String = provider_name.to_string();
-    // Bug #3: 启动期 primary provider 名（owned，不可变）。`/provider` 切换时据此
-    // 判断是否切回原 primary（决定是否复用 `config.api_key`/`config.api_url`）。
-    let original_provider_name: String = provider_name.to_string();
     // Bug #3: provider 句柄（legacy 路径 run_tool_call_loop 直接 `provider.as_ref()`）。
     // `/provider <name>` 时用新 provider 重建并替换此 Arc，同步 set 进 provider_slot（Redux 路径）。
     let mut provider = provider;
@@ -5647,19 +5696,14 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 ));
                 continue;
             }
-            // 切到非原 primary 的 provider 时，不沿用 primary 的显式凭据/URL，让新 provider
+            // 切到非配置 primary 的 provider 时，不沿用 primary 的显式凭据/URL，让新 provider
             // 自行解析（避免把 A provider 的 key 错喂给 B provider）。
-            let is_original_primary = new_provider.eq_ignore_ascii_case(original_provider_name.as_str());
-            let switch_api_key = if is_original_primary {
-                config.api_key.as_deref()
-            } else {
-                None
-            };
-            let switch_api_url = if is_original_primary {
-                config.api_url.as_deref()
-            } else {
-                None
-            };
+            let (switch_api_key, switch_api_url) = configured_provider_connection(
+                &new_provider,
+                configured_provider_name,
+                config.api_key.as_deref(),
+                config.api_url.as_deref(),
+            );
             match providers::create_routed_provider_with_options(
                 &new_provider,
                 switch_api_key,

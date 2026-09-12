@@ -30,6 +30,27 @@ pub fn render_hardware_access_guidance(tools: &[ToolSpec]) -> String {
         .to_string()
 }
 
+/// Render the compact, authoritative capability inventory for one provider
+/// request. It is derived from the post-filter, post-middleware ToolSpec
+/// snapshot, so it cannot drift from the execution allowlist like TOOLS.md did.
+pub fn render_runtime_capability_snapshot(tools: &[ToolSpec]) -> String {
+    if tools.is_empty() {
+        return String::new();
+    }
+
+    let names = tools
+        .iter()
+        .map(|tool| format!("`{}`", tool.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "## Runtime Capabilities\n\n\
+         The following {} tools are exposed and executable for this request: {names}.\n\
+         This request-local list is authoritative; use the supplied tool schemas for arguments.",
+        tools.len()
+    )
+}
+
 /// Render the canonical prompt-guided tool-calling contract.
 ///
 /// Callers must pass the frozen ToolSpec snapshot selected for the current
@@ -95,5 +116,20 @@ mod tests {
             parameters: serde_json::json!({"type": "object"}),
         }];
         assert!(render_hardware_access_guidance(&hardware).contains("## Hardware Access"));
+    }
+
+    #[test]
+    fn capability_snapshot_lists_only_the_supplied_tools() {
+        let tools = vec![ToolSpec {
+            name: "browser_navigate".to_string(),
+            description: "Navigate a browser".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+
+        let rendered = render_runtime_capability_snapshot(&tools);
+
+        assert!(rendered.contains("1 tools"));
+        assert!(rendered.contains("`browser_navigate`"));
+        assert!(!rendered.contains("shell"));
     }
 }

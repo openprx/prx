@@ -29,6 +29,9 @@ pub struct DelegateTool {
     security: Arc<SecurityPolicy>,
     /// Global credential fallback (from config.api_key)
     fallback_credential: Option<String>,
+    /// Provider that owns `fallback_credential`. Other providers must resolve
+    /// their own explicit credential or auth profile.
+    fallback_provider: Option<String>,
     /// Provider runtime options inherited from root config.
     provider_runtime_options: providers::ProviderRuntimeOptions,
     /// Reliability settings for the per-agent provider chain.
@@ -160,6 +163,7 @@ impl DelegateTool {
             agents: Arc::new(agents),
             security,
             fallback_credential,
+            fallback_provider: None,
             provider_runtime_options,
             reliability: crate::config::ReliabilityConfig::default(),
             depth: 0,
@@ -207,6 +211,7 @@ impl DelegateTool {
             agents: Arc::new(agents),
             security,
             fallback_credential,
+            fallback_provider: None,
             provider_runtime_options,
             reliability: crate::config::ReliabilityConfig::default(),
             depth,
@@ -222,6 +227,23 @@ impl DelegateTool {
     pub fn with_parent_tools(mut self, parent_tools: Arc<Vec<Arc<dyn Tool>>>) -> Self {
         self.parent_tools = parent_tools;
         self
+    }
+
+    /// Scope the global fallback credential to the provider it belongs to.
+    #[must_use]
+    pub fn with_fallback_provider(mut self, provider: Option<String>) -> Self {
+        self.fallback_provider = provider;
+        self
+    }
+
+    fn credential_for_provider(&self, agent_config: &DelegateAgentConfig, effective_provider: &str) -> Option<String> {
+        agent_config.api_key.clone().or_else(|| {
+            self.fallback_provider
+                .as_deref()
+                .is_some_and(|provider| provider.eq_ignore_ascii_case(effective_provider))
+                .then(|| self.fallback_credential.clone())
+                .flatten()
+        })
     }
 
     /// Attach multimodal configuration for sub-agent tool loops.
@@ -453,10 +475,7 @@ impl Tool for DelegateTool {
         let effective_model = model_override.clone().unwrap_or_else(|| agent_config.model.clone());
 
         // Create provider for this agent
-        let provider_credential_owned = agent_config
-            .api_key
-            .clone()
-            .or_else(|| self.fallback_credential.clone());
+        let provider_credential_owned = self.credential_for_provider(agent_config, &effective_provider);
         #[allow(clippy::option_as_ref_deref)]
         let provider_credential = provider_credential_owned.as_ref().map(String::as_str);
 
@@ -2266,6 +2285,27 @@ mod tests {
             },
         );
         agents
+    }
+
+    #[test]
+    fn delegate_fallback_credential_is_scoped_to_its_provider() {
+        let mut child = single_agent("tester", "kimi-code", "k3")
+            .remove("tester")
+            .expect("test agent");
+        let tool = DelegateTool::new(HashMap::new(), Some("root-key".to_string()), test_security())
+            .with_fallback_provider(Some("custom:http://127.0.0.1:18083/v1".to_string()));
+
+        assert_eq!(tool.credential_for_provider(&child, "kimi-code"), None);
+        assert_eq!(
+            tool.credential_for_provider(&child, "CUSTOM:http://127.0.0.1:18083/v1"),
+            Some("root-key".to_string())
+        );
+
+        child.api_key = Some("child-key".to_string());
+        assert_eq!(
+            tool.credential_for_provider(&child, "kimi-code"),
+            Some("child-key".to_string())
+        );
     }
 
     #[test]

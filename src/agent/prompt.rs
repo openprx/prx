@@ -55,6 +55,7 @@ impl SystemPromptBuilder {
             sections: vec![
                 Box::new(TaskSection),
                 Box::new(SafetySection),
+                Box::new(OrchestrationSection),
                 Box::new(SkillsSection),
                 Box::new(WorkspaceSection),
                 Box::new(IdentitySection),
@@ -112,6 +113,7 @@ impl SystemPromptBuilder {
 pub struct IdentitySection;
 pub struct TaskSection;
 pub struct SafetySection;
+pub struct OrchestrationSection;
 pub struct SkillsSection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
@@ -189,6 +191,22 @@ impl PromptSection for SafetySection {
     }
 }
 
+impl PromptSection for OrchestrationSection {
+    fn name(&self) -> &str {
+        "orchestration"
+    }
+
+    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
+        Ok(
+            "## Autonomous Orchestration\n\n\
+             Own the requested outcome end to end: understand the goal, make and revise a practical plan, execute it with the tools exposed for the current request, verify observable results, and report unresolved risk honestly.\n\
+             For complex work, use projects/topics and goals/steps when exposed; delegate independent work to sessions or agents when useful; schedule and monitor recurring work when requested; use skills for specialist procedures; and audit the final result before completion.\n\
+             Browser, MCP, WASM, office/document, memory, messaging, scheduling, project, and delegation capabilities are conditional. A capability is available only when a matching tool appears in the current runtime capability snapshot. Never claim or simulate a capability that is absent."
+                .to_string(),
+        )
+    }
+}
+
 impl PromptSection for SkillsSection {
     fn name(&self) -> &str {
         "skills"
@@ -252,7 +270,8 @@ fn load_openclaw_bootstrap_files(prompt: &mut String, workspace_dir: &Path, max_
     prompt.push_str(&build_identity_prompt_with_limit(workspace_dir, max_chars_per_file));
 
     let bootstrap_path = workspace_dir.join("BOOTSTRAP.md");
-    if bootstrap_path.exists() {
+    let bootstrap_completed = workspace_dir.join("state/bootstrap.completed");
+    if bootstrap_path.exists() && !bootstrap_completed.exists() {
         inject_workspace_file(prompt, workspace_dir, "BOOTSTRAP.md", max_chars_per_file);
     }
 }
@@ -341,6 +360,49 @@ mod tests {
     }
 
     #[test]
+    fn completed_bootstrap_is_not_injected() {
+        let workspace = std::env::temp_dir().join(format!("openprx_prompt_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(workspace.join("state")).unwrap();
+        std::fs::write(workspace.join("SOUL.md"), "soul").unwrap();
+        std::fs::write(workspace.join("BOOTSTRAP.md"), "FIRST_RUN_ONLY").unwrap();
+        std::fs::write(workspace.join("state/bootstrap.completed"), "completed\n").unwrap();
+
+        let ctx = PromptContext {
+            workspace_dir: &workspace,
+            model_name: "test-model",
+            skills: &[],
+            identity_config: None,
+            bootstrap_max_chars: None,
+            native_tools: true,
+        };
+        let prompt = IdentitySection.build(&ctx).unwrap();
+
+        assert!(prompt.contains("soul"));
+        assert!(!prompt.contains("FIRST_RUN_ONLY"));
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn pending_bootstrap_is_injected() {
+        let workspace = std::env::temp_dir().join(format!("openprx_prompt_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("BOOTSTRAP.md"), "FIRST_RUN_ONLY").unwrap();
+
+        let ctx = PromptContext {
+            workspace_dir: &workspace,
+            model_name: "test-model",
+            skills: &[],
+            identity_config: None,
+            bootstrap_max_chars: None,
+            native_tools: true,
+        };
+        let prompt = IdentitySection.build(&ctx).unwrap();
+
+        assert!(prompt.contains("FIRST_RUN_ONLY"));
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
     fn prompt_builder_assembles_sections() {
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
@@ -353,6 +415,7 @@ mod tests {
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Your Task"));
         assert!(prompt.contains("## Safety"));
+        assert!(prompt.contains("## Autonomous Orchestration"));
         assert!(prompt.contains("## Workspace"));
         assert!(prompt.contains("## Project Context"));
         assert!(!prompt.contains("## Tools"));
@@ -385,6 +448,7 @@ mod tests {
             vec![
                 "task",
                 "safety",
+                "orchestration",
                 "skills",
                 "workspace",
                 "identity",

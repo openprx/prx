@@ -301,42 +301,28 @@ fn ws_user_template(agent: &str, user: &str, tz: &str, comm_style: &str) -> Stri
     )
 }
 
-fn ws_tools_template() -> String {
+pub(crate) fn ws_tools_template() -> String {
     "\
      # TOOLS.md \u{2014} Local Notes\n\n\
-     Skills define HOW tools work. This file is for YOUR specifics \u{2014}\n\
-     the stuff that's unique to your setup.\n\n\
+     This file records facts and preferences unique to your environment.\n\
+     Skills define specialist procedures; PRX supplies actual tools at runtime.\n\n\
      ## What Goes Here\n\n\
      Things like:\n\
      - SSH hosts and aliases\n\
      - Device nicknames\n\
      - Preferred voices for TTS\n\
-     - Anything environment-specific\n\n\
-     ## Built-in Tools\n\n\
-     - **shell** \u{2014} Execute terminal commands\n\
-       - Use when: running local checks, build/test commands, or diagnostics.\n\
-       - Don't use when: a safer dedicated tool exists, or command is destructive without approval.\n\
-     - **file_read** \u{2014} Read file contents\n\
-       - Use when: inspecting project files, configs, or logs.\n\
-       - Don't use when: you only need a quick string search (prefer targeted search first).\n\
-     - **file_write** \u{2014} Write file contents\n\
-       - Use when: applying focused edits, scaffolding files, or updating docs/code.\n\
-       - Don't use when: unsure about side effects or when the file should remain user-owned.\n\
-     - **memory_store** \u{2014} Save to memory\n\
-       - Use when: preserving durable preferences, decisions, or key context.\n\
-       - Don't use when: info is transient, noisy, or sensitive without explicit need.\n\
-     - **memory_recall** \u{2014} Search memory\n\
-       - Use when: you need prior decisions, user preferences, or historical context.\n\
-       - Don't use when: the answer is already in current files/conversation.\n\
-     - **memory_forget** \u{2014} Delete a memory entry\n\
-       - Use when: memory is incorrect, stale, or explicitly requested to be removed.\n\
-       - Don't use when: uncertain about impact; verify before deleting.\n\n\
+     - Local paths, service names, and environment-specific limitations\n\n\
+     ## Runtime Tools\n\n\
+     Do not copy PRX's built-in, MCP, WASM, browser, office, or delegated-agent\n\
+     tool catalog into this file. PRX injects the exact tools available for each\n\
+     request from its runtime `ToolSpec` snapshot, including their current schemas.\n\
+     A tool omitted from that snapshot is not available for that request.\n\n\
      ---\n\
      *Add whatever helps you do your job. This is your cheat sheet.*\n"
         .to_string()
 }
 
-fn ws_bootstrap_template(agent: &str, user: &str, tz: &str, comm_style: &str) -> String {
+pub(crate) fn ws_bootstrap_template(agent: &str, user: &str, tz: &str, comm_style: &str) -> String {
     format!(
         "# BOOTSTRAP.md \u{2014} Hello, World\n\n\
          *You just woke up. Time to figure out who you are.*\n\n\
@@ -350,9 +336,9 @@ fn ws_bootstrap_template(agent: &str, user: &str, tz: &str, comm_style: &str) ->
          - `IDENTITY.md` \u{2014} your name, vibe, emoji\n\
          - `USER.md` \u{2014} their preferences, work context\n\
          - `SOUL.md` \u{2014} boundaries and behavior\n\n\
-         ## When You're Done\n\n\
-         Delete this file. You don't need a bootstrap script anymore \u{2014}\n\
-         you're you now.\n"
+     ## When You're Done\n\n\
+     Create `state/bootstrap.completed` after updating the identity files. PRX\n\
+     will then stop injecting this first-run guide while preserving it for audit.\n"
     )
 }
 
@@ -1418,6 +1404,10 @@ mod tests {
         // Verify content includes user from env (or fallback)
         let user_md = fs::read_to_string(ws.join("USER.md")).expect("test: read USER.md");
         assert!(user_md.contains("Name:"), "USER.md should contain Name field");
+
+        let tools_md = fs::read_to_string(ws.join("TOOLS.md")).expect("test: read TOOLS.md");
+        assert!(tools_md.contains("runtime `ToolSpec` snapshot"));
+        assert!(!tools_md.contains("## Built-in Tools"));
     }
 
     #[test]

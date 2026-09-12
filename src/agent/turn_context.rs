@@ -59,13 +59,14 @@ impl CompiledToolContext {
     /// Native providers receive the identical snapshot through
     /// [`Self::native_tool_specs`] instead.
     pub(crate) fn apply_to_messages(&self, messages: &mut Vec<ChatMessage>) {
+        let capability_snapshot = crate::tools::prompt::render_runtime_capability_snapshot(&self.tool_specs);
         let hardware_guidance = crate::tools::prompt::render_hardware_access_guidance(&self.tool_specs);
         let tool_protocol = if self.native_tools || self.tool_specs.is_empty() {
             String::new()
         } else {
             crate::tools::prompt::render_prompt_guided_tool_protocol(&self.tool_specs)
         };
-        let instructions = [hardware_guidance, tool_protocol]
+        let instructions = [capability_snapshot, hardware_guidance, tool_protocol]
             .into_iter()
             .filter(|section| !section.is_empty())
             .collect::<Vec<_>>()
@@ -165,7 +166,9 @@ mod tests {
 
         context.apply_to_messages(&mut messages);
 
-        assert_eq!(messages[0].content, "base");
+        assert!(messages[0].content.starts_with("base\n\n## Runtime Capabilities"));
+        assert!(messages[0].content.contains("`shell`"));
+        assert!(!messages[0].content.contains("## Tool Use Protocol"));
         assert_eq!(
             context
                 .native_tool_specs()

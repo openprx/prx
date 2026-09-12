@@ -4288,55 +4288,9 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
          *Update this anytime. The more {agent} knows, the better it helps.*\n"
     );
 
-    let tools = "\
-         # TOOLS.md — Local Notes\n\n\
-         Skills define HOW tools work. This file is for YOUR specifics —\n\
-         the stuff that's unique to your setup.\n\n\
-         ## What Goes Here\n\n\
-         Things like:\n\
-         - SSH hosts and aliases\n\
-         - Device nicknames\n\
-         - Preferred voices for TTS\n\
-         - Anything environment-specific\n\n\
-         ## Built-in Tools\n\n\
-         - **shell** — Execute terminal commands\n\
-           - Use when: running local checks, build/test commands, or diagnostics.\n\
-           - Don't use when: a safer dedicated tool exists, or command is destructive without approval.\n\
-         - **file_read** — Read file contents\n\
-           - Use when: inspecting project files, configs, or logs.\n\
-           - Don't use when: you only need a quick string search (prefer targeted search first).\n\
-         - **file_write** — Write file contents\n\
-           - Use when: applying focused edits, scaffolding files, or updating docs/code.\n\
-           - Don't use when: unsure about side effects or when the file should remain user-owned.\n\
-         - **memory_store** — Save to memory\n\
-           - Use when: preserving durable preferences, decisions, or key context.\n\
-           - Don't use when: info is transient, noisy, or sensitive without explicit need.\n\
-         - **memory_recall** — Search memory\n\
-           - Use when: you need prior decisions, user preferences, or historical context.\n\
-           - Don't use when: the answer is already in current files/conversation.\n\
-         - **memory_forget** — Delete a memory entry\n\
-           - Use when: memory is incorrect, stale, or explicitly requested to be removed.\n\
-           - Don't use when: uncertain about impact; verify before deleting.\n\n\
-         ---\n\
-         *Add whatever helps you do your job. This is your cheat sheet.*\n";
+    let tools = crate::config::init::ws_tools_template();
 
-    let bootstrap = format!(
-        "# BOOTSTRAP.md — Hello, World\n\n\
-         *You just woke up. Time to figure out who you are.*\n\n\
-         Your human's name is **{user}** (timezone: {tz}).\n\
-         They prefer: {comm_style}\n\n\
-         ## First Conversation\n\n\
-         Don't interrogate. Don't be robotic. Just... talk.\n\
-         Introduce yourself as {agent} and get to know each other.\n\n\
-         ## After You Know Each Other\n\n\
-         Update these files with what you learned:\n\
-         - `IDENTITY.md` — your name, vibe, emoji\n\
-         - `USER.md` — their preferences, work context\n\
-         - `SOUL.md` — boundaries and behavior\n\n\
-         ## When You're Done\n\n\
-         Delete this file. You don't need a bootstrap script anymore —\n\
-         you're you now.\n"
-    );
+    let bootstrap = crate::config::init::ws_bootstrap_template(agent, user, tz, comm_style);
 
     let memory = "\
          # MEMORY.md — Long-Term Memory\n\n\
@@ -4394,7 +4348,7 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
         ("HEARTBEAT.md", heartbeat),
         ("SOUL.md", soul),
         ("USER.md", user_md),
-        ("TOOLS.md", tools.to_string()),
+        ("TOOLS.md", tools),
         ("BOOTSTRAP.md", bootstrap),
         ("MEMORY.md", memory.to_string()),
         ("THINKING.md", thinking),
@@ -4732,6 +4686,9 @@ mod tests {
         for f in &expected {
             assert!(tmp.path().join(f).exists(), "missing file: {f}");
         }
+        let tools = fs::read_to_string(tmp.path().join("TOOLS.md")).unwrap();
+        assert!(tools.contains("runtime `ToolSpec` snapshot"));
+        assert!(!tools.contains("## Built-in Tools"));
     }
 
     #[test]
@@ -4994,33 +4951,19 @@ mod tests {
         );
     }
 
-    // ── scaffold_workspace: TOOLS.md lists memory_forget ────────
+    // ── scaffold_workspace: TOOLS.md remains environment-local ───
 
     #[tokio::test]
-    async fn tools_md_lists_all_builtin_tools() {
+    async fn tools_md_defers_runtime_catalog_to_tool_spec_snapshot() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
         let tools = tokio::fs::read_to_string(tmp.path().join("TOOLS.md")).await.unwrap();
-        for tool in &[
-            "shell",
-            "file_read",
-            "file_write",
-            "memory_store",
-            "memory_recall",
-            "memory_forget",
-        ] {
-            assert!(tools.contains(tool), "TOOLS.md should list built-in tool: {tool}");
-        }
-        assert!(
-            tools.contains("Use when:"),
-            "TOOLS.md should include 'Use when' guidance"
-        );
-        assert!(
-            tools.contains("Don't use when:"),
-            "TOOLS.md should include 'Don't use when' guidance"
-        );
+        assert!(tools.contains("runtime `ToolSpec` snapshot"));
+        assert!(tools.contains("environment-specific"));
+        assert!(!tools.contains("## Built-in Tools"));
+        assert!(!tools.contains("**shell**"));
     }
 
     #[tokio::test]
