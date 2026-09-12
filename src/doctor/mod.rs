@@ -5,7 +5,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const DAEMON_STALE_SECONDS: i64 = 30;
@@ -208,9 +208,45 @@ pub async fn diagnose_runtime(config: &Config) -> DoctorReport {
 }
 
 fn check_deployed_binary(items: &mut Vec<DiagItem>) {
+    check_deployed_binary_paths(items, deployed_binary_from_path(), std::env::current_exe());
+}
+
+fn deployed_binary_from_path() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let binary_name = format!("prx{}", std::env::consts::EXE_SUFFIX);
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(&binary_name))
+        .find(|candidate| candidate.is_file())
+}
+
+fn same_executable_path(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn check_deployed_binary_paths(
+    items: &mut Vec<DiagItem>,
+    deployed: Option<PathBuf>,
+    current: std::io::Result<PathBuf>,
+) {
     let cat = "deployed";
-    let deployed = Path::new("/home/ck/.cargo/bin/prx");
-    if deployed.exists() {
+    let Some(deployed) = deployed else {
+        items.push(DiagItem::error(cat, "deployed prx binary not found on PATH"));
+        if let Ok(current) = current {
+            items.push(DiagItem::warn(
+                cat,
+                format!(
+                    "doctor is running from {}, but no deployed prx binary was found on PATH",
+                    current.display()
+                ),
+            ));
+        }
+        return;
+    };
+
+    if deployed.is_file() {
         items.push(DiagItem::ok(
             cat,
             format!("deployed binary exists: {}", deployed.display()),
@@ -222,8 +258,10 @@ fn check_deployed_binary(items: &mut Vec<DiagItem>) {
         ));
     }
 
-    match std::env::current_exe() {
-        Ok(current) if current == deployed => items.push(DiagItem::ok(cat, "doctor is running from deployed binary")),
+    match current {
+        Ok(current) if same_executable_path(&current, &deployed) => {
+            items.push(DiagItem::ok(cat, "doctor is running from deployed binary"));
+        }
         Ok(current) => items.push(DiagItem::warn(
             cat,
             format!("doctor is running from {}, not deployed binary", current.display()),
@@ -1689,6 +1727,36 @@ mod tests {
     )]
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn deployed_binary_check_accepts_the_runtime_path() {
+        let temp = TempDir::new().unwrap();
+        let deployed = temp.path().join("prx");
+        std::fs::write(&deployed, b"binary").unwrap();
+        let mut items = Vec::new();
+
+        check_deployed_binary_paths(&mut items, Some(deployed.clone()), Ok(deployed));
+
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|item| item.severity == Severity::Ok));
+        assert!(
+            items
+                .iter()
+                .any(|item| item.message == "doctor is running from deployed binary")
+        );
+    }
+
+    #[test]
+    fn deployed_binary_check_reports_missing_path_lookup_without_linux_hardcode() {
+        let mut items = Vec::new();
+
+        check_deployed_binary_paths(&mut items, None, Ok(PathBuf::from("/opt/homebrew/bin/prx")));
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].severity, Severity::Error);
+        assert_eq!(items[0].message, "deployed prx binary not found on PATH");
+        assert!(items.iter().all(|item| !item.message.contains("/home/ck")));
+    }
 
     struct EnvGuard {
         key: &'static str,
