@@ -207,25 +207,21 @@ async fn next_steer(steer_rx: &mut Option<tokio::sync::mpsc::Receiver<String>>) 
     }
 }
 
-fn select_tools_for_worker(source: Vec<Box<dyn Tool>>, allowed_tools: &[String]) -> Result<Arc<Vec<Box<dyn Tool>>>> {
+async fn select_tools_for_worker(
+    source: Vec<Box<dyn Tool>>,
+    allowed_tools: &[String],
+) -> Result<Arc<Vec<Box<dyn Tool>>>> {
     let normalized = allowed_tools
         .iter()
         .map(|name| name.trim())
         .filter(|name| !name.is_empty())
         .collect::<Vec<_>>();
-    if normalized.contains(&"*") {
-        if normalized.as_slice() != ["*"] {
-            anyhow::bail!("Worker allowed_tools must use '*' exclusively");
-        }
-    } else {
-        for allowed in &normalized {
-            if !source.iter().any(|tool| tool.supports_name(allowed)) {
-                anyhow::bail!("Allowed tool '{allowed}' is not registered in worker process");
-            }
-        }
+    if normalized.contains(&"*") && normalized.as_slice() != ["*"] {
+        anyhow::bail!("Worker allowed_tools must use '*' exclusively");
     }
 
     let source = Arc::new(source);
+    crate::tools::sessions_spawn::refresh_tools_for_explicit_allowlist(&source, allowed_tools).await?;
     Ok(crate::tools::sessions_spawn::resolve_tools_for_agent(
         source,
         "session-worker",
@@ -922,7 +918,7 @@ async fn run_validated_manifest(
 
     verify_worker_orchestration_tool_names(full_tools.iter().map(|tool| tool.name()))?;
 
-    let tools_registry = select_tools_for_worker(full_tools, &manifest.allowed_tools)?;
+    let tools_registry = select_tools_for_worker(full_tools, &manifest.allowed_tools).await?;
     let _ = spawn_tools_handle.set(Arc::clone(&tools_registry));
     let native_tools = provider
         .capabilities_for(
@@ -1627,11 +1623,13 @@ mod tests {
         assert_eq!(api_url, Some("http://gateway.invalid/v1"));
     }
 
-    #[test]
-    fn worker_wildcard_preserves_its_source_registry() {
+    #[tokio::test]
+    async fn worker_wildcard_preserves_its_source_registry() {
         let source = crate::tools::default_tools(Arc::new(crate::security::SecurityPolicy::default()));
         let expected = source.len();
-        let selected = select_tools_for_worker(source, &["*".to_string()]).expect("wildcard selection");
+        let selected = select_tools_for_worker(source, &["*".to_string()])
+            .await
+            .expect("wildcard selection");
         assert_eq!(selected.len(), expected);
     }
 
@@ -1697,6 +1695,7 @@ mod tests {
             vec![Box::new(WorkerDynamicAliases)],
             &["dynamic__one".to_string(), "dynamic__two".to_string()],
         )
+        .await
         .expect("dynamic aliases must resolve independently");
 
         assert_eq!(selected.len(), 2);
@@ -1724,24 +1723,26 @@ mod tests {
         assert!(error.to_string().contains("message_send"));
     }
 
-    #[test]
-    fn worker_wildcard_must_be_exclusive() {
+    #[tokio::test]
+    async fn worker_wildcard_must_be_exclusive() {
         let source = crate::tools::default_tools(Arc::new(crate::security::SecurityPolicy::default()));
-        let error = match select_tools_for_worker(source, &["*".to_string(), "shell".to_string()]) {
+        let error = match select_tools_for_worker(source, &["*".to_string(), "shell".to_string()]).await {
             Ok(_) => panic!("mixed wildcard must be rejected"),
             Err(error) => error,
         };
         assert!(error.to_string().contains("exclusively"));
     }
 
-    #[test]
-    fn worker_explicit_allowlist_inherits_transcript_recovery_dependency() {
+    #[tokio::test]
+    async fn worker_explicit_allowlist_inherits_transcript_recovery_dependency() {
         let mut source = crate::tools::default_tools(Arc::new(crate::security::SecurityPolicy::default()));
         source.push(Box::new(crate::tools::TranscriptHistoryLookupTool::new(Arc::new(
             crate::memory::NoneMemory::new(),
         ))));
 
-        let selected = select_tools_for_worker(source, &["shell".to_string()]).expect("restricted selection");
+        let selected = select_tools_for_worker(source, &["shell".to_string()])
+            .await
+            .expect("restricted selection");
         let names = selected.iter().map(|tool| tool.name()).collect::<Vec<_>>();
         assert_eq!(names, vec!["shell", crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME]);
     }

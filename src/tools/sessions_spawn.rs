@@ -3192,6 +3192,22 @@ impl SessionsSpawnTool {
             spawn_scope.as_ref(),
         );
         let run_lineage = spawn_lineage(&spawn_scope_for_event, parent_exec_ctx.as_ref(), spawn_scope.as_ref());
+        let allowed_tools = selected_agent
+            .as_ref()
+            .map(|(_, cfg)| {
+                cfg.allowed_tools
+                    .iter()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let tools = self.tools.get().cloned();
+        if let Some(registry) = &tools {
+            refresh_tools_for_explicit_allowlist(registry, &allowed_tools).await?;
+        } else if !allowed_tools.is_empty() {
+            anyhow::bail!("sessions_spawn tool registry is not initialized");
+        }
         let process_config_source = if mode == "process" {
             Some(self.resolved_process_config_source()?)
         } else {
@@ -3272,16 +3288,6 @@ impl SessionsSpawnTool {
             // run's result. Falls back to the active channel when no scope name.
             let channel = self.resolve_announce_channel(run_channel_name.as_deref()).await;
             let keep_workspace = !self.spawn_config.cleanup_on_complete;
-            let allowed_tools = selected_agent
-                .as_ref()
-                .map(|(_, cfg)| {
-                    cfg.allowed_tools
-                        .iter()
-                        .map(|value| value.trim().to_string())
-                        .filter(|value| !value.is_empty())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
             let process_agent_id = selected_agent.as_ref().map(|(name, _)| name.clone());
             let identity_dir = selected_agent.as_ref().and_then(|(_, cfg)| {
                 cfg.identity_dir
@@ -3632,7 +3638,6 @@ impl SessionsSpawnTool {
             (None, None)
         };
         let task_owned = task.to_string();
-        let tools = self.tools.get().cloned();
         let workspace_dir = self.workspace_dir.clone();
         let multimodal_config = self.multimodal_config.clone();
         let security = self.security.clone();
@@ -4665,6 +4670,44 @@ pub(crate) fn resolve_tools_for_agent(
         .collect::<Vec<_>>();
 
     Arc::new(resolved)
+}
+
+pub(crate) async fn refresh_tools_for_explicit_allowlist(
+    source: &Arc<Vec<Box<dyn Tool>>>,
+    allowed_tools: &[String],
+) -> anyhow::Result<()> {
+    let normalized = allowed_tools
+        .iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    if normalized.is_empty() || normalized.as_slice() == ["*"] {
+        return Ok(());
+    }
+    if normalized.contains(&"*") {
+        anyhow::bail!("allowed_tools must use '*' exclusively");
+    }
+    if normalized
+        .iter()
+        .all(|name| source.iter().any(|tool| tool.supports_name(name)))
+    {
+        return Ok(());
+    }
+
+    for tool in source.iter() {
+        tool.refresh().await?;
+    }
+    let unresolved = normalized
+        .into_iter()
+        .filter(|name| !source.iter().any(|tool| tool.supports_name(name)))
+        .collect::<Vec<_>>();
+    if !unresolved.is_empty() {
+        anyhow::bail!(
+            "Allowed tools are not registered after dynamic discovery: {}",
+            unresolved.join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// Queue depth for a sub-agent's steering channel.
@@ -6269,6 +6312,63 @@ mod tests {
         }
     }
 
+    struct RefreshableDynamicCapabilityTool {
+        refreshed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Tool for RefreshableDynamicCapabilityTool {
+        fn name(&self) -> &str {
+            "refreshable_router"
+        }
+
+        fn description(&self) -> &str {
+            "Dynamic discovery fixture"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+
+        fn specs(&self) -> Vec<crate::tools::ToolSpec> {
+            if self.refreshed.load(std::sync::atomic::Ordering::SeqCst) {
+                vec![crate::tools::ToolSpec {
+                    name: "refreshable__alias".to_string(),
+                    description: "Discovered alias".to_string(),
+                    parameters: json!({"type": "object", "properties": {}}),
+                }]
+            } else {
+                vec![self.spec()]
+            }
+        }
+
+        fn supports_name(&self, name: &str) -> bool {
+            name == self.name()
+                || (name == "refreshable__alias" && self.refreshed.load(std::sync::atomic::Ordering::SeqCst))
+        }
+
+        async fn refresh(&self) -> anyhow::Result<()> {
+            self.refreshed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: self.name().to_string(),
+                error: None,
+            })
+        }
+
+        async fn execute_named(&self, name: &str, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: name.to_string(),
+                error: None,
+            })
+        }
+    }
+
     #[tokio::test]
     async fn wildcard_tool_inheritance_preserves_dynamic_specs_and_execution() {
         let source: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(DynamicCapabilityTool)]);
@@ -6288,6 +6388,25 @@ mod tests {
             .await
             .expect("dynamic alias executes");
         assert_eq!(result.output, "capability__dynamic");
+    }
+
+    #[tokio::test]
+    async fn explicit_dynamic_alias_is_discovered_before_child_selection() {
+        let refreshed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let source: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(RefreshableDynamicCapabilityTool {
+            refreshed: Arc::clone(&refreshed),
+        })]);
+        let allowed = vec!["refreshable__alias".to_string()];
+
+        refresh_tools_for_explicit_allowlist(&source, &allowed)
+            .await
+            .expect("dynamic discovery");
+        let selected = resolve_tools_for_agent(source, "worker", MemoryScope::Shared, Some(&allowed));
+
+        assert!(refreshed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name(), "refreshable__alias");
+        assert_eq!(selected[0].specs()[0].name, "refreshable__alias");
     }
 
     #[test]

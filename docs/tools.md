@@ -21,6 +21,7 @@ iteration; see [Unified turn context](unified-turn-context.md).
 | **Hooks** | `hooks_status`, `hooks_manage` |
 | **Remote Nodes** | `nodes` (control paired devices — camera, screen, location, run commands) |
 | **Infrastructure** | `gateway`, `config_reload`, `proxy_config`, `agents_list` |
+| **Integrations** | `composio` (1000+ OAuth apps), `pushover` (notifications) |
 
 The model-managed capability surface is built from the same core registry in
 every model-running entrypoint:
@@ -44,7 +45,11 @@ daemon messaging, and Gateway tools from the parent's sealed configuration.
 They do not reapply request-local intent tiering after that explicit selection.
 UI-owner controls such as attaching a TUI viewport remain in the UI process and
 are not agent execution capabilities.
-| **Integrations** | `composio` (1000+ OAuth apps), `pushover` (notifications) |
+
+When an explicit child allowlist names a dynamic alias that has not been
+discovered yet, PRX refreshes the dynamic registries before resolving the
+allowlist. Multiple aliases exported by the same MCP, WASM, or Skill router are
+represented by independent public-name proxies and remain executable.
 
 Every provider-visible tool uses an object JSON Schema. Multi-action tools
 publish discriminator-specific required fields through canonical conditional

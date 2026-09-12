@@ -14,6 +14,7 @@ Completed in version 0.8.110:
 - preflight rejection before runtime scope and approval injection;
 - task/process selection parity for multiple aliases exported by one dynamic
   router;
+- on-demand dynamic discovery before resolving explicit child allowlists;
 - reconstruction and startup verification of general process-worker tools,
   including orchestration, messaging, image, configuration, Gateway, Skill,
   MCP, WASM, Hook, memory, network, and scheduling surfaces.

@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls as valid.
 - Preserve multiple explicitly allowed MCP, WASM, or Skill aliases backed by a
   single dynamic router when selecting process-worker capabilities.
+- Refresh dynamic registries before resolving explicit child allowlists so a
+  configured alias is not rejected merely because discovery had not run yet.
 
 ## [0.8.109] - 12 September 2026
 
