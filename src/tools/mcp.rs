@@ -1016,25 +1016,33 @@ impl Tool for McpTool {
             }
         }
 
-        json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["call", "list", "status", "refresh"],
-                    "default": "call",
-                    "description": "call invokes a remote tool; list/status inspect discovery; refresh forces rediscovery"
+        crate::tools::schema::with_action_requirements(
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["call", "list", "status", "refresh"],
+                        "default": "call",
+                        "description": "call invokes a remote tool; list/status inspect discovery; refresh forces rediscovery"
+                    },
+                    "server": server_schema,
+                    "tool": tool_schema,
+                    "arguments": {
+                        "type": "object",
+                        "description": "Arguments object forwarded to MCP call_tool",
+                        "default": {}
+                    }
                 },
-                "server": server_schema,
-                "tool": tool_schema,
-                "arguments": {
-                    "type": "object",
-                    "description": "Arguments object forwarded to MCP call_tool",
-                    "default": {}
-                }
-            },
-            "additionalProperties": false
-        })
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+            "action",
+            &[crate::tools::schema::ActionRequirement {
+                action: "call",
+                required: &["server", "tool"],
+            }],
+        )
     }
 
     fn specs(&self) -> Vec<ToolSpec> {
@@ -1570,7 +1578,10 @@ mod tests {
         for action in ["call", "list", "status", "refresh"] {
             assert!(actions.iter().any(|value| value == action));
         }
-        assert!(schema.get("required").is_none());
+        assert_eq!(schema["required"], json!(["action"]));
+        let issues = crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "call"}));
+        assert!(issues.iter().any(|issue| issue.path == "$.server"));
+        assert!(issues.iter().any(|issue| issue.path == "$.tool"));
     }
 
     #[test]

@@ -1240,7 +1240,7 @@ mod tests {
         }
 
         fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
+            serde_json::json!({"type": "object", "properties": {}})
         }
 
         async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
@@ -1267,7 +1267,7 @@ mod tests {
         }
 
         fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
+            serde_json::json!({"type": "object", "properties": {}})
         }
 
         async fn execute(&self, args: serde_json::Value) -> Result<crate::tools::ToolResult> {

@@ -222,32 +222,49 @@ impl Tool for ManagedSessionTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["shell", "list", "logs", "kill"],
-                    "description": "shell starts a managed background shell; list shows sessions; logs reads recent output; kill terminates a shell session."
+        crate::tools::schema::with_action_requirements(
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["shell", "list", "logs", "kill"],
+                        "description": "shell starts a managed background shell; list shows sessions; logs reads recent output; kill terminates a shell session."
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to run for action=shell."
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Managed shell session id for logs or kill."
+                    },
+                    "max_lines": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 500,
+                        "description": "Maximum recent log lines to return for logs."
+                    }
                 },
-                "command": {
-                    "type": "string",
-                    "description": "Shell command to run for action=shell."
+                "required": ["action"]
+            }),
+            "action",
+            &[
+                crate::tools::schema::ActionRequirement {
+                    action: "shell",
+                    required: &["command"],
                 },
-                "session_id": {
-                    "type": "string",
-                    "description": "Managed shell session id for logs or kill."
+                crate::tools::schema::ActionRequirement {
+                    action: "logs",
+                    required: &["session_id"],
                 },
-                "max_lines": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 500,
-                    "description": "Maximum recent log lines to return for logs."
-                }
-            },
-            "required": ["action"]
-        })
+                crate::tools::schema::ActionRequirement {
+                    action: "kill",
+                    required: &["session_id"],
+                },
+            ],
+        )
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {

@@ -602,7 +602,7 @@ mod tests {
         }
 
         fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
+            serde_json::json!({"type": "object", "properties": {}})
         }
 
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -884,6 +884,47 @@ mod tests {
                 "Tool {} schema has no properties",
                 tool.name()
             );
+            crate::tools::schema::SchemaCleanr::validate(&schema)
+                .unwrap_or_else(|error| panic!("Tool {} has an invalid schema: {error}", tool.name()));
+        }
+    }
+
+    #[test]
+    fn full_registry_specs_have_valid_schemas() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let memory: Arc<dyn Memory> = Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let config = test_config(&tmp);
+        let tools = all_tools(
+            Arc::new(config.clone()),
+            &security,
+            memory,
+            None,
+            None,
+            &browser,
+            &http,
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &config,
+        );
+
+        for tool in &tools {
+            for spec in tool.specs() {
+                crate::tools::schema::SchemaCleanr::validate(&spec.parameters).unwrap_or_else(|error| {
+                    panic!(
+                        "Tool spec {} from {} has an invalid schema: {error}",
+                        spec.name,
+                        tool.name()
+                    )
+                });
+            }
         }
     }
 

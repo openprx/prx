@@ -309,21 +309,54 @@ impl Tool for SkillsManageTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["create", "install", "update", "enable", "disable", "validate", "sync", "remove"]
+        crate::tools::schema::with_action_requirements(
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["create", "install", "update", "enable", "disable", "validate", "sync", "remove"]
+                    },
+                    "name": {"type": "string", "description": "Workspace skill name"},
+                    "source": {"type": "string", "description": "Git URL or explicit local directory for install"},
+                    "description": {"type": "string", "description": "Short description for a created skill"},
+                    "instructions": {"type": "string", "description": "SKILL.md instructions for a created skill"}
                 },
-                "name": {"type": "string", "description": "Workspace skill name"},
-                "source": {"type": "string", "description": "Git URL or explicit local directory for install"},
-                "description": {"type": "string", "description": "Short description for a created skill"},
-                "instructions": {"type": "string", "description": "SKILL.md instructions for a created skill"}
-            },
-            "required": ["action"],
-            "additionalProperties": false
-        })
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+            "action",
+            &[
+                crate::tools::schema::ActionRequirement {
+                    action: "create",
+                    required: &["name", "description", "instructions"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "install",
+                    required: &["source"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "update",
+                    required: &["name"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "enable",
+                    required: &["name"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "disable",
+                    required: &["name"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "validate",
+                    required: &["name"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "remove",
+                    required: &["name"],
+                },
+            ],
+        )
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {

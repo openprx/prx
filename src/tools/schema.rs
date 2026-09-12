@@ -54,6 +54,330 @@
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 
+/// One discriminator-specific set of required tool arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionRequirement<'a> {
+    pub action: &'a str,
+    pub required: &'a [&'a str],
+}
+
+/// Attach PRX's canonical action-specific requirements to an object schema.
+///
+/// Keeping this construction in one helper makes the provider-facing schema and
+/// the runtime preflight consume the same declaration. The generated subset is
+/// ordinary JSON Schema and is intentionally identical to the form already used
+/// by the WASM plugin management tool.
+pub fn with_action_requirements(
+    mut schema: Value,
+    discriminator: &str,
+    requirements: &[ActionRequirement<'_>],
+) -> Value {
+    let Some(root) = schema.as_object_mut() else {
+        return schema;
+    };
+    if let Some(properties) = root.get_mut("properties").and_then(Value::as_object_mut) {
+        for name in requirements.iter().flat_map(|requirement| requirement.required) {
+            if let Some(property) = properties.get_mut(*name).and_then(Value::as_object_mut)
+                && property.get("type").and_then(Value::as_str) == Some("string")
+            {
+                property.entry("minLength".to_string()).or_insert_with(|| json!(1));
+            }
+        }
+    }
+    let conditions = requirements
+        .iter()
+        .filter(|requirement| !requirement.required.is_empty())
+        .map(|requirement| {
+            json!({
+                "if": {
+                    "properties": {
+                        discriminator: {"const": requirement.action}
+                    },
+                    "required": [discriminator]
+                },
+                "then": {"required": requirement.required}
+            })
+        })
+        .collect::<Vec<_>>();
+    if !conditions.is_empty() {
+        let existing = root
+            .entry("allOf".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(existing) = existing.as_array_mut() {
+            existing.extend(conditions);
+        }
+    }
+    schema
+}
+
+/// Require at least one complete field set for one discriminator value.
+///
+/// This represents executor contracts such as `expression` OR `schedule`, and
+/// preserves legacy aliases without weakening preflight validation.
+pub fn with_action_alternatives(
+    mut schema: Value,
+    discriminator: &str,
+    action: &str,
+    alternatives: &[&[&str]],
+) -> Value {
+    let Some(root) = schema.as_object_mut() else {
+        return schema;
+    };
+    if let Some(properties) = root.get_mut("properties").and_then(Value::as_object_mut) {
+        for name in alternatives.iter().flat_map(|required| required.iter()) {
+            if let Some(property) = properties.get_mut(*name).and_then(Value::as_object_mut)
+                && property.get("type").and_then(Value::as_str) == Some("string")
+            {
+                property.entry("minLength".to_string()).or_insert_with(|| json!(1));
+            }
+        }
+    }
+    let condition = json!({
+        "if": {
+            "properties": {discriminator: {"const": action}},
+            "required": [discriminator]
+        },
+        "then": {
+            "anyOf": alternatives
+                .iter()
+                .map(|required| json!({"required": required}))
+                .collect::<Vec<_>>()
+        }
+    });
+    let conditions = root
+        .entry("allOf".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Some(conditions) = conditions.as_array_mut() {
+        conditions.push(condition);
+    }
+    schema
+}
+
+/// One deterministic structural problem found before a tool executor runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArgumentValidationIssue {
+    pub path: String,
+    pub message: String,
+}
+
+/// Validate the canonical JSON Schema subset used by PRX tool contracts.
+///
+/// This is deliberately not a general JSON Schema engine. It covers the
+/// structures PRX emits: object/array/scalar types, required fields, enums,
+/// constants, oneOf, and action requirements expressed as allOf if/then pairs.
+#[must_use]
+pub fn validate_tool_arguments(schema: &Value, arguments: &Value) -> Vec<ArgumentValidationIssue> {
+    let mut issues = Vec::new();
+    validate_value(schema, arguments, "$", &mut issues);
+    issues
+}
+
+fn validate_value(schema: &Value, value: &Value, path: &str, issues: &mut Vec<ArgumentValidationIssue>) {
+    if let Some(any_of) = schema.get("anyOf").and_then(Value::as_array) {
+        let any_valid = any_of.iter().any(|candidate| {
+            let mut candidate_issues = Vec::new();
+            validate_value(candidate, value, path, &mut candidate_issues);
+            candidate_issues.is_empty()
+        });
+        if !any_valid {
+            issues.push(ArgumentValidationIssue {
+                path: path.to_string(),
+                message: "does not contain any accepted required-field set".to_string(),
+            });
+        }
+    }
+    if let Some(one_of) = schema.get("oneOf").and_then(Value::as_array) {
+        let matching = one_of
+            .iter()
+            .filter(|candidate| {
+                let mut candidate_issues = Vec::new();
+                validate_value(candidate, value, path, &mut candidate_issues);
+                candidate_issues.is_empty()
+            })
+            .count();
+        if matching != 1 {
+            issues.push(ArgumentValidationIssue {
+                path: path.to_string(),
+                message: "must match exactly one accepted schema".to_string(),
+            });
+        }
+    }
+
+    if let Some(expected) = schema.get("type") {
+        let matches_type = |expected: &str| match expected {
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "string" => value.is_string(),
+            "integer" => value.is_i64() || value.is_u64(),
+            "number" => value.is_number(),
+            "boolean" => value.is_boolean(),
+            "null" => value.is_null(),
+            _ => true,
+        };
+        let type_matches = expected.as_str().is_some_and(matches_type)
+            || expected
+                .as_array()
+                .is_some_and(|types| types.iter().filter_map(Value::as_str).any(matches_type));
+        if !type_matches {
+            issues.push(ArgumentValidationIssue {
+                path: path.to_string(),
+                message: format!("must be of type {expected}"),
+            });
+            return;
+        }
+    }
+
+    if let Some(expected) = schema.get("const")
+        && value != expected
+    {
+        issues.push(ArgumentValidationIssue {
+            path: path.to_string(),
+            message: format!("must equal {expected}"),
+        });
+    }
+
+    if let Some(text) = value.as_str() {
+        let length = text.chars().count() as u64;
+        if let Some(minimum) = schema.get("minLength").and_then(Value::as_u64)
+            && length < minimum
+        {
+            issues.push(ArgumentValidationIssue {
+                path: path.to_string(),
+                message: format!("must contain at least {minimum} character(s)"),
+            });
+        }
+        if let Some(maximum) = schema.get("maxLength").and_then(Value::as_u64)
+            && length > maximum
+        {
+            issues.push(ArgumentValidationIssue {
+                path: path.to_string(),
+                message: format!("must contain at most {maximum} character(s)"),
+            });
+        }
+    }
+
+    if let Some(number) = value.as_f64() {
+        if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64)
+            && number < minimum
+        {
+            issues.push(ArgumentValidationIssue {
+                path: path.to_string(),
+                message: format!("must be at least {minimum}"),
+            });
+        }
+        if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64)
+            && number > maximum
+        {
+            issues.push(ArgumentValidationIssue {
+                path: path.to_string(),
+                message: format!("must be at most {maximum}"),
+            });
+        }
+    }
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array)
+        && !allowed.contains(value)
+    {
+        issues.push(ArgumentValidationIssue {
+            path: path.to_string(),
+            message: format!("must be one of {}", Value::Array(allowed.clone())),
+        });
+    }
+
+    if let Some(object) = value.as_object() {
+        validate_required(schema, object, path, issues);
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            for (name, property_schema) in properties {
+                if let Some(property_value) = object.get(name) {
+                    validate_value(property_schema, property_value, &format!("{path}.{name}"), issues);
+                }
+            }
+            if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false) {
+                for name in object.keys().filter(|name| !properties.contains_key(*name)) {
+                    issues.push(ArgumentValidationIssue {
+                        path: format!("{path}.{name}"),
+                        message: "is not an accepted property".to_string(),
+                    });
+                }
+            }
+        }
+        if let Some(conditions) = schema.get("allOf").and_then(Value::as_array) {
+            for condition in conditions {
+                let Some(if_schema) = condition.get("if") else {
+                    validate_value(condition, value, path, issues);
+                    continue;
+                };
+                let mut condition_issues = Vec::new();
+                validate_value(if_schema, value, path, &mut condition_issues);
+                if condition_issues.is_empty() {
+                    if let Some(then_schema) = condition.get("then") {
+                        validate_value(then_schema, value, path, issues);
+                    }
+                } else if let Some(else_schema) = condition.get("else") {
+                    validate_value(else_schema, value, path, issues);
+                }
+            }
+        }
+    }
+
+    if let Some(items) = value.as_array()
+        && let Some(item_schema) = schema.get("items")
+    {
+        for (index, item) in items.iter().enumerate() {
+            validate_value(item_schema, item, &format!("{path}[{index}]"), issues);
+        }
+    }
+    if let Some(items) = value.as_array() {
+        let length = items.len() as u64;
+        if let Some(minimum) = schema.get("minItems").and_then(Value::as_u64)
+            && length < minimum
+        {
+            issues.push(ArgumentValidationIssue {
+                path: path.to_string(),
+                message: format!("must contain at least {minimum} item(s)"),
+            });
+        }
+        if let Some(maximum) = schema.get("maxItems").and_then(Value::as_u64)
+            && length > maximum
+        {
+            issues.push(ArgumentValidationIssue {
+                path: path.to_string(),
+                message: format!("must contain at most {maximum} item(s)"),
+            });
+        }
+    }
+}
+
+fn validate_required(
+    schema: &Value,
+    object: &Map<String, Value>,
+    path: &str,
+    issues: &mut Vec<ArgumentValidationIssue>,
+) {
+    let Some(required) = schema.get("required").and_then(Value::as_array) else {
+        return;
+    };
+    for name in required.iter().filter_map(Value::as_str) {
+        if !object.contains_key(name) {
+            issues.push(ArgumentValidationIssue {
+                path: format!("{path}.{name}"),
+                message: "is required".to_string(),
+            });
+        }
+    }
+}
+
+#[must_use]
+pub fn format_argument_validation_error(tool_name: &str, issues: &[ArgumentValidationIssue]) -> String {
+    let mut lines = vec![format!("Error: invalid arguments for tool '{tool_name}'.")];
+    lines.extend(
+        issues
+            .iter()
+            .map(|issue| format!("  - {} {}", issue.path, issue.message)),
+    );
+    lines.push("Read the tool schema and retry with corrected arguments.".to_string());
+    lines.join("\n")
+}
+
 /// Keywords that Gemini rejects for tool schemas.
 pub const GEMINI_UNSUPPORTED_KEYWORDS: &[&str] = &[
     // Schema composition
@@ -149,23 +473,7 @@ impl SchemaCleanr {
     ///
     /// Returns an error if the schema is invalid or missing required fields.
     pub fn validate(schema: &Value) -> anyhow::Result<()> {
-        let obj = schema
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("Schema must be an object"))?;
-
-        // Must have 'type' field
-        if !obj.contains_key("type") {
-            anyhow::bail!("Schema missing required 'type' field");
-        }
-
-        // If type is 'object', should have 'properties'
-        if let Some(Value::String(t)) = obj.get("type") {
-            if t == "object" && !obj.contains_key("properties") {
-                tracing::warn!("Object schema without 'properties' field may cause issues");
-            }
-        }
-
-        Ok(())
+        validate_schema_node(schema, "$", true)
     }
 
     // --------------------------------------------------------------------
@@ -534,6 +842,83 @@ impl SchemaCleanr {
     }
 }
 
+fn validate_schema_node(schema: &Value, path: &str, require_type: bool) -> anyhow::Result<()> {
+    let object = schema
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Schema node {path} must be an object"))?;
+    if require_type && !object.contains_key("type") {
+        anyhow::bail!("Schema node {path} is missing required 'type'");
+    }
+    if let Some(schema_type_value) = object.get("type") {
+        const TYPES: &[&str] = &["object", "array", "string", "integer", "number", "boolean", "null"];
+        let schema_types = if let Some(single) = schema_type_value.as_str() {
+            vec![single]
+        } else if let Some(multiple) = schema_type_value.as_array() {
+            if multiple.is_empty() || multiple.iter().any(|entry| !entry.is_string()) {
+                anyhow::bail!("Schema node {path}.type must be a string or a non-empty string array");
+            }
+            multiple.iter().filter_map(Value::as_str).collect::<Vec<_>>()
+        } else {
+            anyhow::bail!("Schema node {path}.type must be a string or a non-empty string array");
+        };
+        if let Some(unsupported) = schema_types.iter().find(|schema_type| !TYPES.contains(schema_type)) {
+            anyhow::bail!("Schema node {path} has unsupported type '{unsupported}'");
+        }
+        if schema_types.contains(&"object") && require_type && !object.get("properties").is_some_and(Value::is_object) {
+            anyhow::bail!("Object schema node {path} must define object 'properties'");
+        }
+        if schema_types.contains(&"array") && !object.contains_key("items") {
+            anyhow::bail!("Array schema node {path} must define 'items'");
+        }
+    }
+    if let Some(required) = object.get("required") {
+        let entries = required
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Schema node {path}.required must be an array"))?;
+        if entries.iter().any(|entry| !entry.is_string()) {
+            anyhow::bail!("Schema node {path}.required must contain only strings");
+        }
+        if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+            for name in entries.iter().filter_map(Value::as_str) {
+                if !properties.contains_key(name) {
+                    anyhow::bail!("Schema node {path} requires undefined property '{name}'");
+                }
+            }
+        }
+    }
+    if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+        for (name, property) in properties {
+            validate_schema_node(property, &format!("{path}.properties.{name}"), false)?;
+        }
+    }
+    if let Some(items) = object.get("items") {
+        validate_schema_node(items, &format!("{path}.items"), false)?;
+    }
+    for keyword in ["allOf", "anyOf", "oneOf"] {
+        if let Some(branches) = object.get(keyword) {
+            let branches = branches
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("Schema node {path}.{keyword} must be an array"))?;
+            if branches.is_empty() {
+                anyhow::bail!("Schema node {path}.{keyword} must not be empty");
+            }
+            for (index, branch) in branches.iter().enumerate() {
+                validate_schema_node(branch, &format!("{path}.{keyword}[{index}]"), false)?;
+                if let Some(if_schema) = branch.get("if") {
+                    validate_schema_node(if_schema, &format!("{path}.{keyword}[{index}].if"), false)?;
+                }
+                if let Some(then_schema) = branch.get("then") {
+                    validate_schema_node(then_schema, &format!("{path}.{keyword}[{index}].then"), false)?;
+                }
+                if let Some(else_schema) = branch.get("else") {
+                    validate_schema_node(else_schema, &format!("{path}.{keyword}[{index}].else"), false)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
@@ -834,5 +1219,134 @@ mod tests {
 
         assert_eq!(cleaned["not"]["type"], "integer");
         assert!(cleaned["not"].get("minimum").is_none());
+    }
+
+    #[test]
+    fn action_requirements_drive_runtime_validation() {
+        let schema = with_action_requirements(
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "create"]},
+                    "name": {"type": "string"}
+                },
+                "required": ["action"]
+            }),
+            "action",
+            &[ActionRequirement {
+                action: "create",
+                required: &["name"],
+            }],
+        );
+
+        assert!(validate_tool_arguments(&schema, &json!({"action": "list"})).is_empty());
+        let missing = validate_tool_arguments(&schema, &json!({"action": "create"}));
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].path, "$.name");
+        assert!(validate_tool_arguments(&schema, &json!({"action": "create", "name": "x"})).is_empty());
+        let empty = validate_tool_arguments(&schema, &json!({"action": "create", "name": ""}));
+        assert_eq!(empty[0].path, "$.name");
+    }
+
+    #[test]
+    fn action_alternatives_preserve_legacy_aliases() {
+        let schema = with_action_alternatives(
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string"},
+                    "tool_slug": {"type": "string"},
+                    "action_name": {"type": "string"}
+                },
+                "required": ["action"]
+            }),
+            "action",
+            "execute",
+            &[&["tool_slug"], &["action_name"]],
+        );
+
+        assert!(validate_tool_arguments(&schema, &json!({"action": "execute", "tool_slug": "x"})).is_empty());
+        assert!(validate_tool_arguments(&schema, &json!({"action": "execute", "action_name": "x"})).is_empty());
+        assert!(!validate_tool_arguments(&schema, &json!({"action": "execute"})).is_empty());
+    }
+
+    #[test]
+    fn nested_required_and_types_are_validated() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                        "required": ["name"]
+                    }
+                }
+            },
+            "required": ["steps"]
+        });
+        let issues = validate_tool_arguments(&schema, &json!({"steps": [{}]}));
+        assert_eq!(issues[0].path, "$.steps[0].name");
+        assert!(!validate_tool_arguments(&schema, &json!({"steps": "wrong"})).is_empty());
+    }
+
+    #[test]
+    fn union_constraints_do_not_skip_sibling_constraints() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["message"]},
+                "message": {"type": "string", "minLength": 1},
+                "text": {"type": "string", "minLength": 1}
+            },
+            "required": ["kind"],
+            "anyOf": [
+                {"required": ["message"]},
+                {"required": ["text"]}
+            ]
+        });
+
+        assert!(
+            validate_tool_arguments(&schema, &json!({"message": "ok"}))
+                .iter()
+                .any(|issue| issue.path == "$.kind")
+        );
+        assert!(
+            validate_tool_arguments(&schema, &json!({"kind": "wrong", "message": "ok"}))
+                .iter()
+                .any(|issue| issue.path == "$.kind")
+        );
+        assert!(
+            validate_tool_arguments(&schema, &json!({"kind": "message", "message": ""}))
+                .iter()
+                .any(|issue| issue.path == "$.message")
+        );
+    }
+
+    #[test]
+    fn additional_properties_and_union_types_are_validated() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "value": {"type": ["string", "null"]}
+            },
+            "required": ["value"]
+        });
+
+        assert!(SchemaCleanr::validate(&schema).is_ok());
+        assert!(validate_tool_arguments(&schema, &json!({"value": "ok"})).is_empty());
+        assert!(validate_tool_arguments(&schema, &json!({"value": null})).is_empty());
+        assert!(
+            validate_tool_arguments(&schema, &json!({"value": 7}))
+                .iter()
+                .any(|issue| issue.path == "$.value")
+        );
+        assert!(
+            validate_tool_arguments(&schema, &json!({"value": "ok", "unexpected": true}))
+                .iter()
+                .any(|issue| issue.path == "$.unexpected")
+        );
     }
 }

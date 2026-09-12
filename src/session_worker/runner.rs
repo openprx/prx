@@ -2,6 +2,7 @@ use crate::agent::loop_::{
     DocumentIngestRuntime, ScopeContext, build_context_with_shared_events_and_scope, run_tool_call_loop_traced,
 };
 use crate::channels::build_identity_prompt;
+use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use crate::config::Config;
 use crate::hooks::HookManager;
 use crate::memory::{Memory, MemoryCategory, MemoryFabric, MessageEvent, MessageEventScope};
@@ -28,6 +29,39 @@ const DEFAULT_SUB_AGENT_SYSTEM_PROMPT: &str = "\
 You are a sub-agent handling a specific delegated task. \
 Complete the task thoroughly and report results concisely. \
 Focus only on the assigned task; do not ask clarifying questions.";
+
+const WORKER_ORCHESTRATION_TOOL_NAMES: &[&str] = &[
+    "sessions_list",
+    "sessions_send",
+    "subagents",
+    "sessions_history",
+    "session_status",
+    "sessions_spawn",
+    "message_send",
+    "image",
+    "config_reload",
+    "gateway",
+];
+
+/// Process workers do not own an inbound channel connection. Session result
+/// announcements remain observable through the parent run registry, so nested
+/// workers use a silent channel instead of writing into the stdout IPC stream.
+struct WorkerChannel;
+
+#[async_trait::async_trait]
+impl Channel for WorkerChannel {
+    fn name(&self) -> &str {
+        "session-worker"
+    }
+
+    async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        anyhow::bail!("session-worker channel does not accept inbound messages")
+    }
+}
 
 /// Resolve credentials for the worker's LLM provider without leaking the
 /// gateway's default credentials or base URL into an explicitly overridden
@@ -173,44 +207,47 @@ async fn next_steer(steer_rx: &mut Option<tokio::sync::mpsc::Receiver<String>>) 
     }
 }
 
-fn select_tools_for_worker(source: Vec<Box<dyn Tool>>, allowed_tools: &[String]) -> Result<Vec<Box<dyn Tool>>> {
+fn select_tools_for_worker(source: Vec<Box<dyn Tool>>, allowed_tools: &[String]) -> Result<Arc<Vec<Box<dyn Tool>>>> {
     let normalized = allowed_tools
         .iter()
         .map(|name| name.trim())
         .filter(|name| !name.is_empty())
         .collect::<Vec<_>>();
-    if normalized.is_empty() || normalized.as_slice() == ["*"] {
-        return Ok(source);
-    }
     if normalized.contains(&"*") {
-        anyhow::bail!("Worker allowed_tools must use '*' exclusively");
-    }
-
-    let mut selected = Vec::new();
-    let mut remaining = source;
-
-    for allowed in normalized {
-        if let Some(index) = remaining
-            .iter()
-            .position(|tool| tool.name() == allowed || tool.supports_name(allowed))
-        {
-            selected.push(remaining.remove(index));
-        } else {
-            anyhow::bail!("Allowed tool '{allowed}' is not registered in worker process");
+        if normalized.as_slice() != ["*"] {
+            anyhow::bail!("Worker allowed_tools must use '*' exclusively");
+        }
+    } else {
+        for allowed in &normalized {
+            if !source.iter().any(|tool| tool.supports_name(allowed)) {
+                anyhow::bail!("Allowed tool '{allowed}' is not registered in worker process");
+            }
         }
     }
 
-    if !selected
-        .iter()
-        .any(|tool| tool.supports_name(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME))
-        && let Some(index) = remaining
-            .iter()
-            .position(|tool| tool.supports_name(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME))
-    {
-        selected.push(remaining.remove(index));
-    }
+    let source = Arc::new(source);
+    Ok(crate::tools::sessions_spawn::resolve_tools_for_agent(
+        source,
+        "session-worker",
+        crate::tools::sessions_spawn::MemoryScope::Shared,
+        (!normalized.is_empty()).then_some(allowed_tools),
+    ))
+}
 
-    Ok(selected)
+fn verify_worker_orchestration_tool_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    let registered = names.into_iter().collect::<std::collections::HashSet<_>>();
+    let missing = WORKER_ORCHESTRATION_TOOL_NAMES
+        .iter()
+        .copied()
+        .filter(|name| !registered.contains(name))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "Session worker is missing required orchestration tools: {}",
+            missing.join(", ")
+        );
+    }
+    Ok(())
 }
 
 fn resolve_system_prompt(manifest: &WorkerManifest) -> String {
@@ -778,9 +815,9 @@ async fn run_validated_manifest(
     if let Some(plugin_runtime) = &wasm_plugin_runtime {
         extensions.extend(plugin_runtime.control_tool_arcs(Arc::clone(&security)));
     }
-    let full_tools = tools::all_tools_with_runtime_ext_and_extensions(
+    let mut full_tools = tools::all_tools_with_runtime_ext_and_extensions(
         Arc::new(config.clone()),
-        shared_config,
+        shared_config.clone(),
         &security,
         runtime,
         memory.clone(),
@@ -796,7 +833,97 @@ async fn run_validated_manifest(
     )
     .tools;
 
+    // Recreate the same orchestration surfaces that owning entrypoints append
+    // after the base factory. Without this block process workers silently lose
+    // sessions_spawn and its shared-registry siblings even with wildcard tool
+    // inheritance.
+    let active_runs: Arc<tokio::sync::RwLock<Vec<crate::tools::sessions_spawn::SubAgentRun>>> =
+        Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let workspace_id = manifest.workspace_dir.to_string_lossy().to_string();
+    let spawn_tool = crate::tools::SessionsSpawnTool::new_with_registry(
+        Arc::new(WorkerChannel),
+        Arc::clone(&provider),
+        manifest.provider_name.clone(),
+        manifest.model.clone(),
+        manifest.temperature,
+        Arc::clone(&security),
+        manifest.workspace_dir.clone(),
+        config.multimodal.clone(),
+        config.agent.compaction.clone(),
+        config.agents.clone(),
+        manifest.api_key.clone().or_else(|| config.api_key.clone()),
+        provider_runtime_options.clone(),
+        config.sessions_spawn.clone(),
+        Arc::clone(&active_runs),
+    )
+    .with_compaction_resolver(crate::router::CompactionResolver::new(
+        config.agent.compaction.clone(),
+        config.router.clone(),
+        config.model_routes.clone(),
+    ))
+    .with_cost_config(config.cost.clone())
+    .with_reliability(config.reliability.clone())
+    .with_shared_memory(Arc::clone(&memory))
+    .with_event_recording(config.memory.event_recording_config());
+    let spawn_tools_handle = spawn_tool.tools_handle();
+    full_tools.push(Box::new(
+        crate::tools::SessionsListTool::new(Arc::clone(&active_runs))
+            .with_shared_memory(Arc::clone(&memory), workspace_id.clone()),
+    ));
+    full_tools.push(Box::new(
+        crate::tools::SessionsSendTool::with_security(Arc::clone(&active_runs), Arc::clone(&security))
+            .with_shared_memory(Arc::clone(&memory))
+            .with_event_recording(config.memory.event_recording_config()),
+    ));
+    full_tools.push(Box::new(
+        crate::tools::SubagentsTool::with_security(Arc::clone(&active_runs), Arc::clone(&security))
+            .with_shared_memory(Arc::clone(&memory))
+            .with_event_recording(config.memory.event_recording_config()),
+    ));
+    full_tools.push(Box::new(
+        crate::tools::SessionsHistoryTool::new(Arc::clone(&active_runs))
+            .with_shared_memory(Arc::clone(&memory), workspace_id.clone()),
+    ));
+    full_tools.push(Box::new(
+        crate::tools::SessionStatusTool::new(
+            Arc::clone(&active_runs),
+            &manifest.provider_name,
+            &manifest.model,
+            vec!["session-worker".to_string()],
+        )
+        .with_shared_memory(Arc::clone(&memory), workspace_id),
+    ));
+    full_tools.push(Box::new(spawn_tool));
+    full_tools.push(Box::new(crate::tools::DaemonMessageSendTool::from_config(
+        &config,
+        Arc::clone(&security),
+    )));
+    full_tools.push(Box::new(crate::tools::ImageTool::new(
+        Arc::clone(&provider),
+        &manifest.model,
+        manifest.temperature,
+        Arc::clone(&security),
+        config.multimodal.clone(),
+    )));
+    full_tools.push(Box::new(crate::tools::ConfigReloadTool::with_security(
+        shared_config.clone(),
+        Arc::clone(&security),
+    )));
+    full_tools.push(Box::new(
+        crate::tools::GatewayTool::new(
+            shared_config,
+            &manifest.provider_name,
+            &manifest.model,
+            vec!["session-worker".to_string()],
+        )
+        .with_tools_count(full_tools.len() + 1)
+        .with_security(Arc::clone(&security)),
+    ));
+
+    verify_worker_orchestration_tool_names(full_tools.iter().map(|tool| tool.name()))?;
+
     let tools_registry = select_tools_for_worker(full_tools, &manifest.allowed_tools)?;
+    let _ = spawn_tools_handle.set(Arc::clone(&tools_registry));
     let native_tools = provider
         .capabilities_for(
             &manifest.model,
@@ -873,12 +1000,10 @@ async fn run_validated_manifest(
         let workspace_dir_ref: &Path = &manifest.workspace_dir;
         let compaction_config_ref = manifest.compaction_config.as_ref();
         let multimodal_ref = &config.multimodal;
-        let tool_tiering_ref = &config.tool_tiering;
         let low_priority_tools_ref: &[String] = &config.agent.low_priority_tools;
         let temperature = manifest.temperature;
         let read_only_window = config.agent.read_only_tool_concurrency_window;
         let priority_scheduling_enabled = config.agent.priority_scheduling_enabled;
-        let tools_registry = Arc::new(tools_registry);
         let tools_registry_ref = &tools_registry;
         let memory_fabric_ref = &memory_fabric;
         let (history, loop_result) =
@@ -910,7 +1035,11 @@ async fn run_validated_manifest(
                         None,
                         scope_ctx_ref,
                         None,
-                        Some(tool_tiering_ref),
+                        // The parent already selected and sealed this worker's
+                        // capability set. Reapplying language-dependent intent
+                        // tiering here would silently hide inherited tools and
+                        // make process mode weaker than task mode.
+                        None,
                         // The ledger comes from `memory` directly: a session worker without a
                         // resolved ingest scope must still be able to run side-effecting tools.
                         crate::agent::loop_::ToolLoopMemory::new(
@@ -1499,11 +1628,100 @@ mod tests {
     }
 
     #[test]
-    fn worker_wildcard_inherits_complete_tool_registry() {
+    fn worker_wildcard_preserves_its_source_registry() {
         let source = crate::tools::default_tools(Arc::new(crate::security::SecurityPolicy::default()));
         let expected = source.len();
         let selected = select_tools_for_worker(source, &["*".to_string()]).expect("wildcard selection");
         assert_eq!(selected.len(), expected);
+    }
+
+    struct WorkerDynamicAliases;
+
+    #[async_trait::async_trait]
+    impl Tool for WorkerDynamicAliases {
+        fn name(&self) -> &str {
+            "dynamic_router"
+        }
+
+        fn description(&self) -> &str {
+            "Dynamic worker alias fixture"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        fn specs(&self) -> Vec<crate::tools::ToolSpec> {
+            ["dynamic__one", "dynamic__two"]
+                .into_iter()
+                .map(|name| crate::tools::ToolSpec {
+                    name: name.to_string(),
+                    description: name.to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"]
+                    }),
+                })
+                .collect()
+        }
+
+        fn supports_name(&self, name: &str) -> bool {
+            matches!(name, "dynamic_router" | "dynamic__one" | "dynamic__two")
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("root execution is outside this fixture's contract".to_string()),
+            })
+        }
+
+        async fn execute_named(
+            &self,
+            name: &str,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: name.to_string(),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_allowlist_can_select_multiple_aliases_from_one_dynamic_router() {
+        let selected = select_tools_for_worker(
+            vec![Box::new(WorkerDynamicAliases)],
+            &["dynamic__one".to_string(), "dynamic__two".to_string()],
+        )
+        .expect("dynamic aliases must resolve independently");
+
+        assert_eq!(selected.len(), 2);
+        for name in ["dynamic__one", "dynamic__two"] {
+            let tool = selected
+                .iter()
+                .find(|tool| tool.name() == name)
+                .expect("selected alias proxy");
+            let result = tool
+                .execute_named(name, serde_json::json!({"value": "ok"}))
+                .await
+                .expect("alias execution");
+            assert_eq!(result.output, name);
+        }
+    }
+
+    #[test]
+    fn worker_orchestration_contract_detects_missing_entrypoint_tools() {
+        verify_worker_orchestration_tool_names(WORKER_ORCHESTRATION_TOOL_NAMES.iter().copied())
+            .expect("complete orchestration contract");
+
+        let error = verify_worker_orchestration_tool_names(["sessions_spawn", "gateway"])
+            .expect_err("incomplete orchestration contract must fail");
+        assert!(error.to_string().contains("sessions_list"));
+        assert!(error.to_string().contains("message_send"));
     }
 
     #[test]

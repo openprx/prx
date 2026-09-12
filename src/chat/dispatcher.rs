@@ -5165,7 +5165,7 @@ mod real_mode_tests {
         }
 
         fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type":"object"})
+            serde_json::json!({"type": "object", "properties": {}})
         }
 
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
@@ -7869,7 +7869,7 @@ mod real_mode_tests {
                 "shell"
             }
             fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({"type": "object"})
+                serde_json::json!({"type": "object", "properties": {}})
             }
             async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
                 self.exec_count.fetch_add(1, AtomicOrdering::SeqCst);
@@ -8352,7 +8352,7 @@ mod real_mode_tests {
                 "ping"
             }
             fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({})
+                serde_json::json!({"type": "object", "properties": {}})
             }
             async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
                 Ok(crate::tools::ToolResult {
@@ -8510,7 +8510,7 @@ mod real_mode_tests {
                 "ping"
             }
             fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({})
+                serde_json::json!({"type": "object", "properties": {}})
             }
             async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
                 Ok(crate::tools::ToolResult {
@@ -10608,7 +10608,7 @@ mod real_mode_tests {
                 "shell"
             }
             fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({})
+                serde_json::json!({"type": "object", "properties": {}})
             }
             async fn execute(&self, args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
                 *self.arguments.lock() = Some(args);
@@ -10804,7 +10804,7 @@ mod real_mode_tests {
                 "danger"
             }
             fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({})
+                serde_json::json!({"type": "object", "properties": {}})
             }
             async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
                 self.executed.store(true, AtomicOrdering::SeqCst);
@@ -11010,7 +11010,7 @@ mod real_mode_tests {
                 "danger"
             }
             fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({})
+                serde_json::json!({"type": "object", "properties": {}})
             }
             async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
                 self.executed.store(true, AtomicOrdering::SeqCst);
@@ -11120,7 +11120,7 @@ mod real_mode_tests {
                 "danger"
             }
             fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({})
+                serde_json::json!({"type": "object", "properties": {}})
             }
             async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
                 self.executed.store(true, AtomicOrdering::SeqCst);
@@ -12096,7 +12096,7 @@ mod s4_a_3 {
                 "write"
             }
             fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({})
+                serde_json::json!({"type": "object", "properties": {}})
             }
             async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
                 self.executed.store(true, AtomicOrdering::SeqCst);
@@ -12180,7 +12180,7 @@ mod s4_a_3 {
                 "large output"
             }
             fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({})
+                serde_json::json!({"type": "object", "properties": {}})
             }
             async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
                 Ok(crate::tools::ToolResult {
@@ -12269,7 +12269,7 @@ mod s4_a_3 {
                 "write"
             }
             fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({})
+                serde_json::json!({"type": "object", "properties": {}})
             }
             async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
                 Ok(crate::tools::ToolResult {
@@ -12343,7 +12343,7 @@ mod s4_a_3 {
                 "read"
             }
             fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({})
+                serde_json::json!({"type": "object", "properties": {}})
             }
             async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
                 Ok(crate::tools::ToolResult {

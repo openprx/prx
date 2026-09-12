@@ -385,95 +385,180 @@ impl Tool for XinTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": [
-                        "list", "get", "events", "runs", "add", "update", "remove", "pause", "resume", "cancel", "run", "status",
-                        "goal_list", "goal_get", "goal_add", "goal_pause", "goal_resume", "goal_cancel", "goal_remove",
-                        "step_list", "step_get", "step_add", "step_retry"
-                    ],
-                    "description": "Action to perform."
-                },
-                "task_id": {
-                    "type": "string",
-                    "description": "Task ID, or Goal ID for the generic events action."
-                },
-                "goal_id": {
-                    "type": "string",
-                    "description": "Goal ID for goal and step-list actions."
-                },
-                "step_id": {
-                    "type": "string",
-                    "description": "Step ID for step_get/step_retry actions."
-                },
-                "name": {
-                    "type": "string",
-                    "description": "Task name (for add action)."
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Task description (for add action)."
-                },
-                "payload": {
-                    "type": "string",
-                    "description": "Task payload: prompt for agent_session, command for shell (for add action)."
-                },
-                "execution_mode": {
-                    "type": "string",
-                    "enum": ["agent_session", "shell"],
-                    "description": "How the task runs: agent_session (LLM) or shell (command). Default: agent_session."
-                },
-                "priority": {
-                    "type": "string",
-                    "enum": ["low", "normal", "high", "critical"],
-                    "description": "Task priority. Default: normal."
-                },
-                "recurring": {
-                    "type": "boolean",
-                    "description": "Whether the task repeats. Default: false."
-                },
-                "interval_secs": {
-                    "type": "integer",
-                    "description": "Repeat interval in seconds (only for recurring tasks)."
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum run-history entries to return (1-50, default 20)."
-                },
-                "sequence": {
-                    "type": "integer",
-                    "description": "One-based step sequence for step_add."
-                },
-                "lease_ttl_secs": {
-                    "type": "integer",
-                    "description": "Optional per-step lease TTL; zero uses the execution-mode default."
-                },
-                "target_completion_at": {
-                    "type": "string",
-                    "description": "Optional RFC3339 target time for goal_add."
-                },
-                "steps": {
-                    "type": "array",
-                    "description": "Optional initial ordered steps for goal_add.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "sequence": {"type": "integer"},
-                            "name": {"type": "string"},
-                            "description": {"type": "string"},
-                            "payload": {"type": "string"},
-                            "execution_mode": {"type": "string", "enum": ["agent_session", "shell"]},
-                            "lease_ttl_secs": {"type": "integer"}
-                        },
-                        "required": ["name", "payload"]
+        crate::tools::schema::with_action_requirements(
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "list", "get", "events", "runs", "add", "update", "remove", "pause", "resume", "cancel", "run", "status",
+                            "goal_list", "goal_get", "goal_add", "goal_pause", "goal_resume", "goal_cancel", "goal_remove",
+                            "step_list", "step_get", "step_add", "step_retry"
+                        ],
+                        "description": "Action to perform."
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task ID, or Goal ID for the generic events action."
+                    },
+                    "goal_id": {
+                        "type": "string",
+                        "description": "Goal ID for goal and step-list actions."
+                    },
+                    "step_id": {
+                        "type": "string",
+                        "description": "Step ID for step_get/step_retry actions."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Task name (for add action)."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Task description (for add action)."
+                    },
+                    "payload": {
+                        "type": "string",
+                        "description": "Task payload: prompt for agent_session, command for shell (for add action)."
+                    },
+                    "execution_mode": {
+                        "type": "string",
+                        "enum": ["agent_session", "shell"],
+                        "description": "How the task runs: agent_session (LLM) or shell (command). Default: agent_session."
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["low", "normal", "high", "critical"],
+                        "description": "Task priority. Default: normal."
+                    },
+                    "recurring": {
+                        "type": "boolean",
+                        "description": "Whether the task repeats. Default: false."
+                    },
+                    "interval_secs": {
+                        "type": "integer",
+                        "description": "Repeat interval in seconds (only for recurring tasks)."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum run-history entries to return (1-50, default 20)."
+                    },
+                    "sequence": {
+                        "type": "integer",
+                        "description": "One-based step sequence for step_add."
+                    },
+                    "lease_ttl_secs": {
+                        "type": "integer",
+                        "description": "Optional per-step lease TTL; zero uses the execution-mode default."
+                    },
+                    "target_completion_at": {
+                        "type": "string",
+                        "description": "Optional RFC3339 target time for goal_add."
+                    },
+                    "steps": {
+                        "type": "array",
+                        "description": "Optional initial ordered steps for goal_add.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "sequence": {"type": "integer"},
+                                "name": {"type": "string"},
+                                "description": {"type": "string"},
+                                "payload": {"type": "string"},
+                                "execution_mode": {"type": "string", "enum": ["agent_session", "shell"]},
+                                "lease_ttl_secs": {"type": "integer"}
+                            },
+                            "required": ["name", "payload"]
+                        }
                     }
-                }
-            },
-            "required": ["action"]
-        })
+                },
+                "required": ["action"]
+            }),
+            "action",
+            &[
+                crate::tools::schema::ActionRequirement {
+                    action: "get",
+                    required: &["task_id"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "events",
+                    required: &["task_id"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "runs",
+                    required: &["task_id"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "add",
+                    required: &["name", "payload"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "update",
+                    required: &["task_id"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "remove",
+                    required: &["task_id"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "pause",
+                    required: &["task_id"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "resume",
+                    required: &["task_id"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "cancel",
+                    required: &["task_id"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "run",
+                    required: &["task_id"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "goal_get",
+                    required: &["goal_id"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "goal_add",
+                    required: &["name"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "goal_pause",
+                    required: &["goal_id"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "goal_resume",
+                    required: &["goal_id"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "goal_cancel",
+                    required: &["goal_id"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "goal_remove",
+                    required: &["goal_id"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "step_list",
+                    required: &["goal_id"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "step_get",
+                    required: &["step_id"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "step_add",
+                    required: &["goal_id", "name", "payload"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "step_retry",
+                    required: &["step_id"],
+                },
+            ],
+        )
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {

@@ -208,7 +208,7 @@ impl Tool for CountingTool {
         "Counts invocations"
     }
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({"type": "object"})
+        json!({"type": "object", "properties": {}})
     }
     async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
         let mut c = self.count.lock().expect("test: lock counting tool");

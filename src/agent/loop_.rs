@@ -4157,9 +4157,6 @@ async fn execute_one_tool(
         ));
     };
 
-    let runtime_approval_grant = runtime_approval_granted
-        .then(|| runtime_approval_grant_for_call(call_name, &call_arguments, scope_ctx))
-        .flatten();
     let root = call_arguments
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("tool arguments must be a JSON object"))?;
@@ -4168,6 +4165,25 @@ async fn execute_one_tool(
     // re-injects the authoritative values below. `strip_runtime_only_args` is
     // the single source of truth for which keys those are.
     crate::tools::execution::strip_runtime_only_args(root);
+
+    // Validate only model-supplied arguments. Trusted runtime-only scope and
+    // approval fields are injected afterward and intentionally do not belong in
+    // provider-facing schemas.
+    let schema = tool.parameters_schema();
+    let validation_issues = crate::tools::schema::validate_tool_arguments(&schema, &call_arguments);
+    if !validation_issues.is_empty() {
+        return Ok(crate::tools::schema::format_argument_validation_error(
+            call_name,
+            &validation_issues,
+        ));
+    }
+
+    let runtime_approval_grant = runtime_approval_granted
+        .then(|| runtime_approval_grant_for_call(call_name, &call_arguments, scope_ctx))
+        .flatten();
+    let root = call_arguments
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("validated tool arguments must remain a JSON object"))?;
     root.insert(
         RUNTIME_APPROVAL_GRANTED_ARG.to_string(),
         serde_json::Value::Bool(runtime_approval_granted),
@@ -4245,24 +4261,6 @@ async fn execute_one_tool(
     } else {
         None
     };
-
-    // Lightweight pre-execution validation: check that all `required` fields
-    // declared in the tool's JSON schema are present in the arguments object.
-    let schema = tool.parameters_schema();
-    if let Some(required) = schema.get("required").and_then(|v| v.as_array()) {
-        if let Some(args_obj) = call_arguments.as_object() {
-            let missing: Vec<&str> = required
-                .iter()
-                .filter_map(|r| r.as_str())
-                .filter(|key| !args_obj.contains_key(*key))
-                .collect();
-            if !missing.is_empty() {
-                return Ok(crate::tools::error_hints::format_missing_params(
-                    call_name, &missing, &schema,
-                ));
-            }
-        }
-    }
 
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
@@ -9165,6 +9163,48 @@ mod tests {
         output: String,
     }
 
+    struct ConditionalSchemaTool {
+        executions: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for ConditionalSchemaTool {
+        fn name(&self) -> &str {
+            "conditional_schema"
+        }
+
+        fn description(&self) -> &str {
+            "Tool used to verify action-specific argument preflight"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            crate::tools::schema::with_action_requirements(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["list", "write"]},
+                        "content": {"type": "string"}
+                    },
+                    "required": ["action"]
+                }),
+                "action",
+                &[crate::tools::schema::ActionRequirement {
+                    action: "write",
+                    required: &["content"],
+                }],
+            )
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "executed".to_string(),
+                error: None,
+            })
+        }
+    }
+
     #[async_trait]
     impl Tool for LargeOutputTool {
         fn name(&self) -> &str {
@@ -9176,7 +9216,7 @@ mod tests {
         }
 
         fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
+            serde_json::json!({"type": "object", "properties": {}})
         }
 
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
@@ -9207,7 +9247,7 @@ mod tests {
         }
 
         fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
+            serde_json::json!({"type": "object", "properties": {}})
         }
 
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
@@ -10105,7 +10145,7 @@ mod tests {
         }
 
         fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
+            serde_json::json!({"type": "object", "properties": {}})
         }
 
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
@@ -11652,6 +11692,31 @@ mod tests {
             1,
             "barrier should serialize concurrent file_write calls"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_rejects_action_specific_schema_errors_before_side_effects() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(ConditionalSchemaTool {
+            executions: Arc::clone(&executions),
+        })];
+
+        let result = execute_one_tool(
+            "conditional_schema",
+            serde_json::json!({"action": "write"}),
+            &tools_registry,
+            &NoopObserver,
+            None,
+            None,
+            false,
+            ChatMode::default(),
+        )
+        .await
+        .expect("schema preflight should return a retryable tool result");
+
+        assert!(result.contains("$.content is required"), "{result}");
+        assert!(result.contains("Read the tool schema and retry"), "{result}");
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
     }
 
     // ── P2-8: /plan /edit /auto mode integration ─────────────────────────

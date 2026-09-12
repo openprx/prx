@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.110] - 12 September 2026
+
+### Changed
+
+- Add a canonical tool-argument contract layer that publishes and enforces
+  action-specific requirements, alternative field sets, nested requirements,
+  scalar and union types, enums, lengths, numeric bounds, and unknown-field
+  rejection before executor dispatch.
+- Give OS-process session workers the same general agentic orchestration
+  surfaces as task-mode children, including sessions, sub-agent management,
+  daemon messaging, image analysis, configuration reload, and Gateway controls,
+  while preserving scope and approval enforcement.
+- Stop reapplying request-local intent tiering inside process workers after the
+  parent has explicitly selected and sealed the worker tool boundary.
+
+### Fixed
+
+- Prevent multi-action tools such as Xin, cron, MCP, Skills, Hooks, sessions,
+  nodes, Git, Composio, and messaging from advertising structurally incomplete
+  calls as valid.
+- Preserve multiple explicitly allowed MCP, WASM, or Skill aliases backed by a
+  single dynamic router when selecting process-worker capabilities.
+
 ## [0.8.109] - 12 September 2026
 
 ### Changed

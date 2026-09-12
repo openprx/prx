@@ -216,61 +216,86 @@ impl Tool for NodesTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["list", "status", "exec", "read", "write", "cancel"],
-                    "description": "Action to perform."
+        crate::tools::schema::with_action_requirements(
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "status", "exec", "read", "write", "cancel"],
+                        "description": "Action to perform."
+                    },
+                    "node": {
+                        "type": "string",
+                        "description": "Node ID for status/exec/read/write/cancel"
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command for exec"
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Timeout override in milliseconds"
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory for exec"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "File path for read/write"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Read offset"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Read byte limit"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Write content"
+                    },
+                    "create_dirs": {
+                        "type": "boolean",
+                        "description": "Create parent directories when writing"
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task ID to cancel"
+                    }
                 },
-                "node": {
-                    "type": "string",
-                    "description": "Node ID for status/exec/read/write/cancel"
+                "required": ["action"]
+            }),
+            "action",
+            &[
+                crate::tools::schema::ActionRequirement {
+                    action: "status",
+                    required: &["node"],
                 },
-                "command": {
-                    "type": "string",
-                    "description": "Shell command for exec"
+                crate::tools::schema::ActionRequirement {
+                    action: "exec",
+                    required: &["node", "command"],
                 },
-                "timeout_ms": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Timeout override in milliseconds"
+                crate::tools::schema::ActionRequirement {
+                    action: "read",
+                    required: &["node", "path"],
                 },
-                "cwd": {
-                    "type": "string",
-                    "description": "Working directory for exec"
+                crate::tools::schema::ActionRequirement {
+                    action: "write",
+                    required: &["node", "path", "content"],
                 },
-                "path": {
-                    "type": "string",
-                    "description": "File path for read/write"
+                crate::tools::schema::ActionRequirement {
+                    action: "cancel",
+                    required: &["node", "task_id"],
                 },
-                "offset": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Read offset"
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Read byte limit"
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Write content"
-                },
-                "create_dirs": {
-                    "type": "boolean",
-                    "description": "Create parent directories when writing"
-                },
-                "task_id": {
-                    "type": "string",
-                    "description": "Task ID to cancel"
-                }
-            },
-            "required": ["action"]
-        })
+            ],
+        )
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {

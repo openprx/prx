@@ -1400,7 +1400,7 @@ mod tests {
         }
 
         fn parameters_schema(&self) -> serde_json::Value {
-            json!({"type": "object"})
+            json!({"type": "object", "properties": {}})
         }
 
         fn specs(&self) -> Vec<super::super::traits::ToolSpec> {

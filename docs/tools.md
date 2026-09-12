@@ -36,9 +36,26 @@ every model-running entrypoint:
 
 Delegated and session-worker turns still honor an agent's explicit
 `allowed_tools` boundary. `allowed_tools = ["*"]` inherits the complete parent
-registry, including dynamically discovered MCP and WASM aliases; a narrower
-allowlist intentionally exposes only the named capabilities.
+eligible capability set, including dynamically discovered MCP and WASM aliases;
+a narrower allowlist intentionally exposes only the named capabilities. Task
+children proxy the live parent registry. Process workers reconstruct native,
+Skill, MCP, WASM, Hook, memory, network, scheduling, session orchestration,
+daemon messaging, and Gateway tools from the parent's sealed configuration.
+They do not reapply request-local intent tiering after that explicit selection.
+UI-owner controls such as attaching a TUI viewport remain in the UI process and
+are not agent execution capabilities.
 | **Integrations** | `composio` (1000+ OAuth apps), `pushover` (notifications) |
+
+Every provider-visible tool uses an object JSON Schema. Multi-action tools
+publish discriminator-specific required fields through canonical conditional
+clauses. The same canonical schema is evaluated immediately before execution,
+including nested required fields, scalar types, enums, string/array lengths,
+numeric bounds, union types, unknown-field rejection, and alternative
+required-field sets. A structurally invalid call is rejected before the
+executor can produce side effects and the model is told which paths must be
+corrected. Executor checks remain as defense in depth.
+See [Tool Schema and Child Capability Parity](tool-schema-and-child-capability-parity.md)
+for the architecture and acceptance matrix.
 
 `skills_list` reports active and disabled skills, their origin/loading mode,
 and whether each supported `SKILL.toml` tool is executable through the skill

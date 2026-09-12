@@ -173,22 +173,29 @@ impl Tool for GatewayTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["config.get", "config.patch", "status", "version", "components", "restart"],
-                    "description": "Action to perform."
+        crate::tools::schema::with_action_requirements(
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["config.get", "config.patch", "status", "version", "components", "restart"],
+                        "description": "Action to perform."
+                    },
+                    "patch": {
+                        "type": "object",
+                        "description": "JSON merge patch payload, required for action='config.patch'."
+                    }
                 },
-                "patch": {
-                    "type": "object",
-                    "description": "JSON merge patch payload, required for action='config.patch'."
-                }
-            },
-            "required": ["action"]
-        })
+                "required": ["action"]
+            }),
+            "action",
+            &[crate::tools::schema::ActionRequirement {
+                action: "config.patch",
+                required: &["patch"],
+            }],
+        )
     }
 
     #[allow(unsafe_code)]

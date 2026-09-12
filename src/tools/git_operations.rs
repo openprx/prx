@@ -516,58 +516,75 @@ impl Tool for GitOperationsTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "operation": {
-                    "type": "string",
-                    "enum": ["status", "diff", "log", "branch", "commit", "add", "checkout", "stash", "push", "reset_hard"],
-                    "description": "Git operation to perform"
+        crate::tools::schema::with_action_requirements(
+            json!({
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["status", "diff", "log", "branch", "commit", "add", "checkout", "stash", "push", "reset_hard"],
+                        "description": "Git operation to perform"
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Commit message (for 'commit' operation)"
+                    },
+                    "paths": {
+                        "type": "string",
+                        "description": "File paths to stage (for 'add' operation)"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch name (for 'checkout' or 'push' operation)"
+                    },
+                    "remote": {
+                        "type": "string",
+                        "description": "Remote name (for 'push' operation, default: origin)"
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Revision target (for 'reset_hard' operation, default: HEAD)"
+                    },
+                    "files": {
+                        "type": "string",
+                        "description": "File or path to diff (for 'diff' operation, default: '.')"
+                    },
+                    "cached": {
+                        "type": "boolean",
+                        "description": "Show staged changes (for 'diff' operation)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of log entries (for 'log' operation, default: 10)"
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["push", "pop", "list", "drop"],
+                        "description": "Stash action (for 'stash' operation)"
+                    },
+                    "index": {
+                        "type": "integer",
+                        "description": "Stash index (for 'stash' with 'drop' action)"
+                    }
                 },
-                "message": {
-                    "type": "string",
-                    "description": "Commit message (for 'commit' operation)"
+                "required": ["operation"]
+            }),
+            "operation",
+            &[
+                crate::tools::schema::ActionRequirement {
+                    action: "commit",
+                    required: &["message"],
                 },
-                "paths": {
-                    "type": "string",
-                    "description": "File paths to stage (for 'add' operation)"
+                crate::tools::schema::ActionRequirement {
+                    action: "add",
+                    required: &["paths"],
                 },
-                "branch": {
-                    "type": "string",
-                    "description": "Branch name (for 'checkout' or 'push' operation)"
+                crate::tools::schema::ActionRequirement {
+                    action: "checkout",
+                    required: &["branch"],
                 },
-                "remote": {
-                    "type": "string",
-                    "description": "Remote name (for 'push' operation, default: origin)"
-                },
-                "target": {
-                    "type": "string",
-                    "description": "Revision target (for 'reset_hard' operation, default: HEAD)"
-                },
-                "files": {
-                    "type": "string",
-                    "description": "File or path to diff (for 'diff' operation, default: '.')"
-                },
-                "cached": {
-                    "type": "boolean",
-                    "description": "Show staged changes (for 'diff' operation)"
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Number of log entries (for 'log' operation, default: 10)"
-                },
-                "action": {
-                    "type": "string",
-                    "enum": ["push", "pop", "list", "drop"],
-                    "description": "Stash action (for 'stash' operation)"
-                },
-                "index": {
-                    "type": "integer",
-                    "description": "Stash index (for 'stash' with 'drop' action)"
-                }
-            },
-            "required": ["operation"]
-        })
+            ],
+        )
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {

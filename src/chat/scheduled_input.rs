@@ -214,40 +214,53 @@ impl Tool for ScheduledInputTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["schedule", "list", "cancel"],
-                    "default": "schedule",
-                    "description": "schedule creates a future main-session wake-up; list shows pending/delivered/cancelled wake-ups; cancel aborts a pending wake-up."
-                },
-                "message": {
-                    "type": "string",
-                    "description": "Message to inject into the main chat session when the wake-up fires."
-                },
-                "delay_seconds": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": MAX_DELAY_SECONDS,
-                    "default": DEFAULT_DELAY_SECONDS,
-                    "description": "Delay before injecting the message. Defaults to 60 seconds."
-                },
-                "priority": {
-                    "type": "boolean",
-                    "default": false,
-                    "description": "When true, injects the wake-up as a priority /now message."
-                },
-                "id": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Wake-up id for cancel."
+        crate::tools::schema::with_action_requirements(
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["schedule", "list", "cancel"],
+                        "description": "schedule creates a future main-session wake-up; list shows pending/delivered/cancelled wake-ups; cancel aborts a pending wake-up."
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Message to inject into the main chat session when the wake-up fires."
+                    },
+                    "delay_seconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_DELAY_SECONDS,
+                        "default": DEFAULT_DELAY_SECONDS,
+                        "description": "Delay before injecting the message. Defaults to 60 seconds."
+                    },
+                    "priority": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, injects the wake-up as a priority /now message."
+                    },
+                    "id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Wake-up id for cancel."
+                    }
                 }
-            },
-            "required": []
-        })
+                ,
+                "required": ["action"]
+            }),
+            "action",
+            &[
+                crate::tools::schema::ActionRequirement {
+                    action: "schedule",
+                    required: &["message"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "cancel",
+                    required: &["id"],
+                },
+            ],
+        )
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -334,7 +347,21 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::schema::validate_tool_arguments;
     use crate::tools::traits::Tool;
+
+    #[test]
+    fn schema_declares_action_specific_requirements() {
+        let tool = ScheduledInputTool::new(ScheduledInputHandle::default());
+        let schema = tool.parameters_schema();
+
+        assert!(!validate_tool_arguments(&schema, &json!({})).is_empty());
+        assert!(!validate_tool_arguments(&schema, &json!({"action": "schedule"})).is_empty());
+        assert!(!validate_tool_arguments(&schema, &json!({"action": "cancel"})).is_empty());
+        assert!(validate_tool_arguments(&schema, &json!({"action": "schedule", "message": "wake"})).is_empty());
+        assert!(validate_tool_arguments(&schema, &json!({"action": "cancel", "id": 1})).is_empty());
+        assert!(validate_tool_arguments(&schema, &json!({"action": "list"})).is_empty());
+    }
 
     #[tokio::test]
     async fn schedule_delivers_message_to_input_sender() {

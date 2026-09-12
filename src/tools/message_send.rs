@@ -204,71 +204,96 @@ pub(crate) const MESSAGE_SEND_TOOL_NAME: &str = "message_send";
 
 /// The one parameter schema both `message_send` entry points expose.
 fn message_send_parameters_schema() -> serde_json::Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": ["send", "react", "edit", "delete", "unsend", "thread"],
-                "description": "Action type: 'send' for text/files/voice, 'react' for emoji reactions, \
-                                'edit' to edit a sent message (message_id + message), \
-                                'delete'/'unsend' to delete a sent message (message_id), \
-                                'thread' to reply in a thread (thread_id + message)"
+    crate::tools::schema::with_action_requirements(
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["send", "react", "edit", "delete", "unsend", "thread"],
+                    "description": "Action type: 'send' for text/files/voice, 'react' for emoji reactions, \
+                                    'edit' to edit a sent message (message_id + message), \
+                                    'delete'/'unsend' to delete a sent message (message_id), \
+                                    'thread' to reply in a thread (thread_id + message)"
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Recipient identifier (phone number, group ID, Signal UUID, etc.). \
+                                    Defaults to the current conversation's sender when omitted."
+                },
+                "channel": {
+                    "type": "string",
+                    "description": "Destination channel name (e.g. 'signal', 'telegram', 'wacli'). \
+                                    Omit to stay on the current conversation's channel. Naming another \
+                                    channel requires it to be permitted by the outbound scope rules and \
+                                    delivers text only — media markers and as_voice are refused. \
+                                    Not accepted for action='react'."
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Message text. Embed media by including markers: \
+                                    [IMAGE:/path/to/file.png], [VOICE:/path/to/audio.m4a], \
+                                    [DOCUMENT:/path/to/file.pdf]. Text outside markers is sent as caption."
+                },
+                "as_voice": {
+                    "type": "boolean",
+                    "description": "When true, the first [VOICE:] or [AUDIO:] attachment is sent as a voice note (default: false)."
+                },
+                "quote_timestamp": {
+                    "type": "integer",
+                    "description": "Timestamp (ms) of the message to quote-reply to."
+                },
+                "quote_author": {
+                    "type": "string",
+                    "description": "Author identifier of the message being replied to (required when quote_timestamp is set)."
+                },
+                "emoji": {
+                    "type": "string",
+                    "description": "For action='react': the emoji to react with, e.g. '👍', '❤️', '😂'."
+                },
+                "target_author": {
+                    "type": "string",
+                    "description": "For action='react': the author of the message to react to."
+                },
+                "target_timestamp": {
+                    "type": "integer",
+                    "description": "For action='react': the timestamp (ms) of the message to react to."
+                },
+                "message_id": {
+                    "type": "string",
+                    "description": "For action='edit'/'delete'/'unsend': the platform-specific message identifier (timestamp in ms for Signal)."
+                },
+                "thread_id": {
+                    "type": "string",
+                    "description": "For action='thread': the thread/conversation identifier to reply into."
+                }
             },
-            "target": {
-                "type": "string",
-                "description": "Recipient identifier (phone number, group ID, Signal UUID, etc.). \
-                                Defaults to the current conversation's sender when omitted."
+            "required": ["action"]
+        }),
+        "action",
+        &[
+            crate::tools::schema::ActionRequirement {
+                action: "react",
+                required: &["emoji", "target_author", "target_timestamp"],
             },
-            "channel": {
-                "type": "string",
-                "description": "Destination channel name (e.g. 'signal', 'telegram', 'wacli'). \
-                                Omit to stay on the current conversation's channel. Naming another \
-                                channel requires it to be permitted by the outbound scope rules and \
-                                delivers text only — media markers and as_voice are refused. \
-                                Not accepted for action='react'."
+            crate::tools::schema::ActionRequirement {
+                action: "edit",
+                required: &["message_id"],
             },
-            "message": {
-                "type": "string",
-                "description": "Message text. Embed media by including markers: \
-                                [IMAGE:/path/to/file.png], [VOICE:/path/to/audio.m4a], \
-                                [DOCUMENT:/path/to/file.pdf]. Text outside markers is sent as caption."
+            crate::tools::schema::ActionRequirement {
+                action: "delete",
+                required: &["message_id"],
             },
-            "as_voice": {
-                "type": "boolean",
-                "description": "When true, the first [VOICE:] or [AUDIO:] attachment is sent as a voice note (default: false)."
+            crate::tools::schema::ActionRequirement {
+                action: "unsend",
+                required: &["message_id"],
             },
-            "quote_timestamp": {
-                "type": "integer",
-                "description": "Timestamp (ms) of the message to quote-reply to."
+            crate::tools::schema::ActionRequirement {
+                action: "thread",
+                required: &["thread_id"],
             },
-            "quote_author": {
-                "type": "string",
-                "description": "Author identifier of the message being replied to (required when quote_timestamp is set)."
-            },
-            "emoji": {
-                "type": "string",
-                "description": "For action='react': the emoji to react with, e.g. '👍', '❤️', '😂'."
-            },
-            "target_author": {
-                "type": "string",
-                "description": "For action='react': the author of the message to react to."
-            },
-            "target_timestamp": {
-                "type": "integer",
-                "description": "For action='react': the timestamp (ms) of the message to react to."
-            },
-            "message_id": {
-                "type": "string",
-                "description": "For action='edit'/'delete'/'unsend': the platform-specific message identifier (timestamp in ms for Signal)."
-            },
-            "thread_id": {
-                "type": "string",
-                "description": "For action='thread': the thread/conversation identifier to reply into."
-            }
-        },
-        "required": ["action"]
-    })
+        ],
+    )
 }
 
 pub struct MessageSendTool {

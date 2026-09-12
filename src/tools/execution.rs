@@ -795,6 +795,13 @@ fn tool_descriptor(
         ToolAdapterKind::WasmPlugin => "WASM plugin",
         ToolAdapterKind::Skill => "skill",
     };
+    let availability = match crate::tools::schema::SchemaCleanr::validate(&spec.parameters) {
+        Ok(()) => availability,
+        Err(error) => CapabilityAvailability::declared(format!(
+            "invalid schema for {adapter_label} tool '{}': {error}",
+            spec.name
+        )),
+    };
     ToolDescriptor {
         public_name: spec.name,
         backend_name: backend_name.to_string(),
@@ -2045,7 +2052,11 @@ mod tests {
         }
 
         fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type":"object", "required":["value"]})
+            serde_json::json!({
+                "type": "object",
+                "properties": {"value": {}},
+                "required": ["value"]
+            })
         }
 
         fn specs(&self) -> Vec<ToolSpec> {
@@ -2096,7 +2107,7 @@ mod tests {
         }
 
         fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type":"object"})
+            serde_json::json!({"type":"object", "properties": {}})
         }
 
         fn specs(&self) -> Vec<ToolSpec> {
@@ -2105,7 +2116,11 @@ mod tests {
                 specs.push(ToolSpec {
                     name: "mcp__late__navigate".to_string(),
                     description: "runtime-discovered alias".to_string(),
-                    parameters: serde_json::json!({"type":"object", "required":["url"]}),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {"url": {"type": "string"}},
+                        "required": ["url"]
+                    }),
                 });
             }
             specs
@@ -3279,7 +3294,7 @@ mod tests {
         }
 
         fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type":"object"})
+            serde_json::json!({"type": "object", "properties": {}})
         }
 
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {

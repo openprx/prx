@@ -563,45 +563,54 @@ impl Tool for ComposioTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "description": "The operation: 'list' (list available actions), 'list_accounts'/'connected_accounts' (list connected accounts), 'execute' (run an action), or 'connect' (get OAuth URL)",
-                    "enum": ["list", "list_accounts", "connected_accounts", "execute", "connect"]
-                },
-                "app": {
-                    "type": "string",
-                    "description": "Toolkit slug filter for 'list' or 'list_accounts', optional app hint for 'execute', or toolkit/app for 'connect' (e.g. 'gmail', 'notion', 'github')"
-                },
-                "action_name": {
-                    "type": "string",
-                    "description": "Action/tool identifier to execute (legacy aliases supported)"
-                },
-                "tool_slug": {
-                    "type": "string",
-                    "description": "Preferred v3 tool slug to execute (alias of action_name)"
-                },
-                "params": {
+        crate::tools::schema::with_action_alternatives(
+            crate::tools::schema::with_action_requirements(
+                json!({
                     "type": "object",
-                    "description": "Parameters to pass to the action"
-                },
-                "entity_id": {
-                    "type": "string",
-                    "description": "Entity/user ID for multi-user setups (defaults to composio.entity_id from config)"
-                },
-                "auth_config_id": {
-                    "type": "string",
-                    "description": "Optional Composio v3 auth config id for connect flow"
-                },
-                "connected_account_id": {
-                    "type": "string",
-                    "description": "Optional connected account ID for execute flow when a specific account is required"
-                }
-            },
-            "required": ["action"]
-        })
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "The operation: 'list' (list available actions), 'list_accounts'/'connected_accounts' (list connected accounts), 'execute' (run an action), or 'connect' (get OAuth URL)",
+                            "enum": ["list", "list_accounts", "connected_accounts", "execute", "connect"]
+                        },
+                        "app": {
+                            "type": "string",
+                            "description": "Toolkit slug filter for 'list' or 'list_accounts', optional app hint for 'execute', or toolkit/app for 'connect' (e.g. 'gmail', 'notion', 'github')"
+                        },
+                        "action_name": {
+                            "type": "string",
+                            "description": "Action/tool identifier to execute (legacy aliases supported)"
+                        },
+                        "tool_slug": {
+                            "type": "string",
+                            "description": "Preferred v3 tool slug to execute (alias of action_name)"
+                        },
+                        "params": {
+                            "type": "object",
+                            "description": "Parameters to pass to the action"
+                        },
+                        "entity_id": {
+                            "type": "string",
+                            "description": "Entity/user ID for multi-user setups (defaults to composio.entity_id from config)"
+                        },
+                        "auth_config_id": {
+                            "type": "string",
+                            "description": "Optional Composio v3 auth config id for connect flow"
+                        },
+                        "connected_account_id": {
+                            "type": "string",
+                            "description": "Optional connected account ID for execute flow when a specific account is required"
+                        }
+                    },
+                    "required": ["action"]
+                }),
+                "action",
+                &[],
+            ),
+            "action",
+            "execute",
+            &[&["tool_slug"], &["action_name"]],
+        )
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -1189,6 +1198,13 @@ mod tests {
         assert!(schema["properties"]["connected_account_id"].is_object());
         let required = schema["required"].as_array().unwrap();
         assert!(required.contains(&json!("action")));
+        assert!(
+            crate::tools::schema::validate_tool_arguments(
+                &schema,
+                &json!({"action": "execute", "action_name": "legacy"})
+            )
+            .is_empty()
+        );
         let enum_values = schema["properties"]["action"]["enum"]
             .as_array()
             .unwrap()

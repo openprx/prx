@@ -359,40 +359,53 @@ impl Tool for SubagentsTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["list", "kill", "steer"],
-                    "default": "list",
-                    "description": "Action to perform."
+        crate::tools::schema::with_action_requirements(
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "kill", "steer"],
+                        "default": "list",
+                        "description": "Action to perform."
+                    },
+                    "run_id": {
+                        "type": "string",
+                        "description": "Target run ID for kill/steer."
+                    },
+                    "message": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Message to send for steer action."
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["all", "running", "completed", "failed"],
+                        "default": "all",
+                        "description": "Optional status filter for list action."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "description": "Maximum number of results for list action (default 20)."
+                    }
                 },
-                "run_id": {
-                    "type": "string",
-                    "description": "Target run ID for kill/steer."
+                "required": []
+            }),
+            "action",
+            &[
+                crate::tools::schema::ActionRequirement {
+                    action: "kill",
+                    required: &["run_id"],
                 },
-                "message": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Message to send for steer action."
+                crate::tools::schema::ActionRequirement {
+                    action: "steer",
+                    required: &["run_id", "message"],
                 },
-                "status": {
-                    "type": "string",
-                    "enum": ["all", "running", "completed", "failed"],
-                    "default": "all",
-                    "description": "Optional status filter for list action."
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 100,
-                    "description": "Maximum number of results for list action (default 20)."
-                }
-            },
-            "required": []
-        })
+            ],
+        )
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {

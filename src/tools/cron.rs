@@ -323,105 +323,214 @@ impl Tool for CronTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": [
-                        "add", "schedule", "once",
-                        "list",
-                        "get",
-                        "remove", "cancel",
-                        "update", "patch",
-                        "run",
-                        "runs", "history",
-                        "events",
-                        "pause", "resume",
-                        "status"
+        crate::tools::schema::with_action_alternatives(
+            crate::tools::schema::with_action_alternatives(
+                crate::tools::schema::with_action_alternatives(
+                    crate::tools::schema::with_action_requirements(
+                        json!({
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": [
+                                    "add", "schedule", "once",
+                                    "list",
+                                    "get",
+                                    "remove", "cancel",
+                                    "update", "patch",
+                                    "run",
+                                    "runs", "history",
+                                    "events",
+                                    "pause", "resume",
+                                    "status"
+                                ],
+                                "description": "Action to perform."
+                            },
+                            "job_id": {
+                                "type": "string",
+                                "description": "Job ID for get/remove/update/run/runs/pause/resume actions."
+                            },
+                            "expression": {
+                                "type": "string",
+                                "description": "Cron expression (e.g. '*/5 * * * *') for recurring shell jobs (add/schedule)."
+                            },
+                            "command": {
+                                "type": "string",
+                                "description": "Shell command to execute (shell jobs)."
+                            },
+                            "delay": {
+                                "type": "string",
+                                "description": "Delay for one-shot jobs (e.g. '30m', '2h')."
+                            },
+                            "run_at": {
+                                "type": "string",
+                                "description": "Absolute RFC3339 timestamp for one-shot jobs."
+                            },
+                            "schedule": {
+                                "type": "object",
+                                "description": "Schedule object for add/schedule: {kind:'cron',expr:'0 9 * * *',tz?:'America/New_York'} | {kind:'at',at:'ISO-8601'} | {kind:'every',every_ms:30000}. Alternative to the plain 'expression' string.",
+                                "properties": {
+                                    "kind": { "type": "string", "enum": ["cron", "at", "every"] },
+                                    "expr": { "type": "string", "minLength": 1 },
+                                    "tz": { "type": "string", "minLength": 1 },
+                                    "at": { "type": "string", "minLength": 1 },
+                                    "every_ms": { "type": "integer", "minimum": 1 }
+                                },
+                                "required": ["kind"],
+                                "allOf": [
+                                    {
+                                        "if": { "properties": { "kind": { "const": "cron" } }, "required": ["kind"] },
+                                        "then": { "required": ["expr"] }
+                                    },
+                                    {
+                                        "if": { "properties": { "kind": { "const": "at" } }, "required": ["kind"] },
+                                        "then": { "required": ["at"] }
+                                    },
+                                    {
+                                        "if": { "properties": { "kind": { "const": "every" } }, "required": ["kind"] },
+                                        "then": { "required": ["every_ms"] }
+                                    }
+                                ]
+                            },
+                            "name": {
+                                "type": "string",
+                                "description": "Human-readable job name (add/schedule)."
+                            },
+                            "payload": {
+                                "type": "object",
+                                "description": "Job payload for add/schedule: {kind:'agentTurn',message:'task prompt'} runs an isolated LLM turn; {kind:'systemEvent',text:'message text'} injects text into the main session.",
+                                "properties": {
+                                    "kind": { "type": "string", "enum": ["agentTurn", "systemEvent"] },
+                                    "message": { "type": "string", "minLength": 1, "description": "Task for agentTurn" },
+                                    "text": { "type": "string", "minLength": 1, "description": "Text for systemEvent" }
+                                },
+                                "required": ["kind"],
+                                "anyOf": [
+                                    { "required": ["message"] },
+                                    { "required": ["text"] }
+                                ]
+                            },
+                            "job_type": {
+                                "type": "string",
+                                "enum": ["shell", "agent"],
+                                "description": "Legacy alternative to 'payload' for add/schedule. 'agent' runs an LLM turn."
+                            },
+                            "prompt": {
+                                "type": "string",
+                                "description": "LLM prompt for agent jobs (add/schedule). Overridden by payload.message/payload.text."
+                            },
+                            "session_target": {
+                                "type": "string",
+                                "enum": ["isolated", "main"],
+                                "description": "Agent-job target session: isolated=new context (default), main=inject into main session."
+                            },
+                            "model": {
+                                "type": "string",
+                                "description": "Override model for agent jobs (add/schedule)."
+                            },
+                            "delivery": {
+                                "type": "object",
+                                "description": "Result delivery for agent jobs: {mode:'announce',channel:'signal',to:'<phone|uuid|group:ID>'} or {mode:'none'}.",
+                                "properties": {
+                                    "mode": { "type": "string", "enum": ["none", "announce"] },
+                                    "channel": { "type": "string", "enum": ["signal", "telegram", "discord", "slack", "mattermost"] },
+                                    "to": { "type": "string", "description": "Recipient: E.164 phone, UUID, or group:<groupId>" },
+                                    "best_effort": { "type": "boolean", "default": true }
+                                }
+                            },
+                            "delete_after_run": {
+                                "type": "boolean",
+                                "description": "Auto-delete one-shot jobs after success (default true for 'at' schedule)."
+                            },
+                            "patch": {
+                                "type": "object",
+                                "description": "Fields to update for the 'update/patch' action."
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Max entries for 'runs' action (default 10)."
+                            },
+                        },
+                                "required": ["action"]
+                            }),
+                        "action",
+                        &[
+                            crate::tools::schema::ActionRequirement {
+                                action: "get",
+                                required: &["job_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "runs",
+                                required: &["job_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "history",
+                                required: &["job_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "events",
+                                required: &["job_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "once",
+                                required: &["command"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "remove",
+                                required: &["job_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "cancel",
+                                required: &["job_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "update",
+                                required: &["job_id", "patch"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "patch",
+                                required: &["job_id", "patch"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "run",
+                                required: &["job_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "pause",
+                                required: &["job_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "resume",
+                                required: &["job_id"],
+                            },
+                        ],
+                    ),
+                    "action",
+                    "add",
+                    &[
+                        &["expression", "command"],
+                        &["schedule", "command"],
+                        &["expression", "prompt"],
+                        &["schedule", "prompt"],
+                        &["expression", "payload"],
+                        &["schedule", "payload"],
                     ],
-                    "description": "Action to perform."
-                },
-                "job_id": {
-                    "type": "string",
-                    "description": "Job ID for get/remove/update/run/runs/pause/resume actions."
-                },
-                "expression": {
-                    "type": "string",
-                    "description": "Cron expression (e.g. '*/5 * * * *') for recurring shell jobs (add/schedule)."
-                },
-                "command": {
-                    "type": "string",
-                    "description": "Shell command to execute (shell jobs)."
-                },
-                "delay": {
-                    "type": "string",
-                    "description": "Delay for one-shot jobs (e.g. '30m', '2h')."
-                },
-                "run_at": {
-                    "type": "string",
-                    "description": "Absolute RFC3339 timestamp for one-shot jobs."
-                },
-                "schedule": {
-                    "type": "object",
-                    "description": "Schedule object for add/schedule: {kind:'cron',expr:'0 9 * * *',tz?:'America/New_York'} | {kind:'at',at:'ISO-8601'} | {kind:'every',every_ms:30000}. Alternative to the plain 'expression' string."
-                },
-                "name": {
-                    "type": "string",
-                    "description": "Human-readable job name (add/schedule)."
-                },
-                "payload": {
-                    "type": "object",
-                    "description": "Job payload for add/schedule: {kind:'agentTurn',message:'task prompt'} runs an isolated LLM turn; {kind:'systemEvent',text:'message text'} injects text into the main session.",
-                    "properties": {
-                        "kind": { "type": "string", "enum": ["agentTurn", "systemEvent"] },
-                        "message": { "type": "string", "description": "Task for agentTurn" },
-                        "text": { "type": "string", "description": "Text for systemEvent" }
-                    }
-                },
-                "job_type": {
-                    "type": "string",
-                    "enum": ["shell", "agent"],
-                    "description": "Legacy alternative to 'payload' for add/schedule. 'agent' runs an LLM turn."
-                },
-                "prompt": {
-                    "type": "string",
-                    "description": "LLM prompt for agent jobs (add/schedule). Overridden by payload.message/payload.text."
-                },
-                "session_target": {
-                    "type": "string",
-                    "enum": ["isolated", "main"],
-                    "description": "Agent-job target session: isolated=new context (default), main=inject into main session."
-                },
-                "model": {
-                    "type": "string",
-                    "description": "Override model for agent jobs (add/schedule)."
-                },
-                "delivery": {
-                    "type": "object",
-                    "description": "Result delivery for agent jobs: {mode:'announce',channel:'signal',to:'<phone|uuid|group:ID>'} or {mode:'none'}.",
-                    "properties": {
-                        "mode": { "type": "string", "enum": ["none", "announce"] },
-                        "channel": { "type": "string", "enum": ["signal", "telegram", "discord", "slack", "mattermost"] },
-                        "to": { "type": "string", "description": "Recipient: E.164 phone, UUID, or group:<groupId>" },
-                        "best_effort": { "type": "boolean", "default": true }
-                    }
-                },
-                "delete_after_run": {
-                    "type": "boolean",
-                    "description": "Auto-delete one-shot jobs after success (default true for 'at' schedule)."
-                },
-                "patch": {
-                    "type": "object",
-                    "description": "Fields to update for the 'update/patch' action."
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max entries for 'runs' action (default 10)."
-                },
-            },
-            "required": ["action"]
-        })
+                ),
+                "action",
+                "schedule",
+                &[
+                    &["expression", "command"],
+                    &["schedule", "command"],
+                    &["expression", "prompt"],
+                    &["schedule", "prompt"],
+                    &["expression", "payload"],
+                    &["schedule", "payload"],
+                ],
+            ),
+            "action",
+            "once",
+            &[&["delay"], &["run_at"]],
+        )
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -1018,7 +1127,48 @@ mod tests {
     use super::*;
     use crate::config::{Config, SharedConfig, new_shared};
     use crate::security::AutonomyLevel;
+    use crate::tools::schema::validate_tool_arguments;
     use tempfile::TempDir;
+
+    #[test]
+    fn schema_requires_a_schedule_and_executable_content() {
+        let config = new_shared(Config::default());
+        let snapshot = config.load_full();
+        let tool = CronTool::new(Arc::clone(&config), test_security(&snapshot));
+        let schema = tool.parameters_schema();
+
+        assert!(!validate_tool_arguments(&schema, &json!({"action": "add"})).is_empty());
+        assert!(!validate_tool_arguments(&schema, &json!({"action": "add", "expression": "0 9 * * *"})).is_empty());
+        assert!(
+            validate_tool_arguments(
+                &schema,
+                &json!({"action": "add", "expression": "0 9 * * *", "command": "date"})
+            )
+            .is_empty()
+        );
+        assert!(
+            validate_tool_arguments(
+                &schema,
+                &json!({
+                    "action": "schedule",
+                    "schedule": {"kind": "every", "every_ms": 1000},
+                    "payload": {"kind": "agentTurn", "message": "inspect state"}
+                })
+            )
+            .is_empty()
+        );
+        assert!(
+            !validate_tool_arguments(
+                &schema,
+                &json!({
+                    "action": "schedule",
+                    "schedule": {"kind": "cron"},
+                    "payload": {"kind": "agentTurn", "message": "inspect state"}
+                })
+            )
+            .is_empty()
+        );
+    }
 
     async fn test_config(tmp: &TempDir) -> SharedConfig {
         let config = Config {

@@ -614,17 +614,34 @@ impl crate::tools::Tool for HooksManageTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["status", "refresh", "validate", "replace", "remove", "test"]},
-                "content": {"type": "string", "description": "Complete hooks.json for validate or replace"},
-                "event": {"type": "string", "enum": HookEvent::ALL.map(HookEvent::as_str)},
-                "payload": {"type": "object", "description": "Synthetic payload for test"}
-            },
-            "required": ["action"],
-            "additionalProperties": false
-        })
+        crate::tools::schema::with_action_requirements(
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["status", "refresh", "validate", "replace", "remove", "test"]},
+                    "content": {"type": "string", "description": "Complete hooks.json for validate or replace"},
+                    "event": {"type": "string", "enum": HookEvent::ALL.map(HookEvent::as_str)},
+                    "payload": {"type": "object", "description": "Synthetic payload for test"}
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+            "action",
+            &[
+                crate::tools::schema::ActionRequirement {
+                    action: "validate",
+                    required: &["content"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "replace",
+                    required: &["content"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "test",
+                    required: &["event"],
+                },
+            ],
+        )
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {

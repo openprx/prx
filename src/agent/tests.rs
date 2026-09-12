@@ -166,7 +166,7 @@ impl Tool for FailingTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({"type": "object"})
+        serde_json::json!({"type": "object", "properties": {}})
     }
 
     async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
@@ -192,7 +192,7 @@ impl Tool for PanickingTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({"type": "object"})
+        serde_json::json!({"type": "object", "properties": {}})
     }
 
     async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
@@ -227,7 +227,7 @@ impl Tool for MockSessionsSpawnTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({"type": "object"})
+        serde_json::json!({"type": "object", "properties": {}})
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
@@ -251,7 +251,7 @@ impl Tool for CountingTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({"type": "object"})
+        serde_json::json!({"type": "object", "properties": {}})
     }
 
     async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
