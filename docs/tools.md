@@ -50,6 +50,29 @@ of every iteration — from carrying the whole inventory on a turn that needs fo
 tools. `always_include` and `always_exclude` override the routing decision by
 name, and `model_allowlists` intersects the result for one exact model.
 
+The keyword table is English-only. A message that activates no category at all —
+a request in another language, or an English one that names no capability — is
+*unrouted*: the whole registry is published rather than the core floor, because
+a table that cannot read the request is no evidence for removing anything from
+it. `always_exclude` (and the channel surface folded into it) still applies, so
+the fallback only ever widens what routing may hide, never what operator policy
+forbids.
+
+Interactive chat adds one more rule on top. The `tools` array sits inside the
+provider's cacheable request prefix next to the system prompt, so re-deciding
+the published set every turn invalidates the cached prefill of the entire
+conversation each time the user rephrases. A chat session therefore publishes
+the **union** of every set routed so far: the catalog grows the first time a new
+capability is named and is byte-identical on every turn that names nothing new.
+`/new` and `/clear` reset the union. Channel, gateway, console and worker turns
+are unaffected — each of those turns is its own session.
+
+The skill catalog in the system prompt follows the same principle: a catalog of
+at most `[skill_rag] top_k` skills (32 by default) is published whole, which
+makes that section a pure function of the installed skills instead of a
+retrieval result that moves with the wording. Larger catalogs fall back to
+relevance retrieval, and chat again exposes the session's union of it.
+
 IM channel sessions (Signal, Telegram, Discord, WhatsApp/wacli, Slack,
 Mattermost, iMessage, Matrix …) additionally run under `channel_exclude`, which
 hides the operations/development surface from a conversation partner:

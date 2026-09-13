@@ -948,6 +948,15 @@ pub struct EffectDeps {
     /// republished the whole registry to the provider on every single turn.
     /// Carrying it here puts terminal chat back on the same boundary.
     pub tool_tiering: crate::config::ToolTieringConfig,
+    /// Session-scoped union of every tool set capability routing has published
+    /// on this chat session.
+    ///
+    /// The `tools` array travels inside the provider's cacheable request
+    /// prefix, next to the system prompt: re-deciding the exposed set on every
+    /// turn invalidates the prefix — and the whole conversation's prefill —
+    /// each time the user rephrases. Exposing the running union instead means
+    /// the prefix moves only when a genuinely new intent appears.
+    pub exposed_tools: crate::tools::intent::SessionToolExposure,
 }
 
 // ─── EffectExecutor (5a-1: real-mode + shadow-mode) ───────────────────────────
@@ -1132,6 +1141,7 @@ impl EffectExecutor {
                 chat_mode,
                 turn_spawn_ctx,
                 turn_message_send_ctx,
+                routing_input,
             } => {
                 // Step 5a-2 — 长耗时：spawn 子任务真调 provider.stream_chat_with_history，
                 // 通过 deps.action_tx 把 chunk / 完成 / 失败 / 取消事件回投给 reducer，
@@ -1197,7 +1207,16 @@ impl EffectExecutor {
                 let provider_turn_handle_tx = deps.provider_turn_lifecycle_tx.clone();
                 let observer = Arc::clone(&deps.observer);
                 let hooks = Arc::clone(&deps.hooks);
-                let tool_tiering = deps.tool_tiering.clone();
+                // Route on the turn's raw user text (never on the enriched
+                // history) and publish the session's cumulative set, so an
+                // injected `[Recent shared workspace events]` block can neither
+                // widen the tool surface nor move the cacheable prefix.
+                let tool_tiering = match (routing_input.as_deref(), tools_registry.as_deref()) {
+                    (Some(input), Some(registry)) => {
+                        deps.exposed_tools.sticky_tiering(&deps.tool_tiering, registry, input)
+                    }
+                    _ => deps.tool_tiering.clone(),
+                };
                 let provider_turn_execution_lease_id =
                     provider_turn_task_id.map(|_| next_provider_turn_execution_lease_id());
                 let provider_task_handle = tokio::spawn(async move {
@@ -1255,6 +1274,7 @@ impl EffectExecutor {
                         observer,
                         hooks,
                         tool_tiering,
+                        routing_input,
                     );
                     // D8-4 (redux path real fix): mirror the legacy
                     // `run_tool_call_loop_traced` wrapper in `chat::run` — seed the
@@ -2363,6 +2383,7 @@ async fn drive_start_turn_stream(
     observer: Arc<dyn Observer>,
     hooks: Arc<HookManager>,
     tool_tiering: crate::config::ToolTieringConfig,
+    routing_input: Option<String>,
 ) {
     // Redux-specific preflight projection stays in the adapter because it must
     // publish the exact compaction patch and injection diagnostic into reducer
@@ -2487,7 +2508,18 @@ async fn drive_start_turn_stream(
         None,
         Some(&tool_tiering),
         // The adapter's ToolExecutionService already carries the resolved ledger.
-        crate::agent::loop_::ToolLoopMemory::none().with_event_fabric(request_event_fabric),
+        // `with_routing_input` pins capability routing to the raw user text:
+        // without it the loop falls back to the last history user message,
+        // which chat has already enriched with memory recall and the
+        // `[Recent shared workspace events]` block — an injected URL there used
+        // to publish the whole web tool surface.
+        {
+            let memory = crate::agent::loop_::ToolLoopMemory::none().with_event_fabric(request_event_fabric);
+            match routing_input {
+                Some(input) => memory.with_routing_input(input),
+                None => memory,
+            }
+        },
         chat_mode,
         None,
         false,
@@ -4668,6 +4700,7 @@ mod tests {
             Arc::new(crate::observability::noop::NoopObserver),
             Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),
             crate::config::ToolTieringConfig::default(),
+            None,
         )
         .await;
 
@@ -5128,6 +5161,7 @@ mod integration_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             },
             Effect::CancelToken(token),
             Effect::ResolveApproval {
@@ -5351,6 +5385,7 @@ mod real_mode_tests {
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
+            exposed_tools: crate::tools::intent::SessionToolExposure::new(),
         };
         (deps, action_rx, hooks, temp)
     }
@@ -5642,6 +5677,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -5799,6 +5835,7 @@ mod real_mode_tests {
                 approval_router: Arc::new(ApprovalRouter::new()),
                 tool_security_policy: full_tool_security_policy(),
                 tool_tiering: crate::config::ToolTieringConfig::default(),
+                exposed_tools: crate::tools::intent::SessionToolExposure::new(),
             };
             let executor = EffectExecutor::new_with_deps(deps);
 
@@ -5869,6 +5906,7 @@ mod real_mode_tests {
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
+            exposed_tools: crate::tools::intent::SessionToolExposure::new(),
         };
         let executor = EffectExecutor::new_with_deps(deps);
         executor.execute(Effect::RequestRedraw).await;
@@ -6000,6 +6038,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
         // execute() 立即返回（不阻塞）；spawn 子任务在后台真调 provider + 回投 Action.
@@ -6067,6 +6106,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -6158,6 +6198,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -6318,6 +6359,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -6442,6 +6484,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -6548,6 +6591,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -6645,6 +6689,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -6877,6 +6922,7 @@ mod real_mode_tests {
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
+            exposed_tools: crate::tools::intent::SessionToolExposure::new(),
         };
         (deps, action_rx, temp)
     }
@@ -7028,6 +7074,7 @@ mod real_mode_tests {
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
+            exposed_tools: crate::tools::intent::SessionToolExposure::new(),
         };
         let executor = EffectExecutor::new_with_deps(deps);
 
@@ -7183,6 +7230,7 @@ mod real_mode_tests {
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
+            exposed_tools: crate::tools::intent::SessionToolExposure::new(),
         };
 
         let executor = EffectExecutor::new_with_deps(deps);
@@ -7381,6 +7429,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -7559,6 +7608,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -7718,6 +7768,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -7922,6 +7973,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: Some(seed),
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -8068,6 +8120,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -8176,6 +8229,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -8219,6 +8273,7 @@ mod real_mode_tests {
             cancel: CancellationToken::new(),
             turn_spawn_ctx: None,
             turn_message_send_ctx: None,
+            routing_input: None,
         });
         assert!(
             matches!(result, DispatchResult::ChannelClosed),
@@ -8566,6 +8621,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -8707,6 +8763,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -8829,6 +8886,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -8965,6 +9023,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -9208,6 +9267,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -9350,6 +9410,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -10224,6 +10285,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -10367,6 +10429,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -10516,6 +10579,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -10657,6 +10721,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -10827,6 +10892,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -11060,6 +11126,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -11541,6 +11608,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -11656,6 +11724,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -11745,6 +11814,7 @@ mod real_mode_tests {
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             })
             .await;
 
@@ -11851,6 +11921,7 @@ mod real_mode_tests {
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
+            exposed_tools: crate::tools::intent::SessionToolExposure::new(),
         };
         let executor = EffectExecutor::new_with_deps(deps);
 

@@ -1004,6 +1004,66 @@ fn write_xml_text_element(out: &mut String, indent: usize, tag: &str, value: &st
     out.push_str(">\n");
 }
 
+/// Order a skill catalog by name and collapse duplicate names.
+///
+/// The rendered section lands inside the provider's cacheable request prefix,
+/// so its bytes must be a function of *which* skills are exposed and nothing
+/// else. Retrieval hands the section back in relevance order, which changes
+/// with every rephrasing of the same question; sorting here makes the section
+/// byte-identical whenever the exposed set is the same.
+#[must_use]
+pub fn canonical_skill_order(skills: &[Skill]) -> Vec<&Skill> {
+    let mut ordered: Vec<&Skill> = skills.iter().collect();
+    ordered.sort_by(|left, right| left.name.cmp(&right.name));
+    ordered.dedup_by(|left, right| left.name == right.name);
+    ordered
+}
+
+/// Session-scoped, monotonically growing skill exposure.
+///
+/// Skill RAG re-ranks the catalog against each turn's wording, and the section
+/// it feeds sits ahead of the identity and tool sections in the system prompt —
+/// so a rephrasing invalidates the provider's prefix cache for the entire
+/// conversation, not just for this section. Keeping the union of everything the
+/// session has retrieved makes the section change only the first time a skill
+/// becomes relevant, while still letting retrieval decide *which* skills a
+/// session ever sees. `reset` is the session boundary (`/new`, `/clear`).
+#[derive(Debug, Clone, Default)]
+pub struct SessionSkillExposure {
+    names: std::collections::BTreeSet<String>,
+}
+
+impl SessionSkillExposure {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drop everything retrieved so far.
+    pub fn reset(&mut self) {
+        self.names.clear();
+    }
+
+    /// Absorb this turn's retrieval result and return the catalog entries the
+    /// session exposes, in canonical order.
+    ///
+    /// Entries are taken from `catalog` rather than from `selected` so an
+    /// uninstalled skill disappears from the prompt instead of lingering.
+    #[must_use]
+    pub fn absorb(&mut self, catalog: &[Skill], selected: &[Skill]) -> Vec<Skill> {
+        for skill in selected {
+            if !self.names.contains(&skill.name) {
+                self.names.insert(skill.name.clone());
+            }
+        }
+        canonical_skill_order(catalog)
+            .into_iter()
+            .filter(|skill| self.names.contains(&skill.name))
+            .cloned()
+            .collect()
+    }
+}
+
 /// Build the "Available Skills" system prompt section from catalog metadata.
 ///
 /// Skill instruction bodies stay lazy and are loaded through `skill_read` only
@@ -1017,6 +1077,8 @@ pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
         return String::new();
     }
 
+    let skills = canonical_skill_order(skills);
+
     let mut prompt = String::from(
         "## Available Skills\n\n\
          Skills are listed as metadata and are lazy-loaded.\n\
@@ -1025,7 +1087,7 @@ pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
     );
 
     const CLOSING: &str = "</available_skills>";
-    for skill in skills.iter().take(MAX_SKILLS) {
+    for skill in skills.iter().copied().take(MAX_SKILLS) {
         let mut rendered = String::new();
         let _ = writeln!(rendered, "  <skill>");
         write_xml_text_element(

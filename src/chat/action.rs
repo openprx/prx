@@ -348,6 +348,14 @@ pub enum Action {
         /// the routing default must be carried through the reducer/effect
         /// boundary and scoped at the actual tool execution site.
         turn_message_send_ctx: Option<crate::tools::message_send::MessageSendExecutionContext>,
+        /// The turn's raw user text, before memory recall, `@path` expansion,
+        /// or the `[Recent shared workspace events]` block are prepended to it.
+        /// Capability routing runs on this and nothing else: every other entry
+        /// point already passes `ToolLoopMemory::with_routing_input`, and chat
+        /// was the one surface routing on injected context, which let recalled
+        /// text and shared-workspace events widen the published tool surface.
+        /// `None` keeps non-chat/test callers on the driver's history fallback.
+        routing_input: Option<String>,
     },
     /// 收到一个 streaming 增量块
     StreamChunkReceived {

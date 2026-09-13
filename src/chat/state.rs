@@ -188,6 +188,11 @@ pub enum Effect {
         /// Per-turn default route for `message_send` tool calls. `None` keeps
         /// non-turn/test callers on the tool's legacy fallback slot.
         turn_message_send_ctx: Option<crate::tools::message_send::MessageSendExecutionContext>,
+        /// The turn's raw user text, forwarded to the driver as the capability
+        /// routing input. Provider history is enriched with memory recall and
+        /// shared-workspace events before it reaches the driver; routing on
+        /// that text let injected content widen the tool surface.
+        routing_input: Option<String>,
     },
     /// 持久化当前会话快照
     SaveSession(ChatSession),
@@ -1115,6 +1120,7 @@ impl ChatState {
                 cancel,
                 turn_spawn_ctx,
                 turn_message_send_ctx,
+                routing_input,
             } => self.reduce_start_llm_turn(
                 provider_turn_task_id,
                 provider_turn_sequence,
@@ -1125,6 +1131,7 @@ impl ChatState {
                 cancel,
                 turn_spawn_ctx,
                 turn_message_send_ctx,
+                routing_input,
             ),
             Action::StreamChunkReceived {
                 draft_id,
@@ -1706,6 +1713,7 @@ impl ChatState {
         cancel: CancellationToken,
         turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
         turn_message_send_ctx: Option<crate::tools::message_send::MessageSendExecutionContext>,
+        routing_input: Option<String>,
     ) -> Vec<Effect> {
         self.insert_visible_streaming_draft(
             provider_turn_task_id,
@@ -1738,6 +1746,7 @@ impl ChatState {
                 chat_mode,
                 turn_spawn_ctx,
                 turn_message_send_ctx,
+                routing_input,
             },
             Effect::RequestRedraw,
         ]
@@ -1755,6 +1764,7 @@ impl ChatState {
         cancel: CancellationToken,
         turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
         turn_message_send_ctx: Option<crate::tools::message_send::MessageSendExecutionContext>,
+        routing_input: Option<String>,
     ) -> Vec<Effect> {
         self.insert_visible_streaming_draft(
             provider_turn_task_id,
@@ -1785,6 +1795,7 @@ impl ChatState {
                 chat_mode,
                 turn_spawn_ctx,
                 turn_message_send_ctx,
+                routing_input,
             },
             Effect::RequestRedraw,
         ]
@@ -7149,6 +7160,7 @@ mod tests {
                 cancel,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             });
 
             // 状态变更：draft + active_cancel + generating
@@ -7192,6 +7204,7 @@ mod tests {
                 cancel: cancel.clone(),
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             });
             // 通过取消原 token，验证 Effect 内的 token 一并取消（共享 cancellation）
             cancel.cancel();
@@ -7224,6 +7237,7 @@ mod tests {
                 cancel: CancellationToken::new(),
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             });
 
             let carried = effects.iter().find_map(|effect| match effect {
@@ -7259,6 +7273,7 @@ mod tests {
                 cancel: CancellationToken::new(),
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             });
 
             let carried = effects.iter().find_map(|effect| match effect {
@@ -7364,6 +7379,7 @@ mod tests {
                 cancel,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             });
             assert!(state.control.generating);
 
@@ -7391,6 +7407,7 @@ mod tests {
                 cancel: CancellationToken::new(),
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             });
             assert!(has_start_turn(&effects), "phase1 draft start must still emit StartTurn");
         }
@@ -9499,6 +9516,7 @@ mod tests {
                 cancel: CancellationToken::new(),
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             });
         }
 
@@ -9708,6 +9726,7 @@ mod tests {
                 cancel,
                 turn_spawn_ctx: None,
                 turn_message_send_ctx: None,
+                routing_input: None,
             });
         }
 

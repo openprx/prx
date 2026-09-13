@@ -12,6 +12,8 @@ pub mod terminal;
 pub(crate) mod turn_context;
 
 #[cfg(test)]
+mod prefix_stability_tests;
+#[cfg(test)]
 mod tests;
 
 pub use loop_::run;

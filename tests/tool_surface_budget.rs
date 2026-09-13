@@ -19,8 +19,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 
-/// A greeting-sized message: it names no capability, so intent routing may
-/// activate nothing and the surface falls back to its unconditional tools.
+/// A greeting-sized message. It names no capability, so routing is *unrouted*
+/// and falls back to the whole registry — which is exactly why the channel
+/// exclusion below has to be a policy boundary and not a routing side effect.
 const NEUTRAL_MESSAGE: &str = "thanks, that answers it";
 
 fn registry(tmp: &TempDir) -> Vec<Box<dyn Tool>> {
@@ -96,9 +97,9 @@ fn channel_sessions_do_not_advertise_the_operations_surface() {
         "the channel surface may never be wider than the operator surface"
     );
 
-    // A neutral message is the weak case: intent routing already drops most of
-    // this list. The exclusion only earns its place when the message *does* name
-    // those capabilities, so drive the full operator surface and diff the two.
+    // The neutral case above is carried entirely by `always_exclude`. Prove the
+    // exclusion also survives a message that explicitly names those
+    // capabilities, which is the case routing would otherwise let through.
     let broad = "check the git plugins, the proxy config, the mcp status, the skills and reindex the documents";
     let operator_broad = specs_for(&tools, broad, &operator);
     let channel_broad = specs_for(&tools, broad, &channel);
@@ -216,5 +217,119 @@ fn channel_exclusion_survives_a_capability_matching_message() {
     assert!(
         wire_bytes(&channel_specs) < wire_bytes(&operator_specs),
         "the channel surface must be strictly cheaper on an operations-shaped message"
+    );
+}
+
+/// What a real request actually gets, against the real default registry.
+///
+/// Every existing routing test uses synthetic probe tools or asserts on
+/// categories, so none of them could see a request that reaches the model
+/// without the tool it obviously needs. These name the tools by hand.
+#[test]
+fn common_requests_reach_the_tools_they_obviously_need() {
+    let tmp = TempDir::new().unwrap();
+    let tools = registry(&tmp);
+    let tiering = ToolTieringConfig::default();
+
+    let cases: [(&str, &[&str]); 8] = [
+        ("commit this change and push the branch", &["git_operations", "shell"]),
+        ("search the web for the rustls release notes", &["web_search_tool"]),
+        (
+            "fetch https://example.com/report and summarise it",
+            &["web_fetch", "http_request"],
+        ),
+        ("remember that I prefer tabs over spaces", &["memory_store"]),
+        ("schedule a cron job that runs this every morning", &["cron"]),
+        ("send a notification about it", &["pushover"]),
+        (
+            "read the file in that directory and fix the typo",
+            &["file_read", "file_edit"],
+        ),
+        ("check the mcp server status", &["mcp_status"]),
+    ];
+
+    for (message, expected) in cases {
+        let specs = specs_for(&tools, message, &tiering);
+        let got = names(&specs);
+        for tool in expected {
+            assert!(got.contains(tool), "`{message}` must reach `{tool}`, got {got:?}");
+        }
+    }
+}
+
+/// The keyword table is English-only on purpose, so a request it cannot read is
+/// not evidence for trimming anything: the surface falls back to the whole
+/// registry rather than to the Core floor.
+///
+/// MUTATION GUARD: delete the `unrouted` short-circuit in
+/// `select_tools_for_intent` and every one of these goes red.
+#[test]
+fn a_request_the_keyword_table_cannot_read_keeps_the_whole_registry() {
+    let tmp = TempDir::new().unwrap();
+    let tools = registry(&tmp);
+    let tiering = ToolTieringConfig::default();
+    // The unrouted surface is the whole published catalog; `tools.len()` is not
+    // the same number because a registry entry may publish several names.
+    let baseline = specs_for(&tools, "", &tiering);
+    let everything = names(&baseline);
+    assert!(
+        everything.contains(&"cron") && everything.contains(&"git_operations"),
+        "the fixture's baseline must really be the whole catalog: {everything:?}"
+    );
+
+    // Three ordinary requests that contain no English capability keyword: two
+    // non-English, one English small talk.
+    let unrouted = [
+        "\u{5e2e}\u{6211}\u{628a}\u{8fd9}\u{6bb5}\u{6539}\u{5f97}\u{66f4}\u{7b80}\u{6d01}\u{4e00}\u{70b9}",
+        "\u{3053}\u{306e}\u{6587}\u{7ae0}\u{3092}\u{77ed}\u{304f}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}",
+        "could you make that sound a little friendlier please",
+    ];
+    for message in unrouted {
+        let specs = specs_for(&tools, message, &tiering);
+        let got = names(&specs);
+        assert_eq!(
+            got,
+            everything,
+            "an unrouted request must keep the whole registry, got {} of {} tools",
+            got.len(),
+            everything.len()
+        );
+    }
+
+    // ... and operator policy still outranks the fallback.
+    let restricted = ToolTieringConfig {
+        always_exclude: vec!["cron".to_string()],
+        ..ToolTieringConfig::default()
+    };
+    let restricted_specs = specs_for(&tools, unrouted[0], &restricted);
+    let got = names(&restricted_specs);
+    assert!(
+        !got.contains(&"cron"),
+        "always_exclude must survive the fallback: {got:?}"
+    );
+}
+
+/// An English request that *does* name a capability is still narrowed — the
+/// fallback is a floor for unreadable input, not a retreat from routing.
+#[test]
+fn a_routed_english_request_is_still_narrowed() {
+    let tmp = TempDir::new().unwrap();
+    let tools = registry(&tmp);
+    let tiering = ToolTieringConfig::default();
+
+    let routed_specs = specs_for(&tools, "commit this change", &tiering);
+    let routed = names(&routed_specs);
+    let baseline = specs_for(&tools, "", &tiering);
+    let everything = names(&baseline);
+    assert!(
+        routed.len() < everything.len(),
+        "naming a capability must still drop the rest of the catalog: {} vs {}",
+        routed.len(),
+        everything.len()
+    );
+    assert!(routed.contains(&"git_operations"), "{routed:?}");
+    assert!(
+        !routed.contains(&"cron"),
+        "an unnamed Extended capability must stay out: {routed:?}"
     );
 }

@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.118] - 13 September 2026
+
+### Fixed
+
+- Keep the skill section of the system prompt stable across the turns of one
+  session. The section is rebuilt from a relevance ranking of the current user
+  message and sits ahead of the identity and runtime sections, so every
+  rephrasing invalidated the provider's cacheable prefix for the whole
+  conversation — the tool-catalog work in 0.8.113 stabilized a later section
+  than the one that actually moved. A catalog of at most `[skill_rag] top_k`
+  skills is now published whole and rendered in a canonical, de-duplicated
+  order, which makes the section a pure function of the installed skills; the
+  default `top_k` is raised from 5 to 32 because the section carries metadata
+  only. Oversized catalogs still fall back to retrieval.
+- Route terminal chat on the raw user text. The chat driver passed no routing
+  input to the tool loop, so routing fell back to the last history message —
+  which chat has already enriched with memory recall and the
+  `[Recent shared workspace events]` block. Any participant could therefore
+  widen the published tool surface by posting a URL into the shared workspace.
+  Every other entry point already pinned the raw text.
+
+### Changed
+
+- Publish one cumulative tool set per chat session. Intent routing is a per-turn
+  decision, but the `tools` array is part of the provider's cacheable request
+  prefix: re-deciding it on every turn re-prefilled the whole conversation each
+  time the user rephrased, which cost more than the tool schemas it saved. A
+  chat session now exposes the union of every set routed so far, through the
+  existing `[tool_tiering] always_include` knob, so the prefix moves only the
+  first time a new capability is named. `/new` and `/clear` reset the union;
+  channel, gateway, console and worker turns are one-session-per-turn and are
+  unaffected.
+- Intent keywords are English-only, with a language-neutral fallback. The
+  classifier table no longer carries non-English entries, and the English side
+  gained the words the removed ones covered (`store`, `save`, `screenshot`,
+  `voice`, `audio`, `webpage`, `repository`, `picture`, `recurring`, `send`).
+  A message that activates no category is now unrouted: the whole registry is
+  published instead of the core floor, because a keyword table that cannot read
+  the request is not evidence for removing capabilities from it.
+  `always_exclude`, `channel_exclude` and `model_allowlists` are unchanged and
+  still outrank the fallback.
+
 ## [0.8.117] - 13 September 2026
 
 ### Fixed

@@ -4342,6 +4342,15 @@ pub async fn run(
     #[cfg(not(feature = "terminal-tui"))]
     let _ = &provider_turn_lifecycle_tx;
 
+    // Session-scoped exposure ledgers. Both feed the provider's cacheable
+    // request prefix (the skill section of the system prompt and the `tools`
+    // array), so both are unions over the session rather than per-turn
+    // decisions: the prefix then moves only when the session genuinely reaches
+    // a new capability, not when the user rephrases. `/new` and `/clear` reset
+    // them, because those are the points where the prefix restarts anyway.
+    let session_tool_exposure = crate::tools::intent::SessionToolExposure::new();
+    let mut session_skill_exposure = crate::skills::SessionSkillExposure::new();
+
     // 根据 redux mode 选择 EffectExecutor 模式（TUI feature only）
     #[cfg(feature = "terminal-tui")]
     let effect_executor = {
@@ -4365,6 +4374,7 @@ pub async fn run(
             approval_router: Arc::new(dispatcher::ApprovalRouter::new()),
             tool_security_policy: Arc::clone(&security),
             tool_tiering: config.tool_tiering.clone(),
+            exposed_tools: session_tool_exposure.clone(),
         };
         tracing::info!(mode = ?mode, "chat EffectExecutor in Pure real-deps mode");
         dispatcher::EffectExecutor::new_with_deps(deps)
@@ -5824,6 +5834,10 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // session-scoped UI/model ledger. It must not share `/clear` semantics,
         // otherwise the old title, turns, and token usage survive indefinitely.
         if user_input == "/new" {
+            // A new session identity restarts the provider prefix from scratch,
+            // so the exposure unions must not survive it.
+            session_tool_exposure.reset();
+            session_skill_exposure.reset();
             match start_new_chat_session(
                 mem.as_ref(),
                 ChatSwitchCtx {
@@ -5866,6 +5880,10 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // Handle /clear separately (needs mutable history). This intentionally
         // keeps the current session identity and accounting ledger.
         if user_input == "/clear" {
+            // Same reasoning as `/new`: the conversation the prefix was built
+            // over is gone, so the exposure unions start over too.
+            session_tool_exposure.reset();
+            session_skill_exposure.reset();
             history.clear();
             // S2-C Step 4: 双写 HistoryCleared 到 reducer。reducer 的语义是
             // "drain 所有非 system + 保留 system"——legacy 是先 clear 再可能 push
@@ -7130,6 +7148,12 @@ Retry with a compatible model: /provider {new_provider} <model>"
 
         // Build system prompt with skill selection
         let selected_skills = select_prompt_skills(&user_input, &skills, &config, skill_embedder.as_ref()).await;
+        // Retrieval decides which skills this session ever sees; the session
+        // union decides what the prompt says. Without it the section is
+        // re-ranked against every rephrasing, and because it sits ahead of the
+        // identity and tool sections, each re-rank invalidates the provider's
+        // prefix cache for the entire conversation.
+        let selected_skills = session_skill_exposure.absorb(&skills, &selected_skills);
         let system_prompt = build_runtime_system_prompt(&config, model_name, &selected_skills, native_tools);
         let persisted_history_for_turn = persisted_history_for_current_turn(&chat_session, &system_prompt, &user_input);
         upsert_leading_system_prompt(&mut history, system_prompt.clone());
@@ -7601,6 +7625,11 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     cancel: cancellation.clone(),
                     turn_spawn_ctx: Some(redux_turn_spawn_ctx),
                     turn_message_send_ctx: Some(redux_turn_message_send_ctx),
+                    // Route on what the user typed. `history_for_provider`
+                    // already carries the memory preamble and the
+                    // `[Recent shared workspace events]` block, and routing on
+                    // that let injected text widen the published tool surface.
+                    routing_input: Some(user_input_for_prompt.clone()),
                 },
                 "chat.start_llm_turn",
             );
@@ -16779,6 +16808,7 @@ mod s4_a_4 {
             cancel: CancellationToken::new(),
             turn_spawn_ctx: None,
             turn_message_send_ctx: None,
+            routing_input: None,
         });
         let _ = state.reduce(crate::chat::action::Action::StartLLMTurn {
             provider_turn_task_id: None,
@@ -16790,6 +16820,7 @@ mod s4_a_4 {
             cancel: CancellationToken::new(),
             turn_spawn_ctx: None,
             turn_message_send_ctx: None,
+            routing_input: None,
         });
         let _ = state.reduce(crate::chat::action::Action::StreamChunkReceived {
             draft_id: "draft-a".to_string(),
@@ -18754,6 +18785,7 @@ mod p3_directional_switch_tests {
             cancel: CancellationToken::new(),
             turn_spawn_ctx: None,
             turn_message_send_ctx: None,
+            routing_input: None,
         });
 
         let ready_effects = state.reduce(Action::ProviderTurnReadyForCommit {
