@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.113] - 13 September 2026
+
+### Fixed
+
+- Keep the system prompt prefix stable across turns of one session. The
+  `## Runtime Capabilities` inventory and the prompt-guided tool catalog are now
+  rendered from a canonical snapshot (name-sorted, one entry per name), so two
+  turns that expose the same tools produce byte-identical system prompts and the
+  provider-side prefix cache keeps hitting instead of missing whenever intent
+  routing returned the same tools in a different order.
+
+### Changed
+
+- Memoize the compiled tool snapshot's rendered prompt sections and SHA-256
+  fingerprint for the duration of a turn. The snapshot is still rebuilt on every
+  iteration so dynamic backends cannot go stale, but an unchanged tool set is no
+  longer re-rendered and re-hashed per iteration. The compiled request-context
+  event and the `openprx::prompt` debug record now report the render cache's hit
+  and miss counts.
+- Canonicalize the provider-native tool array with the same ordering, so the
+  tool list sent to native providers is also stable for a given exposed set.
+
 ## [0.8.112] - 13 September 2026
 
 ### Changed

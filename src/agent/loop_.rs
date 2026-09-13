@@ -6209,6 +6209,11 @@ async fn run_tool_call_loop_outcome_unguarded(
     let mut empty_response_retry_attempted = false;
     let mut inject_empty_response_retry_instruction = false;
 
+    // Rebuilt every iteration so dynamic backends cannot go stale, but the
+    // snapshot is normally identical across a turn's iterations: memoize its
+    // rendered prompt sections and fingerprint instead of recomputing one JSON
+    // serialization plus two SHA-256 digests per tool each time.
+    let mut tool_snapshot_render_cache = crate::agent::turn_context::ToolSnapshotRenderCache::default();
     let mut iteration = 0usize;
     loop {
         iteration = iteration.saturating_add(1);
@@ -6376,8 +6381,11 @@ async fn run_tool_call_loop_outcome_unguarded(
             tool_specs.retain(|spec| spec.name != crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME);
             tool_specs.push(required);
         }
-        let compiled_tool_context =
-            crate::agent::turn_context::CompiledToolContext::new(mode_capabilities.native_tool_calling, tool_specs);
+        let compiled_tool_context = crate::agent::turn_context::CompiledToolContext::compile(
+            mode_capabilities.native_tool_calling,
+            tool_specs,
+            &mut tool_snapshot_render_cache,
+        );
         compiled_tool_context.apply_to_messages(&mut prepared_messages.messages);
         let mut execution_adapter = runtime_adapter.clone();
         execution_adapter.allowed_tool_names = Some(compiled_tool_context.allowed_tool_names());
@@ -6402,6 +6410,8 @@ async fn run_tool_call_loop_outcome_unguarded(
             system_prompt_chars,
             tool_snapshot_sha256 = %tool_snapshot.sha256,
             tool_count = tool_snapshot.count,
+            tool_snapshot_render_hits = tool_snapshot_render_cache.hits(),
+            tool_snapshot_render_misses = tool_snapshot_render_cache.misses(),
             "final request system prompt compiled"
         );
 
@@ -6416,6 +6426,10 @@ async fn run_tool_call_loop_outcome_unguarded(
                 "chars": system_prompt_chars,
             },
             "tool_snapshot": &tool_snapshot,
+            "tool_snapshot_render": {
+                "hits": tool_snapshot_render_cache.hits(),
+                "misses": tool_snapshot_render_cache.misses(),
+            },
         });
         if let Some(fabric) = event_fabric.as_ref() {
             let scope = request_event_scope
@@ -9707,6 +9721,153 @@ mod tests {
                 .contains("private system instructions"),
             "durable provenance must not duplicate system prompt content"
         );
+    }
+
+    /// The compiled tool snapshot is rebuilt on every iteration so dynamic
+    /// backends cannot go stale, but rendering and fingerprinting it is
+    /// memoized for the turn. A second iteration must reuse the first
+    /// iteration's render, and the system prefix it contributes must not move
+    /// between iterations — that prefix is what provider-side prompt caches key
+    /// on.
+    #[tokio::test]
+    async fn compiled_tool_snapshot_is_rendered_once_per_turn_with_a_stable_system_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let fabric = MemoryFabric::new(memory.clone(), "workspace-render-cache");
+        let mut request_scope = MessageEventScope::new("chat", MemoryVisibility::Workspace)
+            .with_session_key("chat:render-cache")
+            .with_run_id("run-render-cache")
+            .with_channel("terminal")
+            .with_sender("local-user");
+        request_scope.causation_event_id = Some("user-event-render-cache".to_string());
+        let runtime = ToolLoopMemory::new(&memory, tmp.path(), None)
+            .with_event_fabric(fabric)
+            .with_request_event_scope(request_scope);
+
+        let provider = NativeScriptedProvider::new(vec![
+            ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "delay_progress".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+                reasoning_content: None,
+            },
+            ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            },
+        ]);
+        // Four tools registered out of name order: past the point where a
+        // registry that happens to be sorted would hide an ordering bug.
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(SteadyTool {
+                delay: Duration::from_millis(0),
+                executions: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(RefreshCountingTool {
+                name: "mcp_probe",
+                category: ToolCategory::System,
+                refreshes: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(RefreshCountingTool {
+                name: "automation_probe",
+                category: ToolCategory::Automation,
+                refreshes: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(RefreshCountingTool {
+                name: "extra_probe",
+                category: ToolCategory::System,
+                refreshes: Arc::new(AtomicUsize::new(0)),
+            }),
+        ];
+        let mut history = vec![
+            ChatMessage::system("stable base system prompt"),
+            ChatMessage::user("run the probe"),
+        ];
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            Arc::new(tools_registry),
+            &NoopObserver,
+            &HookManager::new(tmp.path().to_path_buf()),
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "terminal",
+            &crate::config::MultimodalConfig::default(),
+            2,
+            false,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            runtime,
+            ChatMode::default(),
+        )
+        .await
+        .expect("two-iteration tool loop should complete");
+        assert_eq!(result, "done");
+
+        let principal = MemoryPrincipal {
+            workspace_id: "workspace-render-cache".to_string(),
+            agent_id: None,
+            persona_id: None,
+            session_key: Some("chat:render-cache".to_string()),
+            channel: Some("terminal".to_string()),
+            sender: Some("local-user".to_string()),
+            owner_id: None,
+            legacy_session_key: None,
+        };
+        let events = memory.list_message_events_since(&principal, 0, 50).await.unwrap();
+        let mut payloads = events
+            .iter()
+            .filter(|event| event.event_type == "llm.request.context.compiled")
+            .filter_map(|event| event.raw_payload_json.as_deref())
+            .filter_map(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .collect::<Vec<_>>();
+        payloads.sort_by_key(|payload| payload["iteration"].as_u64().unwrap_or_default());
+        assert_eq!(payloads.len(), 2, "one compiled request context per iteration");
+        assert_eq!(payloads[0]["iteration"], 1);
+        assert_eq!(payloads[1]["iteration"], 2);
+
+        assert_eq!(payloads[0]["tool_snapshot"]["count"], 4);
+        assert_eq!(
+            payloads[0]["tool_snapshot"]["sha256"], payloads[1]["tool_snapshot"]["sha256"],
+            "an unchanged tool set must fingerprint identically across iterations"
+        );
+        assert_eq!(
+            payloads[0]["system_prompt"]["sha256"], payloads[1]["system_prompt"]["sha256"],
+            "the system prefix must stay byte-identical across iterations of one turn"
+        );
+        assert_eq!(payloads[0]["tool_snapshot_render"]["hits"], 0);
+        assert_eq!(payloads[0]["tool_snapshot_render"]["misses"], 1);
+        assert_eq!(
+            payloads[1]["tool_snapshot_render"]["hits"], 1,
+            "iteration 2 must reuse iteration 1's rendered snapshot"
+        );
+        assert_eq!(
+            payloads[1]["tool_snapshot_render"]["misses"], 1,
+            "iteration 2 must not re-render or re-fingerprint the snapshot"
+        );
+
+        let names = payloads[0]["tool_snapshot"]["tools"]
+            .as_array()
+            .expect("test: fingerprinted tool list")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        let mut canonical = names.clone();
+        canonical.sort_unstable();
+        assert_eq!(names, canonical, "the exposed snapshot must be canonically ordered");
     }
 
     #[tokio::test]
