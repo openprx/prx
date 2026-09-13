@@ -1886,7 +1886,6 @@ async fn apply_redux_context_rollover(
     config: &crate::config::AgentCompactionConfig,
     audit: Option<&crate::agent::loop_::DocumentIngestRuntime>,
     action_tx: &mpsc::Sender<Action>,
-    draft_id: Option<&str>,
     reason: crate::chat::action::CompactReason,
     trigger: &str,
 ) -> Result<Option<usize>, ()> {
@@ -1906,35 +1905,21 @@ async fn apply_redux_context_rollover(
     .await
     {
         Ok(Some(patch)) => patch,
-        Ok(None) if matches!(config.mode, crate::config::AgentCompactionMode::Switch) => {
-            let message = "context switch could not create an exact transcript handoff; refusing lossy trim";
-            if let Some(draft_id) = draft_id {
-                let _ = action_tx
-                    .send(Action::StreamFailed {
-                        draft_id: draft_id.to_string(),
-                        err: message.to_string(),
-                        retryable: false,
-                    })
-                    .await;
-            }
-            tracing::warn!(trigger, "{message}");
-            return Err(());
-        }
-        Ok(None) => return Ok(None),
-        Err(error) => {
+        // A `switch` rollover that cannot produce an exact handoff must not end
+        // the turn. Failing the draft here left every session containing tool
+        // calls answering each user message with the same non-retryable error
+        // while history never shrank. Returning `Ok(None)` hands the caller its
+        // ordinary token-aware trim fallback.
+        Ok(None) => {
             if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
-                if let Some(draft_id) = draft_id {
-                    let _ = action_tx
-                        .send(Action::StreamFailed {
-                            draft_id: draft_id.to_string(),
-                            err: format!("context switch failed: {error}"),
-                            retryable: false,
-                        })
-                        .await;
-                }
-                tracing::warn!(error = %error, trigger, "redux driver context switch failed closed");
-                return Err(());
+                tracing::warn!(
+                    trigger,
+                    "context switch could not create an exact transcript handoff; continuing on a lossy trim"
+                );
             }
+            return Ok(None);
+        }
+        Err(error) => {
             tracing::warn!(error = %error, trigger, "redux driver context rollover failed; falling back to trim");
             return Ok(None);
         }
@@ -1948,18 +1933,12 @@ async fn apply_redux_context_rollover(
         crate::agent::loop_::plan_context_budget(history, config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
     if budget.over_hard_limit {
         if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
-            let message = "context switch remained above the hard limit; refusing lossy trim";
-            if let Some(draft_id) = draft_id {
-                let _ = action_tx
-                    .send(Action::StreamFailed {
-                        draft_id: draft_id.to_string(),
-                        err: message.to_string(),
-                        retryable: false,
-                    })
-                    .await;
-            }
-            tracing::warn!(trigger, "{message}");
-            return Err(());
+            tracing::warn!(
+                trigger,
+                used_tokens = budget.used_tokens,
+                hard_limit = budget.available_input_tokens,
+                "context switch remained above the hard limit; degraded to a lossy trim"
+            );
         }
         let trimmed = crate::agent::loop_::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
             history,
@@ -2398,7 +2377,6 @@ async fn drive_start_turn_stream(
                     config,
                     compaction_audit.as_ref(),
                     &action_tx,
-                    Some(&draft_id),
                     crate::chat::action::CompactReason::ContextOverflow,
                     "redux_preflight",
                 )
@@ -2646,7 +2624,6 @@ async fn drive_start_turn_stream_legacy(
                         config,
                         None,
                         &action_tx,
-                        Some(&draft_id),
                         crate::chat::action::CompactReason::ContextOverflow,
                         "redux_preflight",
                     )
@@ -2772,7 +2749,6 @@ async fn drive_start_turn_stream_legacy(
                             config,
                             None,
                             &action_tx,
-                            Some(&draft_id),
                             crate::chat::action::CompactReason::ContextOverflow,
                             "redux_overflow_retry",
                         )
@@ -9403,7 +9379,7 @@ mod real_mode_tests {
     }
 
     #[tokio::test]
-    async fn redux_switch_failure_emits_terminal_error_instead_of_trimming() {
+    async fn redux_switch_without_exact_provenance_degrades_instead_of_failing_the_turn() {
         let provider = MockEnvProvider::from_env();
         let mut history = vec![
             crate::providers::ChatMessage::system("sys"),
@@ -9435,29 +9411,28 @@ mod real_mode_tests {
             &config,
             None,
             &action_tx,
-            Some("draft-switch-failure"),
             crate::chat::action::CompactReason::ContextOverflow,
             "test_switch_failure",
         )
         .await;
 
-        assert!(result.is_err());
+        assert_eq!(
+            result,
+            Ok(None),
+            "a switch without exact provenance must hand the caller its trim fallback, not end the turn"
+        );
         assert_eq!(
             history
                 .iter()
                 .map(|message| (message.role.clone(), message.content.clone()))
                 .collect::<Vec<_>>(),
             original,
-            "failed exact switch must leave history unchanged"
+            "a rollover that produced no patch must leave history untouched for the caller to trim"
         );
-        assert!(matches!(
-            action_rx.recv().await,
-            Some(Action::StreamFailed {
-                draft_id,
-                retryable: false,
-                ..
-            }) if draft_id == "draft-switch-failure"
-        ));
+        assert!(
+            action_rx.try_recv().is_err(),
+            "degrading must not emit a terminal StreamFailed for the draft"
+        );
     }
 
     #[tokio::test]
@@ -9553,7 +9528,6 @@ mod real_mode_tests {
             &config,
             None,
             &action_tx,
-            None,
             crate::chat::action::CompactReason::ContextOverflow,
             "test_persisted_guard_source",
         )
@@ -9702,7 +9676,6 @@ mod real_mode_tests {
             &config,
             None,
             &action_tx,
-            None,
             crate::chat::action::CompactReason::ContextOverflow,
             "test_empty_enrichment_guard_source",
         )
@@ -9829,7 +9802,6 @@ mod real_mode_tests {
             &config,
             None,
             &action_tx,
-            None,
             crate::chat::action::CompactReason::ContextOverflow,
             "test_enrichment_only_fallback",
         )
@@ -9942,7 +9914,6 @@ mod real_mode_tests {
             &config,
             None,
             &action_tx,
-            None,
             crate::chat::action::CompactReason::ContextOverflow,
             "test_second_trim",
         )
@@ -10078,7 +10049,6 @@ mod real_mode_tests {
             &config,
             None,
             &action_tx,
-            None,
             crate::chat::action::CompactReason::ContextOverflow,
             "test_floor_drops_unfit_summary",
         )

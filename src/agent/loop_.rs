@@ -666,6 +666,23 @@ fn autosave_memory_key(prefix: &str) -> String {
 
 /// Trim conversation history to prevent unbounded growth.
 /// Preserves the system prompt (first message if role=system) and the most recent messages.
+/// Drop `role="tool"` messages stranded at `from` after a trim removed the
+/// assistant message that requested them.
+///
+/// Every lossy trim removes from a single position, so only that position can
+/// strand a tool result; native providers reject a tool message that has no
+/// matching `tool_calls` ahead of it, which would turn a survivable trim into
+/// a failed turn.
+fn drop_orphan_tool_results_at(history: &mut Vec<ChatMessage>, from: usize) {
+    while history.len() > from && history.get(from).is_some_and(|message| message.role == "tool") {
+        history.remove(from);
+    }
+}
+
+fn history_non_system_start(history: &[ChatMessage]) -> usize {
+    usize::from(history.first().is_some_and(|message| message.role == "system"))
+}
+
 fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     // Nothing to trim if within limit
     let has_system = history.first().map_or(false, |m| m.role == "system");
@@ -678,6 +695,7 @@ fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     let start: usize = if has_system { 1 } else { 0 };
     let to_remove = non_system_count - max_history;
     history.drain(start..start + to_remove);
+    drop_orphan_tool_results_at(history, start);
 }
 
 /// Aggressive trim fallback: keep only the most recent non-system messages.
@@ -949,6 +967,7 @@ status: {status}\n\
 /// Token-aware mid-turn trim: remove the oldest non-system messages one at a time
 /// until the estimated token count drops below max_tokens.
 fn trim_history_token_aware(history: &mut Vec<ChatMessage>, max_tokens: usize) {
+    let start_of_non_system = history_non_system_start(history);
     loop {
         if estimate_history_tokens(history) <= max_tokens {
             break;
@@ -959,7 +978,9 @@ fn trim_history_token_aware(history: &mut Vec<ChatMessage>, max_tokens: usize) {
             break; // nothing left to remove
         }
         history.remove(start);
+        drop_orphan_tool_results_at(history, start);
     }
+    drop_orphan_tool_results_at(history, start_of_non_system);
 }
 
 fn build_compaction_transcript(messages: &[ChatMessage]) -> String {
@@ -1185,6 +1206,7 @@ pub fn trim_history_to_context_budget_preserving_compaction_replacement(
             break;
         };
         history.remove(remove_index);
+        drop_orphan_tool_results_at(history, remove_index);
     }
     history.len() != before_len || measure_history_tokens(history) != before_tokens
 }
@@ -1201,12 +1223,12 @@ pub fn trim_history_to_context_budget_preserving_compaction_replacement_with_flo
     if after_preserve.over_hard_limit {
         trim_history_to_context_budget(history, config);
         while plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD).over_hard_limit {
-            let has_system = history.first().is_some_and(|m| m.role == "system");
-            let start = if has_system { 1 } else { 0 };
+            let start = history_non_system_start(history);
             if history.len() <= start {
                 break;
             }
             history.remove(start);
+            drop_orphan_tool_results_at(history, start);
         }
     }
     history.len() != before_len || measure_history_tokens(history) != before_tokens
@@ -1347,6 +1369,9 @@ struct CompactionAuditSource {
     source_event_ids: Vec<String>,
     source_event_range: Option<CompactionSourceEventRange>,
     source_event_provenance_status: String,
+    /// Cold-window messages covered by an assistant turn rather than by an
+    /// event id of their own (tool round-trip envelopes and results).
+    unpersisted_companion_count: usize,
     document_refs: Vec<serde_json::Value>,
 }
 
@@ -1358,6 +1383,7 @@ impl Default for CompactionAuditSource {
             source_event_ids: Vec::new(),
             source_event_range: None,
             source_event_provenance_status: "unavailable".to_string(),
+            unpersisted_companion_count: 0,
             document_refs: Vec::new(),
         }
     }
@@ -1370,11 +1396,19 @@ fn build_compaction_audit_source(source_messages: &[ChatMessage]) -> CompactionA
         source_event_ids: Vec::new(),
         source_event_range: None,
         source_event_provenance_status: "unavailable".to_string(),
+        unpersisted_companion_count: 0,
         document_refs: extract_document_ingest_refs(source_messages),
     }
 }
 
 const COMPACTION_SOURCE_EVENT_WINDOW: usize = 500;
+/// Provenance status used when every cold-window message is accounted for, but
+/// some of them are tool round-trip parts covered by their assistant turn
+/// rather than by an event id of their own.
+const COMPACTION_PROVENANCE_EXACT_WITH_TOOL_ROUNDTRIPS: &str = "exact_with_tool_roundtrips";
+/// Event type recorded when a `switch` rollover could not stay lossless and the
+/// turn continued on a token-aware trim instead of failing.
+const CONTEXT_COMPACTION_DEGRADED_EVENT_TYPE: &str = "context.compaction.degraded";
 const CONTEXT_HANDOFF_START: &str = "[context_handoff]";
 const CONTEXT_HANDOFF_END: &str = "[/context_handoff]";
 
@@ -1382,6 +1416,10 @@ const CONTEXT_HANDOFF_END: &str = "[/context_handoff]";
 pub(crate) struct CompactionEventProvenance {
     pub(crate) source_event_ids: Vec<String>,
     pub(crate) covered_range: CompactionSourceEventRange,
+    /// Messages in the cold window that belong to a tool round-trip and have no
+    /// durable event of their own. They are covered by the assistant turn they
+    /// hang off, not by an entry in `source_event_ids`.
+    pub(crate) companion_message_count: usize,
 }
 
 fn source_message_matches_event(message: &ChatMessage, event: &MessageEvent) -> bool {
@@ -1392,6 +1430,59 @@ fn source_message_matches_event(message: &ChatMessage, event: &MessageEvent) -> 
 
 fn is_context_handoff_message(message: &ChatMessage) -> bool {
     message.role == "assistant" && message.content.starts_with(CONTEXT_HANDOFF_START)
+}
+
+/// True when `message` exists only inside a live tool round-trip and therefore
+/// never became its own durable `message.created` event.
+///
+/// The loop appends three such shapes: the `role="tool"` result envelopes
+/// (native mode), the `[Tool results]` user block (prompt mode), and the
+/// assistant envelope carrying native `tool_calls`. They belong to the
+/// assistant turn that requested them, so transcript provenance folds them into
+/// that turn instead of refusing to resolve the whole cold window. Before this,
+/// any agentic session was permanently unable to compact in `switch` mode.
+fn is_tool_roundtrip_companion(message: &ChatMessage) -> bool {
+    match message.role.as_str() {
+        "tool" => true,
+        "user" => message
+            .content
+            .starts_with(crate::causal_tree::snapshot::TOOL_RESULTS_PREFIX),
+        "assistant" => {
+            message.content.starts_with('{')
+                && message.content.contains("\"tool_calls\"")
+                && serde_json::from_str::<serde_json::Value>(&message.content).is_ok_and(|value| {
+                    value
+                        .get("tool_calls")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|calls| !calls.is_empty())
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Move the compaction boundary backwards so the retained hot window never
+/// starts in the middle of a tool round-trip.
+///
+/// A `role="tool"` result whose requesting assistant message was compacted away
+/// is an orphan every native provider rejects, so the boundary walks back until
+/// the first retained message is a durable user/assistant turn.
+fn compaction_boundary_without_orphan_tool_results(
+    source_history: &[ChatMessage],
+    start: usize,
+    compact_end: usize,
+) -> usize {
+    let mut boundary = compact_end;
+    while boundary > start {
+        let Some(first_retained) = source_history.get(boundary) else {
+            break;
+        };
+        if !is_tool_roundtrip_companion(first_retained) {
+            break;
+        }
+        boundary = boundary.saturating_sub(1);
+    }
+    boundary
 }
 
 fn context_handoff_lineage(history: &[ChatMessage]) -> (u64, Option<String>) {
@@ -1424,14 +1515,29 @@ pub(crate) async fn resolve_compaction_event_provenance(
     principal: MemoryPrincipal,
     source_messages: &[ChatMessage],
 ) -> anyhow::Result<Option<CompactionEventProvenance>> {
-    if principal.session_key.is_none()
-        || source_messages.is_empty()
-        || source_messages
+    if principal.session_key.is_none() || source_messages.is_empty() {
+        return Ok(None);
+    }
+
+    // Tool round-trip messages are never persisted verbatim, so they cannot be
+    // matched against transcript events. Fold them into the assistant turn that
+    // produced them and resolve provenance over the durable remainder.
+    let companion_message_count = source_messages
+        .iter()
+        .filter(|message| is_tool_roundtrip_companion(message))
+        .count();
+    let durable_messages = source_messages
+        .iter()
+        .filter(|message| !is_tool_roundtrip_companion(message))
+        .collect::<Vec<_>>();
+    if durable_messages.is_empty()
+        || durable_messages
             .iter()
             .any(|message| !matches!(message.role.as_str(), "user" | "assistant"))
     {
         return Ok(None);
     }
+    let source_messages = durable_messages.as_slice();
 
     let mut events = mem
         .load_recent_session_context(SessionContextQuery {
@@ -1476,7 +1582,7 @@ pub(crate) async fn resolve_compaction_event_provenance(
         };
         let segment_end = remaining_messages
             .iter()
-            .position(is_context_handoff_message)
+            .position(|message| is_context_handoff_message(message))
             .map_or(source_messages.len(), |offset| source_index + offset);
         let Some(segment) = source_messages.get(source_index..segment_end) else {
             return Ok(None);
@@ -1517,6 +1623,7 @@ pub(crate) async fn resolve_compaction_event_provenance(
             source_event_count: source_event_ids.len(),
         },
         source_event_ids,
+        companion_message_count,
     }))
 }
 
@@ -1529,7 +1636,12 @@ async fn attach_compaction_event_provenance(
         Ok(Some(provenance)) => {
             source.source_event_ids = provenance.source_event_ids;
             source.source_event_range = Some(provenance.covered_range);
-            source.source_event_provenance_status = "exact".to_string();
+            source.unpersisted_companion_count = provenance.companion_message_count;
+            source.source_event_provenance_status = if provenance.companion_message_count == 0 {
+                "exact".to_string()
+            } else {
+                COMPACTION_PROVENANCE_EXACT_WITH_TOOL_ROUNDTRIPS.to_string()
+            };
         }
         Ok(None) => {}
         Err(error) => {
@@ -1592,6 +1704,74 @@ async fn persist_context_switch(
         })
         .await?;
     Ok(())
+}
+
+/// Record that a `switch` rollover could not stay lossless and the turn
+/// continued on a token-aware trim.
+///
+/// A hard switch that cannot resolve exact provenance used to abort the whole
+/// turn with a non-retryable error, which made every session containing tool
+/// calls permanently unusable once it crossed the hard limit. Degrading is
+/// lossy, so it is recorded durably next to the compaction audit trail instead
+/// of only being logged.
+async fn persist_context_switch_degradation(
+    audit: Option<&DocumentIngestRuntime>,
+    trigger: &str,
+    reason: &str,
+    before_tokens: usize,
+    after_tokens: usize,
+    hard_limit: usize,
+) {
+    let Some(audit) = audit else {
+        return;
+    };
+    let detail = serde_json::json!({
+        "trigger": trigger,
+        "reason": reason,
+        "before_used_tokens": before_tokens,
+        "after_used_tokens": after_tokens,
+        "hard_limit_tokens": hard_limit,
+        "fallback": "token_aware_trim",
+    });
+    let degraded_event_id = Uuid::new_v4().to_string();
+    if let Err(error) = audit
+        .memory
+        .append_message_event(crate::memory::MessageEventInput {
+            event_id: Some(degraded_event_id.clone()),
+            idempotency_key: Some(format!("context-compaction-degraded:{degraded_event_id}")),
+            workspace_id: audit.workspace_id.clone(),
+            owner_id: audit.owner_id.clone(),
+            source: "context_switch".into(),
+            channel: audit.channel.clone(),
+            session_key: audit.session_key.clone(),
+            parent_session_key: audit.legacy_session_key.clone(),
+            run_id: None,
+            parent_run_id: None,
+            agent_id: audit.agent_id.clone(),
+            persona_id: audit.persona_id.clone(),
+            sender: Some("context_switch".to_string()),
+            recipient: audit.sender.clone(),
+            role: "event".to_string(),
+            event_type: CONTEXT_COMPACTION_DEGRADED_EVENT_TYPE.to_string(),
+            subject: audit
+                .session_key
+                .as_ref()
+                .map(|key| crate::memory::MessageEventSubject::Conversation(key.clone())),
+            goal_id: None,
+            causation_event_id: None,
+            correlation_id: audit.source_message_event_id.clone(),
+            attempt_id: None,
+            lease_epoch: None,
+            config_generation_id: audit.config_generation_id,
+            config_source_revision: audit.config_source_revision.clone(),
+            content: format!("context switch degraded to lossy trim ({reason})"),
+            raw_payload_json: Some(detail.to_string()),
+            visibility: audit.visibility.clone(),
+        })
+        .await
+    {
+        tracing::debug!(error = %error, "failed to append context switch degradation event");
+    }
 }
 
 async fn persist_compaction_audit(
@@ -1786,12 +1966,21 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         return Ok(None);
     }
 
-    let keep_recent = config.keep_recent_messages.max(1).min(non_system_count);
-    let compact_count = non_system_count.saturating_sub(keep_recent);
+    let requested_keep_recent = config.keep_recent_messages.max(1).min(non_system_count);
+    let requested_compact_count = non_system_count.saturating_sub(requested_keep_recent);
+    if requested_compact_count == 0 {
+        return Ok(None);
+    }
+    // Never cut inside a tool round-trip: an orphan `role="tool"` result whose
+    // requesting assistant message was compacted away is rejected by every
+    // native provider.
+    let compact_end =
+        compaction_boundary_without_orphan_tool_results(source_history, start, start + requested_compact_count);
+    let compact_count = compact_end.saturating_sub(start);
     if compact_count == 0 {
         return Ok(None);
     }
-    let compact_end = start + compact_count;
+    let keep_recent = source_history.len().saturating_sub(compact_end);
     let compacted_source_messages = source_history.get(start..compact_end);
     let mut audit_source = audit.and_then(|_| compacted_source_messages.map(build_compaction_audit_source));
     if let (Some(audit), Some(source_messages), Some(source)) =
@@ -1813,8 +2002,11 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
             return Ok(None);
         };
         let Some(source) = audit_source.as_ref().filter(|source| {
-            source.source_event_provenance_status == "exact"
-                && source.source_event_ids.len() == source.message_count
+            matches!(
+                source.source_event_provenance_status.as_str(),
+                "exact" | COMPACTION_PROVENANCE_EXACT_WITH_TOOL_ROUNDTRIPS
+            ) && source.source_event_ids.len()
+                == source.message_count.saturating_sub(source.unpersisted_companion_count)
                 && source.source_event_ids.len() <= crate::tools::transcript_history_lookup::MAX_REFERENCED_EVENTS
                 && source.source_event_range.is_some()
                 && source.source_event_range.as_ref().is_some_and(|range| {
@@ -1846,6 +2038,8 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
             "trigger": trigger,
             "source_message_count": source.message_count,
             "source_token_estimate": source.token_estimate,
+            "unpersisted_companion_count": source.unpersisted_companion_count,
+            "provenance_status": source.source_event_provenance_status,
             "source_event_range": range,
             "retained_recent_message_count": keep_recent,
             "lookup": {
@@ -2075,23 +2269,41 @@ async fn preflight_context_budget_before_provider_call(
         return Ok(budget);
     }
 
+    let is_switch = matches!(config.mode, crate::config::AgentCompactionMode::Switch);
     let mut replacement_len = None;
+    // A `switch` rollover that cannot stay lossless must not abort the turn.
+    // Failing closed here made every session that contains tool calls answer
+    // each user message with the same non-retryable error, because the tool
+    // round-trip messages kept provenance unresolvable and history never
+    // shrank. Degrade to a lossy trim and record the downgrade instead.
+    let mut degraded_reason: Option<&'static str> = None;
     if !matches!(config.mode, crate::config::AgentCompactionMode::Off) {
         match apply_configurable_compaction_with_replacement_len(history, provider, model, config, audit, trigger).await
         {
             Ok(applied_replacement_len) => {
                 replacement_len = applied_replacement_len;
+                if is_switch && applied_replacement_len.is_none() {
+                    degraded_reason = Some("handoff_unavailable");
+                }
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                if !is_switch {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    error = %error,
+                    trigger,
+                    "context switch rollover failed; continuing the turn on a lossy trim"
+                );
+                degraded_reason = Some("handoff_failed");
+            }
         }
     }
 
     budget = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
     if budget.over_hard_limit {
-        if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
-            anyhow::bail!(
-                "context switch could not reduce the provider window below its hard limit without lossy trimming"
-            );
+        if is_switch && degraded_reason.is_none() {
+            degraded_reason = Some("over_hard_limit_after_handoff");
         }
         let trimmed = if let Some(replacement_len) = replacement_len {
             trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
@@ -2111,6 +2323,22 @@ async fn preflight_context_budget_before_provider_call(
             mode = ?config.mode,
             "context budget preflight applied token-aware trim"
         );
+        if let Some(reason) = degraded_reason {
+            tracing::warn!(
+                trigger,
+                reason,
+                "context switch degraded to a lossy token-aware trim so the turn can continue"
+            );
+            persist_context_switch_degradation(
+                audit,
+                trigger,
+                reason,
+                budget.used_tokens,
+                after.used_tokens,
+                after.available_input_tokens,
+            )
+            .await;
+        }
         budget = after;
     }
     Ok(budget)
@@ -6702,19 +6930,31 @@ async fn run_tool_call_loop_outcome_unguarded(
                                 Ok(Some(patch)) => {
                                     let replacement_len = patch.replacement.len();
                                     apply_compaction_patch_exact(history, &patch);
-                                    if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
-                                        let budget = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
-                                        if budget.over_hard_limit {
-                                            anyhow::bail!(
-                                                "context switch retry remained above the hard limit; refusing lossy trim"
-                                            );
-                                        }
-                                    } else {
+                                    let switch_mode = matches!(config.mode, crate::config::AgentCompactionMode::Switch);
+                                    let before_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
+                                    if !switch_mode || before_trim.over_hard_limit {
                                         trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
                                             history,
                                             config,
                                             replacement_len,
                                         );
+                                    }
+                                    if switch_mode && before_trim.over_hard_limit {
+                                        let after_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
+                                        tracing::warn!(
+                                            before_used_tokens = before_trim.used_tokens,
+                                            after_used_tokens = after_trim.used_tokens,
+                                            "context switch retry stayed above the hard limit; degraded to a lossy trim"
+                                        );
+                                        persist_context_switch_degradation(
+                                            document_ingest.as_ref(),
+                                            "overflow_retry",
+                                            "over_hard_limit_after_handoff",
+                                            before_trim.used_tokens,
+                                            after_trim.used_tokens,
+                                            after_trim.available_input_tokens,
+                                        )
+                                        .await;
                                     }
                                     let turns_after = history.len().saturating_sub(usize::from(
                                         history.first().is_some_and(|message| message.role == "system"),
@@ -6737,20 +6977,41 @@ async fn run_tool_call_loop_outcome_unguarded(
                                     .await?;
                                     emitted_exact_patch = true;
                                 }
-                                Ok(None) if matches!(config.mode, crate::config::AgentCompactionMode::Switch) => {
-                                    anyhow::bail!(
-                                        "context switch retry could not create an exact handoff; refusing lossy trim"
-                                    );
-                                }
                                 Ok(None) => {
+                                    let before_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
                                     trim_history_to_context_budget(history, config);
+                                    if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
+                                        let after_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
+                                        tracing::warn!(
+                                            "context switch retry could not create an exact handoff; degraded to a lossy trim"
+                                        );
+                                        persist_context_switch_degradation(
+                                            document_ingest.as_ref(),
+                                            "overflow_retry",
+                                            "handoff_unavailable",
+                                            before_trim.used_tokens,
+                                            after_trim.used_tokens,
+                                            after_trim.available_input_tokens,
+                                        )
+                                        .await;
+                                    }
                                 }
                                 Err(error) => {
-                                    if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
-                                        return Err(error);
-                                    }
                                     tracing::warn!("Overflow retry compaction failed: {error}");
+                                    let before_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
                                     apply_aggressive_trim(history, config.keep_recent_messages);
+                                    if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
+                                        let after_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
+                                        persist_context_switch_degradation(
+                                            document_ingest.as_ref(),
+                                            "overflow_retry",
+                                            "handoff_failed",
+                                            before_trim.used_tokens,
+                                            after_trim.used_tokens,
+                                            after_trim.available_input_tokens,
+                                        )
+                                        .await;
+                                    }
                                 }
                             }
                         } else if let Err(error) = apply_configurable_compaction(
@@ -6763,11 +7024,21 @@ async fn run_tool_call_loop_outcome_unguarded(
                         )
                         .await
                         {
-                            if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
-                                return Err(error);
-                            }
                             tracing::warn!("Overflow retry compaction failed: {error}");
+                            let before_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
                             apply_aggressive_trim(history, config.keep_recent_messages);
+                            if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
+                                let after_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
+                                persist_context_switch_degradation(
+                                    document_ingest.as_ref(),
+                                    "overflow_retry",
+                                    "handoff_failed",
+                                    before_trim.used_tokens,
+                                    after_trim.used_tokens,
+                                    after_trim.available_input_tokens,
+                                )
+                                .await;
+                            }
                         }
                     } else {
                         apply_aggressive_trim(history, COMPACTION_KEEP_RECENT_MESSAGES);
@@ -12956,6 +13227,339 @@ ls -la
                 .map(|message| (message.role.clone(), message.content.clone()))
                 .collect::<Vec<_>>(),
             before
+        );
+    }
+
+    /// Ten assistant -> tool -> assistant round-trips, i.e. the shape every real
+    /// agentic session has. Forty non-system messages is well past the point
+    /// where a cold window is forced, and the tool envelopes are byte-identical
+    /// to the ones `run_tool_call_loop_outcome` appends.
+    fn tool_roundtrip_history_fixture(rounds: usize) -> Vec<ChatMessage> {
+        let mut history = vec![ChatMessage::system("sys")];
+        for round in 0..rounds {
+            history.push(ChatMessage::user(format!(
+                "question {round} {}",
+                "user-context ".repeat(20)
+            )));
+            history.push(ChatMessage::assistant(build_native_assistant_history(
+                "",
+                &[ToolCall {
+                    id: format!("call-{round}"),
+                    name: "shell".to_string(),
+                    arguments: "{\"command\":\"ls\"}".to_string(),
+                }],
+                None,
+            )));
+            history.push(ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": format!("call-{round}"),
+                    "content": format!("result {round} {}", "tool-output ".repeat(20)),
+                })
+                .to_string(),
+            ));
+            history.push(ChatMessage::assistant(format!(
+                "answer {round} {}",
+                "assistant-context ".repeat(20)
+            )));
+        }
+        history
+    }
+
+    /// Persist exactly what the runtime persists: user turns and final assistant
+    /// answers. Tool results and the assistant envelope that requested them
+    /// never become their own `message.created` event.
+    async fn persist_durable_transcript(
+        fabric: &MemoryFabric,
+        envelope: &RuntimeEnvelope,
+        history: &[ChatMessage],
+    ) -> Vec<String> {
+        let mut event_ids = Vec::new();
+        for (index, message) in history.iter().enumerate().skip(1) {
+            if is_tool_roundtrip_companion(message) {
+                continue;
+            }
+            let event = if message.role == "user" {
+                fabric
+                    .record_inbound_user_message(
+                        envelope.message_scope(),
+                        message.content.clone(),
+                        Some(format!("tool-roundtrip-source-{index}")),
+                        None,
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                fabric
+                    .record_assistant_message(envelope.message_scope(), message.content.clone())
+                    .await
+                    .unwrap()
+            };
+            event_ids.push(event.event_id);
+        }
+        event_ids
+    }
+
+    /// Index of the first `role="tool"` message that no longer has the assistant
+    /// envelope requesting it ahead of it. Providers reject such a transcript.
+    fn first_orphan_tool_index(history: &[ChatMessage]) -> Option<usize> {
+        let mut inside_roundtrip = false;
+        for (index, message) in history.iter().enumerate() {
+            if message.role == "tool" {
+                if !inside_roundtrip {
+                    return Some(index);
+                }
+                continue;
+            }
+            inside_roundtrip = message.role == "assistant" && is_tool_roundtrip_companion(message);
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn context_switch_resolves_provenance_across_tool_roundtrips() {
+        let temp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+        let envelope = RuntimeEnvelope::agent("workspace-tool-switch", "run-tool-switch");
+        let audit = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
+        let fabric = MemoryFabric::new(Arc::clone(&memory), "workspace-tool-switch");
+        let provider = ScriptedProvider::from_text_responses(vec!["MODEL_SUMMARY_MUST_NOT_RUN"]);
+        let mut history = tool_roundtrip_history_fixture(10);
+        assert_eq!(history.len(), 41, "fixture must cross the cold-window threshold");
+        assert_eq!(
+            history.iter().filter(|message| message.role == "tool").count(),
+            10,
+            "fixture must carry real tool round-trips"
+        );
+        let persisted_ids = persist_durable_transcript(&fabric, &envelope, &history).await;
+        assert_eq!(persisted_ids.len(), 20);
+
+        // keep_recent_messages = 2 deliberately lands the retained window on the
+        // tool result of the last round, so the boundary has to walk back past
+        // the assistant envelope that requested it.
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Switch,
+            reserve_tokens: 1,
+            keep_recent_messages: 2,
+            memory_flush: true,
+            max_context_tokens: 50,
+            max_context_tokens_explicit: true,
+            os_paging: crate::config::OsPagingConfig::default(),
+        };
+
+        let cold_window = history.get(1..37).expect("cold window slice").to_vec();
+        let provenance = resolve_compaction_event_provenance(&*memory, envelope.memory_principal(), &cold_window)
+            .await
+            .unwrap()
+            .expect("tool round-trips must not make provenance unresolvable");
+        assert_eq!(
+            provenance.source_event_ids.len(),
+            18,
+            "every durable cold message must map to exactly one event"
+        );
+        assert_eq!(
+            provenance.companion_message_count, 18,
+            "tool envelopes and results are folded into their assistant turn"
+        );
+
+        let before_len = history.len();
+        let compacted = apply_configurable_compaction(
+            &mut history,
+            &provider,
+            "model",
+            &config,
+            Some(&audit),
+            "test_tool_switch",
+        )
+        .await
+        .expect("a switch over tool round-trips must not error");
+        assert!(compacted, "switch must actually compact a tool-bearing session");
+        assert!(
+            history.len() <= 6 && history.len() < before_len / 4,
+            "hot window must shrink sharply, got {} from {before_len}",
+            history.len()
+        );
+        assert_eq!(
+            first_orphan_tool_index(&history),
+            None,
+            "compaction must never leave a tool result without its requesting assistant message"
+        );
+        assert!(
+            history.iter().any(|message| message.role == "tool"),
+            "the most recent tool round-trip must survive intact"
+        );
+        assert!(
+            history.iter().any(|message| message.content.contains("result 9")),
+            "the newest tool result must be retained verbatim"
+        );
+        let handoff = history
+            .iter()
+            .find(|message| message.content.contains("[context_handoff]"))
+            .expect("handoff note must replace the cold window");
+        assert!(!handoff.content.contains("MODEL_SUMMARY_MUST_NOT_RUN"));
+        assert!(
+            handoff.content.contains("\"unpersisted_companion_count\":18"),
+            "handoff note must disclose how many messages are covered by their assistant turn"
+        );
+        for event_id in persisted_ids.iter().take(18) {
+            assert!(
+                handoff.content.contains(event_id),
+                "handoff must reference every durable cold event"
+            );
+        }
+
+        let events = memory
+            .list_message_events_recent(&envelope.memory_principal(), 64)
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "context.switch.created")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == CONTEXT_COMPACTION_DEGRADED_EVENT_TYPE)
+                .count(),
+            0,
+            "an exact switch must not report a degradation"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_switch_preflight_degrades_to_trim_instead_of_failing_the_turn() {
+        let temp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+        let envelope = RuntimeEnvelope::agent("workspace-tool-degrade", "run-tool-degrade");
+        let audit = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
+        let provider = ScriptedProvider::from_text_responses(vec!["MODEL_SUMMARY_MUST_NOT_RUN"]);
+        // No durable transcript at all: provenance cannot be exact, which used to
+        // abort every turn of this session with a non-retryable error.
+        let mut history = tool_roundtrip_history_fixture(10);
+        let before_len = history.len();
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Switch,
+            reserve_tokens: 1,
+            keep_recent_messages: 2,
+            memory_flush: false,
+            max_context_tokens: 400,
+            max_context_tokens_explicit: true,
+            os_paging: crate::config::OsPagingConfig::default(),
+        };
+
+        let budget = preflight_context_budget_before_provider_call(
+            &mut history,
+            &provider,
+            "model",
+            &config,
+            Some(&audit),
+            "test_tool_degrade",
+        )
+        .await
+        .expect("switch must degrade, not fail the turn");
+
+        assert!(!budget.over_hard_limit, "the turn must continue under the hard limit");
+        assert!(
+            history.len() < before_len,
+            "the lossy fallback must actually shrink history"
+        );
+        assert_eq!(
+            first_orphan_tool_index(&history),
+            None,
+            "the lossy fallback must not leave an orphan tool result either"
+        );
+
+        let events = memory
+            .list_message_events_recent(&envelope.memory_principal(), 64)
+            .await
+            .unwrap();
+        let degraded = events
+            .iter()
+            .find(|event| event.event_type == CONTEXT_COMPACTION_DEGRADED_EVENT_TYPE)
+            .expect("the downgrade must be durably observable");
+        assert!(
+            degraded
+                .raw_payload_json
+                .as_deref()
+                .is_some_and(|payload| payload.contains("handoff_unavailable") && payload.contains("token_aware_trim")),
+            "degradation event must name the reason and the fallback"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "context.switch.created")
+                .count(),
+            0,
+            "a degraded rollover must not leave an orphan switch event behind"
+        );
+    }
+
+    #[test]
+    fn token_aware_trim_never_strands_a_tool_result() {
+        let fixture = tool_roundtrip_history_fixture(10);
+        // Sweep the whole budget range so at least some limits cut exactly on a
+        // tool result; the lossy fallback must be safe at every one of them.
+        for max_context_tokens in (60..=1400).step_by(20) {
+            let config = crate::config::AgentCompactionConfig {
+                mode: crate::config::AgentCompactionMode::Switch,
+                reserve_tokens: 1,
+                keep_recent_messages: 2,
+                memory_flush: false,
+                max_context_tokens,
+                max_context_tokens_explicit: true,
+                os_paging: crate::config::OsPagingConfig::default(),
+            };
+            let mut history = fixture.clone();
+            trim_history_to_context_budget(&mut history, &config);
+            assert_eq!(
+                first_orphan_tool_index(&history),
+                None,
+                "token-aware trim stranded a tool result at max_context_tokens={max_context_tokens}"
+            );
+            assert_eq!(
+                history.first().map(|message| message.role.as_str()),
+                Some("system"),
+                "the leading system prompt must survive every trim"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn safeguard_compaction_over_tool_roundtrips_keeps_pairs_and_shrinks() {
+        let provider = SystemSummaryProvider {
+            response: "## Decisions\n- keep tool pairing\n## Open TODOs\n- none\n## Critical Context\n- TOOL_SAFEGUARD_SUMMARY".to_string(),
+        };
+        let mut history = tool_roundtrip_history_fixture(10);
+        let before_len = history.len();
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 1,
+            keep_recent_messages: 2,
+            memory_flush: false,
+            max_context_tokens: 400,
+            max_context_tokens_explicit: true,
+            os_paging: crate::config::OsPagingConfig::default(),
+        };
+
+        let budget = preflight_context_budget_before_provider_call(
+            &mut history,
+            &provider,
+            "model",
+            &config,
+            None,
+            "test_tool_safeguard",
+        )
+        .await
+        .expect("safeguard must not regress on tool-bearing history");
+
+        assert!(!budget.over_hard_limit);
+        assert!(history.len() < before_len);
+        assert_eq!(
+            first_orphan_tool_index(&history),
+            None,
+            "safeguard must not leave a tool result without its requesting assistant message"
         );
     }
 

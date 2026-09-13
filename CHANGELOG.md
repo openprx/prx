@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.115] - 13 September 2026
+
+### Fixed
+
+- Unblock `switch` context compaction for sessions that contain tool calls.
+  Transcript provenance refused to resolve whenever the cold window held a
+  `role="tool"` result, the assistant envelope carrying native `tool_calls`, or
+  the prompt-mode `[Tool results]` block, because none of those are persisted as
+  their own `message.created` event. They are now folded into the assistant turn
+  that produced them, so a real agentic session can roll over instead of
+  answering every message with the same non-retryable
+  `context switch could not reduce the provider window` error.
+- Never end a turn because a hard switch cannot stay lossless. The pre-provider
+  budget check, the provider-overflow retry, and the redux driver rollover now
+  fall back to the token-aware trim, log the downgrade, and record a durable
+  `context.compaction.degraded` event instead of failing the draft.
+- Stop compaction and lossy trims from leaving a tool result without the
+  assistant message that requested it. The compaction boundary walks back past a
+  tool round-trip, and every trim drops tool results stranded at the cut, so the
+  retained window stays a transcript providers accept.
+
 ## [0.8.114] - 13 September 2026
 
 ### Added
