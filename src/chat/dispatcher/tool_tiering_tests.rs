@@ -160,6 +160,38 @@ async fn offered_tools_for_history(
     routing_input: Option<&str>,
     tiering: crate::config::ToolTieringConfig,
 ) -> Vec<String> {
+    offered_tools_for_surface(
+        history_user_message,
+        routing_input,
+        // A fresh fixture session has nothing pinned yet, which is the
+        // first-turn case where an unrouted turn still gets the whole registry.
+        crate::tools::intent::SessionToolSurface {
+            tiering,
+            unrouted: crate::tools::intent::UnroutedToolPolicy::KeepPinnedExposure,
+        },
+    )
+    .await
+}
+
+/// Drive one turn of a *continuing* chat session: the dispatcher folds the turn
+/// into the session's cumulative exposure first, exactly as the live driver
+/// does, and hands the resulting surface to the shared tool loop.
+async fn offered_tools_for_session(
+    exposure: &crate::tools::intent::SessionToolExposure,
+    user_message: &str,
+    base: &crate::config::ToolTieringConfig,
+) -> Vec<String> {
+    let surface = exposure.sticky_surface(base, probe_registry().as_ref(), user_message);
+    let mut offered = offered_tools_for_surface(user_message, Some(user_message), surface).await;
+    offered.sort();
+    offered
+}
+
+async fn offered_tools_for_surface(
+    history_user_message: &str,
+    routing_input: Option<&str>,
+    surface: crate::tools::intent::SessionToolSurface,
+) -> Vec<String> {
     let provider = Arc::new(CatalogRecordingProvider::new());
     let (action_tx, mut action_rx) = mpsc::channel::<Action>(128);
     let policy = Arc::new(SecurityPolicy::default());
@@ -204,7 +236,7 @@ async fn offered_tools_for_history(
         crate::agent::loop_::ChatMode::Edit,
         Arc::new(crate::observability::noop::NoopObserver),
         Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),
-        tiering,
+        surface,
         routing_input.map(str::to_string),
     )
     .await;
@@ -311,5 +343,39 @@ async fn injected_workspace_events_do_not_widen_the_published_tool_surface() {
     assert!(
         fallback.iter().any(|name| name == WEB_TOOL),
         "fixture is useless unless the injected text can reach the web surface, got {fallback:?}"
+    );
+}
+
+/// The dispatcher decides the session surface, but the shared tool loop routes
+/// the same text all over again. Both halves have to carry the same unrouted
+/// policy: a quiet turn that reaches the loop without it answers "the whole
+/// registry" there, and the session union absorbs the whole registry from then
+/// on. This is the redux driver end of the R3 defect, driven through the real
+/// `drive_start_turn_stream` and read off the provider's catalog.
+///
+/// MUTATION GUARD: drop `.with_unrouted_tool_policy(tool_surface.unrouted)`
+/// from the `ToolLoopMemory` built in `drive_start_turn_stream` and the last
+/// assertion goes red.
+#[tokio::test]
+async fn a_quiet_turn_republishes_the_chat_session_set_through_the_driver() {
+    let base = crate::config::ToolTieringConfig::default();
+    let exposure = crate::tools::intent::SessionToolExposure::new();
+
+    let routed = offered_tools_for_session(&exposure, "spawn a sub-agent for this", &base).await;
+    // Fixture self-check: the session really is narrower than the registry, so
+    // the equality below cannot be satisfied by a set that never narrowed.
+    assert!(
+        routed.iter().any(|name| name == EXTENDED_TOOL),
+        "the routed turn must reach the automation probe: {routed:?}"
+    );
+    assert!(
+        !routed.iter().any(|name| name == WEB_TOOL),
+        "the routed turn must not reach the web probe: {routed:?}"
+    );
+
+    let quiet = offered_tools_for_session(&exposure, "thanks, that is all", &base).await;
+    assert_eq!(
+        quiet, routed,
+        "a turn the keyword table cannot read must republish the session set, not the registry"
     );
 }

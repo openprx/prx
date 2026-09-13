@@ -303,6 +303,12 @@ pub(crate) struct ToolLoopMemory {
     /// that enriched payload here can activate capabilities the user did not
     /// request in this turn.
     routing_input: Option<String>,
+    /// What this entry point publishes when the turn routes to nothing. The
+    /// default (publish everything operator policy allows) is correct for every
+    /// entry point that keeps no memory between turns; a caller that pins a
+    /// session's cumulative exposure through `always_include` sets
+    /// `KeepPinnedExposure` so this loop cannot re-widen what it held still.
+    unrouted_tools: crate::tools::intent::UnroutedToolPolicy,
 }
 
 impl ToolLoopMemory {
@@ -314,6 +320,7 @@ impl ToolLoopMemory {
             event_fabric: None,
             request_event_scope: None,
             routing_input: None,
+            unrouted_tools: crate::tools::intent::UnroutedToolPolicy::PublishEverything,
         }
     }
 
@@ -338,6 +345,15 @@ impl ToolLoopMemory {
         self
     }
 
+    /// Declare what this turn publishes when capability routing reads nothing.
+    /// Callers that carry a session's cumulative tool exposure pass
+    /// `KeepPinnedExposure`, so an unrouted turn re-publishes that exposure
+    /// instead of falling back to the whole registry and absorbing it.
+    pub(crate) const fn with_unrouted_tool_policy(mut self, policy: crate::tools::intent::UnroutedToolPolicy) -> Self {
+        self.unrouted_tools = policy;
+        self
+    }
+
     /// The document-ingest runtime, when this entry point resolved a scope for it.
     pub(crate) const fn ingest(&self) -> Option<&DocumentIngestRuntime> {
         self.ingest.as_ref()
@@ -353,6 +369,7 @@ impl ToolLoopMemory {
             event_fabric: None,
             request_event_scope: None,
             routing_input: None,
+            unrouted_tools: crate::tools::intent::UnroutedToolPolicy::PublishEverything,
         }
     }
 
@@ -365,6 +382,7 @@ impl ToolLoopMemory {
             event_fabric: None,
             request_event_scope: None,
             routing_input: None,
+            unrouted_tools: crate::tools::intent::UnroutedToolPolicy::PublishEverything,
         }
     }
 
@@ -6384,6 +6402,7 @@ async fn run_tool_call_loop_outcome_unguarded(
         event_fabric,
         request_event_scope,
         routing_input,
+        unrouted_tools,
     } = memory_runtime;
     // Capture routing intent once from the unmodified turn input. The provider
     // history is allowed to evolve through recall, compaction, middleware, and
@@ -6622,11 +6641,12 @@ async fn run_tool_call_loop_outcome_unguarded(
         let selected_tools: Vec<&dyn Tool> = tool_tiering.map_or_else(
             || tools_registry.iter().map(|tool| tool.as_ref()).collect(),
             |cfg| {
-                crate::tools::intent::select_tools_for_intent(
+                crate::tools::intent::resolve_tools_for_intent(
                     tools_registry.as_ref(),
                     &routing_user_message,
                     &cfg.always_include,
                     &cfg.always_exclude,
+                    unrouted_tools,
                 )
             },
         );

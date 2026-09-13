@@ -61,11 +61,19 @@ name, and `model_allowlists` intersects the result for one exact model.
 
 The keyword table is English-only. A message that activates no category at all —
 a request in another language, or an English one that names no capability — is
-*unrouted*: the whole registry is published rather than the core floor, because
-a table that cannot read the request is no evidence for removing anything from
-it. `always_exclude` (and the channel surface folded into it) still applies, so
-the fallback only ever widens what routing may hide, never what operator policy
-forbids.
+*unrouted*, and routing then refuses to decide: a table that cannot read the
+request is no evidence for removing anything from it, and no evidence for adding
+anything either. What an unrouted turn publishes is the entry point's call:
+
+- **Channel, gateway, console, delegated and worker turns** keep no memory
+  between turns, so there is nothing to fall back on: they publish the whole
+  registry. A non-English message on an IM channel never loses its tools.
+- **Interactive chat** keeps a session exposure (below) and re-publishes exactly
+  that, unchanged.
+
+`always_exclude` (and the channel surface folded into it) still applies in every
+case, so the fallback only ever widens what routing may hide, never what
+operator policy forbids.
 
 Interactive chat adds one more rule on top. The `tools` array sits inside the
 provider's cacheable request prefix next to the system prompt, so re-deciding
@@ -73,6 +81,15 @@ the published set every turn invalidates the cached prefill of the entire
 conversation each time the user rephrases. A chat session therefore publishes
 the **union** of every set routed so far: the catalog grows the first time a new
 capability is named and is byte-identical on every turn that names nothing new.
+
+An unrouted turn is absorbed into that union **only on the session's first
+turn**, where there is no earlier decision to keep — so a session opened in a
+language the table cannot read still starts at the full registry. Afterwards an
+unrouted turn adds nothing: a greeting, a "thanks, that is all", or a request in
+another language re-publishes the set the session already had. Absorbing the
+full-registry fallback on every unrouted turn is what used to make one such turn
+pin a session at the whole catalog for the rest of its life.
+
 `/new` and `/clear` reset the union. Channel, gateway, console and worker turns
 are unaffected — each of those turns is its own session.
 

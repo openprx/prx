@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.120] - 13 September 2026
+
+### Fixed
+
+- Stop one unreadable turn from pinning a chat session at the whole tool
+  catalog. Capability routing falls back to the full registry when its
+  English-only keyword table activates no category, which is right for an entry
+  point that keeps no memory between turns but wrong for chat: the session's
+  cumulative exposure absorbed that fallback, so a single greeting, a closing
+  "thanks, that is all", or any non-English turn widened the session to every
+  tool and held it there for good. A captured session went 14 tools, 16 tools,
+  then 43 tools (49 KB of schemas) on a closing pleasantry, and stayed at 43.
+  `select_tools_for_intent` now returns `RoutingOutcome::Unrouted` instead of a
+  set and the entry point picks the fallback through `UnroutedToolPolicy`:
+  channels, gateway, console, delegated and worker turns still publish
+  everything operator policy allows, while a chat session republishes the set it
+  already had. A session whose *first* turn is unrouted still gets the whole
+  registry — there is no earlier decision to keep — so a non-English opener
+  loses nothing. `always_exclude` continues to outrank every fallback.
+
 ## [0.8.119] - 13 September 2026
 
 ### Fixed

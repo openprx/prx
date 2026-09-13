@@ -879,11 +879,14 @@ impl Agent {
                     _ => None,
                 })
                 .unwrap_or_default();
-            let selected_tools = crate::tools::intent::select_tools_for_intent(
+            // No session-level exposure memory on this path, so an unrouted
+            // turn publishes everything operator policy allows.
+            let selected_tools = crate::tools::intent::resolve_tools_for_intent(
                 &self.tools,
                 last_user_msg,
                 &self.tool_tiering.always_include,
                 &self.tool_tiering.always_exclude,
+                crate::tools::intent::UnroutedToolPolicy::PublishEverything,
             );
             let selected_tools = crate::tools::intent::apply_model_tool_allowlist(
                 selected_tools,

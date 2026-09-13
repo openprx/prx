@@ -26,7 +26,7 @@ use crate::agent::loop_::{build_runtime_system_prompt, select_prompt_skills};
 use crate::config::{Config, ToolTieringConfig};
 use crate::memory::embeddings::LocalHashEmbedding;
 use crate::skills::{SessionSkillExposure, Skill, SkillTool};
-use crate::tools::intent::{SessionToolExposure, select_tools_for_intent};
+use crate::tools::intent::{SessionToolExposure, SessionToolSurface, UnroutedToolPolicy, resolve_tools_for_intent};
 use crate::tools::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use async_trait::async_trait;
 
@@ -134,11 +134,33 @@ fn registry() -> Vec<Box<dyn Tool>> {
     ]
 }
 
+/// What a stateless entry point publishes for this turn.
 fn exposed_names(tools: &[Box<dyn Tool>], message: &str, tiering: &ToolTieringConfig) -> Vec<String> {
-    let mut names = select_tools_for_intent(tools, message, &tiering.always_include, &tiering.always_exclude)
-        .into_iter()
-        .map(|tool| tool.name().to_string())
-        .collect::<Vec<_>>();
+    policy_names(tools, message, tiering, UnroutedToolPolicy::PublishEverything)
+}
+
+/// What a chat turn publishes: the session surface decided by the dispatcher,
+/// resolved again by the shared tool loop exactly as production does.
+fn session_names(tools: &[Box<dyn Tool>], message: &str, surface: &SessionToolSurface) -> Vec<String> {
+    policy_names(tools, message, &surface.tiering, surface.unrouted)
+}
+
+fn policy_names(
+    tools: &[Box<dyn Tool>],
+    message: &str,
+    tiering: &ToolTieringConfig,
+    unrouted: UnroutedToolPolicy,
+) -> Vec<String> {
+    let mut names = resolve_tools_for_intent(
+        tools,
+        message,
+        &tiering.always_include,
+        &tiering.always_exclude,
+        unrouted,
+    )
+    .into_iter()
+    .map(|tool| tool.name().to_string())
+    .collect::<Vec<_>>();
     names.sort();
     names
 }
@@ -156,7 +178,7 @@ fn fixture_config(workspace: &std::path::Path) -> Config {
 /// subject. The system prompt must be byte-identical throughout and the
 /// published tool set must move exactly once.
 ///
-/// MUTATION GUARD: make `SessionToolExposure::sticky_tiering` return
+/// MUTATION GUARD: make `SessionToolExposure::sticky_surface` return
 /// `base.clone()` and the last two tool-set assertions go red; drop the
 /// catalog short-circuit in `select_prompt_skills` and the prompt assertions
 /// go red.
@@ -186,8 +208,8 @@ async fn one_session_holds_its_request_prefix_still_across_rewordings() {
         let retrieved = select_prompt_skills(message, &skills, &config, &embedder).await;
         let exposed = skill_exposure.absorb(&skills, &retrieved);
         prompts.push(build_runtime_system_prompt(&config, MODEL, &exposed, true));
-        let tiering = tool_exposure.sticky_tiering(&base, &tools, message);
-        sticky_tools.push(exposed_names(&tools, message, &tiering));
+        let surface = tool_exposure.sticky_surface(&base, &tools, message);
+        sticky_tools.push(session_names(&tools, message, &surface));
         raw_tools.push(exposed_names(&tools, message, &base));
     }
 

@@ -1227,11 +1227,14 @@ impl EffectExecutor {
                 // history) and publish the session's cumulative set, so an
                 // injected `[Recent shared workspace events]` block can neither
                 // widen the tool surface nor move the cacheable prefix.
-                let tool_tiering = match (routing_input.as_deref(), tools_registry.as_deref()) {
+                let tool_surface = match (routing_input.as_deref(), tools_registry.as_deref()) {
                     (Some(input), Some(registry)) => {
-                        deps.exposed_tools.sticky_tiering(&deps.tool_tiering, registry, input)
+                        deps.exposed_tools.sticky_surface(&deps.tool_tiering, registry, input)
                     }
-                    _ => deps.tool_tiering.clone(),
+                    _ => crate::tools::intent::SessionToolSurface {
+                        tiering: deps.tool_tiering.clone(),
+                        unrouted: crate::tools::intent::UnroutedToolPolicy::PublishEverything,
+                    },
                 };
                 let provider_turn_execution_lease_id =
                     provider_turn_task_id.map(|_| next_provider_turn_execution_lease_id());
@@ -1289,7 +1292,7 @@ impl EffectExecutor {
                         chat_mode,
                         observer,
                         hooks,
-                        tool_tiering,
+                        tool_surface,
                         routing_input,
                     );
                     // D8-4 (redux path real fix): mirror the legacy
@@ -2497,7 +2500,7 @@ async fn drive_start_turn_stream(
     chat_mode: crate::agent::loop_::ChatMode,
     observer: Arc<dyn Observer>,
     hooks: Arc<HookManager>,
-    tool_tiering: crate::config::ToolTieringConfig,
+    tool_surface: crate::tools::intent::SessionToolSurface,
     routing_input: Option<String>,
 ) {
     // Redux-specific preflight projection stays in the adapter because it must
@@ -2636,15 +2639,22 @@ async fn drive_start_turn_stream(
         None,
         None,
         None,
-        Some(&tool_tiering),
+        Some(&tool_surface.tiering),
         // The adapter's ToolExecutionService already carries the resolved ledger.
         // `with_routing_input` pins capability routing to the raw user text:
         // without it the loop falls back to the last history user message,
         // which chat has already enriched with memory recall and the
         // `[Recent shared workspace events]` block — an injected URL there used
         // to publish the whole web tool surface.
+        //
+        // `with_unrouted_tool_policy` carries the other half of the session
+        // decision: the loop re-routes this same text, and without it an
+        // unrouted turn would answer "the whole registry" there and undo the
+        // session exposure the dispatcher just held still.
         {
-            let memory = crate::agent::loop_::ToolLoopMemory::none().with_event_fabric(request_event_fabric);
+            let memory = crate::agent::loop_::ToolLoopMemory::none()
+                .with_event_fabric(request_event_fabric)
+                .with_unrouted_tool_policy(tool_surface.unrouted);
             match routing_input {
                 Some(input) => memory.with_routing_input(input),
                 None => memory,
@@ -4854,7 +4864,10 @@ mod tests {
             crate::agent::loop_::ChatMode::Edit,
             Arc::new(crate::observability::noop::NoopObserver),
             Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),
-            crate::config::ToolTieringConfig::default(),
+            crate::tools::intent::SessionToolSurface {
+                tiering: crate::config::ToolTieringConfig::default(),
+                unrouted: crate::tools::intent::UnroutedToolPolicy::KeepPinnedExposure,
+            },
             None,
         )
         .await;

@@ -52,9 +52,42 @@ fn registry(tmp: &TempDir) -> Vec<Box<dyn Tool>> {
     )
 }
 
+/// What a stateless entry point (IM channel, gateway, console, worker) puts on
+/// the wire for one turn: an unrouted turn there has nothing to fall back on,
+/// so it publishes everything operator policy allows.
 fn specs_for(tools: &[Box<dyn Tool>], message: &str, tiering: &ToolTieringConfig) -> Vec<ToolSpec> {
-    let selected = intent::select_tools_for_intent(tools, message, &tiering.always_include, &tiering.always_exclude);
+    specs_with_policy(tools, message, tiering, intent::UnroutedToolPolicy::PublishEverything)
+}
+
+fn specs_with_policy(
+    tools: &[Box<dyn Tool>],
+    message: &str,
+    tiering: &ToolTieringConfig,
+    unrouted: intent::UnroutedToolPolicy,
+) -> Vec<ToolSpec> {
+    let selected = intent::resolve_tools_for_intent(
+        tools,
+        message,
+        &tiering.always_include,
+        &tiering.always_exclude,
+        unrouted,
+    );
     ToolCatalog::from_tools(selected).tool_specs()
+}
+
+/// One chat turn, through both halves of the production decision: the
+/// dispatcher folds the turn into the session's cumulative exposure, then the
+/// shared tool loop re-routes the same text under that surface. Skipping the
+/// second half hides the defect this models — the loop's own unrouted fallback
+/// used to re-widen a surface the session had deliberately held still.
+fn chat_turn_specs(
+    exposure: &intent::SessionToolExposure,
+    tools: &[Box<dyn Tool>],
+    message: &str,
+    base: &ToolTieringConfig,
+) -> Vec<ToolSpec> {
+    let surface = exposure.sticky_surface(base, tools, message);
+    specs_with_policy(tools, message, &surface.tiering, surface.unrouted)
 }
 
 fn wire_bytes(specs: &[ToolSpec]) -> usize {
@@ -261,8 +294,9 @@ fn common_requests_reach_the_tools_they_obviously_need() {
 /// not evidence for trimming anything: the surface falls back to the whole
 /// registry rather than to the Core floor.
 ///
-/// MUTATION GUARD: delete the `unrouted` short-circuit in
-/// `select_tools_for_intent` and every one of these goes red.
+/// MUTATION GUARD: make `select_tools_for_intent` return a routed set for an
+/// empty category set, or make `resolve_tools_for_intent` ignore
+/// `PublishEverything`, and every one of these goes red.
 #[test]
 fn a_request_the_keyword_table_cannot_read_keeps_the_whole_registry() {
     let tmp = TempDir::new().unwrap();
@@ -332,4 +366,171 @@ fn a_routed_english_request_is_still_narrowed() {
         !routed.contains(&"cron"),
         "an unnamed Extended capability must stay out: {routed:?}"
     );
+}
+
+/// Three turns of one real chat session, against the real default registry.
+///
+/// The third turn is a closing pleasantry: it names no capability, so routing
+/// reads nothing. A session that already knows what it exposed must publish
+/// that same set again. Answering "the whole registry" there is what made a
+/// captured session jump from 16 tools to the full catalog on turn 3 and stay
+/// there for every later turn.
+///
+/// MUTATION GUARD: absorb the unrouted fallback unconditionally in
+/// `sticky_surface`, or return `PublishEverything` from it, and the turn-3
+/// assertions go red.
+#[test]
+fn a_closing_pleasantry_does_not_widen_an_established_chat_session() {
+    let tmp = TempDir::new().unwrap();
+    let tools = registry(&tmp);
+    let base = ToolTieringConfig::default();
+    let everything = names(&specs_for(&tools, "", &base))
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+
+    let exposure = intent::SessionToolExposure::new();
+    let turn1 = chat_turn_specs(
+        &exposure,
+        &tools,
+        "Search the web for the latest Rust release notes.",
+        &base,
+    );
+    let turn2 = chat_turn_specs(
+        &exposure,
+        &tools,
+        "Now commit the changes in this repository with git.",
+        &base,
+    );
+    let closing = "Thanks, that is all.";
+    let turn3 = chat_turn_specs(&exposure, &tools, closing, &base);
+
+    let turn1_names = names(&turn1);
+    let turn2_names = names(&turn2);
+    let turn3_names = names(&turn3);
+
+    // Fixture self-check 1: the first two turns really are routed, and really
+    // are far away from the whole catalog — otherwise "turn3 == turn2" would be
+    // satisfied by a fixture that never narrows anything.
+    assert!(
+        turn1_names.contains(&"web_search_tool"),
+        "turn 1 must reach web search: {turn1_names:?}"
+    );
+    assert!(
+        turn2_names.contains(&"git_operations") && turn2_names.contains(&"web_search_tool"),
+        "turn 2 must add git and keep web search: {turn2_names:?}"
+    );
+    assert!(
+        turn2_names.len() > turn1_names.len(),
+        "turn 2 must widen the session: {} vs {}",
+        turn1_names.len(),
+        turn2_names.len()
+    );
+    assert!(
+        turn2_names.len() + 10 < everything.len(),
+        "the fixture must stay well clear of the whole catalog, otherwise the turn-3 assertion is vacuous: {} vs {}",
+        turn2_names.len(),
+        everything.len()
+    );
+
+    // Fixture self-check 2: the closing line really is unrouted — a stateless
+    // entry point still falls back to the whole registry for it.
+    let stateless_specs = specs_for(&tools, closing, &base);
+    assert_eq!(
+        names(&stateless_specs),
+        everything,
+        "the closing line must be genuinely unrouted"
+    );
+
+    assert_eq!(
+        turn3_names,
+        turn2_names,
+        "an unrouted turn must publish the session's set unchanged, got {} tools instead of {}",
+        turn3_names.len(),
+        turn2_names.len()
+    );
+    assert!(
+        turn3_names.len() < everything.len(),
+        "the session must not be pinned at the whole catalog by one pleasantry: {} of {}",
+        turn3_names.len(),
+        everything.len()
+    );
+
+    // Wire bytes are the whole point of the narrowing, so pin that too.
+    assert!(
+        wire_bytes(&turn3) < wire_bytes(&specs_for(&tools, "", &base)),
+        "turn 3 must not pay for the whole catalog: {} bytes",
+        wire_bytes(&turn3),
+    );
+}
+
+/// The protection for an unreadable *first* turn survives. A session with
+/// nothing absorbed has no earlier decision to keep, so it gets the whole
+/// registry — a non-English opener may not lose its tools — and the union then
+/// only grows.
+///
+/// MUTATION GUARD: drop the `names.is_empty()` branch in `sticky_surface` and
+/// the first assertion goes red.
+#[test]
+fn a_chat_session_opening_on_an_unrouted_turn_keeps_the_whole_registry() {
+    let tmp = TempDir::new().unwrap();
+    let tools = registry(&tmp);
+    let base = ToolTieringConfig::default();
+    let everything = names(&specs_for(&tools, "", &base))
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+
+    let exposure = intent::SessionToolExposure::new();
+    let opener = chat_turn_specs(&exposure, &tools, "Please summarize what you can do.", &base);
+    assert_eq!(
+        names(&opener),
+        everything,
+        "an unreadable first turn may not lose capabilities"
+    );
+
+    for follow_up in [
+        "Now commit the changes in this repository with git.",
+        "\u{5e2e}\u{6211}\u{770b}\u{4e00}\u{4e0b}\u{8fd9}\u{4e2a}",
+        "Thanks, that is all.",
+    ] {
+        let specs = chat_turn_specs(&exposure, &tools, follow_up, &base);
+        assert_eq!(
+            names(&specs),
+            everything,
+            "the union only grows, so every later turn stays at the full catalog"
+        );
+    }
+}
+
+/// Channels, gateway, console and worker turns keep R1's behaviour exactly:
+/// each message is its own session, there is no earlier decision to keep, so an
+/// unrouted turn publishes everything operator policy allows.
+///
+/// MUTATION GUARD: make `PublishEverything` behave like `KeepPinnedExposure`
+/// and both assertions go red.
+#[test]
+fn a_stateless_entry_point_still_publishes_everything_on_an_unrouted_turn() {
+    let tmp = TempDir::new().unwrap();
+    let tools = registry(&tmp);
+    let channel = ToolTieringConfig::default().for_channel_surface();
+
+    let allowed_specs = specs_for(&tools, "", &channel);
+    let allowed = names(&allowed_specs);
+    assert!(
+        !allowed.contains(&"proxy_config"),
+        "the channel surface must still hide the operations tools: {allowed:?}"
+    );
+
+    for message in [
+        "Thanks, that is all.",
+        "\u{3053}\u{306e}\u{6587}\u{7ae0}\u{3092}\u{77ed}\u{304f}\u{3057}\u{3066}",
+    ] {
+        let specs = specs_for(&tools, message, &channel);
+        assert_eq!(
+            names(&specs),
+            allowed,
+            "a channel turn the keyword table cannot read must keep every tool it is allowed"
+        );
+    }
 }

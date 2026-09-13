@@ -6,11 +6,20 @@
 //!
 //! The keyword table is English-only by project policy. Narrowing therefore
 //! only ever happens on evidence: a message that activates no category at all
-//! (a non-English request, or an English one that names no capability) keeps
-//! the whole registry instead of collapsing to the [`ToolTier::Core`] floor.
-//! Trimming a catalog on the strength of a keyword table that cannot read the
-//! request would silently amputate capabilities the user asked for, which is a
-//! far worse failure than paying for a few extra tool schemas.
+//! (a non-English request, or an English one that names no capability) is
+//! *unrouted* and the router refuses to decide, returning
+//! [`RoutingOutcome::Unrouted`] instead of collapsing to the [`ToolTier::Core`]
+//! floor. Trimming a catalog on the strength of a keyword table that cannot
+//! read the request would silently amputate capabilities the user asked for,
+//! which is a far worse failure than paying for a few extra tool schemas.
+//!
+//! What an unrouted turn publishes is the *caller's* call, expressed as an
+//! [`UnroutedToolPolicy`]. A stateless entry point publishes the whole allowed
+//! registry; a session that already carries a cumulative exposure
+//! ([`SessionToolExposure`]) keeps exactly what it had, because a turn that
+//! names nothing new must add nothing. Folding both into the router made a
+//! single greeting absorb the full catalog into a chat session's union and hold
+//! it there for the rest of the session.
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -164,26 +173,150 @@ fn keyword_is_in_negative_instruction(message: &str, keyword_index: usize) -> bo
 
 static CLASSIFIER: LazyLock<IntentClassifier> = LazyLock::new(IntentClassifier::new);
 
+/// The capability router's verdict for a single turn.
+///
+/// Routing is deliberately *not* allowed to answer "everything" on its own: the
+/// right surface for a turn the keyword table cannot read depends on whether
+/// the caller remembers what it published before, which routing cannot know.
+pub enum RoutingOutcome<'a> {
+    /// The keyword table read the request. These are the tools it selected,
+    /// with `always_include` / `always_exclude` already applied.
+    Routed(Vec<&'a dyn Tool>),
+    /// The classifier activated no category at all — a request in a language
+    /// the table does not cover, or an English one that names no capability.
+    /// No tool set is implied; the caller decides, see [`UnroutedToolPolicy`].
+    Unrouted,
+}
+
+impl std::fmt::Debug for RoutingOutcome<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Routed(selected) => f
+                .debug_tuple("Routed")
+                .field(&selected.iter().map(|tool| tool.name()).collect::<Vec<_>>())
+                .finish(),
+            Self::Unrouted => f.write_str("Unrouted"),
+        }
+    }
+}
+
+impl<'a> RoutingOutcome<'a> {
+    /// Whether the keyword table produced no evidence about this turn.
+    #[must_use]
+    pub const fn is_unrouted(&self) -> bool {
+        matches!(self, Self::Unrouted)
+    }
+
+    /// The routed set, or `None` when the router had nothing to say.
+    #[must_use]
+    pub fn routed(self) -> Option<Vec<&'a dyn Tool>> {
+        match self {
+            Self::Routed(selected) => Some(selected),
+            Self::Unrouted => None,
+        }
+    }
+}
+
+/// What an entry point publishes on a turn the keyword table cannot read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnroutedToolPolicy {
+    /// Publish everything operator policy allows. The default, and the only
+    /// safe answer for an entry point that keeps no memory across turns
+    /// (channels, gateway, console, delegated and session-worker turns):
+    /// narrowing on a table that cannot read the request would amputate
+    /// capabilities the user actually asked for.
+    #[default]
+    PublishEverything,
+    /// Publish the set the caller already pinned through `always_include`. For
+    /// a session that carries its own cumulative exposure: an unrouted turn
+    /// names nothing new, so it must add nothing. Widening to the whole
+    /// registry here is what let a single greeting pull the entire catalog into
+    /// a chat session's union and keep it there for the rest of the session.
+    KeepPinnedExposure,
+}
+
+/// Every tool operator policy allows, in registry order, ignoring intent.
+#[must_use]
+pub fn full_tool_surface<'a>(all_tools: &'a [Box<dyn Tool>], always_exclude: &[String]) -> Vec<&'a dyn Tool> {
+    all_tools
+        .iter()
+        .filter(|tool| !always_exclude.iter().any(|excluded| excluded == tool.name()))
+        .map(|tool| tool.as_ref())
+        .collect()
+}
+
+/// The tools a caller pinned by name through `always_include`, minus anything
+/// `always_exclude` forbids — operator policy still outranks the pin.
+#[must_use]
+pub fn pinned_tool_surface<'a>(
+    all_tools: &'a [Box<dyn Tool>],
+    always_include: &[String],
+    always_exclude: &[String],
+) -> Vec<&'a dyn Tool> {
+    all_tools
+        .iter()
+        .filter(|tool| {
+            let name = tool.name();
+            !always_exclude.iter().any(|excluded| excluded == name)
+                && always_include.iter().any(|included| included == name)
+        })
+        .map(|tool| tool.as_ref())
+        .collect()
+}
+
+/// Route one turn and resolve an unrouted verdict with `unrouted`.
+///
+/// This is what every entry point calls; [`select_tools_for_intent`] is the
+/// undecided half, kept separate so a caller can see the verdict itself.
+#[must_use]
+pub fn resolve_tools_for_intent<'a>(
+    all_tools: &'a [Box<dyn Tool>],
+    user_message: &str,
+    always_include: &[String],
+    always_exclude: &[String],
+    unrouted: UnroutedToolPolicy,
+) -> Vec<&'a dyn Tool> {
+    match select_tools_for_intent(all_tools, user_message, always_include, always_exclude) {
+        RoutingOutcome::Routed(selected) => selected,
+        RoutingOutcome::Unrouted => match unrouted {
+            UnroutedToolPolicy::PublishEverything => full_tool_surface(all_tools, always_exclude),
+            UnroutedToolPolicy::KeepPinnedExposure => {
+                let pinned = pinned_tool_surface(all_tools, always_include, always_exclude);
+                if pinned.is_empty() {
+                    // Nothing pinned yet — the caller has no earlier decision to
+                    // keep, so it lands on the same floor as everyone else.
+                    full_tool_surface(all_tools, always_exclude)
+                } else {
+                    pinned
+                }
+            }
+        },
+    }
+}
+
 /// Filter tools based on user intent. Core tools always included.
 /// Standard tools included if any of their categories match (or if no categories are set).
 /// Extended tools only included on explicit category match.
 ///
-/// When the classifier activates **no** category the turn is *unrouted*: the
-/// keyword table produced no evidence about this request, so the full registry
-/// is published instead of the Core floor. `always_exclude` (and therefore the
-/// channel surface folded into it) still applies — the fallback widens what
-/// intent routing may hide, never what operator policy forbids.
+/// When the classifier activates **no** category the turn is *unrouted* and
+/// this returns [`RoutingOutcome::Unrouted`] rather than a set: the keyword
+/// table produced no evidence about this request, and the fallback is the
+/// caller's decision. Use [`resolve_tools_for_intent`] to apply one.
 ///
 /// The `always_include` / `always_exclude` lists (tool names) are applied after
 /// tier-based filtering to allow user overrides.
+#[must_use]
 pub fn select_tools_for_intent<'a>(
     all_tools: &'a [Box<dyn Tool>],
     user_message: &str,
     always_include: &[String],
     always_exclude: &[String],
-) -> Vec<&'a dyn Tool> {
+) -> RoutingOutcome<'a> {
     let activated = CLASSIFIER.classify(user_message);
-    let unrouted = activated.is_empty();
+    if activated.is_empty() {
+        tracing::debug!("capability routing found no evidence in this turn; deferring to the caller");
+        return RoutingOutcome::Unrouted;
+    }
 
     let selected = all_tools
         .iter()
@@ -197,12 +330,6 @@ pub fn select_tools_for_intent<'a>(
 
             // always_include overrides tier logic
             if always_include.iter().any(|n| n == name) {
-                return true;
-            }
-
-            // No category activated: the classifier has nothing to say about
-            // this request, so it does not get to remove anything from it.
-            if unrouted {
                 return true;
             }
 
@@ -232,10 +359,10 @@ pub fn select_tools_for_intent<'a>(
             .collect::<Vec<_>>();
         active.sort_unstable();
         rejected.sort_unstable();
-        tracing::debug!(?active, ?rejected, unrouted, "capability routing decision");
+        tracing::debug!(?active, ?rejected, "capability routing decision");
     }
 
-    selected
+    RoutingOutcome::Routed(selected)
 }
 
 /// Return whether a core dependency may be exposed under the turn's explicit
@@ -317,35 +444,63 @@ impl SessionToolExposure {
         self.names.lock().iter().cloned().collect()
     }
 
-    /// Absorb this turn's routing decision and return the tiering policy that
-    /// exposes the session's cumulative set.
+    /// Absorb this turn's routing decision and return the surface that exposes
+    /// the session's cumulative set.
     ///
     /// The union is handed back through the existing `always_include` knob, so
     /// the tool loop keeps running exactly one selector. `always_exclude` still
     /// outranks `always_include` inside [`select_tools_for_intent`], so a name
     /// operator policy forbids can never be resurrected by stickiness.
+    ///
+    /// An **unrouted** turn is absorbed only when the session has nothing yet:
+    /// the very first turn of a session that names no capability still gets the
+    /// whole registry, because there is no earlier decision to fall back on.
+    /// Once the session holds a set, an unrouted turn adds nothing to it — it
+    /// re-publishes what is already there. Absorbing the fallback every time
+    /// made one unreadable turn (a greeting, a non-English request) swallow the
+    /// entire registry and pin the session at full width from then on.
     #[must_use]
-    pub fn sticky_tiering(
+    pub fn sticky_surface(
         &self,
         base: &crate::config::ToolTieringConfig,
         all_tools: &[Box<dyn Tool>],
         routing_input: &str,
-    ) -> crate::config::ToolTieringConfig {
-        let routed = select_tools_for_intent(all_tools, routing_input, &base.always_include, &base.always_exclude);
+    ) -> SessionToolSurface {
+        let outcome = select_tools_for_intent(all_tools, routing_input, &base.always_include, &base.always_exclude);
         let mut names = self.names.lock();
-        for tool in routed {
+        let absorbed = match outcome {
+            RoutingOutcome::Routed(routed) => Some(routed),
+            RoutingOutcome::Unrouted if names.is_empty() => Some(full_tool_surface(all_tools, &base.always_exclude)),
+            RoutingOutcome::Unrouted => None,
+        };
+        for tool in absorbed.into_iter().flatten() {
             if !names.contains(tool.name()) {
                 names.insert(tool.name().to_string());
             }
         }
-        let mut sticky = base.clone();
+        let mut tiering = base.clone();
         for name in names.iter() {
-            if !sticky.always_include.iter().any(|existing| existing == name) {
-                sticky.always_include.push(name.clone());
+            if !tiering.always_include.iter().any(|existing| existing == name) {
+                tiering.always_include.push(name.clone());
             }
         }
-        sticky
+        SessionToolSurface {
+            tiering,
+            unrouted: UnroutedToolPolicy::KeepPinnedExposure,
+        }
     }
+}
+
+/// The tiering policy a session publishes for one turn, together with the
+/// fallback the shared tool loop must apply if it re-routes the same turn and
+/// finds nothing. Both halves travel together so the loop cannot re-widen a
+/// surface the session deliberately held still.
+#[derive(Debug, Clone)]
+pub struct SessionToolSurface {
+    /// Tiering config whose `always_include` carries the session's union.
+    pub tiering: crate::config::ToolTieringConfig,
+    /// What to publish when this turn routes to nothing.
+    pub unrouted: UnroutedToolPolicy,
 }
 
 #[cfg(test)]
@@ -465,7 +620,9 @@ mod tests {
             Arc::new(SecurityPolicy::default()),
         ))];
 
-        let selected = select_tools_for_intent(&tools, "search the release notes", &[], &[]);
+        let selected = select_tools_for_intent(&tools, "search the release notes", &[], &[])
+            .routed()
+            .expect("a search request routes");
         let names: HashSet<&str> = selected.iter().map(|tool| tool.name()).collect();
 
         assert!(
@@ -489,14 +646,17 @@ mod tests {
                 std::path::PathBuf::from("."),
             )),
         ];
-        let selected = select_tools_for_intent(&tools, "run shell", &[], &[]);
+        // `run shell` names no category, so the stateless fallback is what a
+        // gateway/console turn would publish here.
+        let selected = resolve_tools_for_intent(&tools, "run shell", &[], &[], UnroutedToolPolicy::PublishEverything);
         let allowlists = std::collections::HashMap::from([("small-model".to_string(), vec!["shell".to_string()])]);
 
         let filtered = apply_model_tool_allowlist(selected, "small-model", &allowlists);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name(), "shell");
 
-        let unconfigured = select_tools_for_intent(&tools, "run shell", &[], &[]);
+        let unconfigured =
+            resolve_tools_for_intent(&tools, "run shell", &[], &[], UnroutedToolPolicy::PublishEverything);
         assert_eq!(
             apply_model_tool_allowlist(unconfigured, "other-model", &allowlists).len(),
             2
@@ -566,21 +726,47 @@ mod tests {
         ]
     }
 
+    /// What a stateless entry point (channel, gateway, console, worker)
+    /// publishes for this turn.
     fn selected_names(
         tools: &[Box<dyn Tool>],
         message: &str,
         tiering: &crate::config::ToolTieringConfig,
     ) -> Vec<String> {
-        let mut names = select_tools_for_intent(tools, message, &tiering.always_include, &tiering.always_exclude)
-            .into_iter()
-            .map(|tool| tool.name().to_string())
-            .collect::<Vec<_>>();
+        policy_names(tools, message, tiering, UnroutedToolPolicy::PublishEverything)
+    }
+
+    /// What a chat turn publishes: the dispatcher decides the session surface,
+    /// then the shared tool loop re-routes the same text under that surface.
+    /// Both halves must be exercised — the loop is where the old fallback
+    /// re-widened a set the session had just held still.
+    fn session_names(tools: &[Box<dyn Tool>], message: &str, surface: &SessionToolSurface) -> Vec<String> {
+        policy_names(tools, message, &surface.tiering, surface.unrouted)
+    }
+
+    fn policy_names(
+        tools: &[Box<dyn Tool>],
+        message: &str,
+        tiering: &crate::config::ToolTieringConfig,
+        unrouted: UnroutedToolPolicy,
+    ) -> Vec<String> {
+        let mut names = resolve_tools_for_intent(
+            tools,
+            message,
+            &tiering.always_include,
+            &tiering.always_exclude,
+            unrouted,
+        )
+        .into_iter()
+        .map(|tool| tool.name().to_string())
+        .collect::<Vec<_>>();
         names.sort();
         names
     }
 
-    /// MUTATION GUARD: delete the `unrouted` short-circuit in
-    /// `select_tools_for_intent` and this goes red.
+    /// MUTATION GUARD: make `select_tools_for_intent` return
+    /// `RoutingOutcome::Routed` for an empty category set, or make
+    /// `resolve_tools_for_intent` ignore `PublishEverything`, and this goes red.
     #[test]
     fn an_unrouted_message_keeps_the_whole_registry() {
         let tools = probe_registry();
@@ -621,7 +807,7 @@ mod tests {
         );
     }
 
-    /// MUTATION GUARD: make `sticky_tiering` return `base.clone()` and the
+    /// MUTATION GUARD: make `sticky_surface` return `base.clone()` and the
     /// second assertion goes red.
     #[test]
     fn session_tool_exposure_only_ever_grows_until_reset() {
@@ -629,40 +815,118 @@ mod tests {
         let base = crate::config::ToolTieringConfig::default();
         let exposure = SessionToolExposure::new();
 
-        let first = exposure.sticky_tiering(&base, &tools, "commit this change");
+        let first = exposure.sticky_surface(&base, &tools, "commit this change");
         assert_eq!(
-            selected_names(&tools, "commit this change", &first),
+            session_names(&tools, "commit this change", &first),
             vec!["probe_core", "probe_devops"]
         );
 
         // A turn that names nothing this session has not already asked for must
         // publish the identical set, whatever the wording.
-        let second = exposure.sticky_tiering(&base, &tools, "please push the merge to the branch");
+        let second = exposure.sticky_surface(&base, &tools, "please push the merge to the branch");
         assert_eq!(
-            selected_names(&tools, "please push the merge to the branch", &second),
+            session_names(&tools, "please push the merge to the branch", &second),
             vec!["probe_core", "probe_devops"]
         );
 
         // A genuinely new intent widens the set exactly once, and it stays.
-        let third = exposure.sticky_tiering(&base, &tools, "search the changelog");
+        let third = exposure.sticky_surface(&base, &tools, "search the changelog");
         assert_eq!(
-            selected_names(&tools, "search the changelog", &third),
+            session_names(&tools, "search the changelog", &third),
             vec!["probe_core", "probe_devops", "probe_web"]
         );
-        let fourth = exposure.sticky_tiering(&base, &tools, "commit this change");
+        let fourth = exposure.sticky_surface(&base, &tools, "commit this change");
         assert_eq!(
-            selected_names(&tools, "commit this change", &fourth),
+            session_names(&tools, "commit this change", &fourth),
             vec!["probe_core", "probe_devops", "probe_web"],
             "a routed set may not shrink inside one session"
         );
 
         exposure.reset();
         assert!(exposure.snapshot().is_empty());
-        let after_reset = exposure.sticky_tiering(&base, &tools, "commit this change");
+        let after_reset = exposure.sticky_surface(&base, &tools, "commit this change");
         assert_eq!(
-            selected_names(&tools, "commit this change", &after_reset),
+            session_names(&tools, "commit this change", &after_reset),
             vec!["probe_core", "probe_devops"],
             "a session boundary starts the union over"
+        );
+    }
+
+    /// A turn the keyword table cannot read is not evidence of a new capability,
+    /// so a session that already holds a set re-publishes exactly that set. The
+    /// old behaviour published the whole registry and the union absorbed it,
+    /// which pinned every later turn of the session at full width.
+    ///
+    /// MUTATION GUARD: absorb the unrouted fallback unconditionally in
+    /// `sticky_surface`, or return `PublishEverything` from it, and the third
+    /// and fourth assertions go red.
+    #[test]
+    fn an_unrouted_turn_neither_widens_nor_shrinks_an_established_session() {
+        let tools = probe_registry();
+        let base = crate::config::ToolTieringConfig::default();
+        let exposure = SessionToolExposure::new();
+        // Chinese for "thanks, that is all" — an ordinary closing line that
+        // activates no English category.
+        let unreadable = "\u{8c22}\u{8c22}\u{ff0c}\u{5c31}\u{8fd9}\u{4e9b}";
+
+        let routed = exposure.sticky_surface(&base, &tools, "commit this change");
+        let established = session_names(&tools, "commit this change", &routed);
+        assert_eq!(established, vec!["probe_core", "probe_devops"]);
+
+        // Fixture self-check: the same text through a stateless entry point
+        // really does fall back to the whole registry, so the assertion below
+        // is about the session rule and not about the message being routable.
+        assert_eq!(
+            selected_names(&tools, unreadable, &base),
+            vec!["probe_core", "probe_devops", "probe_web"],
+            "the fixture message must be genuinely unrouted"
+        );
+
+        let quiet = exposure.sticky_surface(&base, &tools, unreadable);
+        assert_eq!(
+            session_names(&tools, unreadable, &quiet),
+            established,
+            "an unrouted turn must publish the session set unchanged"
+        );
+        assert_eq!(
+            exposure.snapshot(),
+            vec!["probe_core".to_string(), "probe_devops".to_string()],
+            "an unrouted turn must not absorb the whole registry into the union"
+        );
+
+        // And the session is still able to grow afterwards.
+        let later = exposure.sticky_surface(&base, &tools, "search the changelog");
+        assert_eq!(
+            session_names(&tools, "search the changelog", &later),
+            vec!["probe_core", "probe_devops", "probe_web"]
+        );
+    }
+
+    /// The protection R1 added for an unreadable *first* turn stays: a session
+    /// with nothing absorbed yet has no earlier decision to keep, so it gets the
+    /// whole registry and keeps it.
+    ///
+    /// MUTATION GUARD: drop the `names.is_empty()` branch in `sticky_surface`
+    /// and the first assertion goes red.
+    #[test]
+    fn a_session_opening_on_an_unrouted_turn_still_gets_the_whole_registry() {
+        let tools = probe_registry();
+        let base = crate::config::ToolTieringConfig::default();
+        let exposure = SessionToolExposure::new();
+        let unreadable = "\u{8c22}\u{8c22}\u{ff0c}\u{5c31}\u{8fd9}\u{4e9b}";
+
+        let opening = exposure.sticky_surface(&base, &tools, unreadable);
+        assert_eq!(
+            session_names(&tools, unreadable, &opening),
+            vec!["probe_core", "probe_devops", "probe_web"],
+            "a first turn with no earlier decision may not be trimmed"
+        );
+
+        let next = exposure.sticky_surface(&base, &tools, "commit this change");
+        assert_eq!(
+            session_names(&tools, "commit this change", &next),
+            vec!["probe_core", "probe_devops", "probe_web"],
+            "the union only ever grows"
         );
     }
 
@@ -674,9 +938,9 @@ mod tests {
             ..crate::config::ToolTieringConfig::default()
         };
         let exposure = SessionToolExposure::new();
-        let sticky = exposure.sticky_tiering(&base, &tools, "search the changelog");
+        let sticky = exposure.sticky_surface(&base, &tools, "search the changelog");
         assert_eq!(
-            selected_names(&tools, "search the changelog", &sticky),
+            session_names(&tools, "search the changelog", &sticky),
             vec!["probe_core"],
             "the excluded web probe is the only tool that category would have added"
         );
