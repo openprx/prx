@@ -355,6 +355,22 @@ pub enum Action {
         delta: String,
         version: u64,
     },
+    /// 收到一段 reasoning ("thinking") 增量.
+    ///
+    /// Carries only the delta: the reducer keeps a character counter plus a
+    /// bounded tail on the draft so the TUI can show live thinking progress.
+    /// The authoritative full reasoning body stays in the streaming driver and
+    /// is replayed once in [`Self::StreamCompleted`], so there is no second
+    /// copy of the whole body in reducer state.
+    ///
+    /// `version` is drawn from the same per-turn counter as
+    /// [`Self::StreamChunkReceived`], so the reducer's strict-monotonic guard
+    /// drops stale/reordered reasoning deltas exactly like text deltas.
+    StreamReasoningReceived {
+        draft_id: String,
+        delta: String,
+        version: u64,
+    },
     /// Provider-reported or estimated usage for a streaming turn.
     StreamUsageMetered { draft_id: String, usage: TokenUsage },
     /// streaming 完成，携带最终文本和 reasoning 摘要
@@ -605,6 +621,7 @@ impl Action {
             Self::TurnStarted { .. } => "TurnStarted",
             Self::StartLLMTurn { .. } => "StartLLMTurn",
             Self::StreamChunkReceived { .. } => "StreamChunkReceived",
+            Self::StreamReasoningReceived { .. } => "StreamReasoningReceived",
             Self::StreamUsageMetered { .. } => "StreamUsageMetered",
             Self::StreamCompleted { .. } => "StreamCompleted",
             Self::ProviderTurnReadyForCommit { .. } => "ProviderTurnReadyForCommit",

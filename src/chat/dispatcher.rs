@@ -2198,12 +2198,55 @@ fn chat_tool_execution_service(
     }
 }
 
+/// Minimum wall-clock gap between two live thinking-progress actions.
+///
+/// Reasoning deltas arrive far more finely grained than visible text deltas
+/// (k3-class models emit hundreds of fragments over a 4-40s thinking burst), so
+/// they are batched here instead of producing one action per fragment. This
+/// keeps the reducer/redraw rate at or below the existing text-delta rate.
+const REASONING_PROGRESS_MIN_INTERVAL_MS: i64 = 120;
+
+/// Batches reasoning deltas so the TUI progress counter updates at most once
+/// per [`REASONING_PROGRESS_MIN_INTERVAL_MS`].
+///
+/// Pure logic (the clock is an argument) so the throttle is unit-testable
+/// without sleeping.
+#[derive(Debug, Default)]
+struct ReasoningProgressBatcher {
+    pending: String,
+    last_emit_ms: Option<i64>,
+}
+
+impl ReasoningProgressBatcher {
+    /// Fold one delta in; returns the batch to publish when the throttle window
+    /// has elapsed, otherwise `None` (the delta stays buffered for the next
+    /// window).
+    fn push(&mut self, delta: &str, now_ms: i64) -> Option<String> {
+        if delta.is_empty() {
+            return None;
+        }
+        self.pending.push_str(delta);
+        let due = self
+            .last_emit_ms
+            .is_none_or(|last| now_ms.saturating_sub(last) >= REASONING_PROGRESS_MIN_INTERVAL_MS);
+        if !due {
+            return None;
+        }
+        self.last_emit_ms = Some(now_ms);
+        Some(std::mem::take(&mut self.pending))
+    }
+}
+
 struct ReduxToolLoopEventSink {
     provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
     draft_id: String,
     action_tx: mpsc::Sender<Action>,
     version: AtomicU64,
+    /// Authoritative full reasoning body for this turn — the single source of
+    /// truth replayed in the terminal action. The reducer only ever receives
+    /// deltas for its live counter, never a second full copy.
     reasoning: Arc<ParkingMutex<String>>,
+    reasoning_progress: ParkingMutex<ReasoningProgressBatcher>,
 }
 
 #[async_trait]
@@ -2217,7 +2260,15 @@ impl crate::agent::loop_::ToolLoopEventSink for ReduxToolLoopEventSink {
             },
             crate::agent::loop_::ToolLoopEvent::ReasoningDelta(delta) => {
                 self.reasoning.lock().push_str(&delta);
-                return Ok(());
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let Some(batch) = self.reasoning_progress.lock().push(&delta, now_ms) else {
+                    return Ok(());
+                };
+                Action::StreamReasoningReceived {
+                    draft_id: self.draft_id.clone(),
+                    delta: batch,
+                    version: self.version.fetch_add(1, Ordering::Relaxed).saturating_add(1),
+                }
             }
             crate::agent::loop_::ToolLoopEvent::RetryAttempt { attempt, reason } => {
                 Action::StreamRetryAttempt { attempt, reason }
@@ -2413,6 +2464,7 @@ async fn drive_start_turn_stream(
         action_tx: action_tx.clone(),
         version: AtomicU64::new(0),
         reasoning: Arc::clone(&reasoning),
+        reasoning_progress: ParkingMutex::new(ReasoningProgressBatcher::default()),
     });
     let runtime_adapter = crate::agent::loop_::ToolLoopRuntimeAdapter {
         events: Some(events),
@@ -4035,6 +4087,43 @@ mod tests {
     use super::*;
     use crate::chat::action::Action;
     use crate::providers::router::MockEnvProvider;
+
+    /// F1: reasoning delta 很碎，节流器必须把窗口内的碎片攒起来，
+    /// 且不丢字符（下一个窗口把攒的和新的一起发出去）。
+    #[test]
+    fn reasoning_progress_batcher_throttles_without_losing_chars() {
+        let mut batcher = ReasoningProgressBatcher::default();
+        let first = batcher
+            .push("思考", 1_000)
+            .expect("test: first delta publishes immediately");
+        assert_eq!(first, "思考");
+
+        // 同一窗口内的碎片全部被压住
+        assert!(batcher.push("中", 1_010).is_none());
+        assert!(batcher.push("……", 1_050).is_none());
+        assert!(
+            batcher
+                .push("😀", 1_000 + REASONING_PROGRESS_MIN_INTERVAL_MS - 1)
+                .is_none(),
+            "窗口未满不得发布"
+        );
+
+        // 窗口到期：攒下的碎片一次性带出，顺序不变
+        let batch = batcher
+            .push("!", 1_000 + REASONING_PROGRESS_MIN_INTERVAL_MS)
+            .expect("test: window elapsed publishes batch");
+        assert_eq!(batch, "中……😀!", "批次必须保序且不丢字符");
+
+        // 发布后缓冲清空
+        assert!(batcher.push("x", 1_000 + REASONING_PROGRESS_MIN_INTERVAL_MS).is_none());
+        let next = batcher
+            .push("y", 1_000 + 2 * REASONING_PROGRESS_MIN_INTERVAL_MS)
+            .expect("test: next window publishes");
+        assert_eq!(next, "xy");
+
+        // 空 delta 不触发任何发布
+        assert!(batcher.push("", 9_999_999).is_none());
+    }
 
     #[test]
     fn dispatcher_tool_specs_never_include_stay_silent() {
@@ -6099,7 +6188,26 @@ mod real_mode_tests {
             other => panic!("expected StreamChunkReceived#1, got {other:?}"),
         }
 
-        // reasoning chunk 不产生 Action（被 buffer），下一条仍是 chunk 2 (delta="world")
+        // F1: reasoning chunk 现在也投 Action，让 TUI 在 thinking 期间显示进度；
+        // 它与文本 delta 共用同一个版本号计数器。
+        let a_reasoning = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+            .await
+            .expect("reasoning progress within 1.5s")
+            .expect("reasoning progress received");
+        match a_reasoning {
+            Action::StreamReasoningReceived {
+                draft_id,
+                delta,
+                version,
+            } => {
+                assert_eq!(draft_id, "draft-stream");
+                assert_eq!(delta, "thinking…");
+                assert_eq!(version, 2, "reasoning shares the text delta version counter");
+            }
+            other => panic!("expected StreamReasoningReceived, got {other:?}"),
+        }
+
+        // 下一条仍是 chunk 2 (delta="world")，版本号继续严格递增
         let a2 = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
             .await
             .expect("second chunk within 1.5s")
@@ -6107,7 +6215,7 @@ mod real_mode_tests {
         match a2 {
             Action::StreamChunkReceived { delta, version, .. } => {
                 assert_eq!(delta, "world");
-                assert_eq!(version, 2, "second delta version must strictly increase");
+                assert_eq!(version, 3, "second delta version must strictly increase");
             }
             other => panic!("expected StreamChunkReceived#2, got {other:?}"),
         }
@@ -6222,16 +6330,26 @@ mod real_mode_tests {
             })
             .await;
 
-        for expected_delta in ["ordered ", "commit"] {
+        // F1: reasoning delta 夹在文本 delta 之间，作为 thinking 进度单独投出。
+        let mut text_deltas = Vec::new();
+        let mut reasoning_deltas = Vec::new();
+        while text_deltas.len() < 2 {
             let action = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
                 .await
                 .expect("stream action within 1.5s")
                 .expect("stream action received");
             match action {
-                Action::StreamChunkReceived { delta, .. } => assert_eq!(delta, expected_delta),
-                other => panic!("expected StreamChunkReceived, got {other:?}"),
+                Action::StreamChunkReceived { delta, .. } => text_deltas.push(delta),
+                Action::StreamReasoningReceived { delta, .. } => reasoning_deltas.push(delta),
+                other => panic!("expected stream delta action, got {other:?}"),
             }
         }
+        assert_eq!(text_deltas, vec!["ordered ".to_string(), "commit".to_string()]);
+        assert_eq!(
+            reasoning_deltas,
+            vec!["gate".to_string()],
+            "thinking 进度必须实时投出，而不是只在完成时出现"
+        );
 
         let terminal = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
             .await

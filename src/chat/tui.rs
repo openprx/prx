@@ -59,6 +59,45 @@ pub struct StreamingDraft {
     /// Monotonically increasing sequence number. `start_stream` returns 0;
     /// every successful `update_stream` raises it. Stale versions are dropped.
     pub version: u64,
+    /// Number of reasoning ("thinking") characters streamed so far for this
+    /// draft.
+    ///
+    /// The full reasoning body is deliberately NOT stored here: the streaming
+    /// driver keeps the single authoritative copy and replays it in
+    /// `Action::StreamCompleted`, which is what becomes the final reasoning
+    /// card. The draft only carries derived progress so the transient activity
+    /// line can advance while the model is still thinking.
+    pub reasoning_chars: usize,
+    /// Bounded tail of the reasoning stream (at most
+    /// [`REASONING_TAIL_MAX_CHARS`] characters) used for the one-line live
+    /// preview under the thinking indicator.
+    pub reasoning_tail: String,
+}
+
+/// Maximum number of characters retained from the reasoning stream for the
+/// live preview. Bounded so a 40s thinking burst cannot grow the draft.
+pub const REASONING_TAIL_MAX_CHARS: usize = 240;
+
+impl StreamingDraft {
+    /// Fresh draft with no accumulated text and no thinking progress.
+    #[must_use]
+    pub fn new(draft_id: impl Into<String>) -> Self {
+        Self {
+            draft_id: draft_id.into(),
+            accumulated: String::new(),
+            version: 0,
+            reasoning_chars: 0,
+            reasoning_tail: String::new(),
+        }
+    }
+
+    /// One-line preview of the most recent reasoning text, whitespace
+    /// collapsed. `None` when nothing has streamed yet.
+    #[must_use]
+    pub fn reasoning_preview(&self) -> Option<String> {
+        let collapsed = self.reasoning_tail.split_whitespace().collect::<Vec<_>>().join(" ");
+        if collapsed.is_empty() { None } else { Some(collapsed) }
+    }
 }
 
 /// State for the TUI layout.
@@ -3202,11 +3241,7 @@ impl TuiState {
     /// must supply a strictly greater version or they are rejected.
     pub fn start_stream(&mut self, draft_id: &str) -> u64 {
         self.stream_started_at_ms = Some(chrono::Utc::now().timestamp_millis());
-        self.streaming = Some(StreamingDraft {
-            draft_id: draft_id.to_string(),
-            accumulated: String::new(),
-            version: 0,
-        });
+        self.streaming = Some(StreamingDraft::new(draft_id));
         0
     }
 
@@ -4272,7 +4307,7 @@ fn push_live_turn_transcript_lines<'a, V: BottomChromeView + ?Sized>(lines: &mut
             )
         });
         if !running_tool {
-            render_turn_activity_line(lines, state);
+            render_turn_activity_line(lines, state, streaming);
         }
         return;
     }
@@ -4285,28 +4320,56 @@ fn push_live_turn_transcript_lines<'a, V: BottomChromeView + ?Sized>(lines: &mut
     lines.push(Line::from(""));
 }
 
-fn render_turn_activity_line<'a, V: BottomChromeView + ?Sized>(lines: &mut Vec<Line<'a>>, state: &V) {
+/// Render the pre-first-token activity line.
+///
+/// While the model is only emitting reasoning ("thinking") deltas there is no
+/// visible text to show, so the label becomes `Thinking` and the detail block
+/// carries the live character / estimated-token counters plus a single clipped
+/// preview line of the newest reasoning text. Without reasoning progress the
+/// line is the unchanged `Working (...)` spinner.
+fn render_turn_activity_line<'a, V: BottomChromeView + ?Sized>(
+    lines: &mut Vec<Line<'a>>,
+    state: &V,
+    streaming: &StreamingDraft,
+) {
     let spinner = spinner_frame_for_tick(state.ascii_fallback(), current_animation_tick());
     let separator = if state.ascii_fallback() { " | " } else { " · " };
-    let detail = state.active_turn_started_at_ms().map_or_else(
-        || "Esc to interrupt".to_string(),
-        |started_at_ms| {
-            format!(
-                "{}{}Esc to interrupt",
-                format_turn_duration(turn_elapsed_ms(started_at_ms)),
-                separator
-            )
-        },
-    );
+    let thinking = Some(streaming).filter(|draft| draft.reasoning_chars > 0);
+    let mut detail = String::new();
+    if let Some(started_at_ms) = state.active_turn_started_at_ms() {
+        detail.push_str(&format_turn_duration(turn_elapsed_ms(started_at_ms)));
+        detail.push_str(separator);
+    }
+    if let Some(draft) = thinking {
+        detail.push_str(&format_thinking_progress(draft.reasoning_chars));
+        detail.push_str(separator);
+    }
+    detail.push_str("Esc to interrupt");
+    let label = if thinking.is_some() { "Thinking" } else { "Working" };
     lines.push(Line::from(vec![
         Span::styled(format!("{spinner} "), Style::default().fg(Color::Cyan)),
-        Span::styled(
-            "Working",
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(label, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         Span::styled(format!(" ({detail})"), Style::default().fg(Color::DarkGray)),
     ]));
+    if let Some(preview) = thinking.and_then(StreamingDraft::reasoning_preview) {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {}",
+                crate::util::truncate_with_ellipsis(&preview, THINKING_PREVIEW_MAX_CHARS)
+            ),
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )));
+    }
     lines.push(Line::from(""));
+}
+
+/// Maximum width of the live reasoning preview line.
+const THINKING_PREVIEW_MAX_CHARS: usize = 96;
+
+/// `"1234 chars (~309 tok)"` — live thinking counters for the activity line.
+fn format_thinking_progress(char_count: usize) -> String {
+    let tokens = estimate_reasoning_tokens(char_count);
+    format!("{char_count} chars (~{tokens} tok)")
 }
 
 fn fullscreen_bottom_chrome_base_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
@@ -12034,6 +12097,8 @@ mod tests {
                 draft_id: "draft-worker-3".to_string(),
                 accumulated: "worker 3 live".to_string(),
                 version: 1,
+                reasoning_chars: 0,
+                reasoning_tail: String::new(),
             },
         }]);
         let out = dispatch_global_key(key(KeyCode::Right), &mut state);
@@ -12165,6 +12230,8 @@ mod tests {
             draft_id: "d".to_string(),
             accumulated: "partial answer".to_string(),
             version: 1,
+            reasoning_chars: 0,
+            reasoning_tail: String::new(),
         };
 
         let lines = provider_worker_io_lines_from_conversation(&conversation, Some(&streaming), 8);
@@ -12974,6 +13041,8 @@ mod tests {
             draft_id: "hint-draft".to_string(),
             accumulated: "streaming delta below".to_string(),
             version: 1,
+            reasoning_chars: 0,
+            reasoning_tail: String::new(),
         });
         let hinted_rows = fullscreen_rows(&state, 70, 16, &mut scroll);
         assert!(
@@ -13029,6 +13098,8 @@ mod tests {
             draft_id: "draft-1".to_string(),
             accumulated: "streaming tail".to_string(),
             version: 1,
+            reasoning_chars: 0,
+            reasoning_tail: String::new(),
         });
         let mut scroll = FullscreenTranscriptScroll::default();
 
@@ -13069,12 +13140,81 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_thinking_progress_replaces_working_line() {
+        let mut state = TuiState::new("provider", "model");
+        state.push_user_message("check service status");
+        state.start_stream("draft-thinking");
+        state.stream_started_at_ms = Some(chrono::Utc::now().timestamp_millis().saturating_sub(3_000));
+        let draft = state.streaming.as_mut().expect("test: draft present");
+        crate::chat::state::apply_reasoning_progress(draft, "让我先梳理调用链 ✅ ");
+        crate::chat::state::apply_reasoning_progress(draft, "再校验边界条件");
+        let expected_chars = "让我先梳理调用链 ✅ 再校验边界条件".chars().count();
+
+        let mut scroll = FullscreenTranscriptScroll::default();
+        let rows = fullscreen_rows(&state, 100, 18, &mut scroll);
+        let rendered = rows.join("\n");
+
+        assert!(rendered.contains("Thinking"), "thinking 标签: {rows:?}");
+        assert!(!rendered.contains("Working"), "thinking 期间不再显示 Working: {rows:?}");
+        assert!(
+            rendered.contains(&format!("{expected_chars} chars")),
+            "实时字符数: {rows:?}"
+        );
+        assert!(rendered.contains("~"), "估算 token 数: {rows:?}");
+        assert!(rendered.contains("tok"), "估算 token 单位: {rows:?}");
+        assert!(rendered.contains("Esc to interrupt"), "中断提示保留: {rows:?}");
+        // 宽字符在测试行提取时按单元格展开，比较前去掉空白。
+        let compact: String = rendered.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(compact.contains("再校验边界条件"), "一行实时预览: {rows:?}");
+    }
+
+    #[test]
+    fn fullscreen_activity_line_stays_working_without_reasoning() {
+        let mut state = TuiState::new("provider", "model");
+        state.push_user_message("check service status");
+        state.start_stream("draft-plain-wait");
+        state.stream_started_at_ms = Some(chrono::Utc::now().timestamp_millis().saturating_sub(1_000));
+
+        let mut scroll = FullscreenTranscriptScroll::default();
+        let rows = fullscreen_rows(&state, 100, 18, &mut scroll);
+        let rendered = rows.join("\n");
+
+        assert!(rendered.contains("Working"), "无 reasoning 时保持原样: {rows:?}");
+        assert!(
+            !rendered.contains("Thinking ("),
+            "无 reasoning 时不显示 thinking 计数: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn thinking_preview_is_bounded_to_one_clipped_line() {
+        let mut draft = StreamingDraft::new("d");
+        for round in 0..40 {
+            crate::chat::state::apply_reasoning_progress(&mut draft, &format!("段落 {round} 推理内容 😀\n"));
+        }
+        let preview = draft.reasoning_preview().expect("test: preview present");
+        assert!(!preview.contains('\n'), "预览折成一行: {preview}");
+        assert_eq!(
+            draft.reasoning_tail.chars().count(),
+            REASONING_TAIL_MAX_CHARS,
+            "尾巴有界"
+        );
+        let clipped = crate::util::truncate_with_ellipsis(&preview, THINKING_PREVIEW_MAX_CHARS);
+        assert!(
+            clipped.chars().count() <= THINKING_PREVIEW_MAX_CHARS.saturating_add(3),
+            "渲染前再裁一次: {clipped}"
+        );
+    }
+
+    #[test]
     fn fullscreen_streaming_tail_is_not_duplicated_in_bottom_chrome() {
         let mut state = TuiState::new("provider", "model");
         state.streaming = Some(StreamingDraft {
             draft_id: "draft-1".to_string(),
             accumulated: "phase2 unique streaming tail".to_string(),
             version: 1,
+            reasoning_chars: 0,
+            reasoning_tail: String::new(),
         });
         let mut scroll = FullscreenTranscriptScroll::default();
 

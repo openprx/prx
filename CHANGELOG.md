@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.114] - 13 September 2026
+
+### Added
+
+- Show live thinking progress in the chat TUI while a reasoning model streams.
+  Reasoning deltas now reach the reducer as `StreamReasoningReceived`, and the
+  pre-first-token activity line reports `Thinking (elapsed - N chars (~M tok) -
+  Esc to interrupt)` with a one-line preview of the newest reasoning text
+  instead of an opaque spinner for the whole 4-40s thinking burst. Reasoning
+  deltas share the text-delta version counter, so stale and reordered deltas are
+  dropped by the same strict-monotonic guard.
+- Batch reasoning deltas behind a 120ms window so the fine-grained reasoning
+  stream cannot redraw faster than the visible text stream.
+
 ## [0.8.113] - 13 September 2026
 
 ### Fixed

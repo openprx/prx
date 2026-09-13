@@ -19,7 +19,7 @@
 // Step 5 删旧路径后 chat_mirror 即被 ChatState.ui 取代。
 
 #[cfg(feature = "terminal-tui")]
-pub use crate::chat::tui::{ConversationLine, SlashMenuState, StreamingDraft, TuiInput};
+pub use crate::chat::tui::{ConversationLine, REASONING_TAIL_MAX_CHARS, SlashMenuState, StreamingDraft, TuiInput};
 
 /// 占位：TuiInput（非 terminal-tui feature；保持 reducer 在最小 feature 下也能编译）
 #[cfg(not(feature = "terminal-tui"))]
@@ -41,6 +41,32 @@ pub struct StreamingDraft {
     pub draft_id: String,
     pub accumulated: String,
     pub version: u64,
+    pub reasoning_chars: usize,
+    pub reasoning_tail: String,
+}
+
+/// 占位：与 terminal-tui 版本保持同值.
+#[cfg(not(feature = "terminal-tui"))]
+pub const REASONING_TAIL_MAX_CHARS: usize = 240;
+
+#[cfg(not(feature = "terminal-tui"))]
+impl StreamingDraft {
+    #[must_use]
+    pub fn new(draft_id: impl Into<String>) -> Self {
+        Self {
+            draft_id: draft_id.into(),
+            accumulated: String::new(),
+            version: 0,
+            reasoning_chars: 0,
+            reasoning_tail: String::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn reasoning_preview(&self) -> Option<String> {
+        let collapsed = self.reasoning_tail.split_whitespace().collect::<Vec<_>>().join(" ");
+        if collapsed.is_empty() { None } else { Some(collapsed) }
+    }
 }
 
 use std::sync::Arc;
@@ -584,6 +610,25 @@ impl StreamState {
     }
 }
 
+/// Fold one reasoning delta into a draft's live thinking progress.
+///
+/// Counts characters (not bytes, so multi-byte text is reported honestly) and
+/// keeps at most [`REASONING_TAIL_MAX_CHARS`] trailing characters for the
+/// one-line preview. Truncation is char-based, so a multi-byte character is
+/// never split.
+pub fn apply_reasoning_progress(draft: &mut StreamingDraft, delta: &str) {
+    if delta.is_empty() {
+        return;
+    }
+    draft.reasoning_chars = draft.reasoning_chars.saturating_add(delta.chars().count());
+    draft.reasoning_tail.push_str(delta);
+    let tail_len = draft.reasoning_tail.chars().count();
+    if tail_len > REASONING_TAIL_MAX_CHARS {
+        let skip = tail_len.saturating_sub(REASONING_TAIL_MAX_CHARS);
+        draft.reasoning_tail = draft.reasoning_tail.chars().skip(skip).collect();
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ToolTaskKey {
     Task(crate::chat::turn_scheduler::TurnTaskId),
@@ -1086,6 +1131,11 @@ impl ChatState {
                 delta,
                 version,
             } => self.reduce_stream_chunk_received(&draft_id, &delta, version),
+            Action::StreamReasoningReceived {
+                draft_id,
+                delta,
+                version,
+            } => self.reduce_stream_reasoning_received(&draft_id, &delta, version),
             Action::StreamUsageMetered { .. } => vec![],
             Action::StreamCompleted {
                 draft_id,
@@ -1585,11 +1635,7 @@ impl ChatState {
             sequence: Self::visible_draft_sequence(task_id, sequence),
             prompt_preview,
             started_at_ms: chrono::Utc::now().timestamp_millis(),
-            draft: StreamingDraft {
-                draft_id,
-                accumulated: String::new(),
-                version: 0,
-            },
+            draft: StreamingDraft::new(draft_id),
         });
     }
 
@@ -1777,6 +1823,31 @@ impl ChatState {
         }
         draft.accumulated.push_str(delta);
         draft.version = version;
+        vec![Effect::RequestRedraw]
+    }
+
+    /// `Action::StreamReasoningReceived` — 版本号防护 + 累计 thinking 进度.
+    ///
+    /// 与 [`Self::reduce_stream_chunk_received`] 共用同一条 strict-monotonic
+    /// 规则（无 draft / 旧 version → 静默丢弃），因为两种 delta 的 version 来自
+    /// 同一个 per-turn 计数器。
+    ///
+    /// 单一真相源：这里只累计**字符数**和一段有界尾巴（用于一行实时预览），
+    /// reasoning 正文仍只由流式驱动持有，并在 `Action::StreamCompleted` 里
+    /// 一次性带回来生成最终卡片 —— reducer 状态里不存第二份全文。
+    fn reduce_stream_reasoning_received(&mut self, draft_id: &str, delta: &str, version: u64) -> Vec<Effect> {
+        let Some(turn) = self.stream.visible_draft_mut(draft_id) else {
+            // 已 finalize — delta 视为 stale，丢弃
+            return vec![];
+        };
+        let draft = &mut turn.draft;
+        if version <= draft.version {
+            // 严格单调：等于或更小都视为乱序/重复，丢弃
+            return vec![];
+        }
+        draft.version = version;
+        apply_reasoning_progress(draft, delta);
+        self.refresh_provider_worker_view_if_focused();
         vec![Effect::RequestRedraw]
     }
 
@@ -3349,6 +3420,7 @@ const fn ui_dirty_for(action: &Action) -> bool {
         Action::TurnStarted { .. }
         | Action::StartLLMTurn { .. }
         | Action::StreamChunkReceived { .. }
+        | Action::StreamReasoningReceived { .. }
         | Action::StreamCompleted { .. }
         | Action::StreamFailed { .. }
         | Action::StreamCancelled { .. }
@@ -5311,6 +5383,243 @@ mod tests {
                     Some(crate::chat::tui::ConversationLine::Reasoning { .. })
                 ),
                 "最后一行应是 Reasoning"
+            );
+        }
+
+        /// F1 fixture: multi-segment thinking stream that crosses the
+        /// bounded-tail threshold and mixes CJK / emoji / ASCII, so char vs
+        /// byte counting and char-boundary truncation are both exercised.
+        fn thinking_segments() -> Vec<String> {
+            let base = [
+                "让我先梳理调用链：",
+                "1) 解析输入 ✅\n",
+                "2) 校验边界 — 空串、超长、非法 UTF-8\n",
+                "3) 组合最终答案 😀\n",
+            ];
+            let mut out = Vec::new();
+            for round in 0..6 {
+                for seg in &base {
+                    out.push(format!("[{round}] {seg}"));
+                }
+            }
+            out
+        }
+
+        fn live_draft(state: &ChatState) -> &crate::chat::tui::StreamingDraft {
+            state
+                .stream
+                .primary_streaming_draft()
+                .expect("test: streaming draft present")
+        }
+
+        /// F1: 每条 reasoning delta 都要让 draft 上的可见进度前进（字符数按
+        /// char 计、不是字节），并请求重绘。
+        #[test]
+        fn test_reasoning_delta_updates_live_thinking_progress() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let segments = thinking_segments();
+            let mut expected_chars = 0usize;
+            for (idx, seg) in segments.iter().enumerate() {
+                let version = u64::try_from(idx).unwrap_or(0).saturating_add(1);
+                let effects = state.reduce(Action::StreamReasoningReceived {
+                    draft_id: "d1".to_string(),
+                    delta: seg.clone(),
+                    version,
+                });
+                assert!(has_request_redraw(&effects), "delta {idx} 必须请求重绘");
+                expected_chars = expected_chars.saturating_add(seg.chars().count());
+                let draft = live_draft(&state);
+                assert_eq!(draft.reasoning_chars, expected_chars, "delta {idx} 计数必须实时更新");
+                assert_eq!(draft.version, version);
+            }
+            let joined: String = segments.concat();
+            assert_ne!(
+                joined.chars().count(),
+                joined.len(),
+                "fixture 必须含多字节字符，否则 char/byte 计数分不开"
+            );
+            let draft = live_draft(&state);
+            assert_eq!(draft.reasoning_chars, joined.chars().count());
+            assert!(draft.accumulated.is_empty(), "thinking 不得污染可见文本");
+            assert!(state.ui.conversation_lines.is_empty(), "流式期间不得往 transcript 落行");
+            let preview = draft.reasoning_preview().expect("test: preview present");
+            assert!(!preview.is_empty());
+            assert!(!preview.contains('\n'), "预览必须折成一行");
+        }
+
+        /// F1: 尾巴有界且按 char 截断（多字节字符不得被劈开），计数仍是全量。
+        #[test]
+        fn test_reasoning_tail_is_bounded_and_char_aligned() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let segments = thinking_segments();
+            for (idx, seg) in segments.iter().enumerate() {
+                let version = u64::try_from(idx).unwrap_or(0).saturating_add(1);
+                let _ = state.reduce(Action::StreamReasoningReceived {
+                    draft_id: "d1".to_string(),
+                    delta: seg.clone(),
+                    version,
+                });
+            }
+            let joined: String = segments.concat();
+            assert!(
+                joined.chars().count() > crate::chat::state::REASONING_TAIL_MAX_CHARS,
+                "fixture 必须跨过尾巴阈值，否则截断分支没被覆盖"
+            );
+            let draft = live_draft(&state);
+            assert_eq!(
+                draft.reasoning_tail.chars().count(),
+                crate::chat::state::REASONING_TAIL_MAX_CHARS,
+                "尾巴必须裁到上限"
+            );
+            let expected_tail: String = joined
+                .chars()
+                .skip(joined.chars().count() - crate::chat::state::REASONING_TAIL_MAX_CHARS)
+                .collect();
+            assert_eq!(draft.reasoning_tail, expected_tail, "尾巴必须是全文末尾且不劈字符");
+            assert_eq!(draft.reasoning_chars, joined.chars().count(), "计数仍是全量");
+        }
+
+        /// F1: 乱序 / 重复 / 陈旧 version 与 StreamChunkReceived 同规则丢弃；
+        /// 两类 delta 共用同一个版本号计数器。
+        #[test]
+        fn test_reasoning_delta_version_guard_drops_stale() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::StreamReasoningReceived {
+                draft_id: "d1".to_string(),
+                delta: "思考中……".to_string(),
+                version: 5,
+            });
+            let baseline = live_draft(&state).reasoning_chars;
+            assert_eq!(baseline, "思考中……".chars().count());
+
+            for stale_version in [5u64, 3, 0] {
+                let effects = state.reduce(Action::StreamReasoningReceived {
+                    draft_id: "d1".to_string(),
+                    delta: "STALE".to_string(),
+                    version: stale_version,
+                });
+                assert!(effects.is_empty(), "version {stale_version} 必须被丢弃");
+                assert_eq!(live_draft(&state).reasoning_chars, baseline);
+                assert_eq!(live_draft(&state).version, 5);
+            }
+
+            // 未知 draft_id（跨 turn stale）同样丢弃
+            let effects = state.reduce(Action::StreamReasoningReceived {
+                draft_id: "other".to_string(),
+                delta: "STALE".to_string(),
+                version: 99,
+            });
+            assert!(effects.is_empty(), "陌生 draft_id 必须被丢弃");
+            assert_eq!(live_draft(&state).reasoning_chars, baseline);
+
+            // 共用计数器：reasoning 推高 version 后，旧版本文本 delta 也被丢弃
+            let effects = state.reduce(Action::StreamChunkReceived {
+                draft_id: "d1".to_string(),
+                delta: "late text".to_string(),
+                version: 4,
+            });
+            assert!(effects.is_empty(), "版本号计数器由两类 delta 共用");
+            assert!(live_draft(&state).accumulated.is_empty());
+        }
+
+        /// F1: 实时进度不改变 StreamCompleted 之后的最终 reasoning 卡片。
+        #[test]
+        fn test_reasoning_progress_leaves_final_card_unchanged() {
+            let full_reasoning = thinking_segments().concat();
+
+            let mut with_progress = s();
+            let _ = with_progress.reduce(Action::TurnStarted {
+                draft_id: "d1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            for (idx, seg) in thinking_segments().iter().enumerate() {
+                let version = u64::try_from(idx).unwrap_or(0).saturating_add(1);
+                let _ = with_progress.reduce(Action::StreamReasoningReceived {
+                    draft_id: "d1".to_string(),
+                    delta: seg.clone(),
+                    version,
+                });
+            }
+            let _ = with_progress.reduce(Action::StreamCompleted {
+                draft_id: "d1".to_string(),
+                final_text: "ans".to_string(),
+                reasoning: full_reasoning.clone(),
+            });
+
+            let mut without_progress = s();
+            let _ = without_progress.reduce(Action::TurnStarted {
+                draft_id: "d1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = without_progress.reduce(Action::StreamCompleted {
+                draft_id: "d1".to_string(),
+                final_text: "ans".to_string(),
+                reasoning: full_reasoning.clone(),
+            });
+
+            assert_eq!(
+                format!("{:?}", with_progress.ui.conversation_lines),
+                format!("{:?}", without_progress.ui.conversation_lines),
+                "带实时进度与不带实时进度的最终 transcript 必须逐行相同"
+            );
+            match with_progress.ui.conversation_lines.last() {
+                Some(crate::chat::tui::ConversationLine::Reasoning {
+                    content,
+                    char_count,
+                    folded,
+                }) => {
+                    assert_eq!(content, &full_reasoning);
+                    assert_eq!(*char_count, full_reasoning.chars().count());
+                    assert!(*folded, "最终卡片仍默认折叠");
+                }
+                other => panic!("最后一行应是 Reasoning 卡片，实得 {other:?}"),
+            }
+            assert!(
+                with_progress.stream.primary_streaming_draft().is_none(),
+                "完成后 draft 必须清除"
+            );
+        }
+
+        /// F1: `--plain`（无 TUI 渲染器）不得因 thinking 进度刷屏 —— 该 Action
+        /// 只产生 RequestRedraw（无渲染器时是 no-op），不产生任何输出 Effect，
+        /// 也不往 transcript 追加行。
+        #[test]
+        fn test_reasoning_delta_produces_no_output_for_plain_mode() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let lines_before = state.ui.conversation_lines.len();
+            for (idx, seg) in thinking_segments().iter().enumerate() {
+                let version = u64::try_from(idx).unwrap_or(0).saturating_add(1);
+                let effects = state.reduce(Action::StreamReasoningReceived {
+                    draft_id: "d1".to_string(),
+                    delta: seg.clone(),
+                    version,
+                });
+                assert_eq!(effects.len(), 1, "每条 delta 只允许一个 Effect: {effects:?}");
+                assert!(
+                    matches!(effects.first(), Some(Effect::RequestRedraw)),
+                    "唯一 Effect 必须是 RequestRedraw: {effects:?}"
+                );
+            }
+            assert_eq!(
+                state.ui.conversation_lines.len(),
+                lines_before,
+                "plain 模式下 thinking 不得往 transcript 写行"
             );
         }
 
