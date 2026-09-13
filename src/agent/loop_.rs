@@ -1461,6 +1461,97 @@ fn is_tool_roundtrip_companion(message: &ChatMessage) -> bool {
     }
 }
 
+/// True when `message` is the *request* half of a tool round-trip: the assistant
+/// envelope carrying native `tool_calls`, or the prompt-mode `[Tool results]`
+/// block that stands in for one when the request itself is a durable message.
+///
+/// Counting request halves (rather than every companion) makes "round-trips" a
+/// number the model and the user can reason about: one per tool batch the
+/// window contains.
+fn is_tool_roundtrip_request(message: &ChatMessage) -> bool {
+    match message.role.as_str() {
+        "user" => message
+            .content
+            .starts_with(crate::causal_tree::snapshot::TOOL_RESULTS_PREFIX),
+        "assistant" => is_tool_roundtrip_companion(message),
+        _ => false,
+    }
+}
+
+/// Names of the tools called inside `message`, in call order.
+fn tool_names_in_roundtrip_request(message: &ChatMessage) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content) else {
+        return Vec::new();
+    };
+    let Some(calls) = value.get("tool_calls").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    calls
+        .iter()
+        .filter_map(|call| {
+            call.get("name")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    call.get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// How many tool round-trips a switch handoff folds away, and which tools they
+/// called.
+///
+/// A `switch` handoff is an event-id pointer, not a summary, and tool results
+/// never became events of their own. Everything this counts is therefore
+/// verbatim context that no lookup can bring back, which is precisely what the
+/// note has to say out loud.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct FoldedToolRoundtrips {
+    pub(crate) count: usize,
+    pub(crate) tools: Vec<String>,
+}
+
+/// Names listed in the handoff note. Beyond this the list stops being a hint and
+/// starts being the payload it is meant to replace.
+const FOLDED_TOOL_NAME_LIMIT: usize = 12;
+
+pub(crate) fn folded_tool_roundtrips(source_messages: &[ChatMessage]) -> FoldedToolRoundtrips {
+    let mut count = 0usize;
+    let mut tools: Vec<String> = Vec::new();
+    for message in source_messages
+        .iter()
+        .filter(|message| is_tool_roundtrip_request(message))
+    {
+        count = count.saturating_add(1);
+        for name in tool_names_in_roundtrip_request(message) {
+            if !tools.iter().any(|existing| *existing == name) {
+                tools.push(name);
+            }
+        }
+    }
+    tools.truncate(FOLDED_TOOL_NAME_LIMIT);
+    FoldedToolRoundtrips { count, tools }
+}
+
+/// The one line the model and the user read to learn what the window lost.
+pub(crate) fn format_folded_tool_roundtrips_notice(folded: &FoldedToolRoundtrips) -> String {
+    if folded.count == 0 {
+        return "no tool round-trips were folded into this handoff".to_string();
+    }
+    let tools = if folded.tools.is_empty() {
+        "unknown".to_string()
+    } else {
+        folded.tools.join(", ")
+    };
+    format!(
+        "{} tool round-trips (tools: {tools}) were folded into this handoff and are not recoverable in this window",
+        folded.count
+    )
+}
+
 /// Move the compaction boundary backwards so the retained hot window never
 /// starts in the middle of a tool round-trip.
 ///
@@ -1714,7 +1805,7 @@ async fn persist_context_switch(
 /// calls permanently unusable once it crossed the hard limit. Degrading is
 /// lossy, so it is recorded durably next to the compaction audit trail instead
 /// of only being logged.
-async fn persist_context_switch_degradation(
+pub(crate) async fn persist_context_switch_degradation(
     audit: Option<&DocumentIngestRuntime>,
     trigger: &str,
     reason: &str,
@@ -2026,6 +2117,12 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         let (from_generation, parent_handoff_event_id) = context_handoff_lineage(source_history);
         let to_generation = from_generation.saturating_add(1);
         let handoff_event_id = Uuid::new_v4().to_string();
+        // The handoff replaces the cold window with event-id pointers, and tool
+        // round-trips have no events of their own. Without this line the note
+        // reads as an exact transfer while the tool output — usually the
+        // substance of an agentic window — is gone with nothing naming it.
+        let folded = folded_tool_roundtrips(compacted_source_messages.unwrap_or_default());
+        let folded_notice = format_folded_tool_roundtrips_notice(&folded);
         let note = serde_json::json!({
             "schema_version": 1,
             "kind": "context_handoff",
@@ -2039,6 +2136,11 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
             "source_message_count": source.message_count,
             "source_token_estimate": source.token_estimate,
             "unpersisted_companion_count": source.unpersisted_companion_count,
+            "folded_tool_roundtrips": {
+                "count": folded.count,
+                "tools": folded.tools,
+            },
+            "folded_tool_roundtrips_notice": folded_notice,
             "provenance_status": source.source_event_provenance_status,
             "source_event_range": range,
             "retained_recent_message_count": keep_recent,
@@ -13245,8 +13347,15 @@ ls -la
     /// where a cold window is forced, and the tool envelopes are byte-identical
     /// to the ones `run_tool_call_loop_outcome` appends.
     fn tool_roundtrip_history_fixture(rounds: usize) -> Vec<ChatMessage> {
+        tool_roundtrip_history_fixture_with_tools(rounds, &["shell"])
+    }
+
+    /// Same shape, but the round-trips call the given tools in rotation so a
+    /// test can tell one folded tool apart from another.
+    fn tool_roundtrip_history_fixture_with_tools(rounds: usize, tools: &[&str]) -> Vec<ChatMessage> {
         let mut history = vec![ChatMessage::system("sys")];
         for round in 0..rounds {
+            let tool_name = tools.get(round % tools.len().max(1)).copied().unwrap_or("shell");
             history.push(ChatMessage::user(format!(
                 "question {round} {}",
                 "user-context ".repeat(20)
@@ -13255,7 +13364,7 @@ ls -la
                 "",
                 &[ToolCall {
                     id: format!("call-{round}"),
-                    name: "shell".to_string(),
+                    name: tool_name.to_string(),
                     arguments: "{\"command\":\"ls\"}".to_string(),
                 }],
                 None,
@@ -13323,6 +13432,103 @@ ls -la
             inside_roundtrip = message.role == "assistant" && is_tool_roundtrip_companion(message);
         }
         None
+    }
+
+    /// The folded-round-trip statistics are computed from the cold window alone,
+    /// so they stay honest for both native and prompt-mode transcripts.
+    #[test]
+    fn folded_tool_roundtrips_counts_requests_and_names_their_tools() {
+        let mut window = tool_roundtrip_history_fixture_with_tools(3, &["shell", "file_read"]);
+        // Prompt mode has no assistant envelope: the `[Tool results]` block is
+        // the only companion, and it is a round-trip of its own.
+        window.push(ChatMessage::user(format!(
+            "{} web_search output",
+            crate::causal_tree::snapshot::TOOL_RESULTS_PREFIX
+        )));
+        let folded = folded_tool_roundtrips(&window);
+        assert_eq!(
+            folded.count, 4,
+            "three native envelopes plus one prompt-mode results block"
+        );
+        assert_eq!(folded.tools, vec!["shell".to_string(), "file_read".to_string()]);
+        let notice = format_folded_tool_roundtrips_notice(&folded);
+        assert!(
+            notice.contains("4 tool round-trips (tools: shell, file_read)"),
+            "notice must state the count and the tools: {notice}"
+        );
+        assert!(
+            notice.contains("not recoverable in this window"),
+            "notice must say the folded output cannot be looked up: {notice}"
+        );
+
+        let empty = folded_tool_roundtrips(&[ChatMessage::user("plain"), ChatMessage::assistant("plain")]);
+        assert_eq!(empty, FoldedToolRoundtrips::default());
+        assert_eq!(
+            format_folded_tool_roundtrips_notice(&empty),
+            "no tool round-trips were folded into this handoff"
+        );
+    }
+
+    /// A `switch` handoff is a pointer list, and tool round-trips have no events
+    /// to point at. The note therefore has to say how much verbatim tool traffic
+    /// the window is losing and which tools produced it — without that line the
+    /// note reads as an exact transfer of a window that is half gone.
+    #[tokio::test]
+    async fn switch_handoff_states_how_many_tool_roundtrips_it_folded() {
+        let temp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+        let envelope = RuntimeEnvelope::agent("workspace-folded-stats", "run-folded-stats");
+        let audit = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
+        let fabric = MemoryFabric::new(Arc::clone(&memory), "workspace-folded-stats");
+        let provider = ScriptedProvider::from_text_responses(vec!["MODEL_SUMMARY_MUST_NOT_RUN"]);
+        let mut history = tool_roundtrip_history_fixture_with_tools(10, &["shell", "file_read"]);
+        assert_eq!(history.len(), 41, "fixture must cross the cold-window threshold");
+        persist_durable_transcript(&fabric, &envelope, &history).await;
+
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Switch,
+            reserve_tokens: 1,
+            keep_recent_messages: 2,
+            memory_flush: true,
+            max_context_tokens: 50,
+            max_context_tokens_explicit: true,
+            os_paging: crate::config::OsPagingConfig::default(),
+        };
+        let compacted = apply_configurable_compaction(
+            &mut history,
+            &provider,
+            "model",
+            &config,
+            Some(&audit),
+            "test_folded_stats",
+        )
+        .await
+        .expect("a switch over tool round-trips must not error");
+        assert!(compacted, "switch must compact the tool-bearing session");
+
+        let handoff = history
+            .iter()
+            .find(|message| message.content.contains("[context_handoff]"))
+            .expect("handoff note must replace the cold window");
+        // The cold window is messages 1..37 — nine complete round-trips — so the
+        // statistics have to report nine, not the ten the fixture built.
+        assert!(
+            handoff.content.contains("\"count\":9"),
+            "handoff must count the folded round-trips: {}",
+            handoff.content
+        );
+        assert!(
+            handoff
+                .content
+                .contains("9 tool round-trips (tools: shell, file_read) were folded"),
+            "handoff must name the tools whose output is gone: {}",
+            handoff.content
+        );
+        assert!(
+            handoff.content.contains("not recoverable in this window"),
+            "handoff must not read as an exact transfer: {}",
+            handoff.content
+        );
     }
 
     #[tokio::test]

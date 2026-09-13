@@ -1043,6 +1043,73 @@ fn validate_plugin_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Parameter schema for `wasm_plugins_manage`.
+///
+/// Kept as a free function so the schema contract can be asserted without
+/// standing up a plugin runtime.
+pub(crate) fn plugin_manage_parameters_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["status", "get", "refresh", "install", "update", "enable", "disable", "remove", "middleware_test", "cron_run", "provider_chat", "storage_health", "storage_store", "storage_recall", "storage_forget", "storage_count"],
+                "description": "Action to perform."
+            },
+            "name": {"type": "string", "minLength": 1, "description": "Plugin name or exported adapter name; required by 'get'/'enable'/'disable'/'remove'/'cron_run'/'provider_chat' and by every storage action ('storage_health'/'storage_store'/'storage_recall'/'storage_forget'/'storage_count')."},
+            "source": {"type": "string", "description": "'install'/'update': plugin source directory in the workspace."},
+            "stage": {"type": "string", "enum": ["inbound", "outbound", "llm_request", "llm_response"], "description": "'middleware_test': pipeline stage to exercise."},
+            "data": {"description": "'middleware_test': the envelope passed to the stage."},
+            "message": {"type": "string", "description": "'provider_chat': single user message."},
+            "messages": {
+                "type": "array",
+                "description": "'provider_chat': full message list; alternative to 'message'.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "role": {"type": "string", "enum": ["system", "user", "assistant", "tool"]},
+                        "content": {"type": "string"}
+                    },
+                    "required": ["role", "content"],
+                    "additionalProperties": false
+                }
+            },
+            "model": {"type": "string", "description": "'provider_chat': model override."},
+            "temperature": {"type": "number", "description": "'provider_chat': sampling temperature."},
+            "key": {"type": "string", "description": "Storage key; required by 'storage_store' and 'storage_forget'."},
+            "content": {"type": "string", "description": "Value to store; required by 'storage_store'."},
+            "category": {"type": "string", "description": "Optional storage category for 'storage_store'/'storage_recall'/'storage_count'."},
+            "session_id": {"type": "string", "description": "Optional storage session scope for 'storage_store'/'storage_recall'/'storage_count'."},
+            "query": {"type": "string", "description": "'storage_recall': search query."},
+            "limit": {"type": "integer", "minimum": 1, "description": "'storage_recall': maximum number of results."}
+        },
+        "required": ["action"],
+        "allOf": [
+            {
+                "if": {"properties": {"action": {"enum": ["get", "enable", "disable", "remove", "cron_run", "provider_chat", "storage_health", "storage_store", "storage_recall", "storage_forget", "storage_count"]}}},
+                "then": {"required": ["name"]}
+            },
+            {
+                "if": {"properties": {"action": {"enum": ["install", "update"]}}},
+                "then": {"required": ["source"]}
+            },
+            {
+                "if": {"properties": {"action": {"const": "middleware_test"}}},
+                "then": {"required": ["stage"]}
+            },
+            {
+                "if": {"properties": {"action": {"const": "storage_store"}}},
+                "then": {"required": ["key", "content"]}
+            },
+            {
+                "if": {"properties": {"action": {"const": "storage_forget"}}},
+                "then": {"required": ["key"]}
+            }
+        ],
+        "additionalProperties": false
+    })
+}
+
 #[async_trait]
 impl Tool for PluginManageTool {
     fn name(&self) -> &str {
@@ -1054,61 +1121,7 @@ impl Tool for PluginManageTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["status", "get", "refresh", "install", "update", "enable", "disable", "remove", "middleware_test", "cron_run", "provider_chat", "storage_health", "storage_store", "storage_recall", "storage_forget", "storage_count"]},
-                "name": {"type": "string", "minLength": 1, "description": "Plugin name or exported adapter name; required by get/enable/disable/remove/cron_run/provider_chat and every storage_* action"},
-                "source": {"type": "string", "description": "install/update: plugin source directory in the workspace"},
-                "stage": {"type": "string", "enum": ["inbound", "outbound", "llm_request", "llm_response"]},
-                "data": {"description": "middleware_test envelope"},
-                "message": {"type": "string", "description": "provider_chat single user message"},
-                "messages": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "role": {"type": "string", "enum": ["system", "user", "assistant", "tool"]},
-                            "content": {"type": "string"}
-                        },
-                        "required": ["role", "content"],
-                        "additionalProperties": false
-                    }
-                },
-                "model": {"type": "string"},
-                "temperature": {"type": "number"},
-                "key": {"type": "string"},
-                "content": {"type": "string"},
-                "category": {"type": "string"},
-                "session_id": {"type": "string"},
-                "query": {"type": "string"},
-                "limit": {"type": "integer", "minimum": 1}
-            },
-            "required": ["action"],
-            "allOf": [
-                {
-                    "if": {"properties": {"action": {"enum": ["get", "enable", "disable", "remove", "cron_run", "provider_chat", "storage_health", "storage_store", "storage_recall", "storage_forget", "storage_count"]}}},
-                    "then": {"required": ["name"]}
-                },
-                {
-                    "if": {"properties": {"action": {"enum": ["install", "update"]}}},
-                    "then": {"required": ["source"]}
-                },
-                {
-                    "if": {"properties": {"action": {"const": "middleware_test"}}},
-                    "then": {"required": ["stage"]}
-                },
-                {
-                    "if": {"properties": {"action": {"const": "storage_store"}}},
-                    "then": {"required": ["key", "content"]}
-                },
-                {
-                    "if": {"properties": {"action": {"const": "storage_forget"}}},
-                    "then": {"required": ["key"]}
-                }
-            ],
-            "additionalProperties": false
-        })
+        plugin_manage_parameters_schema()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -1433,6 +1446,17 @@ pub async fn init_plugin_runtime(workspace_dir: &Path, memory: Option<Arc<dyn Me
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// `wasm_plugins_manage` dispatches on `action` like `cron` and `xin`, so it
+    /// owes the same contract: every parameter an action cannot be called
+    /// without has to name that action, and no parameter may ship undescribed.
+    #[test]
+    fn manage_schema_names_every_action_in_the_parameters_it_requires() {
+        crate::tools::schema::action_contract::assert_action_schema_contract(
+            "wasm_plugins_manage",
+            &plugin_manage_parameters_schema(),
+        );
+    }
 
     fn write_manifest(dir: &Path, version: &str) {
         std::fs::create_dir_all(dir).unwrap();

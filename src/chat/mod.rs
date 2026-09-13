@@ -631,6 +631,17 @@ fn format_compact_feedback(
     }
 }
 
+/// One line telling the user that context was dropped and cannot be recovered.
+///
+/// A `switch` rollover that cannot resolve exact provenance has no summary and
+/// no event to look the dropped messages up with, so the wording has to say
+/// "lossy" rather than "compacted": the difference decides whether the user
+/// re-states what the model just lost.
+pub(crate) fn format_context_degraded_notice(dropped_messages: usize) -> String {
+    let plural = if dropped_messages == 1 { "message" } else { "messages" };
+    format!("Context trimmed (lossy): {dropped_messages} older {plural} dropped without a recoverable handoff.")
+}
+
 fn manual_compact_below_trigger_threshold(
     history: &[ChatMessage],
     compaction_config: &crate::config::AgentCompactionConfig,
@@ -1064,7 +1075,7 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn print_fallback_chat_output(text: &str) {
+pub(crate) fn print_fallback_chat_output(text: &str) {
     let out = format_fallback_chat_output_for(text, std::io::stdout().is_terminal());
     print!("{out}");
     let _ = std::io::stdout().flush();
@@ -2656,6 +2667,32 @@ mod compact_command_tests {
         assert_eq!(before, after);
     }
 
+    /// Plain (`--plain` / piped) chat has no transcript renderer, so the whole
+    /// signal has to fit in the single line that gets printed.
+    #[test]
+    fn context_degraded_notice_prints_as_one_plain_line() {
+        let notice = format_context_degraded_notice(7);
+        assert!(
+            notice.contains("lossy"),
+            "the notice must not read as a clean compaction"
+        );
+        assert!(notice.contains('7'), "the notice must say how much was dropped");
+        assert!(!notice.contains('\n'), "the notice must be a single line: {notice:?}");
+
+        let piped = format_fallback_chat_output_for(&notice, false);
+        assert_eq!(
+            piped.lines().count(),
+            1,
+            "plain mode must print exactly one line: {piped:?}"
+        );
+        assert!(piped.ends_with('\n'), "plain output must terminate its line");
+
+        assert!(
+            format_context_degraded_notice(1).contains("1 older message dropped"),
+            "a single dropped message must not read as plural"
+        );
+    }
+
     #[test]
     fn compact_command_reports_window_and_reclaim_delta() {
         let text = format_compact_feedback(20, 12, 10_000, 4_000, 1_000_000);
@@ -3030,6 +3067,7 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
             Effect::AutoTitleSession(_) => "AutoTitleSession",
             Effect::RequestApproval { .. } => "RequestApproval",
             Effect::ResolveApproval { .. } => "ResolveApproval",
+            Effect::SurfaceNotice { .. } => "SurfaceNotice",
         })
         .collect();
 

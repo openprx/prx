@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.119] - 13 September 2026
+
+### Fixed
+
+- Tell the user when context is dropped without a recoverable handoff. A
+  `switch` rollover that cannot resolve exact transcript provenance answers the
+  turn on a token-aware trim instead of ending it, but the redux chat driver
+  only logged the downgrade: the session kept replying while its oldest messages
+  were deleted with no summary and no event to look them up with. The driver now
+  dispatches `HistoryCompactionDegraded`, which the reducer turns into one line
+  (`Context trimmed (lossy): N older messages dropped …`) in the transcript and,
+  when no renderer is attached (`--plain`, piped), on stdout. Repeats inside one
+  turn are collapsed, so a turn that degrades on every tool iteration still
+  prints a single line.
+- Record the durable `context.compaction.degraded` event on the redux driver
+  rollover as well. The 0.8.115 entry claimed all three degradation paths wrote
+  it; only the two inside the shared tool loop did. The event is written once per
+  degradation and only when a compaction audit runtime is attached, so sessions
+  with no durable transcript scope add no writes.
+- State in the `switch` handoff note how much tool traffic it folds away. The
+  note is a list of event ids, and tool round-trips never became events of their
+  own, so an agentic window handed over a pointer list that silently omitted its
+  tool output. The note now carries `folded_tool_roundtrips` (count plus the
+  tools called) and a plain sentence saying that output is not recoverable in
+  this window. Tool results are still not persisted as their own events — doing
+  so would add a synchronous write per tool call — so the note discloses the gap
+  rather than closing it.
+
+### Changed
+
+- Hold every action-dispatched tool schema to one enforceable contract.
+  `sessions_spawn`, `cron`, `xin`, `message_send` and `wasm_plugins_manage` are
+  now checked against a shared assertion derived from each schema's own
+  conditional-required clauses: a parameter an action cannot be called without
+  has to name that action, and no parameter may ship without a description.
+  `cron`, `xin`, `message_send` and `wasm_plugins_manage` are brought into
+  compliance — `cron` had stopped naming `history`, `events` and `cancel` in
+  `job_id` at all, and eleven `wasm_plugins_manage` parameters carried no
+  description.
+
 ## [0.8.118] - 13 September 2026
 
 ### Fixed
@@ -81,9 +121,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cron`, `message_send`, `xin` and `wasm_plugins_manage` carried per-action
   prose that restated the same action/parameter mapping in four places; the
   descriptions are condensed while field names, types, enums, defaults and the
-  conditional required-field clauses stay byte-for-byte the same, and the
+  conditional required-field clauses stay byte-for-byte the same. The
   schema-contract tests that require every action to be named where the model
-  reads it continue to hold.
+  reads it only covered `sessions_spawn` at this point, and `cron` left the
+  compression no longer naming its actions; 0.8.119 generalizes the contract and
+  brings the other four schemas back into compliance.
 
 ## [0.8.115] - 13 September 2026
 
@@ -99,8 +141,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `context switch could not reduce the provider window` error.
 - Never end a turn because a hard switch cannot stay lossless. The pre-provider
   budget check, the provider-overflow retry, and the redux driver rollover now
-  fall back to the token-aware trim, log the downgrade, and record a durable
-  `context.compaction.degraded` event instead of failing the draft.
+  fall back to the token-aware trim instead of failing the draft. The two paths
+  inside the shared tool loop also record a durable
+  `context.compaction.degraded` event; the redux driver rollover only logged the
+  downgrade until 0.8.119.
 - Stop compaction and lossy trims from leaving a tool result without the
   assistant message that requested it. The compaction boundary walks back past a
   tool round-trip, and every trim drops tool results stranded at the cut, so the

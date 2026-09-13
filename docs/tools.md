@@ -35,9 +35,18 @@ every model-running entrypoint:
 | `prx chat` (TUI or plain) | yes | yes | yes | yes |
 | `prx agent` (interactive or one-shot) | yes | yes | yes | yes |
 | embedded `process_message` | yes | yes | yes | yes |
-| standalone IM channel supervisor | yes | yes | yes | yes |
+| standalone IM channel supervisor | use only¹ | call only¹ | no¹ | call only¹ |
 | gateway/webhook turns | yes | yes | yes | yes |
 | delegated/session-worker turns | yes | yes | yes | yes |
+
+¹ The registry a channel supervisor builds is the same one; `channel_exclude`
+then hides the management and status tools from the turn, because a channel turn
+is driven by a conversation partner rather than by the operator. `skills_manage`,
+`mcp_status`, `hooks_status`, `hooks_manage`, `wasm_plugins_status`,
+`wasm_plugins_manage` and `wasm_plugin_reload` are excluded; invoking a skill, an
+MCP tool or a WASM plugin tool is not. See
+[Per-turn capability routing](#per-turn-capability-routing) for the full list and
+how to override it.
 
 ## Per-turn capability routing
 

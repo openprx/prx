@@ -1131,6 +1131,22 @@ impl EffectExecutor {
                     tracing::trace!("RequestRedraw: redraw_tx not yet injected (P0-2)");
                 }
             }
+            Effect::SurfaceNotice { text } => {
+                // With a renderer attached the reducer already holds the line in
+                // its transcript ledger, so a redraw is all that is owed. With
+                // no renderer (`--plain`, piped, non-TUI build) the ledger is
+                // never drawn, and printing is the only way the notice is seen.
+                let tx = {
+                    let slot_guard = self.redraw_slot.lock();
+                    slot_guard.as_ref().or(deps.redraw_tx.as_ref()).cloned()
+                };
+                match tx {
+                    Some(tx) => {
+                        let _ = tx.try_send(());
+                    }
+                    None => crate::chat::print_fallback_chat_output(&text),
+                }
+            }
             Effect::StartTurn {
                 provider_turn_task_id,
                 draft_id,
@@ -1908,6 +1924,38 @@ fn compaction_patch_for_reducer_without_pending_user(
     }
 }
 
+/// What a redux rollover attempt left behind for its caller.
+///
+/// `replacement_len` keeps the previous return value: `Some` when a compaction
+/// patch was applied, `None` when the caller still owes the history its own
+/// token-aware trim. `degraded` is the part that used to be invisible — the
+/// rollover could not stay lossless, so whatever the caller trims next is
+/// context nobody can get back.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ContextRolloverOutcome {
+    replacement_len: Option<usize>,
+    degraded: bool,
+}
+
+/// Tell the user, once per turn, that context was dropped for good.
+async fn send_context_degraded_notice(
+    action_tx: &mpsc::Sender<Action>,
+    reason: crate::chat::action::CompactReason,
+    dropped_messages: usize,
+) -> Result<(), ()> {
+    if let Err(error) = action_tx
+        .send(Action::HistoryCompactionDegraded {
+            reason,
+            dropped_messages,
+        })
+        .await
+    {
+        tracing::debug!(%error, "StartTurn: action_tx closed on compaction-degraded notice");
+        return Err(());
+    }
+    Ok(())
+}
+
 async fn apply_redux_context_rollover(
     provider: &dyn Provider,
     history: &mut Vec<crate::providers::traits::ChatMessage>,
@@ -1918,9 +1966,9 @@ async fn apply_redux_context_rollover(
     action_tx: &mpsc::Sender<Action>,
     reason: crate::chat::action::CompactReason,
     trigger: &str,
-) -> Result<Option<usize>, ()> {
+) -> Result<ContextRolloverOutcome, ()> {
     if matches!(config.mode, crate::config::AgentCompactionMode::Off) {
-        return Ok(None);
+        return Ok(ContextRolloverOutcome::default());
     }
 
     let patch = match crate::agent::loop_::build_configurable_compaction_patch_with_source_history(
@@ -1940,18 +1988,57 @@ async fn apply_redux_context_rollover(
         // calls answering each user message with the same non-retryable error
         // while history never shrank. Returning `Ok(None)` hands the caller its
         // ordinary token-aware trim fallback.
+        // A `switch` rollover that could not resolve exact provenance produced
+        // no patch at all: the caller's trim is the whole remediation, and it is
+        // lossy. Summary mode returns `None` when there is simply nothing to
+        // compact, which is not a degradation.
         Ok(None) => {
-            if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
+            let degraded = matches!(config.mode, crate::config::AgentCompactionMode::Switch);
+            if degraded {
                 tracing::warn!(
                     trigger,
                     "context switch could not create an exact transcript handoff; continuing on a lossy trim"
                 );
+                let budget = crate::agent::loop_::plan_context_budget(
+                    history,
+                    config,
+                    crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+                );
+                crate::agent::loop_::persist_context_switch_degradation(
+                    audit,
+                    trigger,
+                    "handoff_unavailable",
+                    budget.used_tokens,
+                    budget.used_tokens,
+                    budget.available_input_tokens,
+                )
+                .await;
             }
-            return Ok(None);
+            return Ok(ContextRolloverOutcome {
+                replacement_len: None,
+                degraded,
+            });
         }
         Err(error) => {
             tracing::warn!(error = %error, trigger, "redux driver context rollover failed; falling back to trim");
-            return Ok(None);
+            let budget = crate::agent::loop_::plan_context_budget(
+                history,
+                config,
+                crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+            );
+            crate::agent::loop_::persist_context_switch_degradation(
+                audit,
+                trigger,
+                "handoff_failed",
+                budget.used_tokens,
+                budget.used_tokens,
+                budget.available_input_tokens,
+            )
+            .await;
+            return Ok(ContextRolloverOutcome {
+                replacement_len: None,
+                degraded: true,
+            });
         }
     };
 
@@ -1961,6 +2048,7 @@ async fn apply_redux_context_rollover(
     crate::agent::loop_::apply_compaction_patch_exact(compaction_guard_history, &patch);
     let budget =
         crate::agent::loop_::plan_context_budget(history, config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
+    let mut degraded_dropped = 0usize;
     if budget.over_hard_limit {
         if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
             tracing::warn!(
@@ -1970,17 +2058,35 @@ async fn apply_redux_context_rollover(
                 "context switch remained above the hard limit; degraded to a lossy trim"
             );
         }
+        let before_trim = history.len();
         let trimmed = crate::agent::loop_::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
             history,
             config,
             replacement_len,
         );
+        degraded_dropped = before_trim.saturating_sub(history.len());
         tracing::warn!(
             used_tokens = budget.used_tokens,
             hard_limit = budget.available_input_tokens,
             trimmed,
             "redux driver context rollover applied preserving trim"
         );
+        if degraded_dropped > 0 {
+            let after = crate::agent::loop_::plan_context_budget(
+                history,
+                config,
+                crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+            );
+            crate::agent::loop_::persist_context_switch_degradation(
+                audit,
+                trigger,
+                "over_hard_limit_after_handoff",
+                budget.used_tokens,
+                after.used_tokens,
+                budget.available_input_tokens,
+            )
+            .await;
+        }
     }
     let reducer_patch =
         compaction_patch_for_reducer_without_pending_user(&patch, &reducer_source_history, compaction_guard_history);
@@ -1995,7 +2101,16 @@ async fn apply_redux_context_rollover(
         tracing::debug!(%error, "StartTurn: action_tx closed on summary-compaction-patch");
         return Err(());
     }
-    Ok(Some(replacement_len))
+    // The patch itself is lossless; only the extra trim above is not, so the
+    // notice is sent here with the exact count that trim removed rather than
+    // left to the caller, which cannot tell the two apart.
+    if degraded_dropped > 0 {
+        send_context_degraded_notice(action_tx, reason, degraded_dropped).await?;
+    }
+    Ok(ContextRolloverOutcome {
+        replacement_len: Some(replacement_len),
+        degraded: false,
+    })
 }
 
 fn chat_history_turn_count(history: &[crate::providers::traits::ChatMessage]) -> usize {
@@ -2398,8 +2513,9 @@ async fn drive_start_turn_stream(
             let injection_diagnostic =
                 redux_injection_overbudget_diagnostic_text(&history, &compaction_guard_history, config);
             let compaction_off = matches!(config.mode, crate::config::AgentCompactionMode::Off);
-            let replacement_len = if compaction_off {
-                None
+            let messages_before_rollover = history.len();
+            let outcome = if compaction_off {
+                ContextRolloverOutcome::default()
             } else {
                 match apply_redux_context_rollover(
                     provider.as_ref(),
@@ -2414,10 +2530,11 @@ async fn drive_start_turn_stream(
                 )
                 .await
                 {
-                    Ok(replacement_len) => replacement_len,
+                    Ok(outcome) => outcome,
                     Err(()) => return,
                 }
             };
+            let replacement_len = outcome.replacement_len;
             let after_compact = crate::agent::loop_::plan_context_budget(
                 &history,
                 config,
@@ -2430,6 +2547,19 @@ async fn drive_start_turn_stream(
                     config,
                     replacement_len,
                 );
+            }
+            // The rollover produced no patch, so every message the trim above
+            // removed is gone without a summary or an event to recover it from.
+            if outcome.degraded
+                && send_context_degraded_notice(
+                    &action_tx,
+                    crate::chat::action::CompactReason::ContextOverflow,
+                    messages_before_rollover.saturating_sub(history.len()),
+                )
+                .await
+                .is_err()
+            {
+                return;
             }
             let mut injection_feedback = None;
             if send_redux_injection_overbudget_diagnostic(
@@ -2656,8 +2786,9 @@ async fn drive_start_turn_stream_legacy(
                 let injection_overbudget_diagnostic =
                     redux_injection_overbudget_diagnostic_text(&history, &compaction_guard_history, config);
                 let compaction_off = matches!(config.mode, crate::config::AgentCompactionMode::Off);
-                let summary_replacement_len = if compaction_off {
-                    None
+                let messages_before_rollover = history.len();
+                let outcome = if compaction_off {
+                    ContextRolloverOutcome::default()
                 } else {
                     match apply_redux_context_rollover(
                         provider.as_ref(),
@@ -2672,10 +2803,11 @@ async fn drive_start_turn_stream_legacy(
                     )
                     .await
                     {
-                        Ok(replacement_len) => replacement_len,
+                        Ok(outcome) => outcome,
                         Err(()) => return,
                     }
                 };
+                let summary_replacement_len = outcome.replacement_len;
                 let after_compact = crate::agent::loop_::plan_context_budget(
                     &history,
                     config,
@@ -2697,6 +2829,17 @@ async fn drive_start_turn_stream_legacy(
                         trimmed,
                         "redux driver context budget preflight remediated with summary-compaction/token-aware trim"
                     );
+                }
+                if outcome.degraded
+                    && send_context_degraded_notice(
+                        &action_tx,
+                        crate::chat::action::CompactReason::ContextOverflow,
+                        messages_before_rollover.saturating_sub(history.len()),
+                    )
+                    .await
+                    .is_err()
+                {
+                    return;
                 }
                 if send_redux_injection_overbudget_diagnostic(
                     &action_tx,
@@ -2784,7 +2927,8 @@ async fn drive_start_turn_stream_legacy(
                         );
                     }
                     Some(config) => {
-                        let summary_replacement_len = match apply_redux_context_rollover(
+                        let messages_before_rollover = history.len();
+                        let outcome = match apply_redux_context_rollover(
                             provider.as_ref(),
                             &mut history,
                             &mut compaction_guard_history,
@@ -2797,10 +2941,10 @@ async fn drive_start_turn_stream_legacy(
                         )
                         .await
                         {
-                            Ok(replacement_len) => replacement_len,
+                            Ok(outcome) => outcome,
                             Err(()) => return,
                         };
-                        if summary_replacement_len.is_none() {
+                        if outcome.replacement_len.is_none() {
                             let trimmed = trim_redux_driver_context_budget_after_rollover(
                                 &mut history,
                                 &mut compaction_guard_history,
@@ -2811,6 +2955,17 @@ async fn drive_start_turn_stream_legacy(
                                 trimmed,
                                 "redux driver context-overflow retry summary unavailable; used token-aware trim"
                             );
+                        }
+                        if outcome.degraded
+                            && send_context_degraded_notice(
+                                &action_tx,
+                                crate::chat::action::CompactReason::ContextOverflow,
+                                messages_before_rollover.saturating_sub(history.len()),
+                            )
+                            .await
+                            .is_err()
+                        {
+                            return;
                         }
                     }
                     None => {
@@ -5919,6 +6074,32 @@ mod real_mode_tests {
         );
     }
 
+    /// With a renderer attached the notice is already in the reducer's
+    /// transcript ledger, so the effect owes it a frame.
+    #[tokio::test]
+    async fn surface_notice_pings_renderer_when_one_is_attached() {
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, _action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        let (redraw_tx, mut redraw_rx) = mpsc::channel::<()>(4);
+        deps.redraw_tx = Some(redraw_tx);
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        executor
+            .execute(Effect::SurfaceNotice {
+                text: "Context trimmed (lossy): 3 older messages dropped.".to_string(),
+            })
+            .await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), redraw_rx.recv())
+                .await
+                .expect("redraw within 200ms")
+                .is_some(),
+            "SurfaceNotice must ping the renderer so the line is drawn"
+        );
+    }
+
     #[cfg(feature = "terminal-tui")]
     #[tokio::test]
     async fn request_approval_in_tui_opens_surface_without_auto_send() {
@@ -8918,6 +9099,127 @@ mod real_mode_tests {
         assert!(saw_completion, "must complete after compact+retry");
     }
 
+    /// A `switch` preflight that cannot resolve provenance answers the turn on a
+    /// lossy trim. It must say so: the previous behaviour ended the turn with a
+    /// loud error, and replacing that with silence is how a session quietly
+    /// forgets its own history while looking healthy.
+    #[tokio::test]
+    async fn redux_driver_switch_degradation_tells_the_user_context_was_dropped() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+
+        struct PlainProvider;
+        #[async_trait]
+        impl Provider for PlainProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok("SUMMARY_MUST_NOT_BE_USED".to_string())
+            }
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: Some("unused".into()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                stream::iter(vec![
+                    Ok(StreamChunk::delta("answered anyway")),
+                    Ok(StreamChunk::final_chunk()),
+                ])
+                .boxed()
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(PlainProvider);
+        let executor = EffectExecutor::new_with_deps(deps);
+        // Switch mode with no durable transcript scope: provenance can never
+        // resolve, so the rollover produces no patch at all.
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Switch,
+            reserve_tokens: 10,
+            keep_recent_messages: 2,
+            memory_flush: false,
+            max_context_tokens: 160,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let mut history = vec![PMsg::system("sys")];
+        for i in 0..24 {
+            history.push(PMsg::user(format!("turn {i} {}", "long context ".repeat(40))));
+        }
+
+        executor
+            .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
+                draft_id: "draft-switch-degraded".into(),
+                history,
+                compaction_guard_history: None,
+                compaction_config: Some(config),
+                cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
+                routing_input: None,
+            })
+            .await;
+
+        let mut dropped = None;
+        for _ in 0..16 {
+            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+                .await
+                .expect("driver action within 2s")
+                .expect("must arrive");
+            match action {
+                Action::HistoryCompactionDegraded { dropped_messages, .. } => dropped = Some(dropped_messages),
+                Action::StreamCompleted { final_text, .. } => {
+                    assert!(final_text.contains("answered anyway"), "got {final_text:?}");
+                    break;
+                }
+                Action::StreamFailed { err, .. } => panic!("degrading must not end the turn: {err}"),
+                _ => {}
+            }
+        }
+        let dropped = dropped.expect("a lossy switch fallback must announce itself to the user");
+        assert!(dropped > 0, "the notice must report the messages the trim removed");
+
+        // The reducer turns that action into exactly one visible line.
+        let mut reducer_state =
+            crate::chat::state::ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
+        let effects = reducer_state.reduce(Action::HistoryCompactionDegraded {
+            reason: crate::chat::action::CompactReason::ContextOverflow,
+            dropped_messages: dropped,
+        });
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                crate::chat::state::Effect::SurfaceNotice { text } if text.contains("lossy")
+            )),
+            "the degradation action must reach the user as a notice"
+        );
+    }
+
     #[tokio::test]
     async fn redux_driver_preflight_uses_provider_summary_before_first_stream_request() {
         use crate::providers::traits::{
@@ -9497,8 +9799,11 @@ mod real_mode_tests {
 
         assert_eq!(
             result,
-            Ok(None),
-            "a switch without exact provenance must hand the caller its trim fallback, not end the turn"
+            Ok(ContextRolloverOutcome {
+                replacement_len: None,
+                degraded: true,
+            }),
+            "a switch without exact provenance must hand the caller its trim fallback (flagged lossy), not end the turn"
         );
         assert_eq!(
             history
@@ -9612,6 +9917,7 @@ mod real_mode_tests {
         )
         .await
         .unwrap()
+        .replacement_len
         .expect("summary patch must apply");
         assert_eq!(replacement_len, 1);
 
@@ -9760,6 +10066,7 @@ mod real_mode_tests {
         )
         .await
         .unwrap()
+        .replacement_len
         .expect("summary patch must apply");
         assert_eq!(replacement_len, 1);
         let patch = match action_rx.recv().await.expect("patch action") {
@@ -9886,6 +10193,7 @@ mod real_mode_tests {
         )
         .await
         .unwrap()
+        .replacement_len
         .expect("provider-side enrichment pressure should still produce a patch attempt");
         assert_eq!(replacement_len, 1);
         let patch = match action_rx.recv().await.expect("patch action") {
@@ -9998,6 +10306,7 @@ mod real_mode_tests {
         )
         .await
         .unwrap()
+        .replacement_len
         .expect("summary patch must apply");
         assert_eq!(replacement_len, 2, "memory flush plus summary must both be protected");
         let after_compact = crate::agent::loop_::plan_context_budget(
@@ -10133,6 +10442,7 @@ mod real_mode_tests {
         )
         .await
         .unwrap()
+        .replacement_len
         .expect("summary patch must apply");
         assert_eq!(replacement_len, 1);
 

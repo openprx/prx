@@ -400,27 +400,27 @@ impl Tool for XinTool {
                         },
                         "task_id": {
                             "type": "string",
-                            "description": "Task ID; Goal ID for the generic events action."
+                            "description": "Task ID for 'get'/'runs'/'update'/'run'/'pause'/'resume'/'cancel'/'remove'; the Goal ID when 'events' is called on a goal."
                         },
                         "goal_id": {
                             "type": "string",
-                            "description": "Goal ID for goal_*/step_list."
+                            "description": "Goal ID for 'goal_get'/'goal_pause'/'goal_resume'/'goal_cancel'/'goal_remove'/'step_list'/'step_add'."
                         },
                         "step_id": {
                             "type": "string",
-                            "description": "Step ID for step_get/step_retry."
+                            "description": "Step ID for 'step_get'/'step_retry'."
                         },
                         "name": {
                             "type": "string",
-                            "description": "Task name (add)."
+                            "description": "Name: the task for 'add', the goal for 'goal_add', the step for 'step_add'; also one of the fields 'update' may change."
                         },
                         "description": {
                             "type": "string",
-                            "description": "Task description (add)."
+                            "description": "Free-text description for 'add' and 'step_add'; also one of the fields 'update' may change."
                         },
                         "payload": {
                             "type": "string",
-                            "description": "add: prompt for agent_session, command for shell."
+                            "description": "Work to run — prompt for agent_session, command for shell. Required by 'add' and 'step_add'; also one of the fields 'update' may change."
                         },
                         "execution_mode": {
                             "type": "string",
@@ -430,7 +430,7 @@ impl Tool for XinTool {
                         "priority": {
                             "type": "string",
                             "enum": ["low", "normal", "high", "critical"],
-                            "description": "Priority (default normal)."
+                            "description": "Priority (default normal); also one of the fields 'update' may change."
                         },
                         "recurring": {
                             "type": "boolean",
@@ -438,7 +438,7 @@ impl Tool for XinTool {
                         },
                         "interval_secs": {
                             "type": "integer",
-                            "description": "Repeat interval in seconds (recurring only)."
+                            "description": "Repeat interval in seconds (recurring only); also one of the fields 'update' may change."
                         },
                         "limit": {
                             "type": "integer",
@@ -446,7 +446,7 @@ impl Tool for XinTool {
                         },
                         "sequence": {
                             "type": "integer",
-                            "description": "One-based step sequence (step_add)."
+                            "description": "One-based step sequence for 'step_add'."
                         },
                         "lease_ttl_secs": {
                             "type": "integer",
@@ -454,11 +454,11 @@ impl Tool for XinTool {
                         },
                         "target_completion_at": {
                             "type": "string",
-                            "description": "RFC3339 target time (goal_add)."
+                            "description": "RFC3339 target time for 'goal_add'."
                         },
                         "steps": {
                             "type": "array",
-                            "description": "Initial ordered steps (goal_add).",
+                            "description": "Initial ordered steps for 'goal_add'.",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -1382,6 +1382,17 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         }
+    }
+
+    /// See `cron`'s copy of this test: the contract is derived from the schema's
+    /// own conditional-required clauses, so a compressed or rewritten
+    /// description that stops naming its actions turns this red.
+    #[test]
+    fn schema_names_every_action_in_the_parameters_it_requires() {
+        let config = Config::default();
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
+        let tool = XinTool::new(new_shared(config), security);
+        crate::tools::schema::action_contract::assert_action_schema_contract("xin", &tool.parameters_schema());
     }
 
     #[test]

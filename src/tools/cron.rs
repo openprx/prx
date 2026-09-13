@@ -344,27 +344,27 @@ impl Tool for CronTool {
                             },
                             "job_id": {
                                 "type": "string",
-                                "description": "Job ID for get/remove/update/run/runs/pause/resume."
+                                "description": "Job ID for 'get'/'runs'/'history'/'events'/'update'/'patch'/'run'/'pause'/'resume'/'remove'/'cancel'."
                             },
                             "expression": {
                                 "type": "string",
-                                "description": "Cron expression (e.g. '*/5 * * * *') for add/schedule."
+                                "description": "Cron expression (e.g. `*/5 * * * *`) for 'add'/'schedule'; alternative to 'schedule'."
                             },
                             "command": {
                                 "type": "string",
-                                "description": "Shell command to run."
+                                "description": "Shell command to run; required by 'once' and one way to give 'add'/'schedule' its work."
                             },
                             "delay": {
                                 "type": "string",
-                                "description": "One-shot delay (e.g. '30m', '2h')."
+                                "description": "One-shot delay for 'once' (e.g. `30m`, `2h`); alternative to 'run_at'."
                             },
                             "run_at": {
                                 "type": "string",
-                                "description": "One-shot absolute RFC3339 time."
+                                "description": "One-shot absolute RFC3339 time for 'once'; alternative to 'delay'."
                             },
                             "schedule": {
                                 "type": "object",
-                                "description": "add/schedule: {kind:'cron',expr,tz?} | {kind:'at',at} | {kind:'every',every_ms}. Alternative to 'expression'.",
+                                "description": "'add'/'schedule': {kind:cron,expr,tz?} | {kind:at,at} | {kind:every,every_ms}. Alternative to 'expression'.",
                                 "properties": {
                                     "kind": { "type": "string", "enum": ["cron", "at", "every"] },
                                     "expr": { "type": "string", "minLength": 1 },
@@ -394,11 +394,11 @@ impl Tool for CronTool {
                             },
                             "payload": {
                                 "type": "object",
-                                "description": "add/schedule payload: {kind:'agentTurn',message} runs an isolated LLM turn; {kind:'systemEvent',text} injects text into the main session.",
+                                "description": "'add'/'schedule' payload: {kind:agentTurn,message} runs an isolated LLM turn; {kind:systemEvent,text} injects text into the main session.",
                                 "properties": {
                                     "kind": { "type": "string", "enum": ["agentTurn", "systemEvent"] },
-                                    "message": { "type": "string", "minLength": 1 },
-                                    "text": { "type": "string", "minLength": 1 }
+                                    "message": { "type": "string", "minLength": 1, "description": "agentTurn prompt." },
+                                    "text": { "type": "string", "minLength": 1, "description": "systemEvent text." }
                                 },
                                 "required": ["kind"],
                                 "anyOf": [
@@ -413,7 +413,7 @@ impl Tool for CronTool {
                             },
                             "prompt": {
                                 "type": "string",
-                                "description": "LLM prompt for agent jobs; overridden by payload."
+                                "description": "LLM prompt for agent jobs on 'add'/'schedule'; overridden by payload."
                             },
                             "session_target": {
                                 "type": "string",
@@ -440,7 +440,7 @@ impl Tool for CronTool {
                             },
                             "patch": {
                                 "type": "object",
-                                "description": "Fields to update for update/patch."
+                                "description": "Fields to update for 'update'/'patch'."
                             },
                             "limit": {
                                 "type": "integer",
@@ -1125,6 +1125,20 @@ mod tests {
     use crate::security::AutonomyLevel;
     use crate::tools::schema::validate_tool_arguments;
     use tempfile::TempDir;
+
+    /// Every action that cannot be called without a parameter has to say so in
+    /// that parameter's own description.
+    ///
+    /// `cron` lost the convention silently once: the quotes around the action
+    /// names were dropped during a schema compression and no test noticed,
+    /// because the contract lived only inside `sessions_spawn`.
+    #[test]
+    fn schema_names_every_action_in_the_parameters_it_requires() {
+        let config = new_shared(Config::default());
+        let snapshot = config.load_full();
+        let tool = CronTool::new(Arc::clone(&config), test_security(&snapshot));
+        crate::tools::schema::action_contract::assert_action_schema_contract("cron", &tool.parameters_schema());
+    }
 
     #[test]
     fn schema_requires_a_schedule_and_executable_content() {

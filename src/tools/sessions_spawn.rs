@@ -12884,6 +12884,20 @@ mod tests {
         text.contains(&format!("'{action}'"))
     }
 
+    /// The shared contract every action-dispatched tool is held to. This tool's
+    /// own matrix goes further, but running the shared one here keeps the five
+    /// compressed schemas on one enforceable standard rather than one of them
+    /// being the only place the convention is written down.
+    #[test]
+    fn schema_names_every_action_in_the_parameters_it_requires() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+        crate::tools::schema::action_contract::assert_action_schema_contract(
+            "sessions_spawn",
+            &tool.parameters_schema(),
+        );
+    }
+
     /// Every parameter must name *every* action that reads it.
     ///
     /// This is the regression that cost the round trip: `task` serves both

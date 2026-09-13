@@ -495,6 +495,20 @@ pub enum Action {
         patch: crate::agent::loop_::CompactionPatch,
         compaction_config: crate::config::AgentCompactionConfig,
     },
+    /// A rollover could not produce a lossless handoff and the turn continued on
+    /// a token-aware trim that dropped `dropped_messages` older messages.
+    ///
+    /// The degradation used to end the turn with a non-retryable `StreamFailed`.
+    /// Continuing is the right call, but continuing *silently* replaced a loud
+    /// failure with an invisible one: the session keeps answering while its
+    /// oldest context is deleted with no summary and no durable event to recover
+    /// it from. This action surfaces one short notice instead, and the reducer
+    /// collapses repeats so a turn that degrades on every tool iteration still
+    /// prints a single line.
+    HistoryCompactionDegraded {
+        reason: CompactReason,
+        dropped_messages: usize,
+    },
 
     // ── UI 折叠/展开 ───────────────────────────────────────────
     /// Tab — 折叠/展开工具卡片
@@ -651,6 +665,7 @@ impl Action {
             Self::SetLeadingSystemPrompt { .. } => "SetLeadingSystemPrompt",
             Self::HistoryCompacted { .. } => "HistoryCompacted",
             Self::HistoryCompactionPatchApplied { .. } => "HistoryCompactionPatchApplied",
+            Self::HistoryCompactionDegraded { .. } => "HistoryCompactionDegraded",
             Self::ToolCardFoldToggled => "ToolCardFoldToggled",
             Self::ReasoningFoldToggled => "ReasoningFoldToggled",
             Self::RedrawRequested => "RedrawRequested",

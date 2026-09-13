@@ -232,6 +232,14 @@ pub enum Effect {
     AutoTitleSession(String),
     /// 结构化 trace 日志
     LogTrace { level: tracing::Level, msg: String },
+    /// Surface one short operational notice to whoever is watching this chat.
+    ///
+    /// The reducer owns the transcript ledger, but the ledger is only rendered
+    /// by the interactive TUI. `--plain` / piped chat has no renderer, so a
+    /// notice that only reaches `conversation_lines` is invisible exactly where
+    /// the user has no other signal. The executor therefore pings the renderer
+    /// when one is attached and prints the line otherwise.
+    SurfaceNotice { text: String },
     /// **S3 T3-1**: EffectExecutor 把 approval 请求转发到 UI / CLI prompt.
     ///
     /// driver 在执行需 approval 的 tool 前 dispatch [`Action::ToolApprovalRequested`]；
@@ -273,6 +281,7 @@ impl Effect {
             Self::DisplayMedia { .. } => "DisplayMedia",
             Self::AutoTitleSession(_) => "AutoTitleSession",
             Self::LogTrace { .. } => "LogTrace",
+            Self::SurfaceNotice { .. } => "SurfaceNotice",
             Self::RequestApproval { .. } => "RequestApproval",
             Self::ResolveApproval { .. } => "ResolveApproval",
             Self::Quit => "Quit",
@@ -692,6 +701,13 @@ pub struct ControlState {
     /// P3c: final aggregate usage records are idempotent per provider task.
     /// Incremental usage records are intentionally never tracked here.
     pub final_usage_tasks_recorded: std::collections::HashSet<crate::chat::turn_scheduler::TurnTaskId>,
+    /// Whether this turn has already surfaced the lossy-compaction notice.
+    ///
+    /// The pre-provider budget check runs once per tool iteration, so a session
+    /// whose provenance cannot be resolved degrades on every iteration. Without
+    /// this latch the transcript would fill with the same line; with it the user
+    /// is told once per turn and the rest is trace only.
+    pub context_degrade_notified: bool,
 }
 
 impl ControlState {
@@ -890,6 +906,7 @@ impl ChatState {
                 tool_buffers: std::collections::HashMap::new(),
                 turn_cancels: std::collections::HashMap::new(),
                 final_usage_tasks_recorded: std::collections::HashSet::new(),
+                context_degrade_notified: false,
             },
             #[cfg(feature = "terminal-tui")]
             cached_lines_arc: None,
@@ -1107,6 +1124,10 @@ impl ChatState {
                 patch,
                 compaction_config,
             } => self.reduce_history_compaction_patch_applied(reason, patch, &compaction_config),
+            Action::HistoryCompactionDegraded {
+                reason,
+                dropped_messages,
+            } => self.reduce_history_compaction_degraded(reason, dropped_messages),
 
             // ── LLM 流式 (Step 3) ─────────────────────────────────
             Action::TurnStarted { draft_id, cancel } => self.reduce_turn_started(draft_id, cancel),
@@ -1667,6 +1688,7 @@ impl ChatState {
         self.control.clear_tool_buffer(ToolTaskKey::Primary);
         self.control.register_turn_cancel(ToolTaskKey::Primary, cancel);
         self.control.generating = true;
+        self.control.context_degrade_notified = false;
         vec![
             Effect::LogTrace {
                 level: tracing::Level::INFO,
@@ -1682,6 +1704,7 @@ impl ChatState {
         self.control.clear_tool_buffer(ToolTaskKey::Primary);
         self.control.register_turn_cancel(ToolTaskKey::Primary, cancel);
         self.control.generating = true;
+        self.control.context_degrade_notified = false;
         vec![
             Effect::LogTrace {
                 level: tracing::Level::INFO,
@@ -1728,6 +1751,7 @@ impl ChatState {
         self.control
             .register_turn_cancel(ToolTaskKey::from_task_id(provider_turn_task_id), cancel.clone());
         self.control.generating = true;
+        self.control.context_degrade_notified = false;
         // BUG-09: capture the current chat mode so the driver can enforce plan
         // mode's read-only contract on write/shell/git tools.
         let chat_mode = self.session.mode;
@@ -1777,6 +1801,7 @@ impl ChatState {
         self.control
             .register_turn_cancel(ToolTaskKey::from_task_id(provider_turn_task_id), cancel.clone());
         self.control.generating = true;
+        self.control.context_degrade_notified = false;
         // BUG-09: capture the current chat mode so the driver can enforce plan
         // mode's read-only contract on write/shell/git tools.
         let chat_mode = self.session.mode;
@@ -3322,6 +3347,37 @@ impl ChatState {
         }]
     }
 
+    /// `Action::HistoryCompactionDegraded` — one user-visible line per turn when
+    /// a rollover fell back to a lossy trim.
+    ///
+    /// Losing the oldest context is worth exactly one line: the turn still
+    /// answers, so an error would be wrong, but saying nothing hides the fact
+    /// that the messages are gone for good. Repeats inside the same turn are
+    /// collapsed to trace level.
+    fn reduce_history_compaction_degraded(&mut self, reason: CompactReason, dropped_messages: usize) -> Vec<Effect> {
+        if self.control.context_degrade_notified {
+            return vec![Effect::LogTrace {
+                level: tracing::Level::DEBUG,
+                msg: format!(
+                    "HistoryCompactionDegraded suppressed (already surfaced this turn) reason={reason:?} dropped={dropped_messages}"
+                ),
+            }];
+        }
+        self.control.context_degrade_notified = true;
+        let text = crate::chat::format_context_degraded_notice(dropped_messages);
+        #[cfg(feature = "terminal-tui")]
+        self.ui
+            .conversation_lines
+            .push(crate::chat::tui::ConversationLine::System { content: text.clone() });
+        vec![
+            Effect::LogTrace {
+                level: tracing::Level::WARN,
+                msg: format!("HistoryCompactionDegraded reason={reason:?} dropped={dropped_messages}"),
+            },
+            Effect::SurfaceNotice { text },
+        ]
+    }
+
     /// 辅助：从 StreamState 中取出当前 draft 的 id（不同 feature 下结构不同）.
     #[cfg(feature = "terminal-tui")]
     fn take_draft_id(stream: &StreamState) -> Option<String> {
@@ -3459,6 +3515,8 @@ const fn ui_dirty_for(action: &Action) -> bool {
         | Action::SetLeadingSystemPrompt { .. }
         | Action::HistoryCompacted { .. }
         | Action::HistoryCompactionPatchApplied { .. } => false,
+        // The degradation notice writes a conversation line of its own.
+        Action::HistoryCompactionDegraded { .. } => true,
         // v4: BackgroundSessionRecorded only upserts session.background_sessions
         // (a persistence field, not a snapshot/UI field) → no UI dirty.
         Action::BackgroundSessionRecorded { .. } => false,
@@ -6738,6 +6796,85 @@ mod tests {
             // 验证 Effect::Quit 在结果中
             let has_quit_effect = effects2.iter().any(|e| matches!(e, Effect::Quit));
             assert!(has_quit_effect, "effects2 应包含 Effect::Quit");
+        }
+
+        /// A turn that degrades on every tool iteration owes the user one line,
+        /// not one per iteration — and the next turn is a new fact, so the latch
+        /// has to re-arm.
+        #[test]
+        fn context_degradation_notice_is_surfaced_once_per_turn() {
+            use crate::chat::action::CompactReason;
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "draft-1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+
+            let first = state.reduce(Action::HistoryCompactionDegraded {
+                reason: CompactReason::ContextOverflow,
+                dropped_messages: 7,
+            });
+            let notices = first
+                .iter()
+                .filter_map(|effect| match effect {
+                    Effect::SurfaceNotice { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                notices.len(),
+                1,
+                "the first degradation must surface exactly one notice"
+            );
+            let notice = notices.first().cloned().unwrap_or_default();
+            assert!(
+                notice.contains("lossy") && notice.contains('7'),
+                "the notice must say the trim was lossy and how much it dropped: {notice}"
+            );
+            assert!(
+                !notice.contains('\n'),
+                "the notice must stay a single line for plain mode: {notice:?}"
+            );
+
+            let second = state.reduce(Action::HistoryCompactionDegraded {
+                reason: CompactReason::ContextOverflow,
+                dropped_messages: 4,
+            });
+            assert!(
+                !second
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::SurfaceNotice { .. })),
+                "a second degradation inside the same turn must not repeat the notice"
+            );
+
+            #[cfg(feature = "terminal-tui")]
+            {
+                let lines = state
+                    .ui
+                    .conversation_lines
+                    .iter()
+                    .filter(|line| {
+                        matches!(line, crate::chat::tui::ConversationLine::System { content }
+                            if content.contains("lossy"))
+                    })
+                    .count();
+                assert_eq!(lines, 1, "the transcript must carry the notice exactly once");
+            }
+
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "draft-2".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let next_turn = state.reduce(Action::HistoryCompactionDegraded {
+                reason: CompactReason::ContextOverflow,
+                dropped_messages: 2,
+            });
+            assert!(
+                next_turn
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::SurfaceNotice { .. })),
+                "a new turn that degrades is a new fact and must be surfaced again"
+            );
         }
 
         /// S2-B Step 1: HistoryCompacted 算法基线 — 保留 system + 截断单条 + 限总预算

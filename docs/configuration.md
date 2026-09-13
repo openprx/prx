@@ -281,6 +281,15 @@ always_include = []
 always_exclude = []
 # channel_exclude = []
 
+# Skill catalog published in the system prompt. A catalog at or below `top_k` is
+# published whole, in a canonical order, which keeps that section of the prompt a
+# pure function of the installed skills instead of a retrieval result that moves
+# with the wording. The section carries metadata only (instruction bodies stay
+# behind `skill_read`), which is why the default is large. Larger catalogs fall
+# back to relevance retrieval.
+[skill_rag]
+top_k = 32
+
 # Optional exact-model tool allowlists are applied after normal intent tiering.
 # Models without an entry keep the ordinary tool set. An empty list deliberately
 # exposes no tools. Quote model names containing `/` or `:` in TOML.

@@ -227,8 +227,8 @@ fn channel_message_send_parameters_schema() -> serde_json::Value {
                 },
                 "message": {
                     "type": "string",
-                    "description": "Message text. Embed media with markers [IMAGE:path], [VOICE:path], [DOCUMENT:path]; \
-                                    text outside a marker becomes the caption."
+                    "description": "Message text, required by 'send', 'edit' and 'thread'. Embed media with markers \
+                                    [IMAGE:path], [VOICE:path], [DOCUMENT:path]; text outside a marker becomes the caption."
                 },
                 "as_voice": {
                     "type": "boolean",
@@ -244,23 +244,23 @@ fn channel_message_send_parameters_schema() -> serde_json::Value {
                 },
                 "emoji": {
                     "type": "string",
-                    "description": "react: the emoji, e.g. '👍'."
+                    "description": "'react': the emoji, e.g. 👍."
                 },
                 "target_author": {
                     "type": "string",
-                    "description": "react: author of the target message."
+                    "description": "'react': author of the target message."
                 },
                 "target_timestamp": {
                     "type": "integer",
-                    "description": "react: timestamp (ms) of the target message."
+                    "description": "'react': timestamp (ms) of the target message."
                 },
                 "message_id": {
                     "type": "string",
-                    "description": "edit/delete/unsend: platform message id (ms timestamp on Signal)."
+                    "description": "'edit'/'delete'/'unsend': platform message id (ms timestamp on Signal)."
                 },
                 "thread_id": {
                     "type": "string",
-                    "description": "thread: the thread/conversation id to reply into."
+                    "description": "'thread': the thread/conversation id to reply into."
                 }
             },
             "required": ["action"]
@@ -1271,6 +1271,21 @@ mod tests {
         assert!(
             crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "send", "message": "hello"}))
                 .is_empty()
+        );
+    }
+
+    /// Both message_send schemas owe the model the same thing `cron` and
+    /// `sessions_spawn` owe it: a parameter an action cannot be called without
+    /// has to name that action.
+    #[test]
+    fn schemas_name_every_action_in_the_parameters_they_require() {
+        crate::tools::schema::action_contract::assert_action_schema_contract(
+            "message_send",
+            &channel_message_send_parameters_schema(),
+        );
+        crate::tools::schema::action_contract::assert_action_schema_contract(
+            "message_send (daemon)",
+            &daemon_message_send_parameters_schema(),
         );
     }
 
