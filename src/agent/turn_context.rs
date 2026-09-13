@@ -75,12 +75,12 @@ fn tool_specs_match(left: &[ToolSpec], right: &[ToolSpec]) -> bool {
 
 impl ToolSnapshotRenderCache {
     /// Number of iterations that reused an already rendered snapshot.
-    pub(crate) fn hits(&self) -> u64 {
+    pub(crate) const fn hits(&self) -> u64 {
         self.hits
     }
 
     /// Number of iterations that had to render and fingerprint a snapshot.
-    pub(crate) fn misses(&self) -> u64 {
+    pub(crate) const fn misses(&self) -> u64 {
         self.misses
     }
 
@@ -421,7 +421,7 @@ mod tests {
         duplicated.push(spec("shell"));
 
         assert_eq!(
-            system_prompt_for(false, registry_order.clone()),
+            system_prompt_for(false, registry_order),
             system_prompt_for(false, duplicated.clone())
         );
         let context = CompiledToolContext::new(true, duplicated);
@@ -443,7 +443,7 @@ mod tests {
         let first = CompiledToolContext::compile(false, registry_order.clone(), &mut cache);
         assert_eq!((cache.hits(), cache.misses()), (0, 1));
 
-        let second = CompiledToolContext::compile(false, registry_order.clone(), &mut cache);
+        let second = CompiledToolContext::compile(false, registry_order, &mut cache);
         assert_eq!(
             (cache.hits(), cache.misses()),
             (1, 1),

@@ -53,7 +53,7 @@ fn registry(tmp: &TempDir) -> Vec<Box<dyn Tool>> {
 
 fn specs_for(tools: &[Box<dyn Tool>], message: &str, tiering: &ToolTieringConfig) -> Vec<ToolSpec> {
     let selected = intent::select_tools_for_intent(tools, message, &tiering.always_include, &tiering.always_exclude);
-    ToolCatalog::from_tools(selected.into_iter()).tool_specs()
+    ToolCatalog::from_tools(selected).tool_specs()
 }
 
 fn wire_bytes(specs: &[ToolSpec]) -> usize {

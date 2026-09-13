@@ -13160,7 +13160,7 @@ mod tests {
             rendered.contains(&format!("{expected_chars} chars")),
             "实时字符数: {rows:?}"
         );
-        assert!(rendered.contains("~"), "估算 token 数: {rows:?}");
+        assert!(rendered.contains('~'), "估算 token 数: {rows:?}");
         assert!(rendered.contains("tok"), "估算 token 单位: {rows:?}");
         assert!(rendered.contains("Esc to interrupt"), "中断提示保留: {rows:?}");
         // 宽字符在测试行提取时按单元格展开，比较前去掉空白。

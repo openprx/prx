@@ -174,7 +174,7 @@ mod tests {
             "capability list must be name-sorted: {first}"
         );
 
-        let mut narrowed = registry_order.clone();
+        let mut narrowed = registry_order;
         narrowed.retain(|tool| tool.name != "cron");
         assert_ne!(
             first,
@@ -210,7 +210,7 @@ mod tests {
         assert!(file_read_at < shell_at, "tool catalog must be name-sorted");
         assert_ne!(
             first,
-            render_prompt_guided_tool_protocol(&registry_order[..2]),
+            render_prompt_guided_tool_protocol(registry_order.get(..2).unwrap_or(&[])),
             "dropping an exposed tool must change the rendered protocol"
         );
     }

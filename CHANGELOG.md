@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.117] - 13 September 2026
+
+### Fixed
+
+- Satisfy strict clippy gates in the prompt cache, thinking progress, and
+  tool surface budget tests.
+
 ## [0.8.116] - 13 September 2026
 
 ### Changed
