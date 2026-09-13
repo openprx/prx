@@ -940,6 +940,14 @@ pub struct EffectDeps {
     /// The TUI router above is only the human confirmation adapter; it cannot
     /// widen ACL or autonomy decisions.
     pub tool_security_policy: Arc<crate::security::SecurityPolicy>,
+    /// Capability-routing policy for this chat session's turns.
+    ///
+    /// Every other entry point (channels, gateway, console, worker, spawn,
+    /// delegate) hands `[tool_tiering]` to the shared tool loop; the redux chat
+    /// driver used to pass `None`, which disables intent routing entirely and
+    /// republished the whole registry to the provider on every single turn.
+    /// Carrying it here puts terminal chat back on the same boundary.
+    pub tool_tiering: crate::config::ToolTieringConfig,
 }
 
 // ─── EffectExecutor (5a-1: real-mode + shadow-mode) ───────────────────────────
@@ -1189,6 +1197,7 @@ impl EffectExecutor {
                 let provider_turn_handle_tx = deps.provider_turn_lifecycle_tx.clone();
                 let observer = Arc::clone(&deps.observer);
                 let hooks = Arc::clone(&deps.hooks);
+                let tool_tiering = deps.tool_tiering.clone();
                 let provider_turn_execution_lease_id =
                     provider_turn_task_id.map(|_| next_provider_turn_execution_lease_id());
                 let provider_task_handle = tokio::spawn(async move {
@@ -1245,6 +1254,7 @@ impl EffectExecutor {
                         chat_mode,
                         observer,
                         hooks,
+                        tool_tiering,
                     );
                     // D8-4 (redux path real fix): mirror the legacy
                     // `run_tool_call_loop_traced` wrapper in `chat::run` — seed the
@@ -2352,6 +2362,7 @@ async fn drive_start_turn_stream(
     chat_mode: crate::agent::loop_::ChatMode,
     observer: Arc<dyn Observer>,
     hooks: Arc<HookManager>,
+    tool_tiering: crate::config::ToolTieringConfig,
 ) {
     // Redux-specific preflight projection stays in the adapter because it must
     // publish the exact compaction patch and injection diagnostic into reducer
@@ -2474,7 +2485,7 @@ async fn drive_start_turn_stream(
         None,
         None,
         None,
-        None,
+        Some(&tool_tiering),
         // The adapter's ToolExecutionService already carries the resolved ledger.
         crate::agent::loop_::ToolLoopMemory::none().with_event_fabric(request_event_fabric),
         chat_mode,
@@ -4656,6 +4667,7 @@ mod tests {
             crate::agent::loop_::ChatMode::Edit,
             Arc::new(crate::observability::noop::NoopObserver),
             Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),
+            crate::config::ToolTieringConfig::default(),
         )
         .await;
 
@@ -5338,6 +5350,7 @@ mod real_mode_tests {
             tools_registry: None,
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
+            tool_tiering: crate::config::ToolTieringConfig::default(),
         };
         (deps, action_rx, hooks, temp)
     }
@@ -5785,6 +5798,7 @@ mod real_mode_tests {
                 tools_registry: None,
                 approval_router: Arc::new(ApprovalRouter::new()),
                 tool_security_policy: full_tool_security_policy(),
+                tool_tiering: crate::config::ToolTieringConfig::default(),
             };
             let executor = EffectExecutor::new_with_deps(deps);
 
@@ -5854,6 +5868,7 @@ mod real_mode_tests {
             tools_registry: None,
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
+            tool_tiering: crate::config::ToolTieringConfig::default(),
         };
         let executor = EffectExecutor::new_with_deps(deps);
         executor.execute(Effect::RequestRedraw).await;
@@ -6861,6 +6876,7 @@ mod real_mode_tests {
             tools_registry: None,
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
+            tool_tiering: crate::config::ToolTieringConfig::default(),
         };
         (deps, action_rx, temp)
     }
@@ -7011,6 +7027,7 @@ mod real_mode_tests {
             tools_registry: None,
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
+            tool_tiering: crate::config::ToolTieringConfig::default(),
         };
         let executor = EffectExecutor::new_with_deps(deps);
 
@@ -7165,6 +7182,7 @@ mod real_mode_tests {
             tools_registry: None,
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
+            tool_tiering: crate::config::ToolTieringConfig::default(),
         };
 
         let executor = EffectExecutor::new_with_deps(deps);
@@ -11832,6 +11850,7 @@ mod real_mode_tests {
             tools_registry: None,
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
+            tool_tiering: crate::config::ToolTieringConfig::default(),
         };
         let executor = EffectExecutor::new_with_deps(deps);
 
@@ -11927,6 +11946,9 @@ mod real_mode_tests {
 
 #[cfg(test)]
 mod turn_characterization_tests;
+
+#[cfg(test)]
+mod tool_tiering_tests;
 
 // ─── S4-A Commit 3: dispatcher snapshot 推送 ────────────────────────────────
 

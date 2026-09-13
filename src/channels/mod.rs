@@ -1117,7 +1117,7 @@ fn message_runtime_snapshot(
             low_priority_tools: ctx.low_priority_tools.clone(),
             min_relevance_score: ctx.min_relevance_score,
             agent_compaction: ctx.agent_compaction.clone(),
-            tool_tiering: ctx.tool_tiering.clone(),
+            tool_tiering: ctx.tool_tiering.for_channel_surface(),
         };
     }
     #[cfg(not(test))]
@@ -1131,7 +1131,11 @@ fn message_runtime_snapshot(
         low_priority_tools: config.agent.low_priority_tools.clone(),
         min_relevance_score: config.memory.min_relevance_score,
         agent_compaction: config.agent.compaction.clone(),
-        tool_tiering: config.tool_tiering.clone(),
+        // IM channel turns run under the channel tiering policy: the
+        // operations/development surface is folded into `always_exclude` here,
+        // once, so capability routing and the prompt compilers below cannot
+        // disagree about what this turn may reach.
+        tool_tiering: config.tool_tiering.for_channel_surface(),
     }
 }
 
@@ -5236,8 +5240,9 @@ pub async fn start_channels_with_config(
     let native_tools = provider
         .capabilities_for(&model, crate::providers::traits::ProviderRequestMode::NonStreaming)
         .native_tool_calling;
+    let channel_tool_tiering = config.tool_tiering.for_channel_surface();
     let prompt_skills =
-        if crate::tools::intent::core_dependency_is_available("skill_read", &model, &config.tool_tiering) {
+        if crate::tools::intent::core_dependency_is_available("skill_read", &model, &channel_tool_tiering) {
             skills.as_slice()
         } else {
             &[]
@@ -6622,6 +6627,40 @@ mod tests {
             current_message.read_only_tool_concurrency_window,
             pinned_before_reload.read_only_tool_concurrency_window
         );
+    }
+
+    /// The channel turn's tiering policy is the *channel* policy, not the raw
+    /// config: the snapshot is what `process_channel_message` hands to the tool
+    /// loop and to `core_dependency_is_available`, so the fold has to happen
+    /// here rather than being remembered at each call site.
+    ///
+    /// MUTATION GUARD: change `message_runtime_snapshot` back to
+    /// `config.tool_tiering.clone()` and this test goes red.
+    #[test]
+    fn channel_message_runtime_hides_the_operations_tools_by_default() {
+        let manager = crate::config::new_shared(Config::default());
+        let generation = manager.pin();
+        let mut ctx = ctx_with_histories(HashMap::new());
+        ctx.config = Arc::clone(&manager);
+        ctx.config_generation = Arc::clone(&generation);
+        ctx.tool_tiering = generation.effective.tool_tiering.clone();
+
+        let snapshot = message_runtime_snapshot(&ctx, &generation);
+        assert!(
+            generation.effective.tool_tiering.always_exclude.is_empty(),
+            "fixture must start from an operator config that excludes nothing"
+        );
+        for hidden in crate::config::DEFAULT_CHANNEL_EXCLUDED_TOOLS {
+            assert!(
+                snapshot
+                    .tool_tiering
+                    .always_exclude
+                    .iter()
+                    .any(|excluded| excluded == hidden),
+                "`{hidden}` must be excluded on a channel turn: {:?}",
+                snapshot.tool_tiering.always_exclude
+            );
+        }
     }
 
     #[test]

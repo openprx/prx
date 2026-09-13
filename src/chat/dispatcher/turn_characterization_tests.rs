@@ -343,6 +343,7 @@ async fn run_chat_fixture_with_history(
         crate::agent::loop_::ChatMode::Edit,
         Arc::new(crate::observability::noop::NoopObserver),
         Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),
+        crate::config::ToolTieringConfig::default(),
     )
     .await;
 

@@ -212,33 +212,27 @@ fn channel_message_send_parameters_schema() -> serde_json::Value {
                 "action": {
                     "type": "string",
                     "enum": ["send", "react", "edit", "delete", "unsend", "thread"],
-                    "description": "Action type: 'send' for text/files/voice, 'react' for emoji reactions, \
-                                    'edit' to edit a sent message (message_id + message), \
-                                    'delete'/'unsend' to delete a sent message (message_id), \
-                                    'thread' to reply in a thread (thread_id + message)"
+                    "description": "'send' text/files/voice (message); 'react' emoji reaction; 'edit' (message_id + message); \
+                                    'delete'/'unsend' (message_id); 'thread' (thread_id + message)."
                 },
                 "target": {
                     "type": "string",
-                    "description": "Recipient identifier (phone number, group ID, Signal UUID, etc.). \
-                                    Defaults to the current conversation's sender when omitted."
+                    "description": "Recipient (phone number, group ID, Signal UUID, …). Defaults to the current sender."
                 },
                 "channel": {
                     "type": "string",
-                    "description": "Destination channel name (e.g. 'signal', 'telegram', 'wacli'). \
-                                    Omit to stay on the current conversation's channel. Naming another \
-                                    channel requires it to be permitted by the outbound scope rules and \
-                                    delivers text only — media markers and as_voice are refused. \
-                                    Not accepted for action='react'."
+                    "description": "Destination channel (e.g. 'signal', 'telegram', 'wacli'); omit to stay on the current one. \
+                                    Another channel must be allowed by the outbound scope rules and carries text only \
+                                    (media markers and as_voice are refused). Not accepted for 'react'."
                 },
                 "message": {
                     "type": "string",
-                    "description": "Message text. Embed media by including markers: \
-                                    [IMAGE:/path/to/file.png], [VOICE:/path/to/audio.m4a], \
-                                    [DOCUMENT:/path/to/file.pdf]. Text outside markers is sent as caption."
+                    "description": "Message text. Embed media with markers [IMAGE:path], [VOICE:path], [DOCUMENT:path]; \
+                                    text outside a marker becomes the caption."
                 },
                 "as_voice": {
                     "type": "boolean",
-                    "description": "When true, the first [VOICE:] or [AUDIO:] attachment is sent as a voice note (default: false)."
+                    "description": "Send the first [VOICE:]/[AUDIO:] attachment as a voice note (default false)."
                 },
                 "quote_timestamp": {
                     "type": "integer",
@@ -246,27 +240,27 @@ fn channel_message_send_parameters_schema() -> serde_json::Value {
                 },
                 "quote_author": {
                     "type": "string",
-                    "description": "Author identifier of the message being replied to (required when quote_timestamp is set)."
+                    "description": "Author of the quoted message (required with quote_timestamp)."
                 },
                 "emoji": {
                     "type": "string",
-                    "description": "For action='react': the emoji to react with, e.g. '👍', '❤️', '😂'."
+                    "description": "react: the emoji, e.g. '👍'."
                 },
                 "target_author": {
                     "type": "string",
-                    "description": "For action='react': the author of the message to react to."
+                    "description": "react: author of the target message."
                 },
                 "target_timestamp": {
                     "type": "integer",
-                    "description": "For action='react': the timestamp (ms) of the message to react to."
+                    "description": "react: timestamp (ms) of the target message."
                 },
                 "message_id": {
                     "type": "string",
-                    "description": "For action='edit'/'delete'/'unsend': the platform-specific message identifier (timestamp in ms for Signal)."
+                    "description": "edit/delete/unsend: platform message id (ms timestamp on Signal)."
                 },
                 "thread_id": {
                     "type": "string",
-                    "description": "For action='thread': the thread/conversation identifier to reply into."
+                    "description": "thread: the thread/conversation id to reply into."
                 }
             },
             "required": ["action"]
@@ -607,10 +601,9 @@ impl Tool for MessageSendTool {
     }
 
     fn description(&self) -> &str {
-        "Send a message through the active messaging channel (Signal, Telegram, etc.). \
-         Supports text, file/image/voice attachments, emoji reactions, and quote replies. \
-         Use action='send' for messages and action='react' for emoji reactions. \
-         Set 'channel' to deliver text on a different configured channel."
+        "Send a message on the active messaging channel (Signal, Telegram, …). Text, file/image/voice \
+         attachments, emoji reactions and quote replies. Use action='send' to send and action='react' \
+         to react; set 'channel' to deliver text on another configured channel."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

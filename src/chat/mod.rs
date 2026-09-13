@@ -4364,6 +4364,7 @@ pub async fn run(
             tools_registry: Some(Arc::clone(&tools_registry)),
             approval_router: Arc::new(dispatcher::ApprovalRouter::new()),
             tool_security_policy: Arc::clone(&security),
+            tool_tiering: config.tool_tiering.clone(),
         };
         tracing::info!(mode = ?mode, "chat EffectExecutor in Pure real-deps mode");
         dispatcher::EffectExecutor::new_with_deps(deps)

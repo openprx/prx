@@ -380,8 +380,7 @@ impl Tool for XinTool {
     }
 
     fn description(&self) -> &str {
-        "Xin autonomous task heartbeat engine. \
-         Manage tasks and durable goal/step workflows, including execution and history."
+        "Xin autonomous task heartbeat engine: tasks and durable goal/step workflows, with execution and history."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -401,65 +400,65 @@ impl Tool for XinTool {
                         },
                         "task_id": {
                             "type": "string",
-                            "description": "Task ID, or Goal ID for the generic events action."
+                            "description": "Task ID; Goal ID for the generic events action."
                         },
                         "goal_id": {
                             "type": "string",
-                            "description": "Goal ID for goal and step-list actions."
+                            "description": "Goal ID for goal_*/step_list."
                         },
                         "step_id": {
                             "type": "string",
-                            "description": "Step ID for step_get/step_retry actions."
+                            "description": "Step ID for step_get/step_retry."
                         },
                         "name": {
                             "type": "string",
-                            "description": "Task name (for add action)."
+                            "description": "Task name (add)."
                         },
                         "description": {
                             "type": "string",
-                            "description": "Task description (for add action)."
+                            "description": "Task description (add)."
                         },
                         "payload": {
                             "type": "string",
-                            "description": "Task payload: prompt for agent_session, command for shell (for add action)."
+                            "description": "add: prompt for agent_session, command for shell."
                         },
                         "execution_mode": {
                             "type": "string",
                             "enum": ["agent_session", "shell"],
-                            "description": "How the task runs: agent_session (LLM) or shell (command). Default: agent_session."
+                            "description": "agent_session (LLM, default) or shell (command)."
                         },
                         "priority": {
                             "type": "string",
                             "enum": ["low", "normal", "high", "critical"],
-                            "description": "Task priority. Default: normal."
+                            "description": "Priority (default normal)."
                         },
                         "recurring": {
                             "type": "boolean",
-                            "description": "Whether the task repeats. Default: false."
+                            "description": "Repeat the task (default false)."
                         },
                         "interval_secs": {
                             "type": "integer",
-                            "description": "Repeat interval in seconds (only for recurring tasks)."
+                            "description": "Repeat interval in seconds (recurring only)."
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "Maximum run-history entries to return (1-50, default 20)."
+                            "description": "Max run-history entries (1-50, default 20)."
                         },
                         "sequence": {
                             "type": "integer",
-                            "description": "One-based step sequence for step_add."
+                            "description": "One-based step sequence (step_add)."
                         },
                         "lease_ttl_secs": {
                             "type": "integer",
-                            "description": "Optional per-step lease TTL; zero uses the execution-mode default."
+                            "description": "Per-step lease TTL; 0 uses the execution-mode default."
                         },
                         "target_completion_at": {
                             "type": "string",
-                            "description": "Optional RFC3339 target time for goal_add."
+                            "description": "RFC3339 target time (goal_add)."
                         },
                         "steps": {
                             "type": "array",
-                            "description": "Optional initial ordered steps for goal_add.",
+                            "description": "Initial ordered steps (goal_add).",
                             "items": {
                                 "type": "object",
                                 "properties": {

@@ -1050,7 +1050,7 @@ impl Tool for PluginManageTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect, manage, and invoke workspace WASM plugins across tool, middleware, hook, cron, provider, and storage capabilities."
+        "Inspect, manage and invoke workspace WASM plugins (tool, middleware, hook, cron, provider, storage)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1058,11 +1058,11 @@ impl Tool for PluginManageTool {
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": ["status", "get", "refresh", "install", "update", "enable", "disable", "remove", "middleware_test", "cron_run", "provider_chat", "storage_health", "storage_store", "storage_recall", "storage_forget", "storage_count"]},
-                "name": {"type": "string", "minLength": 1, "description": "Required for get, enable, disable, remove, cron_run, provider_chat, and every storage_* action; use a plugin name or exported adapter name"},
-                "source": {"type": "string", "description": "Plugin source directory inside the workspace for install or update"},
+                "name": {"type": "string", "minLength": 1, "description": "Plugin name or exported adapter name; required by get/enable/disable/remove/cron_run/provider_chat and every storage_* action"},
+                "source": {"type": "string", "description": "install/update: plugin source directory in the workspace"},
                 "stage": {"type": "string", "enum": ["inbound", "outbound", "llm_request", "llm_response"]},
-                "data": {"description": "JSON envelope for middleware_test"},
-                "message": {"type": "string", "description": "Single user message for provider_chat"},
+                "data": {"description": "middleware_test envelope"},
+                "message": {"type": "string", "description": "provider_chat single user message"},
                 "messages": {
                     "type": "array",
                     "items": {

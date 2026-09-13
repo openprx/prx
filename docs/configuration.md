@@ -267,6 +267,20 @@ priority_scheduling_enabled = false
 # listed here — adding it would demote every cron action, not just background runs.
 low_priority_tools = ["sessions_spawn", "delegate"]
 
+# Per-turn capability routing. `always_include` / `always_exclude` override the
+# intent decision by name on every surface. `channel_exclude` applies to IM
+# channel sessions only (Signal / Telegram / Discord / WhatsApp / …) and defaults
+# to the operations/development surface: wasm_plugins_manage, wasm_plugin_reload,
+# wasm_plugins_status, hooks_manage, hooks_status, proxy_config, config_reload,
+# gateway, mcp_status, nodes, git_operations, skills_manage, memory_reindex,
+# document_sync, document_ingest. Terminal chat, the gateway and the console are
+# unaffected. Name a tool in `always_include` to put it back on channels, or set
+# `channel_exclude = []` to drop the default entirely.
+[tool_tiering]
+always_include = []
+always_exclude = []
+# channel_exclude = []
+
 # Optional exact-model tool allowlists are applied after normal intent tiering.
 # Models without an entry keep the ordinary tool set. An empty list deliberately
 # exposes no tools. Quote model names containing `/` or `:` in TOML.

@@ -111,6 +111,25 @@ turn has produced no text of its own; the first streamed token replaces it and
 progress notes stop. Channels that support typing indicators keep those
 refreshed throughout. Both are reports: neither can end anything.
 
+## Tools On Channel Turns
+
+A channel message is written by a conversation partner, not by the operator at
+the host, so a channel turn runs under a narrower tool policy than terminal chat
+or the gateway. On top of ordinary per-turn capability routing, the
+`[tool_tiering] channel_exclude` list is folded into that turn's `always_exclude`
+and defaults to the operations/development surface:
+
+`wasm_plugins_manage`, `wasm_plugin_reload`, `wasm_plugins_status`,
+`hooks_manage`, `hooks_status`, `proxy_config`, `config_reload`, `gateway`,
+`mcp_status`, `nodes`, `git_operations`, `skills_manage`, `memory_reindex`,
+`document_sync`, `document_ingest`.
+
+These are not advertised to the model on a channel turn even when the message
+names their capability, which both removes their schemas from every request and
+puts runtime reconfiguration out of reach of a misread sentence. Naming one in
+`always_include` restores it; `channel_exclude = []` drops the default entirely.
+See [Tools](tools.md#per-turn-capability-routing).
+
 ## Listener Liveness Reporting
 
 Channel health is derived from what a listener has actually been observed doing,

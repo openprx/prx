@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.116] - 13 September 2026
+
+### Changed
+
+- Route capabilities on the terminal chat driver. The redux chat turn owner
+  passed no `[tool_tiering]` policy to the shared tool loop, which does not mean
+  "use the defaults" — it disables intent routing outright, so `prx chat`
+  re-serialized the entire registry into every request of every iteration while
+  channels, gateway, console, session workers, `sessions_spawn` and `delegate`
+  all routed normally. Terminal chat is back on the same boundary; a tool that
+  routing drops is restored by name through `[tool_tiering] always_include`.
+- Hide the operations/development tool surface from IM channel sessions by
+  default, through a new `[tool_tiering] channel_exclude` list:
+  `wasm_plugins_manage`, `wasm_plugin_reload`, `wasm_plugins_status`,
+  `hooks_manage`, `hooks_status`, `proxy_config`, `config_reload`, `gateway`,
+  `mcp_status`, `nodes`, `git_operations`, `skills_manage`, `memory_reindex`,
+  `document_sync`, `document_ingest`. The list is folded into that turn's
+  `always_exclude`, so those tools stay hidden even when the message names their
+  capability. Terminal chat, the gateway/webhook surface and the web console are
+  unaffected. `always_include` still wins per tool, and `channel_exclude = []`
+  turns the default off.
+- Compress the tool schemas the model pays for on every turn. `sessions_spawn`,
+  `cron`, `message_send`, `xin` and `wasm_plugins_manage` carried per-action
+  prose that restated the same action/parameter mapping in four places; the
+  descriptions are condensed while field names, types, enums, defaults and the
+  conditional required-field clauses stay byte-for-byte the same, and the
+  schema-contract tests that require every action to be named where the model
+  reads it continue to hold.
+
 ## [0.8.115] - 13 September 2026
 
 ### Fixed

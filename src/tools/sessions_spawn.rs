@@ -2181,22 +2181,11 @@ impl Tool for SessionsSpawnTool {
     }
 
     fn description(&self) -> &str {
-        "Hand work to an async sub-agent, or to a live `prx chat` session, and manage what is running. Actions: \
-         'spawn' (default) — launch a sub-agent for a task and return a run_id; \
-         'spawn_batch' — launch several sub-agents at once and return a batch_id; \
-         'join' — block until every sub-agent in a batch_id has finished, then return all their results; \
-         'list' — show all active/completed sub-agent runs; \
-         'kill' — abort a running sub-agent by run_id; \
-         'history' — view the conversation log of a sub-agent run; \
-         'steer' — inject a message into a running sub-agent to redirect it; \
-         'chat_sessions' — list the live `prx chat` sessions you may hand work to; \
-         'chat_assign' — hand a task to one of those chat sessions and have its result \
-         relayed back to this conversation when it finishes. \
-         Each action reads a different parameter, so pass the right one the first time: \
-         'spawn' needs `task`; 'spawn_batch' needs `tasks`; 'join' needs `batch_id`; \
-         'kill'/'history' need `run_id`; 'steer' needs `run_id` + `message`; \
-         'chat_assign' needs `session_id` + `task` (the work goes in `task`, not `message`); \
-         'list' and 'chat_sessions' take no parameters."
+        "Hand work to an async sub-agent or to a live `prx chat` session, and manage what is running. \
+         Actions and their parameters: 'spawn' (default) task -> run_id; 'spawn_batch' tasks -> batch_id; \
+         'join' batch_id (waits for every member, returns all results); 'list'; 'kill' run_id; \
+         'history' run_id; 'steer' run_id + message; 'chat_sessions'; 'chat_assign' session_id + task. \
+         Work text always goes in `task`, never `message`."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -2215,31 +2204,24 @@ impl Tool for SessionsSpawnTool {
                         "type": "string",
                         "enum": ["spawn", "spawn_batch", "join", "list", "kill", "history", "steer", "chat_sessions", "chat_assign"],
                         "default": "spawn",
-                        "description": "Action to perform, and what each one requires: \
-                         'spawn' (task) launches a new sub-agent; \
-                         'spawn_batch' (tasks) launches a whole fan-out; \
-                         'join' (batch_id) waits for all of a batch's results; \
-                         'list' (no parameters) shows all runs; \
-                         'kill' (run_id) aborts a run; \
-                         'history' (run_id) views a run's log; \
-                         'steer' (run_id, message) redirects a running sub-agent; \
-                         'chat_sessions' (no parameters) lists the live `prx chat` sessions you may assign work to; \
-                         'chat_assign' (session_id, task) hands one of them a task."
+                        "description": "Action to perform, with the parameter it reads: 'spawn' task; \
+                         'spawn_batch' tasks; 'join' batch_id; 'list' none; 'kill' run_id; 'history' run_id; \
+                         'steer' run_id + message; 'chat_sessions' none; 'chat_assign' session_id + task."
                     },
                     "session_id": {
                         "type": "string",
-                        "description": "Required for action='chat_assign': which live `prx chat` session gets the task, as reported by action='chat_sessions'. This is a chat session id, not a sub-agent run id — 'kill'/'history'/'steer' address sub-agents through `run_id` instead. Unused by every other action."
+                        "description": "For 'chat_assign': the live `prx chat` session that gets the task, as listed by 'chat_sessions'. A chat session id, not a sub-agent run_id."
                     },
                     "disposition": {
                         "type": "string",
                         "enum": ["queue", "steer", "interrupt"],
                         "default": "queue",
-                        "description": "Optional, for action='chat_assign' only: what to do about a turn that chat session may already be running. 'queue' (default) waits for it to finish, 'steer' hands the task to the running turn as extra input, 'interrupt' stops the running turn first. Choose 'queue' unless the user asked for the work to happen right now."
+                        "description": "For 'chat_assign': how to handle a turn that session is already running. 'queue' (default) waits, 'steer' feeds the task to the running turn, 'interrupt' stops it first. Prefer 'queue'."
                     },
                     "tasks": {
                         "type": "array",
                         "minItems": 1,
-                        "description": "Required for action='spawn_batch' (and used by no other action): the tasks to launch, all at once. Each entry is either a task string or an object {task, agent?, model?, provider?, mode?, recipient?} — those six keys and no others; any other key is rejected rather than ignored. Any top-level parameter of this call acts as the default for every entry, and an entry key overrides that default for that member alone. There is no limit on how many may be launched. Members do not announce their own results — call 'join' with the returned batch_id and report the outcome yourself in a single message.",
+                        "description": "For 'spawn_batch': the tasks to launch together, unlimited in number. Each entry is a task string or an object {task, agent?, model?, provider?, mode?, recipient?}; any other key is rejected. Top-level parameters are per-entry defaults that an entry key overrides. Members never announce their own results: call 'join' with the returned batch_id and report them yourself.",
                         "items": {
                             "anyOf": [
                                 {"type": "string", "minLength": 1},
@@ -2249,38 +2231,36 @@ impl Tool for SessionsSpawnTool {
                     },
                     "batch_id": {
                         "type": "string",
-                        "description": "Batch identifier returned by 'spawn_batch'. Required for the 'join' action, which blocks until every member of that batch has finished — however long that takes — and then reports all of them. Unused by every other action."
+                        "description": "For 'join': the batch identifier returned by 'spawn_batch'. 'join' blocks until every member has finished, however long that takes."
                     },
                     "task": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "The work to be done, written as instructions for whoever carries it out. Required by TWO actions: \
-                                        for action='spawn' it is the task the new sub-agent is launched with, and \
-                                        for action='chat_assign' it is the task handed to the live `prx chat` session named by `session_id`. \
-                                        chat_assign carries its text here — there is no `message`, `prompt` or `text` parameter for it. \
-                                        For action='spawn_batch' pass `tasks` instead; for action='steer' pass `message`."
+                        "description": "The work to be done, as instructions. Required by 'spawn' and by 'chat_assign' \
+                                        ('chat_assign' has no `message`, `prompt` or `text` parameter). Use `tasks` for \
+                                        'spawn_batch' and `message` for 'steer'."
                     },
                     "run_id": {
                         "type": "string",
-                        "description": "Identifier of one sub-agent run, as returned by 'spawn' and listed by 'list'. Required for actions 'kill', 'history' and 'steer'. Not a chat session id — action='chat_assign' addresses those through `session_id`."
+                        "description": "Sub-agent run id returned by 'spawn' and listed by 'list'. Required by 'kill', 'history' and 'steer'. Not a chat session id."
                     },
                     "message": {
                         "type": "string",
-                        "description": "Required for action='steer' (and used by no other action): the text injected into an already-running sub-agent to redirect it. \
-                                        This is not how work is handed out — action='spawn' and action='chat_assign' both take their instructions in `task`."
+                        "description": "For 'steer': text injected into an already-running sub-agent to redirect it. \
+                                        Not how work is handed out — 'spawn' and 'chat_assign' take their instructions in `task`."
                     },
                     "model": {
                         "type": "string",
-                        "description": "Optional model override for the sub-agent, for actions 'spawn' and 'spawn_batch' (ignored by every other action). Defaults to the gateway model."
+                        "description": "For 'spawn' and 'spawn_batch': model override. Defaults to the gateway model."
                     },
                     "provider": {
                         "type": "string",
-                        "description": "Optional provider override for the sub-agent (e.g. 'openrouter', 'ollama'), for actions 'spawn' and 'spawn_batch' (ignored by every other action). Defaults to the agent config provider, then the gateway provider."
+                        "description": "For 'spawn' and 'spawn_batch': provider override (e.g. openrouter, ollama). Defaults to the agent config provider, then the gateway provider."
                     },
                     "agent": {
                         "type": "string",
                         "description": format!(
-                            "Optional identity agent name, for actions 'spawn' and 'spawn_batch' (ignored by every other action). Available: {}",
+                            "For 'spawn' and 'spawn_batch': identity agent name. Available: {}",
                             if available_agents.is_empty() {
                                 "(none configured)".to_string()
                             } else {
@@ -2292,35 +2272,30 @@ impl Tool for SessionsSpawnTool {
                         "type": "string",
                         "enum": ["task", "process"],
                         "default": "task",
-                        "description": "Execution mode, for actions 'spawn' and 'spawn_batch' (ignored by every other action). 'task' keeps current in-process behavior (default), 'process' launches an isolated OS process."
+                        "description": "For 'spawn' and 'spawn_batch': 'task' runs in-process (default), 'process' launches an isolated OS process."
                     },
                     "recipient": {
                         "type": "string",
-                        "description": "Optional recipient (phone number, group ID, etc.) for what action='spawn' sends about a run: \
-                                        its result announcement, and any later kill notice. Defaults to the current conversation \
-                                        sender. Under action='spawn_batch' it only routes the kill notice, since a batch member \
-                                        never announces its own result. Unused by every other action — action='chat_assign' \
-                                        always relays its answer back into the assigning conversation, and offers no override."
+                        "description": "For 'spawn': recipient (phone number, group ID, …) of the result announcement and any \
+                                        kill notice; defaults to the current sender. Under 'spawn_batch' it routes only the \
+                                        kill notice. 'chat_assign' always replies into the assigning conversation."
                     },
                     "announce": {
                         "type": "boolean",
-                        "description": "Whether this sub-agent posts its own result to the channel when it finishes. \
-                                        Applies to 'spawn' only and defaults to true. A 'spawn_batch' member never \
-                                        announces, whatever this is set to: a batch's results are collected by 'join' \
-                                        and summarised by you in one message, instead of each member reporting \
-                                        separately. Use a plain 'spawn' for a run that should report for itself."
+                        "description": "For 'spawn', default true: whether the sub-agent posts its own result to the channel. \
+                                        A 'spawn_batch' member never announces; collect a batch with 'join' and report it once."
                     },
                     "last_n": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 200,
-                        "description": "Optional, for action='history' only: return only the last N entries. Defaults to the last 20 entries so final proof markers stay visible."
+                        "description": "For 'history': return the last N entries (default 20, keeping final proof markers visible)."
                     },
                     "max_chars_per_entry": {
                         "type": "integer",
                         "minimum": 80,
                         "maximum": 4000,
-                        "description": "Optional, for action='history' only: maximum characters per returned history entry. Defaults to 800."
+                        "description": "For 'history': maximum characters per returned entry (default 800)."
                     }
                 },
                 "required": ["action"]

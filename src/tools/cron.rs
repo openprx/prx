@@ -312,14 +312,10 @@ impl Tool for CronTool {
 
     fn description(&self) -> &str {
         "Unified cron/scheduler management — the single entry point for ALL scheduled-task \
-         operations. Actions: \
-         add/schedule (create recurring job: pass `expression` + `command` for a shell job, \
-         or a `schedule` object {kind:'cron'|'at'|'every'} with `payload`/`job_type` for shell \
-         or agent jobs, optionally `name`, `session_target`, `model`, `delivery`, \
-         `delete_after_run`); \
-         once (one-shot shell job via `delay` or `run_at`); \
-         list; get; remove/cancel; update/patch; run (force-run now); runs/history (run log); \
-         events; pause; resume; status."
+         operations. Actions: add/schedule (recurring job: `expression`+`command`, or a \
+         `schedule` object with `payload`/`job_type`); once (one-shot shell job via `delay` \
+         or `run_at`); list; get; remove/cancel; update/patch; run; runs/history; events; \
+         pause; resume; status."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -348,27 +344,27 @@ impl Tool for CronTool {
                             },
                             "job_id": {
                                 "type": "string",
-                                "description": "Job ID for get/remove/update/run/runs/pause/resume actions."
+                                "description": "Job ID for get/remove/update/run/runs/pause/resume."
                             },
                             "expression": {
                                 "type": "string",
-                                "description": "Cron expression (e.g. '*/5 * * * *') for recurring shell jobs (add/schedule)."
+                                "description": "Cron expression (e.g. '*/5 * * * *') for add/schedule."
                             },
                             "command": {
                                 "type": "string",
-                                "description": "Shell command to execute (shell jobs)."
+                                "description": "Shell command to run."
                             },
                             "delay": {
                                 "type": "string",
-                                "description": "Delay for one-shot jobs (e.g. '30m', '2h')."
+                                "description": "One-shot delay (e.g. '30m', '2h')."
                             },
                             "run_at": {
                                 "type": "string",
-                                "description": "Absolute RFC3339 timestamp for one-shot jobs."
+                                "description": "One-shot absolute RFC3339 time."
                             },
                             "schedule": {
                                 "type": "object",
-                                "description": "Schedule object for add/schedule: {kind:'cron',expr:'0 9 * * *',tz?:'America/New_York'} | {kind:'at',at:'ISO-8601'} | {kind:'every',every_ms:30000}. Alternative to the plain 'expression' string.",
+                                "description": "add/schedule: {kind:'cron',expr,tz?} | {kind:'at',at} | {kind:'every',every_ms}. Alternative to 'expression'.",
                                 "properties": {
                                     "kind": { "type": "string", "enum": ["cron", "at", "every"] },
                                     "expr": { "type": "string", "minLength": 1 },
@@ -394,15 +390,15 @@ impl Tool for CronTool {
                             },
                             "name": {
                                 "type": "string",
-                                "description": "Human-readable job name (add/schedule)."
+                                "description": "Human-readable job name."
                             },
                             "payload": {
                                 "type": "object",
-                                "description": "Job payload for add/schedule: {kind:'agentTurn',message:'task prompt'} runs an isolated LLM turn; {kind:'systemEvent',text:'message text'} injects text into the main session.",
+                                "description": "add/schedule payload: {kind:'agentTurn',message} runs an isolated LLM turn; {kind:'systemEvent',text} injects text into the main session.",
                                 "properties": {
                                     "kind": { "type": "string", "enum": ["agentTurn", "systemEvent"] },
-                                    "message": { "type": "string", "minLength": 1, "description": "Task for agentTurn" },
-                                    "text": { "type": "string", "minLength": 1, "description": "Text for systemEvent" }
+                                    "message": { "type": "string", "minLength": 1 },
+                                    "text": { "type": "string", "minLength": 1 }
                                 },
                                 "required": ["kind"],
                                 "anyOf": [
@@ -413,42 +409,42 @@ impl Tool for CronTool {
                             "job_type": {
                                 "type": "string",
                                 "enum": ["shell", "agent"],
-                                "description": "Legacy alternative to 'payload' for add/schedule. 'agent' runs an LLM turn."
+                                "description": "Legacy alternative to 'payload'. 'agent' runs an LLM turn."
                             },
                             "prompt": {
                                 "type": "string",
-                                "description": "LLM prompt for agent jobs (add/schedule). Overridden by payload.message/payload.text."
+                                "description": "LLM prompt for agent jobs; overridden by payload."
                             },
                             "session_target": {
                                 "type": "string",
                                 "enum": ["isolated", "main"],
-                                "description": "Agent-job target session: isolated=new context (default), main=inject into main session."
+                                "description": "Agent-job target: isolated=new context (default), main=inject into main session."
                             },
                             "model": {
                                 "type": "string",
-                                "description": "Override model for agent jobs (add/schedule)."
+                                "description": "Model override for agent jobs."
                             },
                             "delivery": {
                                 "type": "object",
-                                "description": "Result delivery for agent jobs: {mode:'announce',channel:'signal',to:'<phone|uuid|group:ID>'} or {mode:'none'}.",
+                                "description": "Agent-job result delivery: {mode:'announce',channel,to} or {mode:'none'}.",
                                 "properties": {
                                     "mode": { "type": "string", "enum": ["none", "announce"] },
                                     "channel": { "type": "string", "enum": ["signal", "telegram", "discord", "slack", "mattermost"] },
-                                    "to": { "type": "string", "description": "Recipient: E.164 phone, UUID, or group:<groupId>" },
+                                    "to": { "type": "string", "description": "E.164 phone, UUID, or group:<groupId>" },
                                     "best_effort": { "type": "boolean", "default": true }
                                 }
                             },
                             "delete_after_run": {
                                 "type": "boolean",
-                                "description": "Auto-delete one-shot jobs after success (default true for 'at' schedule)."
+                                "description": "Auto-delete one-shot jobs after success (default true for 'at')."
                             },
                             "patch": {
                                 "type": "object",
-                                "description": "Fields to update for the 'update/patch' action."
+                                "description": "Fields to update for update/patch."
                             },
                             "limit": {
                                 "type": "integer",
-                                "description": "Max entries for 'runs' action (default 10)."
+                                "description": "Max entries for 'runs' (default 10)."
                             },
                         },
                                 "required": ["action"]

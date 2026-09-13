@@ -39,6 +39,40 @@ every model-running entrypoint:
 | gateway/webhook turns | yes | yes | yes | yes |
 | delegated/session-worker turns | yes | yes | yes | yes |
 
+## Per-turn capability routing
+
+Every model-running entrypoint narrows the registry before the provider call,
+using the turn's own user message and the `[tool_tiering]` policy: core tools are
+always offered, standard tools whenever their category is mentioned (or when they
+declare no category), extended tools only on an explicit category match. This is
+what keeps the per-turn tool catalog — which is re-serialized into every request
+of every iteration — from carrying the whole inventory on a turn that needs four
+tools. `always_include` and `always_exclude` override the routing decision by
+name, and `model_allowlists` intersects the result for one exact model.
+
+IM channel sessions (Signal, Telegram, Discord, WhatsApp/wacli, Slack,
+Mattermost, iMessage, Matrix …) additionally run under `channel_exclude`, which
+hides the operations/development surface from a conversation partner:
+
+`wasm_plugins_manage`, `wasm_plugin_reload`, `wasm_plugins_status`,
+`hooks_manage`, `hooks_status`, `proxy_config`, `config_reload`, `gateway`,
+`mcp_status`, `nodes`, `git_operations`, `skills_manage`, `memory_reindex`,
+`document_sync`, `document_ingest`.
+
+These names are folded into that turn's `always_exclude`, so they stay hidden
+even when the message names their capability. Terminal chat, the
+gateway/webhook surface and the web console are unaffected — those callers are
+the operator. To put one back on channels, name it in `always_include`; to turn
+the whole default off, set `channel_exclude = []`:
+
+```toml
+[tool_tiering]
+# Re-enable repository access for channel conversations.
+always_include = ["git_operations"]
+# Or drop the channel default entirely.
+# channel_exclude = []
+```
+
 Delegated and session-worker turns still honor an agent's explicit
 `allowed_tools` boundary. `allowed_tools = ["*"]` inherits the complete parent
 eligible capability set, including dynamically discovered MCP and WASM aliases;

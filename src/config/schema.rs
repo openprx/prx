@@ -5327,6 +5327,37 @@ pub struct SecurityConfig {
     pub audit: AuditConfig,
 }
 
+/// Operations/development tools hidden from IM channel sessions by default.
+///
+/// A chat message arriving over Signal / Telegram / Discord / WhatsApp is written
+/// by a conversation partner, not by the operator sitting at the host. Advertising
+/// the plugin, hook, proxy, node, repository and index-maintenance surfaces on that
+/// path costs tokens on every turn and puts a misfire one sentence away from
+/// changing how the runtime itself is configured. None of these is reachable by
+/// accident from a conversation that actually needs them: listing a name in
+/// `[tool_tiering] always_include` restores it, and `channel_exclude = []` turns
+/// the whole default off.
+///
+/// Terminal chat, the gateway/webhook surface and the web console are unaffected —
+/// those callers are the operator.
+pub const DEFAULT_CHANNEL_EXCLUDED_TOOLS: &[&str] = &[
+    "wasm_plugins_manage",
+    "wasm_plugin_reload",
+    "wasm_plugins_status",
+    "hooks_manage",
+    "hooks_status",
+    "proxy_config",
+    "config_reload",
+    "gateway",
+    "mcp_status",
+    "nodes",
+    "git_operations",
+    "skills_manage",
+    "memory_reindex",
+    "document_sync",
+    "document_ingest",
+];
+
 /// Tool tiering configuration — controls which tools are surfaced to the LLM based on intent.
 ///
 /// When `enabled = true`, the agent narrows the tool list before each LLM call using the
@@ -5338,6 +5369,10 @@ pub struct ToolTieringConfig {
     pub always_include: Vec<String>,
     /// Tool names to always exclude regardless of intent classification.
     pub always_exclude: Vec<String>,
+    /// Tool names hidden from IM channel sessions only, on top of `always_exclude`.
+    /// Defaults to [`DEFAULT_CHANNEL_EXCLUDED_TOOLS`]; set to `[]` to expose the
+    /// full operator surface on channels again.
+    pub channel_exclude: Vec<String>,
     /// Optional exact-model tool allowlists. When a model key is present, only
     /// matching tools from the ordinary intent-selected set are exposed.
     pub model_allowlists: HashMap<String, Vec<String>>,
@@ -5348,8 +5383,40 @@ impl Default for ToolTieringConfig {
         Self {
             always_include: Vec::new(),
             always_exclude: Vec::new(),
+            channel_exclude: DEFAULT_CHANNEL_EXCLUDED_TOOLS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
             model_allowlists: HashMap::new(),
         }
+    }
+}
+
+impl ToolTieringConfig {
+    /// The tiering policy an IM channel session runs under.
+    ///
+    /// `channel_exclude` is folded into `always_exclude` rather than applied as a
+    /// separate stage so that every consumer of this config — capability routing,
+    /// the prompt compilers' `core_dependency_is_available`, and the model
+    /// allowlist intersection — sees one boundary instead of three. An operator
+    /// who re-enables a tool through `always_include` keeps it: that list is
+    /// consulted before the exclusion inside [`crate::tools::intent`], so the
+    /// default is a default and not a ceiling.
+    #[must_use]
+    pub fn for_channel_surface(&self) -> Self {
+        if self.channel_exclude.is_empty() {
+            return self.clone();
+        }
+        let mut effective = self.clone();
+        for name in &self.channel_exclude {
+            if self.always_include.iter().any(|allowed| allowed == name) {
+                continue;
+            }
+            if !effective.always_exclude.iter().any(|excluded| excluded == name) {
+                effective.always_exclude.push(name.clone());
+            }
+        }
+        effective
     }
 }
 
@@ -6773,6 +6840,71 @@ mod tests {
             .insert("broken-model".into(), vec!["".into()]);
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("broken-model"), "{error}");
+    }
+
+    /// MUTATION GUARD: drop the `always_include` skip in `for_channel_surface`
+    /// and the re-enabled tool lands in `always_exclude`, where the router gives
+    /// exclusion the higher priority — silently un-doing the operator override.
+    #[test]
+    async fn channel_tiering_folds_defaults_in_without_overriding_the_operator() {
+        let mut config = ToolTieringConfig::default();
+        assert!(
+            config.channel_exclude.contains(&"wasm_plugins_manage".to_string()),
+            "the operations surface must be excluded from channels by default"
+        );
+        assert!(
+            config.always_exclude.is_empty(),
+            "the default must not touch the operator surface"
+        );
+
+        config.always_include.push("git_operations".to_string());
+        config.always_exclude.push("shell".to_string());
+        let channel = config.for_channel_surface();
+
+        assert!(
+            channel.always_exclude.contains(&"shell".to_string()),
+            "existing entries stay"
+        );
+        assert!(
+            channel.always_exclude.contains(&"nodes".to_string()),
+            "channel_exclude entries are folded in"
+        );
+        assert!(
+            !channel.always_exclude.contains(&"git_operations".to_string()),
+            "a tool the operator re-enabled must not be folded into the exclusion"
+        );
+        assert_eq!(
+            channel.always_include, config.always_include,
+            "the include list is carried through unchanged"
+        );
+    }
+
+    #[test]
+    async fn channel_tiering_is_identity_when_the_default_is_emptied() {
+        let config = ToolTieringConfig {
+            channel_exclude: Vec::new(),
+            always_exclude: vec!["shell".to_string()],
+            ..ToolTieringConfig::default()
+        };
+        let channel = config.for_channel_surface();
+        assert_eq!(channel.always_exclude, vec!["shell".to_string()]);
+    }
+
+    #[test]
+    async fn channel_tiering_does_not_duplicate_an_already_excluded_tool() {
+        let config = ToolTieringConfig {
+            always_exclude: vec!["nodes".to_string()],
+            ..ToolTieringConfig::default()
+        };
+        let channel = config.for_channel_surface();
+        assert_eq!(
+            channel
+                .always_exclude
+                .iter()
+                .filter(|name| name.as_str() == "nodes")
+                .count(),
+            1
+        );
     }
 
     #[test]
