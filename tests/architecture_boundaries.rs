@@ -698,8 +698,13 @@ fn production_tool_loop_memory_is_wired_to_request_context_events() {
 
     let dispatcher =
         fs::read_to_string(repository_root().join("src/chat/dispatcher.rs")).expect("read src/chat/dispatcher.rs");
+    let redux_memory_chain = dispatcher
+        .find("ToolLoopMemory::none()")
+        .and_then(|start| dispatcher.get(start..))
+        .and_then(|rest| rest.find(';').and_then(|end| rest.get(..end)))
+        .unwrap_or_default();
     assert!(
-        dispatcher.contains("ToolLoopMemory::none().with_event_fabric(request_event_fabric)"),
+        redux_memory_chain.contains(".with_event_fabric(request_event_fabric)"),
         "the Redux driver must attach request-context persistence to its adapter-owned memory runtime"
     );
 }

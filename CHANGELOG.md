@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.121] - 13 September 2026
+
+### Fixed
+
+- Make the Redux request-context wiring guard tolerate multi-line builder
+  chains instead of asserting one exact source line.
+
 ## [0.8.120] - 13 September 2026
 
 ### Fixed
