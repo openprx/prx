@@ -6749,6 +6749,15 @@ async fn run_tool_call_loop_outcome_unguarded(
         compiled_tool_context.apply_to_messages(&mut prepared_messages.messages);
         let mut execution_adapter = runtime_adapter.clone();
         execution_adapter.allowed_tool_names = Some(compiled_tool_context.allowed_tool_names());
+        // Argument validation enforces the contract the model was shown, and
+        // what it was shown depends on which provider serves the turn: Gemini
+        // strips `additionalProperties` / `minLength` / `minimum` and a dozen
+        // more keywords before the request leaves. Seeded from this turn's
+        // routed selection and re-stamped below from the provider that actually
+        // answered, so a fallback across provider families validates against the
+        // fallback's dialect rather than the one that was routed to first.
+        execution_adapter.tool_execution_context.schema_dialect =
+            crate::tools::ToolSchemaDialect::for_provider(provider_name);
 
         // Some provider templates (including the deployed Qwen template)
         // reject any system message that is not the first transcript item.
@@ -6899,6 +6908,8 @@ async fn run_tool_call_loop_outcome_unguarded(
                 usage_accumulator.record(trace.tokens_used.clone());
                 // Record this turn's real attribution. Overwritten each turn;
                 // the value at the returning turn is what the caller receives.
+                execution_adapter.tool_execution_context.schema_dialect =
+                    crate::tools::ToolSchemaDialect::for_provider(&trace.final_provider);
                 last_turn_trace = ToolLoopTrace {
                     final_provider: Some(trace.final_provider),
                     final_model: Some(trace.final_model),

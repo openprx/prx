@@ -898,6 +898,15 @@ fn drain_gemini_chunk(
 
 #[async_trait]
 impl Provider for GeminiProvider {
+    /// Gemini's API rejects `additionalProperties`, `minLength`, `minimum` and
+    /// the rest of [`crate::tools::schema::GEMINI_UNSUPPORTED_KEYWORDS`], so
+    /// every tool schema goes out through `SchemaCleanr::clean_for_gemini`
+    /// (here and in `chat_with_history`). The model therefore never sees those
+    /// constraints and must not be held to them on the way back.
+    fn tool_schema_dialect(&self) -> crate::tools::ToolSchemaDialect {
+        crate::tools::ToolSchemaDialect::Gemini
+    }
+
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
         crate::providers::traits::ProviderCapabilities {
             native_tool_calling: true,

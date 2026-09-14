@@ -560,6 +560,21 @@ pub trait Provider: Send + Sync {
         }
     }
 
+    /// Which rewrite of the published tool schemas this provider puts on the
+    /// wire.
+    ///
+    /// A provider that cannot accept the published document rewrites it (see
+    /// `SchemaCleanr`), and the model then answers against the rewritten
+    /// contract. `ToolExecutionService` validates the answer against the
+    /// document named here, so a constraint this provider strips is never
+    /// enforced against a model that was never shown it. Override this in the
+    /// same implementation that does the rewriting — the two must agree, and
+    /// `provider_aliases_agree_with_the_declared_schema_dialect` in
+    /// `src/providers/mod.rs` fails if they stop agreeing.
+    fn tool_schema_dialect(&self) -> crate::tools::ToolSchemaDialect {
+        crate::tools::ToolSchemaDialect::Raw
+    }
+
     /// Convert tool specifications to provider-native format.
     ///
     /// Default implementation returns `PromptGuided` payload, which injects

@@ -28,25 +28,31 @@ use uuid::Uuid;
 
 const DEFAULT_CONVERSATION_LIMIT: usize = 50;
 const MAX_CONVERSATION_QUERY_LIMIT: usize = 500;
-/// Smallest number of embedded memories `vector_search` will ever score.
+/// Default ceiling on the embedded memories `vector_search` will score, used
+/// when no configuration is supplied.
 ///
-/// Cosine similarity cannot use an index, so the scan is bounded by recency.
-/// The floor is set well above any realistic per-turn working set: the bound
-/// exists to stop a very large memory store from making every turn slower, not
-/// to trim ordinary recall.
-const VECTOR_CANDIDATE_FLOOR: usize = 2_000;
-/// Candidates scored per requested result, above the floor.
-const VECTOR_CANDIDATE_MULTIPLIER: usize = 50;
+/// Cosine similarity cannot use an index, so the scan is bounded by insertion
+/// order. Operators override this with `[memory] vector_candidate_cap`.
+const VECTOR_CANDIDATE_CAP: usize = 2_000;
 
-/// Recency-bounded candidate count for one vector recall.
-const fn vector_candidate_cap(limit: usize) -> usize {
-    let scaled = limit.saturating_mul(VECTOR_CANDIDATE_MULTIPLIER);
-    if scaled > VECTOR_CANDIDATE_FLOOR {
-        scaled
-    } else {
-        VECTOR_CANDIDATE_FLOOR
-    }
+/// Candidate count for one vector recall.
+///
+/// The configured cap is authoritative — it is the number an operator tunes —
+/// and is only ever raised to `limit`, because scoring fewer candidates than
+/// the caller asked for results would return a short list for no reason.
+/// Before 0.8.126 this was `max(limit * 50, 2000)` with no way to change it,
+/// so a store larger than the cap lost recall with nothing to turn.
+const fn vector_candidate_cap(limit: usize, configured: usize) -> usize {
+    if limit > configured { limit } else { configured }
 }
+
+/// One process says "your memory store has outgrown the candidate cap" once.
+///
+/// This is a warning, not a debug line: past this point vector recall is
+/// silently incomplete — an old-but-relevant memory is never scored — and the
+/// only fix is an operator raising `[memory] vector_candidate_cap`. Emitting it
+/// per recall would bury the turn logs, so it is latched per process.
+static VECTOR_CANDIDATE_CAP_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Placeholder dialect for D4 read-merge `session_key` predicate fragments.
 const SQLITE_DIALECT: crate::memory::session_predicate::PlaceholderDialect =
     crate::memory::session_predicate::PlaceholderDialect::Sqlite;
@@ -329,6 +335,9 @@ pub struct SqliteMemory {
     vector_weight: f32,
     keyword_weight: f32,
     cache_max: usize,
+    /// Ceiling on the candidates one vector recall scores; see
+    /// `[memory] vector_candidate_cap`.
+    vector_candidate_cap: usize,
 }
 
 impl SqliteMemory {
@@ -549,7 +558,19 @@ impl SqliteMemory {
             vector_weight,
             keyword_weight,
             cache_max,
+            vector_candidate_cap: VECTOR_CANDIDATE_CAP,
         })
+    }
+
+    /// Override how many embedded memories one vector recall may score.
+    ///
+    /// Wired from `[memory] vector_candidate_cap`. A cap of zero would score
+    /// nothing at all, so it is clamped back to the shipped floor rather than
+    /// silently disabling vector recall.
+    #[must_use]
+    pub const fn with_vector_candidate_cap(mut self, cap: usize) -> Self {
+        self.vector_candidate_cap = if cap == 0 { VECTOR_CANDIDATE_CAP } else { cap };
+        self
     }
 
     /// Snapshot of reader-pool and writer contention counters.
@@ -702,10 +723,9 @@ impl SqliteMemory {
             );
             CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
             CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(key);
-            -- Bounds the unindexed cosine scan in `vector_search` to the most
-            -- recently updated embedded memories.
-            CREATE INDEX IF NOT EXISTS idx_memories_embedding_recency
-                ON memories(updated_at DESC) WHERE embedding IS NOT NULL;
+            -- The vector-recall candidate index is created after the column
+            -- migrations below, because the columns it spans are added by
+            -- ALTER TABLE on stores that predate them.
 
             -- FTS5 full-text search (BM25 scoring)
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -1309,6 +1329,29 @@ impl SqliteMemory {
                 }
             }
         }
+
+        // Only now do `memories.embedding_provider` / `embedding_model` /
+        // `embedding_dimensions` exist on every store: a database created by an
+        // older build (or by `snapshot::hydrate_from_snapshot`, which writes a
+        // minimal `memories` table) gets them from the ALTER TABLE block above,
+        // so an index spanning them cannot live in the CREATE TABLE batch.
+        conn.execute_batch(
+            // Superseded index: it led with `updated_at`, a local-offset RFC 3339
+            // string whose lexicographic order is not chronological across
+            // timezone or DST changes, and it carried none of the
+            // embedding-identity columns every vector query filters on, so a
+            // store whose embedding model had changed scanned past large runs of
+            // non-matching rows to fill the candidate set.
+            "DROP INDEX IF EXISTS idx_memories_embedding_recency;
+             -- Leads with the three columns `vector_search` always
+             -- equality-filters, which leaves the matching entries already
+             -- ordered by rowid, so the newest-first candidate window is a
+             -- backward index scan with no sort and no scan of rows belonging to
+             -- another embedding model.
+             CREATE INDEX IF NOT EXISTS idx_memories_embedding_candidates
+                 ON memories(embedding_provider, embedding_model, embedding_dimensions)
+                 WHERE embedding IS NOT NULL;",
+        )?;
 
         let mut chunk_column_stmt = conn.prepare("PRAGMA table_info(document_chunks)")?;
         let existing_chunk_columns = chunk_column_stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -2874,11 +2917,25 @@ impl SqliteMemory {
     /// Optional `category` and `session_id` filters reduce full-table scans
     /// when the caller already knows the scope of relevant memories.
     ///
-    /// Cosine similarity has no index, so the candidate set is bounded by
-    /// recency (`idx_memories_embedding_recency`) before scoring: without a
-    /// bound this is O(N) over every embedded memory on a path that runs once
-    /// per turn. The bound is generous enough that it is inert for realistic
-    /// memory stores and only engages once recall would otherwise degrade.
+    /// Cosine similarity has no index, so the candidate set is bounded before
+    /// scoring: without a bound this is O(N) over every embedded memory on a
+    /// path that runs once per turn.
+    ///
+    /// The bound orders by `rowid`, not by `updated_at`. `updated_at` is
+    /// `Local::now().to_rfc3339()` — an RFC 3339 string carrying the writer's
+    /// UTC offset — and it is ordered lexicographically by SQLite. Within one
+    /// fixed offset that happens to match chronological order, but a DST
+    /// transition, a machine timezone change, or a store shared between
+    /// processes in different zones reorders whole blocks of rows, and any row
+    /// historically written with `Utc::now()` sorts in a third order again. The
+    /// rows dropped by `LIMIT` would then be the wrong ones. `rowid` is
+    /// monotonic per insert, needs no migration, and cannot be reordered by a
+    /// clock; "newest" here therefore means most recently *created*, not most
+    /// recently touched.
+    ///
+    /// `candidate_cap` is the configured `[memory] vector_candidate_cap`. Hitting it is
+    /// a real recall regression — an old-but-relevant memory is never scored —
+    /// so it is reported once per process at `warn`, not at `debug`.
     fn vector_search(
         conn: &Connection,
         query_embedding: &[f32],
@@ -2888,6 +2945,7 @@ impl SqliteMemory {
         limit: usize,
         category: Option<&str>,
         session_id: Option<&str>,
+        candidate_cap: usize,
     ) -> anyhow::Result<Vec<(String, f32)>> {
         let mut sql = "SELECT id, embedding FROM memories
                        WHERE embedding IS NOT NULL
@@ -2911,8 +2969,8 @@ impl SqliteMemory {
             param_values.push(Box::new(sid.to_string()));
             idx += 1;
         }
-        let candidate_cap = vector_candidate_cap(limit);
-        let _ = write!(sql, " ORDER BY updated_at DESC LIMIT ?{idx}");
+        let candidate_cap = vector_candidate_cap(limit, candidate_cap);
+        let _ = write!(sql, " ORDER BY rowid DESC LIMIT ?{idx}");
         param_values.push(Box::new(i64::try_from(candidate_cap).unwrap_or(i64::MAX)));
 
         let mut stmt = conn.prepare(&sql)?;
@@ -2944,11 +3002,13 @@ impl SqliteMemory {
             }
         }
 
-        if candidates >= candidate_cap {
-            tracing::debug!(
+        if candidates >= candidate_cap && !VECTOR_CANDIDATE_CAP_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
                 candidate_cap,
                 limit,
-                "Vector recall reached its recency candidate cap; older embedded memories were not scored"
+                "Vector recall hit its candidate cap: older embedded memories are no longer scored and \
+                 cannot be recalled. Raise [memory] vector_candidate_cap to score more of the store."
             );
         }
 
@@ -3255,6 +3315,7 @@ impl Memory for SqliteMemory {
         let embedding_provider = self.embedding_provider_name();
         let embedding_model = self.embedding_model_name();
         let embedding_dimensions = self.embedder.dimensions();
+        let vector_candidate_cap = self.vector_candidate_cap;
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let reader = pool.read()?;
@@ -3281,6 +3342,7 @@ impl Memory for SqliteMemory {
                     limit * 2,
                     None,
                     session_ref,
+                    vector_candidate_cap,
                 ) {
                     Ok(results) => results,
                     Err(e) => {
@@ -10666,6 +10728,299 @@ source: tool_output\n\
             mem.pool_stats().reader_discards,
             0,
             "the reader was reset, not thrown away"
+        );
+    }
+
+    // ── Vector recall candidate window ───────────────────────────
+
+    fn local_embedding_memory(tmp: &TempDir) -> SqliteMemory {
+        SqliteMemory::with_embedder(
+            tmp.path(),
+            Arc::new(crate::memory::embeddings::LocalHashEmbedding::new(
+                "prx-local-hash-v1",
+                384,
+            )),
+            0.7,
+            0.3,
+            100,
+            None,
+        )
+        .expect("test: open sqlite memory")
+    }
+
+    fn local_query_embedding(text: &str) -> Vec<f32> {
+        use crate::memory::embeddings::EmbeddingProvider as _;
+        let embedder = crate::memory::embeddings::LocalHashEmbedding::new("prx-local-hash-v1", 384);
+        futures::executor::block_on(embedder.embed(&[text]))
+            .expect("test: embed query")
+            .into_iter()
+            .next()
+            .expect("test: one embedding")
+    }
+
+    fn vector_candidates(mem: &SqliteMemory, query: &str, limit: usize, cap: usize) -> Vec<String> {
+        let embedding = local_query_embedding(query);
+        let conn = mem.pool.write();
+        SqliteMemory::vector_search(
+            &conn,
+            &embedding,
+            "local",
+            "prx-local-hash-v1",
+            384,
+            limit,
+            None,
+            None,
+            cap,
+        )
+        .expect("test: vector search")
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+    }
+
+    fn memory_key_for_id(mem: &SqliteMemory, id: &str) -> String {
+        let conn = mem.pool.write();
+        conn.query_row("SELECT key FROM memories WHERE id = ?1", params![id], |row| {
+            row.get::<_, String>(0)
+        })
+        .expect("test: look up memory key")
+    }
+
+    /// The candidate cap is a real recall trade-off, not a formality: past it an
+    /// old memory is never scored no matter how relevant it is. The fixture puts
+    /// the only good match on the far side of a cap of 3 out of 10 embedded
+    /// rows, then raises the cap and gets it back.
+    #[tokio::test]
+    async fn the_vector_candidate_cap_bounds_recall_and_raising_it_restores_the_old_memory() {
+        let tmp = TempDir::new().expect("test: tempdir");
+        let mem = local_embedding_memory(&tmp);
+
+        mem.store(
+            "oldest_relevant",
+            "release deployment pipeline failure",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .expect("test: store the oldest memory");
+        for index in 0..9 {
+            mem.store(
+                &format!("filler_{index}"),
+                &format!("unrelated gardening note number {index}"),
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .expect("test: store filler");
+        }
+
+        let query = "release deployment pipeline failure";
+        let capped = vector_candidates(&mem, query, 5, 3);
+        assert!(
+            !capped.iter().any(|id| memory_key_for_id(&mem, id) == "oldest_relevant"),
+            "a cap of 3 over 10 embedded rows must not reach the oldest memory"
+        );
+
+        let widened = vector_candidates(&mem, query, 5, 100);
+        assert_eq!(
+            widened.first().map(|id| memory_key_for_id(&mem, id)).as_deref(),
+            Some("oldest_relevant"),
+            "raising [memory] vector_candidate_cap must bring the old memory back"
+        );
+    }
+
+    /// `updated_at` is `Local::now().to_rfc3339()`, and SQLite orders it as text.
+    /// Across a DST transition the later instant sorts *earlier* as a string, so
+    /// ordering the candidate window by `updated_at` truncates the wrong rows.
+    /// This fixture writes exactly that pair of timestamps and asserts the
+    /// window still follows insertion order.
+    #[tokio::test]
+    async fn the_candidate_window_follows_insertion_order_not_local_timestamp_text() {
+        let tmp = TempDir::new().expect("test: tempdir");
+        let mem = local_embedding_memory(&tmp);
+
+        for index in 0..4 {
+            mem.store(
+                &format!("note_{index}"),
+                "release deployment pipeline failure",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .expect("test: store note");
+        }
+
+        {
+            let conn = mem.pool.write();
+            // 01:30-04:00 is 05:30Z; 01:15-05:00 is 06:15Z. The rows written
+            // *later* (note_2, note_3) therefore carry the timestamp that sorts
+            // *first* as text, which is exactly what a DST end does to this
+            // column.
+            for (key, updated_at) in [
+                ("note_0", "2026-11-01T01:30:00-04:00"),
+                ("note_1", "2026-11-01T01:31:00-04:00"),
+                ("note_2", "2026-11-01T01:15:00-05:00"),
+                ("note_3", "2026-11-01T01:16:00-05:00"),
+            ] {
+                conn.execute(
+                    "UPDATE memories SET updated_at = ?1 WHERE key = ?2",
+                    params![updated_at, key],
+                )
+                .expect("test: rewrite updated_at");
+            }
+        }
+
+        let window: Vec<String> = vector_candidates(&mem, "release deployment pipeline failure", 2, 2)
+            .iter()
+            .map(|id| memory_key_for_id(&mem, id))
+            .collect();
+        let mut sorted = window;
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec!["note_2".to_string(), "note_3".to_string()],
+            "the two most recently inserted rows must be the candidates; ordering by updated_at text \
+             would have picked note_0/note_1, whose local-offset strings sort later"
+        );
+    }
+
+    /// Both optional filters bind their own placeholder. When `category` and
+    /// `session_id` were supplied together the third placeholder was reused, so
+    /// the candidate limit was bound where the session filter belonged.
+    #[tokio::test]
+    async fn category_and_session_filters_bind_distinct_placeholders() {
+        let tmp = TempDir::new().expect("test: tempdir");
+        let mem = local_embedding_memory(&tmp);
+
+        mem.store(
+            "wanted",
+            "release deployment pipeline failure",
+            MemoryCategory::Core,
+            Some("session-a"),
+        )
+        .await
+        .expect("test: store wanted");
+        mem.store(
+            "wrong_session",
+            "release deployment pipeline failure",
+            MemoryCategory::Core,
+            Some("session-b"),
+        )
+        .await
+        .expect("test: store wrong session");
+        mem.store(
+            "wrong_category",
+            "release deployment pipeline failure",
+            MemoryCategory::Daily,
+            Some("session-a"),
+        )
+        .await
+        .expect("test: store wrong category");
+
+        let embedding = local_query_embedding("release deployment pipeline failure");
+        let conn = mem.pool.write();
+        let matched = SqliteMemory::vector_search(
+            &conn,
+            &embedding,
+            "local",
+            "prx-local-hash-v1",
+            384,
+            10,
+            Some("core"),
+            Some("session-a"),
+            100,
+        )
+        .expect("test: filtered vector search");
+        drop(conn);
+
+        let keys: Vec<String> = matched.iter().map(|(id, _)| memory_key_for_id(&mem, id)).collect();
+        assert_eq!(
+            keys,
+            vec!["wanted".to_string()],
+            "both filters must apply; a collided placeholder drops or widens one of them"
+        );
+    }
+
+    /// The candidate window must be an index scan, not a sort: the index leads
+    /// with the three embedding-identity columns every vector query filters on,
+    /// which leaves its entries already in rowid order.
+    #[tokio::test]
+    async fn the_candidate_window_is_served_by_an_index_without_a_sort() {
+        let tmp = TempDir::new().expect("test: tempdir");
+        let mem = local_embedding_memory(&tmp);
+        mem.store("seed", "release deployment", MemoryCategory::Core, None)
+            .await
+            .expect("test: store seed");
+
+        let conn = mem.pool.write();
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id, embedding FROM memories \
+                 WHERE embedding IS NOT NULL AND embedding_provider = ?1 AND embedding_model = ?2 \
+                 AND embedding_dimensions = ?3 ORDER BY rowid DESC LIMIT ?4",
+                params!["local", "prx-local-hash-v1", 384_i64, 10_i64],
+                |row| row.get::<_, String>(3),
+            )
+            .expect("test: explain query plan");
+        assert!(
+            plan.contains("idx_memories_embedding_candidates"),
+            "the candidate window must use the embedding-identity index, got: {plan}"
+        );
+        assert!(
+            !plan.to_ascii_uppercase().contains("TEMP B-TREE"),
+            "the candidate window must not sort, got: {plan}"
+        );
+    }
+
+    /// Opening an existing store must retire the 0.8.124 index, whose leading
+    /// column was the local-timestamp text this no longer orders by.
+    #[tokio::test]
+    async fn opening_an_existing_store_retires_the_timestamp_ordered_index() {
+        let tmp = TempDir::new().expect("test: tempdir");
+        {
+            let mem = local_embedding_memory(&tmp);
+            mem.store("seed", "release deployment", MemoryCategory::Core, None)
+                .await
+                .expect("test: store seed");
+            let conn = mem.pool.write();
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_memories_embedding_recency \
+                 ON memories(updated_at DESC) WHERE embedding IS NOT NULL;",
+            )
+            .expect("test: recreate the legacy index");
+            let legacy: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_memories_embedding_recency'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("test: count legacy index");
+            assert_eq!(legacy, 1, "test fixture must start with the legacy index present");
+        }
+
+        let reopened = local_embedding_memory(&tmp);
+        let conn = reopened.pool.write();
+        let legacy: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_memories_embedding_recency'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("test: count legacy index after reopen");
+        assert_eq!(legacy, 0, "the timestamp-ordered index must be dropped on open");
+    }
+
+    #[test]
+    fn the_configured_candidate_cap_is_authoritative() {
+        assert_eq!(vector_candidate_cap(5, 2_000), 2_000);
+        assert_eq!(vector_candidate_cap(5, 10), 10, "an operator may lower the cap");
+        // Never below what the caller asked for: scoring fewer candidates than
+        // results would return a short list for no reason.
+        assert_eq!(vector_candidate_cap(50, 10), 50);
+        assert_eq!(
+            crate::config::MemoryConfig::default().vector_candidate_cap,
+            VECTOR_CANDIDATE_CAP,
+            "the shipped default must be the documented one"
         );
     }
 }

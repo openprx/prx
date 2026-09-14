@@ -360,7 +360,8 @@ pub fn create_memory_with_storage_and_routes_with_acl(
             config.sqlite_open_timeout_secs,
             config.acl_enabled,
             config.sqlite_read_pool_size,
-        )?;
+        )?
+        .with_vector_candidate_cap(config.vector_candidate_cap);
         Ok(mem)
     }
 

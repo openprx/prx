@@ -370,6 +370,7 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         keyword_weight: 0.3,
         min_relevance_score: 0.4,
         embedding_cache_size: if profile.uses_sqlite_hygiene { 10000 } else { 0 },
+        vector_candidate_cap: MemoryConfig::default().vector_candidate_cap,
         auto_hydrate: true,
         sqlite_open_timeout_secs: None,
         sqlite_read_pool_size: None,

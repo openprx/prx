@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.126] - 14 September 2026
+
+### Security
+
+- Route the gateway MCP endpoint through the shared tool execution service.
+  `POST /mcp/v1/tools/call` called `Tool::execute_named` directly, so a request
+  body an authenticated external MCP client fully controls reached a tool with
+  no autonomy policy decision, no approval gate, no published-schema check and
+  no audit record — none of which the 0.8.123 schema enforcement could see,
+  because that enforcement lives in `ToolExecutionService::execute`. The
+  endpoint now builds the same service every other entry point uses. Approval
+  there is fail-closed (`DenyApprovalStrategy`): a remote client cannot answer a
+  prompt, so a tool the autonomy level wants confirmed is refused rather than
+  auto-approved. The success and tool-failure response shapes are unchanged, and
+  a service-level refusal reuses the same envelope with `is_error: true`.
+  `exposed_tools` semantics are unchanged.
+  `tests/architecture_boundaries.rs` now pins the inventory of production call
+  sites that invoke a tool directly, so a new bypass fails a test.
+
+### Fixed
+
+- Validate tool arguments against the schema the provider was actually shown.
+  Gemini's API rejects `additionalProperties`, `minLength`, `minimum` and a
+  dozen more keywords, so those are stripped before the request goes out — but
+  validation ran against the unstripped document, so every tool that closes its
+  property set (30+ of them) rejected otherwise-correct Gemini calls for a field
+  the model was never told about. Execution now carries the provider's schema
+  dialect and replays the same `SchemaCleanr` strategy before validating, so the
+  relaxation list is the cleaner's list rather than a second copy of it.
+  Everything that survives the rewrite stays enforced, and OpenAI and
+  OpenAI-compatible endpoints are validated against the published document
+  unchanged.
+- Print the `prx init` report instead of logging it. `prx init` returns before
+  any tracing subscriber is installed, so the archive directory, the list of
+  preserved keys and the reset warning all went nowhere: an operator whose whole
+  configuration had just been reset to templates saw no output at all. The
+  report is now written to stdout/stderr directly.
+- Stop `prx init --force` from resetting a configuration silently. When the
+  preserved values fail staged validation the command still falls back to bare
+  templates — that is how `--force` repairs a configuration this build cannot
+  load — but it now prints an uppercase warning naming the archive directory and
+  the validation error, and exits non-zero.
+- Order the vector recall candidate window by insertion (`rowid`) instead of
+  `updated_at`. `updated_at` is a local-offset RFC 3339 string ordered as text,
+  so a DST transition, a machine timezone change, or a store shared between
+  processes in different zones reordered whole blocks of rows and truncated the
+  wrong ones. The partial index is replaced by
+  `idx_memories_embedding_candidates`, which leads with the three
+  embedding-identity columns every vector query filters on; the previous index
+  led with `updated_at` and carried none of them, so a store whose embedding
+  model had changed scanned past large runs of non-matching rows.
+  `idx_memories_embedding_recency` is dropped on open.
+
+### Added
+
+- `[memory] vector_candidate_cap` (default 2000) bounds how many embedded
+  memories one vector recall scores. In a store holding more embedded memories
+  than the cap, an old-but-highly-relevant memory is never scored and therefore
+  never recalled; the key makes that trade-off tunable, and vector recall now
+  warns once per process when a recall actually hits the cap instead of logging
+  it at `debug`. `docs/configuration.md` documents the trade-off in both
+  directions.
+
+### Changed
+
+- The vector recall candidate count is the configured cap, raised only to the
+  requested result count. It was `max(limit * 50, 2000)` with nothing to tune,
+  which meant a caller asking for many results silently widened the scan and an
+  operator could not narrow it.
+- `prx init` exits non-zero when it resets a configuration to templates. A
+  script that treated `prx init --force` as always-clean will now see the
+  failure it was hiding; the tree on disk is still valid and usable.
+
 ## [0.8.125] - 14 September 2026
 
 ### Security

@@ -3010,6 +3010,55 @@ Connection: close\r\n\
         assert!(create_provider("gemini", None).is_ok());
     }
 
+    /// `ToolSchemaDialect::for_provider` decides which schema document
+    /// `ToolExecutionService` validates a tool call against. It maps provider
+    /// *labels*, while the rewriting happens inside each provider
+    /// *implementation*; this pins the two together so a provider that starts
+    /// (or stops) cleaning its schemas cannot silently leave the validator
+    /// enforcing a contract the model was never shown.
+    #[test]
+    fn provider_aliases_agree_with_the_declared_schema_dialect() {
+        for alias in [
+            "anthropic",
+            "claude-code",
+            "claude-cli",
+            "gemini",
+            "google",
+            "google-gemini",
+            "openai",
+            "ollama",
+            "openrouter",
+            "venice",
+            "groq",
+        ] {
+            let provider = create_provider(alias, Some("test-key"))
+                .unwrap_or_else(|error| panic!("test: provider {alias} constructs: {error}"));
+            assert_eq!(
+                provider.tool_schema_dialect(),
+                crate::tools::ToolSchemaDialect::for_provider(alias),
+                "provider label '{alias}' maps to a different schema dialect than the provider itself declares"
+            );
+        }
+    }
+
+    /// The two labels that do rewrite their schemas must not decay to `Raw`,
+    /// which would put the validator back on the published document.
+    #[test]
+    fn cleaning_providers_declare_a_non_raw_dialect() {
+        assert_eq!(
+            crate::tools::ToolSchemaDialect::for_provider("gemini"),
+            crate::tools::ToolSchemaDialect::Gemini
+        );
+        assert_eq!(
+            crate::tools::ToolSchemaDialect::for_provider("anthropic"),
+            crate::tools::ToolSchemaDialect::Anthropic
+        );
+        assert_eq!(
+            crate::tools::ToolSchemaDialect::for_provider("openai"),
+            crate::tools::ToolSchemaDialect::Raw
+        );
+    }
+
     // ── OpenAI-compatible providers ──────────────────────────
 
     #[test]

@@ -26,8 +26,24 @@ impl Spec {
         }
     }
 
-    /// Generate the full configuration tree into `target_dir`.
+    /// Generate the full configuration tree into `target_dir`, printing the
+    /// report to stdout/stderr.
+    ///
+    /// `prx init` returns from `main` *before* any tracing subscriber is
+    /// installed, so anything this path logged through `tracing` went nowhere:
+    /// the operator saw neither the preserved-key list, nor the archive
+    /// directory, nor the warning that their whole configuration had been
+    /// reset. The report is therefore written directly to stdout/stderr, and
+    /// [`InitReport::into_result`] turns a reset into a non-zero exit.
     pub async fn generate(self, target_dir: &Path, force: bool) -> Result<()> {
+        let report = self.generate_reported(target_dir, force).await?;
+        report.print();
+        report.into_result()
+    }
+
+    /// [`generate`](Self::generate) without the printing, so callers (and
+    /// tests) can inspect exactly what the operator is told.
+    pub async fn generate_reported(self, target_dir: &Path, force: bool) -> Result<InitReport> {
         // 1. Check for existing configuration
         let config_path = target_dir.join("config.toml");
         let regenerating = config_path.exists();
@@ -60,20 +76,22 @@ impl Spec {
         // `--force` is a repair operation, not a reset.
         let main_toml = main_config_template(self);
         let workspace_dir = target_dir.join("workspace");
+        let mut report = InitReport::default();
+        let archive = if regenerating {
+            archive_previous_config(target_dir, &config_path)?
+        } else {
+            None
+        };
         let (effective_main, effective_fragments) = if regenerating {
-            let archive = archive_previous_config(target_dir, &config_path)?;
             match preserve_previous_settings(&config_path, &main_toml, &fragments) {
                 Ok((merged_main, merged_fragments, outcome)) => {
-                    report_preservation(&outcome, archive.as_deref());
+                    report.record_preservation(&outcome, archive.as_deref());
                     (merged_main, merged_fragments)
                 }
                 Err(error) => {
-                    tracing::warn!(
-                        "Could not read the previous configuration to preserve explicit settings ({error:#}); \
-                         regenerating from templates. Previous files: {}",
-                        archive
-                            .as_deref()
-                            .map_or_else(|| "not archived".to_string(), |path| path.display().to_string())
+                    report.record_reset(
+                        &format!("the previous configuration could not be read ({error:#})"),
+                        archive.as_deref(),
                     );
                     (main_toml.clone(), fragments.clone())
                 }
@@ -87,10 +105,15 @@ impl Spec {
         let plan = match super::files::plan_mutation(&config_path, &workspace_dir, effective_main, effective_fragments)
         {
             Ok(plan) => plan,
+            // Falling back to bare templates still repairs a configuration that
+            // this build cannot load at all, which is what `--force` is for; it
+            // is not allowed to do so quietly. The operator's values are in the
+            // archive, the reason is printed, and `into_result` exits non-zero
+            // so neither a human nor a script can mistake this for a clean run.
             Err(error) if regenerating => {
-                tracing::warn!(
-                    "Preserved settings do not validate against this build ({error:#}); \
-                     regenerating from templates instead. Previous values remain in the archive directory."
+                report.record_reset(
+                    &format!("the preserved settings do not validate against this build ({error:#})"),
+                    archive.as_deref(),
                 );
                 super::files::plan_mutation(&config_path, &workspace_dir, main_toml, fragments)?
             }
@@ -114,14 +137,116 @@ impl Spec {
         #[cfg(unix)]
         set_directory_permissions(target_dir)?;
 
-        // 8. Log summary
-        tracing::info!("PRX configuration initialized ({spec})", spec = self.name());
-        tracing::info!("  Config dir: {}", target_dir.display());
-        tracing::info!("  Capabilities are always available; activation follows concrete configuration");
-        tracing::info!("  Config files: config.toml + 13 managed fragments");
-        tracing::info!("  Workspace .md files scaffolded");
+        // 8. Summary
+        report
+            .notices
+            .insert(0, format!("PRX configuration initialized ({spec})", spec = self.name()));
+        report
+            .notices
+            .insert(1, format!("  Config dir: {}", target_dir.display()));
+        report
+            .notices
+            .push("  Capabilities are always available; activation follows concrete configuration".to_string());
+        report
+            .notices
+            .push("  Config files: config.toml + 13 managed fragments".to_string());
+        report.notices.push("  Workspace .md files scaffolded".to_string());
 
-        Ok(())
+        Ok(report)
+    }
+}
+
+/// What `prx init` tells the operator, kept separate from how it is printed.
+///
+/// `prx init` runs before any tracing subscriber exists, so this is written to
+/// stdout/stderr rather than logged. Holding it as data also lets tests assert
+/// on the exact lines an operator sees instead of on a log sink that would be
+/// empty in production anyway.
+#[derive(Debug, Default)]
+pub struct InitReport {
+    notices: Vec<String>,
+    warnings: Vec<String>,
+    /// Set when the operator's values were discarded and bare templates were
+    /// written instead. Carries the full explanation, including the archive.
+    reset: Option<String>,
+}
+
+impl InitReport {
+    /// Informational lines, in the order they are printed to stdout.
+    #[must_use]
+    pub fn notices(&self) -> &[String] {
+        &self.notices
+    }
+
+    /// Warning lines, in the order they are printed to stderr.
+    #[must_use]
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    /// Whether the operator's explicit settings were discarded.
+    #[must_use]
+    pub const fn was_reset_to_templates(&self) -> bool {
+        self.reset.is_some()
+    }
+
+    /// Write the report where `prx init` can actually be read: stdout for the
+    /// summary, stderr for anything the operator has to act on.
+    // `prx init` has no log subscriber and no TUI; stdout/stderr is the only
+    // channel it has, which is the whole point of this type.
+    #[allow(clippy::print_stdout, clippy::print_stderr)]
+    pub fn print(&self) {
+        for line in &self.notices {
+            println!("{line}");
+        }
+        for line in &self.warnings {
+            eprintln!("{line}");
+        }
+    }
+
+    /// A reset is a data-loss event, so it ends the command non-zero even
+    /// though the tree on disk is valid and usable.
+    pub fn into_result(self) -> Result<()> {
+        self.reset.map_or_else(|| Ok(()), |reason| Err(anyhow::anyhow!(reason)))
+    }
+
+    fn record_preservation(&mut self, outcome: &PreservationOutcome, archive: Option<&Path>) {
+        if let Some(path) = archive {
+            self.notices
+                .push(format!("  Previous configuration archived to {}", path.display()));
+        }
+        if outcome.kept.is_empty() {
+            self.notices
+                .push("  No explicit settings differed from the regenerated templates".to_string());
+        } else {
+            self.notices.push(format!(
+                "  Preserved {} explicit setting(s): {}",
+                outcome.kept.len(),
+                outcome.kept.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if !outcome.dropped.is_empty() {
+            self.warnings.push(format!(
+                "WARNING: reset {} setting(s) this build can no longer represent: {}",
+                outcome.dropped.len(),
+                outcome.dropped.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+
+    fn record_reset(&mut self, reason: &str, archive: Option<&Path>) {
+        let archive = archive.map_or_else(
+            || "NOT ARCHIVED - the previous files were not copied".to_string(),
+            |path| path.display().to_string(),
+        );
+        let message = format!(
+            "WARNING: EVERY EXPLICIT SETTING WAS RESET TO THE SHIPPED TEMPLATES because {reason}. \
+             Your previous configuration is at {archive} - copy the values you still want back into \
+             config.toml or config.d/, then run `prx doctor`. Nothing was lost on disk, but this \
+             installation is now running on defaults."
+        );
+        self.warnings.push(message.clone());
+        self.reset = Some(message);
     }
 }
 
@@ -140,28 +265,6 @@ impl Spec {
 struct PreservationOutcome {
     kept: BTreeSet<String>,
     dropped: BTreeSet<String>,
-}
-
-fn report_preservation(outcome: &PreservationOutcome, archive: Option<&Path>) {
-    if let Some(path) = archive {
-        tracing::info!("  Previous configuration archived to {}", path.display());
-    }
-    if outcome.kept.is_empty() {
-        tracing::info!("  No explicit settings differed from the regenerated templates");
-    } else {
-        tracing::info!(
-            "  Preserved {} explicit setting(s): {}",
-            outcome.kept.len(),
-            outcome.kept.iter().cloned().collect::<Vec<_>>().join(", ")
-        );
-    }
-    if !outcome.dropped.is_empty() {
-        tracing::warn!(
-            "  Reset {} setting(s) this build can no longer represent: {}",
-            outcome.dropped.len(),
-            outcome.dropped.iter().cloned().collect::<Vec<_>>().join(", ")
-        );
-    }
 }
 
 /// Copy the previous `config.toml` and every `config.d` fragment into a
@@ -1732,6 +1835,117 @@ mod tests {
             .as_ref()
             .expect("test: a preset without a channels template must not delete channel settings");
         assert_eq!(telegram.bot_token, "operator-token");
+    }
+
+    /// `prx init` returns before any tracing subscriber is installed, so the
+    /// preservation report has to be printed, not logged. This pins the lines
+    /// an operator actually receives: the archive directory and the explicit
+    /// keys that survived.
+    #[tokio::test]
+    async fn force_regeneration_reports_the_archive_and_the_preserved_keys() {
+        let tmp = tempfile::tempdir().expect("test: create tempdir");
+        let dir = tmp.path();
+        Spec::Full.generate(dir, false).await.expect("test: generate full");
+        fs::write(
+            dir.join("config.d/memory.toml"),
+            "[memory]\nembedding_provider = \"none\"\nconversation_retention_days = 99\n",
+        )
+        .expect("test: write operator memory fragment");
+
+        let report = Spec::Full
+            .generate_reported(dir, true)
+            .await
+            .expect("test: force regenerate");
+
+        assert!(!report.was_reset_to_templates());
+        let notices = report.notices().join("\n");
+        let archive_line = report
+            .notices()
+            .iter()
+            .find(|line| line.contains("Previous configuration archived to"))
+            .expect("test: the archive directory must be reported");
+        let archive_path = archive_line
+            .rsplit_once("archived to ")
+            .map(|(_, path)| PathBuf::from(path))
+            .expect("test: the archive line must name a path");
+        assert!(
+            archive_path.join("memory.toml").exists(),
+            "the reported archive directory must be the real one: {}",
+            archive_path.display()
+        );
+        assert!(
+            notices.contains("Preserved") && notices.contains("explicit setting(s)"),
+            "the preserved-key count must be reported: {notices}"
+        );
+        assert!(
+            notices.contains("memory.conversation_retention_days"),
+            "each preserved key must be named: {notices}"
+        );
+        assert!(report.warnings().is_empty(), "a clean preserve must not warn");
+    }
+
+    /// The fallback to bare templates throws away every value the operator
+    /// typed. It stays available — it is how `--force` repairs a configuration
+    /// this build cannot load — but it must be impossible to miss: an uppercase
+    /// warning naming the archive, and a non-zero exit.
+    #[tokio::test]
+    async fn a_configuration_that_cannot_validate_reports_the_reset_and_exits_non_zero() {
+        let tmp = tempfile::tempdir().expect("test: create tempdir");
+        let dir = tmp.path();
+        Spec::Full.generate(dir, false).await.expect("test: generate full");
+        // A telegram block without `allowed_users` folds in cleanly but fails
+        // the staged validation, which is exactly the shape that used to reset
+        // the whole tree with a single dropped `tracing::warn!`.
+        fs::write(
+            dir.join("config.d/channels.toml"),
+            "[channels_config.telegram]\nbot_token = \"operator-token\"\n",
+        )
+        .expect("test: write invalid operator channels fragment");
+
+        let report = Spec::Full
+            .generate_reported(dir, true)
+            .await
+            .expect("test: the tree is still regenerated");
+
+        assert!(
+            report.was_reset_to_templates(),
+            "an unvalidatable preserve must be recorded as a reset"
+        );
+        let warning = report
+            .warnings()
+            .iter()
+            .find(|line| line.contains("EVERY EXPLICIT SETTING WAS RESET"))
+            .expect("test: the reset must be an uppercase warning");
+        let archive = fs::read_dir(dir)
+            .expect("test: read target dir")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("config.d.pre-"))
+            })
+            .expect("test: the previous configuration must still be archived");
+        assert!(
+            warning.contains(&archive.display().to_string()),
+            "the warning must point at the archive directory: {warning}"
+        );
+        assert!(
+            fs::read_to_string(archive.join("channels.toml"))
+                .expect("test: read archived fragment")
+                .contains("operator-token"),
+            "the archive the warning points at must hold the operator's values"
+        );
+
+        // The tree on disk is valid and usable ...
+        crate::config::Config::load_from_path(&dir.join("config.toml"), dir.join("workspace"))
+            .expect("test: the regenerated config must load");
+        // ... but the command still fails, so no script treats this as clean.
+        let error = report.into_result().expect_err("test: a reset must exit non-zero");
+        assert!(
+            format!("{error:#}").contains("EVERY EXPLICIT SETTING WAS RESET"),
+            "the process exit must carry the same explanation: {error:#}"
+        );
     }
 
     #[tokio::test]

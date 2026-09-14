@@ -52,7 +52,9 @@
 //! ```
 //!
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hasher};
 use std::sync::{Arc, LazyLock};
@@ -675,21 +677,119 @@ fn hash_schema(value: &Value, hasher: &mut impl Hasher) {
     }
 }
 
+/// Which schema document a provider was actually shown for this request.
+///
+/// Tool schemas are not sent verbatim to every provider: Gemini rejects a long
+/// list of keywords and Anthropic does not resolve `$ref`, so
+/// [`SchemaCleanr`] rewrites the published document before it goes on the wire.
+/// Validating the model's answer against the *unrewritten* document therefore
+/// rejects calls the model had no way to get right — a model that was never
+/// shown `additionalProperties: false` cannot be held to it.
+///
+/// This enum names the rewrite that was applied so the validator can enforce
+/// exactly the contract the model saw. The relaxation list is never duplicated:
+/// each variant maps to the same [`CleaningStrategy`] the provider used, so a
+/// keyword added to (or removed from) [`GEMINI_UNSUPPORTED_KEYWORDS`] changes
+/// both sides at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSchemaDialect {
+    /// The provider was shown the published document unchanged (OpenAI, every
+    /// OpenAI-compatible endpoint, Ollama, and every non-model entry point such
+    /// as the gateway MCP server).
+    #[default]
+    Raw,
+    /// The provider was shown `SchemaCleanr::clean_for_gemini(..)`.
+    Gemini,
+    /// The provider was shown `SchemaCleanr::clean_for_anthropic(..)`.
+    Anthropic,
+}
+
+impl ToolSchemaDialect {
+    /// The dialect a provider label selects.
+    ///
+    /// The labels are the ones `crate::providers::create_provider` accepts;
+    /// `provider_aliases_agree_with_the_declared_schema_dialect` in
+    /// `src/providers/mod.rs` pins this map against what each provider
+    /// implementation actually does, so the two cannot drift.
+    #[must_use]
+    pub fn for_provider(provider: &str) -> Self {
+        match provider.trim().to_ascii_lowercase().as_str() {
+            "gemini" | "google" | "google-gemini" => Self::Gemini,
+            "anthropic" | "claude-code" | "claude-cli" => Self::Anthropic,
+            _ => Self::Raw,
+        }
+    }
+
+    /// The cleaning strategy this dialect corresponds to, or `None` when the
+    /// published document went out untouched.
+    #[must_use]
+    pub const fn cleaning_strategy(self) -> Option<CleaningStrategy> {
+        match self {
+            Self::Raw => None,
+            Self::Gemini => Some(CleaningStrategy::Gemini),
+            Self::Anthropic => Some(CleaningStrategy::Anthropic),
+        }
+    }
+
+    /// The document a call made under this dialect must be validated against.
+    ///
+    /// Borrowed for [`Raw`](Self::Raw) — the overwhelmingly common case — so the
+    /// validator allocates nothing when no rewrite happened.
+    #[must_use]
+    pub fn enforceable_schema<'a>(self, schema: &'a Value) -> Cow<'a, Value> {
+        self.cleaning_strategy().map_or(Cow::Borrowed(schema), |strategy| {
+            Cow::Owned(SchemaCleanr::clean(schema.clone(), strategy))
+        })
+    }
+}
+
+/// Compile `schema` once per (tool name, dialect, schema fingerprint) and reuse it.
+///
+/// Every production tool call validates its arguments, so the compile step must
+/// not repeat per call. Fingerprinting is a non-allocating walk of the *published*
+/// schema with the dialect folded in; compiling — and, for a non-`Raw` dialect,
+/// cleaning — is not, which is what the cache saves. One process normally talks
+/// to one provider family, so the dialect component is stable in practice;
+/// alternating families for the same tool name misses the cache and recompiles,
+/// exactly as alternating schemas for one name already does.
 #[must_use]
-fn schema_fingerprint(schema: &Value) -> u64 {
+pub fn compiled_tool_schema_for_dialect(
+    tool_name: &str,
+    dialect: ToolSchemaDialect,
+    schema: &Value,
+) -> Arc<CompiledToolSchema> {
+    let fingerprint = dialect_schema_fingerprint(dialect, schema);
+    {
+        let cache = COMPILED_TOOL_SCHEMAS.read();
+        if let Some((cached_fingerprint, compiled)) = cache.get(tool_name)
+            && *cached_fingerprint == fingerprint
+        {
+            return Arc::clone(compiled);
+        }
+    }
+    let compiled = Arc::new(CompiledToolSchema::compile(&dialect.enforceable_schema(schema)));
+    let mut cache = COMPILED_TOOL_SCHEMAS.write();
+    if cache.len() >= COMPILED_TOOL_SCHEMA_CACHE_CAPACITY && !cache.contains_key(tool_name) {
+        cache.clear();
+    }
+    cache.insert(tool_name.to_string(), (fingerprint, Arc::clone(&compiled)));
+    compiled
+}
+
+#[must_use]
+fn dialect_schema_fingerprint(dialect: ToolSchemaDialect, schema: &Value) -> u64 {
     let mut hasher = DefaultHasher::new();
+    hasher.write_u8(dialect as u8);
     hash_schema(schema, &mut hasher);
     hasher.finish()
 }
 
-/// Compile `schema` once per (tool name, schema fingerprint) and reuse it.
-///
-/// Every production tool call validates its arguments, so the compile step must
-/// not repeat per call. Fingerprinting is a non-allocating walk of the schema;
-/// compiling is not, which is what the cache saves.
+/// [`compiled_tool_schema_for_dialect`] for callers that hold the published
+/// document with no provider rewrite in play.
 #[must_use]
 pub fn compiled_tool_schema(tool_name: &str, schema: &Value) -> Arc<CompiledToolSchema> {
-    let fingerprint = schema_fingerprint(schema);
+    let fingerprint = dialect_schema_fingerprint(ToolSchemaDialect::Raw, schema);
     {
         let cache = COMPILED_TOOL_SCHEMAS.read();
         if let Some((cached_fingerprint, compiled)) = cache.get(tool_name)
@@ -1969,6 +2069,80 @@ mod tests {
             validate_tool_arguments(&schema, &json!({"value": "ok", "unexpected": true}))
                 .iter()
                 .any(|issue| issue.path == "$.unexpected")
+        );
+    }
+
+    /// The relaxation list is the cleaner's list, not a copy of it: every
+    /// keyword `clean_for_gemini` deletes must be gone from the document the
+    /// Gemini dialect enforces, and nothing else may be.
+    #[test]
+    fn the_gemini_dialect_enforces_exactly_what_clean_for_gemini_leaves() {
+        let published = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["mode"],
+            "properties": {
+                "mode": {"type": "string", "enum": ["read", "write"], "minLength": 1},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+                "tags": {"type": "array", "items": {"type": "string"}, "minItems": 1}
+            }
+        });
+
+        let enforced = ToolSchemaDialect::Gemini.enforceable_schema(&published);
+        assert_eq!(
+            enforced.as_ref(),
+            &SchemaCleanr::clean_for_gemini(published.clone()),
+            "the Gemini dialect must enforce the exact document clean_for_gemini produces"
+        );
+
+        let rendered = enforced.to_string();
+        for keyword in GEMINI_UNSUPPORTED_KEYWORDS {
+            assert!(
+                !rendered.contains(&format!("\"{keyword}\"")),
+                "{keyword} survived into the enforced Gemini document"
+            );
+        }
+        // Everything Gemini *does* see stays enforceable.
+        for keyword in ["type", "enum", "required", "properties", "items"] {
+            assert!(
+                rendered.contains(&format!("\"{keyword}\"")),
+                "{keyword} must survive cleaning and stay enforced"
+            );
+        }
+
+        // Raw borrows the published document untouched — no allocation, no drift.
+        let raw = ToolSchemaDialect::Raw.enforceable_schema(&published);
+        assert!(matches!(raw, Cow::Borrowed(_)));
+        assert_eq!(raw.as_ref(), &published);
+    }
+
+    /// A cached compilation must never be reused across dialects: the same tool
+    /// name with the same published schema means two different contracts on the
+    /// Gemini and OpenAI paths.
+    #[test]
+    fn the_compiled_schema_cache_separates_dialects() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {"mode": {"type": "string"}}
+        });
+        let args = json!({"mode": "read", "extra": 1});
+
+        let raw = compiled_tool_schema_for_dialect("dialect_cache_tool", ToolSchemaDialect::Raw, &schema);
+        assert!(
+            !raw.validate_tool_arguments(&args).is_empty(),
+            "the published contract closes the property set"
+        );
+        let gemini = compiled_tool_schema_for_dialect("dialect_cache_tool", ToolSchemaDialect::Gemini, &schema);
+        assert!(
+            gemini.validate_tool_arguments(&args).is_empty(),
+            "the Gemini contract has no additionalProperties to enforce"
+        );
+        // Back to Raw: the dialect must not have been cached over.
+        let raw_again = compiled_tool_schema_for_dialect("dialect_cache_tool", ToolSchemaDialect::Raw, &schema);
+        assert!(
+            !raw_again.validate_tool_arguments(&args).is_empty(),
+            "the Gemini compilation leaked into the Raw path"
         );
     }
 }

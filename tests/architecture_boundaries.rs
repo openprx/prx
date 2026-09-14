@@ -852,3 +852,140 @@ fn tool_arguments_are_schema_validated_on_the_production_execution_path() {
         "the per-tool compiled-schema cache is gone; every production call would recompile its contract"
     );
 }
+
+/// Strip every `#[cfg(test)]` item from `source`, brace-balanced.
+///
+/// Line-based and deliberately conservative: it matches the shape this crate
+/// actually uses (`#[cfg(test)]` immediately above a `mod tests {` or a
+/// test-only item). Anything it cannot balance is dropped, which errs towards
+/// scanning less rather than reporting a test as a production bypass.
+fn strip_cfg_test_items(source: &str) -> String {
+    let mut kept = Vec::new();
+    let mut lines = source.lines();
+    while let Some(line) = lines.next() {
+        if line.trim_start().starts_with("#[cfg(test)]") {
+            let mut depth: i32 = 0;
+            let mut started = false;
+            for next in lines.by_ref() {
+                for character in next.chars() {
+                    if character == '{' {
+                        depth += 1;
+                        started = true;
+                    } else if character == '}' {
+                        depth -= 1;
+                    }
+                }
+                if started && depth <= 0 {
+                    break;
+                }
+            }
+            continue;
+        }
+        kept.push(line);
+    }
+    kept.join("\n")
+}
+
+/// Production call sites that invoke a `Tool` directly instead of going through
+/// `ToolExecutionService`, each with the reason it is allowed to.
+///
+/// `ToolExecutionService::execute` is the only place that applies the autonomy
+/// policy, the approval gate, the published-schema check and the audit record.
+/// A direct `Tool::execute_named` call skips all four. The gateway MCP endpoint
+/// did exactly that until 0.8.126 and handed an unauthenticated-by-the-runtime,
+/// fully attacker-controlled body straight to a tool; this inventory exists so
+/// the next one fails a test instead of shipping.
+///
+/// Two shapes are legitimate and listed here:
+///  * **decorators** — a `Tool` implementation forwarding to the tool it wraps.
+///    The service already ran its gates on the outer call; the inner hop is one
+///    tool's own implementation detail.
+///  * **operator-typed chat commands** — `!cmd`, `@file`, `/spawn` and friends
+///    in the terminal UI, where the human at the keyboard *is* the authority and
+///    there is no model-authored argument document to validate. Converging these
+///    onto the service is tracked separately; adding a new one is not.
+///
+/// A new entry needs a reason on the line above it, and any entry under
+/// `src/gateway/` is a regression of the 0.8.126 fix by construction.
+const ALLOWED_DIRECT_TOOL_INVOCATIONS: &[&str] = &[
+    // Legacy `Agent::run_single` shell, reachable only from the crate's own
+    // tests today; kept out of the service until that shell is removed.
+    "src/agent/agent.rs::execute_tool_call",
+    "src/agent/agent.rs::spawn_delegate_task",
+    // Operator-typed terminal commands: `@file` mention expansion, `/kill`,
+    // `/spawn`, `/steer` and `!command`. The human at the keyboard is the
+    // authority and the argument document is built by this code, not by a model.
+    "src/chat/mod.rs::enrich_file_mentions_for_prompt",
+    "src/chat/mod.rs::kill_local_session",
+    "src/chat/mod.rs::run",
+    // Decorator: the WASM plugin runtime dispatches a plugin alias onto the
+    // plugin tool it already resolved.
+    "src/plugins/runtime.rs::dispatch_alias",
+    "src/plugins/runtime.rs::execute_named",
+    // Decorator: delegate/capability aliases forward to the inner tool.
+    "src/tools/delegate.rs::execute",
+    "src/tools/delegate.rs::execute_named",
+    "src/tools/delegate.rs::execute_named_with_cancellation",
+    "src/tools/delegate.rs::execute_with_cancellation",
+    // The service's own legacy per-call adapter.
+    "src/tools/execution.rs::invoke",
+    // Decorator: the `mcp_call` root alias forwards to its own named entry.
+    "src/tools/mcp.rs::execute",
+    // Decorator: the tiering wrapper forwards to the wrapped tool.
+    "src/tools/mod.rs::execute_named",
+    "src/tools/mod.rs::execute_named_with_cancellation",
+    // Decorator: session-scoped aliases rewrite arguments then forward.
+    "src/tools/sessions_spawn.rs::execute",
+    "src/tools/sessions_spawn.rs::execute_named",
+    "src/tools/sessions_spawn.rs::execute_named_with_cancellation",
+    "src/tools/sessions_spawn.rs::execute_with_cancellation",
+    // Decorator: skill aliases forward to the skill runner.
+    "src/tools/skills.rs::execute",
+    "src/tools/skills.rs::execute_named",
+    // Decorator: the `Tool` cancellation twin routes to the named entry.
+    "src/tools/traits.rs::execute_named_with_cancellation",
+];
+
+/// The autonomy policy, the approval gate, the published-schema check and the
+/// audit record all live in `ToolExecutionService::execute`. Anything that calls
+/// a `Tool` directly gets none of them, so the set of direct callers is pinned.
+#[test]
+fn direct_tool_invocations_outside_the_execution_service_are_allowlisted() {
+    let mut found = Vec::new();
+    for path in rust_source_files() {
+        let source = fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let production = strip_cfg_test_items(&source);
+        let lines: Vec<&str> = production.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            if !line.contains(".execute_named(") && !line.contains(".execute_named_with_cancellation(") {
+                continue;
+            }
+            found.push(format!(
+                "{}::{}",
+                relative_path(&path),
+                enclosing_function(&lines, index)
+            ));
+        }
+    }
+    found.sort();
+    found.dedup();
+
+    for entry in &found {
+        assert!(
+            !entry.starts_with("src/gateway/"),
+            "{entry} calls a tool directly. The gateway MCP endpoint was routed through \
+             ToolExecutionService in 0.8.126 precisely so an external caller cannot skip policy, \
+             approval, schema validation and audit; re-adding a direct call there reopens that hole"
+        );
+    }
+
+    assert_inventory(
+        "direct Tool::execute_named call sites outside ToolExecutionService",
+        found,
+        ALLOWED_DIRECT_TOOL_INVOCATIONS,
+    );
+}

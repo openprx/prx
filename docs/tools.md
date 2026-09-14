@@ -154,9 +154,30 @@ the backend. Executor checks remain as defense in depth.
 Validation is fail-open on JSON Schema keywords PRX does not model and
 fail-closed on the ones it does: a dynamic MCP or WASM contract that uses
 `pattern`, `format`, `propertyNames` or similar keeps working, and only the
-modelled constraints bind. Each contract is compiled once per tool name and
-schema fingerprint, so a re-advertised alias with a changed contract is
-recompiled rather than checked against stale rules.
+modelled constraints bind. Each contract is compiled once per tool name, schema
+fingerprint and provider dialect, so a re-advertised alias with a changed
+contract is recompiled rather than checked against stale rules.
+
+The document enforced is the one the caller was actually shown. Tool schemas do
+not always reach a provider verbatim: Gemini's API rejects `additionalProperties`,
+`minLength`, `maxLength`, `pattern`, `format`, `minimum`, `maximum`, `minItems`
+and several more, and Anthropic does not resolve `$ref`, so PRX rewrites the
+schema for those providers before the request goes out. Validation replays the
+same rewrite, so a constraint a provider strips is never enforced against a
+model that was never shown it — without this, every tool that closes its
+property set rejected otherwise-correct Gemini calls. Everything that survives
+the rewrite (`type`, `enum`, `required`, conditional clauses) stays enforced on
+every provider, and OpenAI and OpenAI-compatible endpoints, which are sent the
+published document unchanged, are validated against it unchanged.
+
+The gateway MCP server (`POST /mcp/v1/tools/call`) runs through the same
+service. An external MCP client is shown the published document, so it is held
+to the published document, and its request goes through the same policy
+decision, approval gate, schema check and audit record as a model-issued call.
+Approval there is fail-closed: a remote client cannot answer a prompt, so a tool
+the autonomy level wants confirmed is refused rather than auto-approved.
+`tests/architecture_boundaries.rs` pins the inventory of production call sites
+that invoke a tool directly, so a new bypass fails a test.
 See [Tool Schema and Child Capability Parity](tool-schema-and-child-capability-parity.md)
 for the architecture and acceptance matrix.
 

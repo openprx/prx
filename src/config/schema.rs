@@ -2947,6 +2947,18 @@ pub struct MemoryConfig {
     /// Max embedding cache entries before LRU eviction
     #[serde(default = "default_cache_size")]
     pub embedding_cache_size: usize,
+    /// How many embedded memories one vector recall may score.
+    ///
+    /// Cosine similarity cannot use an index, so the candidate set is bounded
+    /// by insertion order (newest first) before scoring; without a bound this
+    /// is a full scan of every embedded memory, once per turn. The trade-off is
+    /// real and not free: in a store with more embedded memories than this cap,
+    /// an old-but-highly-relevant memory is never scored and therefore never
+    /// recalled. Raise it to buy recall with latency, lower it to buy latency
+    /// with recall. Vector recall logs a warning the first time a recall
+    /// actually hits the cap, so a store that has outgrown it says so.
+    #[serde(default = "default_vector_candidate_cap")]
+    pub vector_candidate_cap: usize,
 
     // ── Memory Snapshot (soul backup to Markdown) ─────────────
     /// Auto-hydrate from MEMORY_SNAPSHOT.md when brain.db is missing
@@ -3060,6 +3072,13 @@ const fn default_min_relevance_score() -> f64 {
 const fn default_cache_size() -> usize {
     10_000
 }
+/// Default ceiling on the embedded memories one vector recall scores.
+///
+/// Well above any realistic per-turn working set; the bound exists to stop a
+/// very large store from making every turn slower, not to trim ordinary recall.
+const fn default_vector_candidate_cap() -> usize {
+    2_000
+}
 const fn default_semantic_auto_promote_min_chars() -> usize {
     30
 }
@@ -3097,6 +3116,7 @@ impl Default for MemoryConfig {
             keyword_weight: default_keyword_weight(),
             min_relevance_score: default_min_relevance_score(),
             embedding_cache_size: default_cache_size(),
+            vector_candidate_cap: default_vector_candidate_cap(),
             auto_hydrate: true,
             sqlite_open_timeout_secs: None,
             sqlite_read_pool_size: None,

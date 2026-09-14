@@ -5,6 +5,7 @@
 //! migration; callers submit a typed command and runtime context instead of
 //! resolving and invoking adapters directly.
 
+use super::schema::ToolSchemaDialect;
 use super::traits::{Tool, ToolCategory, ToolResult, ToolSpec, ToolTier, is_tool_cancelled_result};
 use crate::capability::CapabilityAvailability;
 use crate::memory::{Memory, MessageEventInput};
@@ -256,6 +257,16 @@ pub struct ToolExecutionContext {
     pub chat_type: String,
     pub chat_id: String,
     pub semantic_turn_id: String,
+    /// Which rewrite of the published tool schemas the model behind this turn
+    /// was actually shown.
+    ///
+    /// Argument validation enforces *that* document, not the published one: a
+    /// provider whose API rejects `additionalProperties` / `minLength` /
+    /// `minimum` never showed those constraints to the model, so holding the
+    /// model to them rejects calls it had no way to get right. Defaults to
+    /// [`ToolSchemaDialect::Raw`] — the published document — which is correct
+    /// for OpenAI and for every non-model entry point.
+    pub schema_dialect: ToolSchemaDialect,
 }
 
 impl ToolExecutionContext {
@@ -273,7 +284,15 @@ impl ToolExecutionContext {
             chat_type: chat_type.into(),
             chat_id,
             semantic_turn_id,
+            schema_dialect: ToolSchemaDialect::Raw,
         }
+    }
+
+    /// Declare the schema rewrite the serving provider applied for this turn.
+    #[must_use]
+    pub const fn with_schema_dialect(mut self, schema_dialect: ToolSchemaDialect) -> Self {
+        self.schema_dialect = schema_dialect;
+        self
     }
 
     #[must_use]
@@ -1523,8 +1542,11 @@ impl ToolExecutionService {
         // Structural validation runs before approval on purpose: a call that
         // cannot legally execute must never reach an approval prompt, a
         // reservation, or a backend. This is the one production gate for the
-        // published schema, and every entry point funnels through here.
-        if let Err(error) = validate_command_arguments(&command.arguments, &descriptor) {
+        // tool contract, and every entry point funnels through here — including
+        // the gateway MCP server, which ran outside it until 0.8.126. The
+        // contract enforced is the one the caller was shown: see
+        // `ToolExecutionContext::schema_dialect`.
+        if let Err(error) = validate_command_arguments(&command.arguments, &descriptor, context.schema_dialect) {
             return self.finish(
                 &command,
                 &context,
@@ -1947,14 +1969,23 @@ pub fn strip_runtime_only_args(root: &mut serde_json::Map<String, serde_json::Va
     root.retain(|key, _| !is_runtime_only_arg(key));
 }
 
-/// Enforce a tool's published schema against caller-supplied arguments.
+/// Enforce a tool's schema against caller-supplied arguments.
 ///
 /// The descriptor's `parameters` document is the single truth source: native,
-/// skill, MCP alias and WASM plugin tools all reach this with the exact schema
-/// the provider was shown, so there is no second, hand-written rule set to
-/// drift. Runtime-only keys are removed first because the runtime authors them
-/// after validation and they are intentionally absent from public schemas.
-fn validate_command_arguments(arguments: &serde_json::Value, descriptor: &ToolDescriptor) -> Result<(), String> {
+/// skill, MCP alias and WASM plugin tools all reach this with the same schema
+/// the provider was offered, so there is no second, hand-written rule set to
+/// drift. `dialect` says which rewrite of that document the model was actually
+/// shown — Gemini strips `additionalProperties`, `minLength`, `minimum` and a
+/// dozen more keywords before the request goes out — and the same
+/// [`crate::tools::schema::SchemaCleanr`] strategy is replayed here so a
+/// constraint the model never saw is never enforced against it. Runtime-only
+/// keys are removed first because the runtime authors them after validation and
+/// they are intentionally absent from public schemas.
+fn validate_command_arguments(
+    arguments: &serde_json::Value,
+    descriptor: &ToolDescriptor,
+    dialect: ToolSchemaDialect,
+) -> Result<(), String> {
     let Some(root) = arguments.as_object() else {
         return Err("tool arguments must be a JSON object".to_string());
     };
@@ -1967,7 +1998,11 @@ fn validate_command_arguments(arguments: &serde_json::Value, descriptor: &ToolDe
     } else {
         arguments
     };
-    let compiled = crate::tools::schema::compiled_tool_schema(&descriptor.public_name, &descriptor.parameters);
+    let compiled = crate::tools::schema::compiled_tool_schema_for_dialect(
+        &descriptor.public_name,
+        dialect,
+        &descriptor.parameters,
+    );
     let issues = compiled.validate_tool_arguments(candidate);
     if issues.is_empty() {
         return Ok(());
@@ -3246,6 +3281,92 @@ mod tests {
             .await;
         let observed = calls.load(Ordering::SeqCst);
         (outcome, observed)
+    }
+
+    async fn contract_outcome_for_dialect(
+        arguments: serde_json::Value,
+        dialect: ToolSchemaDialect,
+    ) -> (ToolExecutionOutcome, usize) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = contract_service(&calls);
+        let outcome = service
+            .execute(
+                ToolExecutionCommand::new("contract_tool", arguments),
+                context().with_schema_dialect(dialect),
+                None,
+            )
+            .await;
+        let observed = calls.load(Ordering::SeqCst);
+        (outcome, observed)
+    }
+
+    /// Gemini's API rejects `additionalProperties` and `minimum`, so
+    /// `SchemaCleanr::clean_for_gemini` deletes them before the request goes
+    /// out. A model that was never shown those constraints cannot be held to
+    /// them: the same two calls must pass on the Gemini path and fail on the
+    /// OpenAI path, which is shown the published document verbatim.
+    #[tokio::test]
+    async fn gemini_calls_are_validated_against_the_document_gemini_was_shown() {
+        // The published schema closes the property set; Gemini never saw that.
+        let undeclared = serde_json::json!({"action": "list", "nope": 1});
+        let (raw, raw_calls) = contract_outcome_for_dialect(undeclared.clone(), ToolSchemaDialect::Raw).await;
+        assert_eq!(
+            raw.status,
+            ToolExecutionStatus::InvalidArguments,
+            "the published contract closes the property set: {}",
+            raw.model_content
+        );
+        assert_eq!(raw_calls, 0);
+
+        let (gemini, gemini_calls) = contract_outcome_for_dialect(undeclared, ToolSchemaDialect::Gemini).await;
+        assert_eq!(
+            gemini.status,
+            ToolExecutionStatus::Succeeded,
+            "clean_for_gemini strips additionalProperties, so it must not be enforced: {}",
+            gemini.model_content
+        );
+        assert_eq!(gemini_calls, 1);
+
+        // Same story for a numeric bound.
+        let below_minimum = serde_json::json!({"action": "list", "limit": 0});
+        let (raw, _) = contract_outcome_for_dialect(below_minimum.clone(), ToolSchemaDialect::Raw).await;
+        assert_eq!(raw.status, ToolExecutionStatus::InvalidArguments);
+        assert!(raw.model_content.contains("$.limit"), "{}", raw.model_content);
+
+        let (gemini, gemini_calls) = contract_outcome_for_dialect(below_minimum, ToolSchemaDialect::Gemini).await;
+        assert_eq!(
+            gemini.status,
+            ToolExecutionStatus::Succeeded,
+            "clean_for_gemini strips minimum: {}",
+            gemini.model_content
+        );
+        assert_eq!(gemini_calls, 1);
+    }
+
+    /// The relaxation is exactly the cleaner's keyword list and nothing wider:
+    /// `enum`, `type`, `required` and the action-specific `if`/`then` clauses
+    /// survive `clean_for_gemini`, so they stay enforced on the Gemini path.
+    #[tokio::test]
+    async fn the_gemini_dialect_still_enforces_everything_gemini_was_shown() {
+        for (arguments, expected_path) in [
+            (serde_json::json!({"action": "delete_everything"}), "$.action"),
+            (serde_json::json!({"action": "publish"}), "$.topic"),
+            (serde_json::json!({"action": "list", "limit": "ten"}), "$.limit"),
+        ] {
+            let (outcome, calls) = contract_outcome_for_dialect(arguments.clone(), ToolSchemaDialect::Gemini).await;
+            assert_eq!(
+                outcome.status,
+                ToolExecutionStatus::InvalidArguments,
+                "{arguments} survives clean_for_gemini and must stay enforced, got {}",
+                outcome.model_content
+            );
+            assert!(
+                outcome.model_content.contains(expected_path),
+                "expected {expected_path} in {}",
+                outcome.model_content
+            );
+            assert_eq!(calls, 0);
+        }
     }
 
     #[tokio::test]

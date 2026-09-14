@@ -101,6 +101,7 @@ pub use message_send::{DaemonMessageSendTool, MessageSendTool};
 pub use nodes::NodesTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
+pub use schema::ToolSchemaDialect;
 pub use session_status::SessionStatusTool;
 pub use sessions_history::SessionsHistoryTool;
 pub use sessions_list::SessionsListTool;

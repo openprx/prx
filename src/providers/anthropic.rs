@@ -1190,6 +1190,13 @@ fn parse_anthropic_sse_record(record: &str) -> StreamResult<Option<AnthropicEven
 
 #[async_trait]
 impl Provider for AnthropicProvider {
+    /// Anthropic does not resolve `$ref`, so tool schemas go out through
+    /// `SchemaCleanr::clean_for_anthropic`, which inlines the definitions
+    /// instead. The model answers against the inlined document.
+    fn tool_schema_dialect(&self) -> crate::tools::ToolSchemaDialect {
+        crate::tools::ToolSchemaDialect::Anthropic
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,

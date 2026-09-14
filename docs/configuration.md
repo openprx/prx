@@ -762,14 +762,55 @@ embedding_provider = "none"   # keyword/FTS recall only
 every key written in `config.toml` or a managed `config.d/*.toml` fragment keeps
 its value, keys the template does not mention are carried over, and the previous
 tree is copied to `config.d.pre-<version>-<timestamp>/` first. Templates supply
-structure, comments and defaults only. The preserved keys are listed in the
-command output; anything this build can no longer represent is reported as reset
-rather than dropped silently.
+structure, comments and defaults only.
 
-Vector recall scores the most recently updated embedded memories rather than the
-whole table — cosine similarity has no index, so the candidate set is bounded by
-recency. The bound is far above any realistic per-turn working set and exists to
-keep a very large memory store from slowing every turn.
+The report is printed by the command itself — `prx init` runs before any log
+subscriber exists, so it does not go through the log at all. The archive
+directory and every preserved key are listed on stdout:
+
+```
+PRX configuration initialized (full)
+  Config dir: /home/you/.openprx
+  Previous configuration archived to /home/you/.openprx/config.d.pre-0.8.126-20260914T101500
+  Preserved 4 explicit setting(s): memory.embedding_provider, ...
+```
+
+If the preserved values cannot be validated against this build, `--force` still
+repairs the tree — that is what it is for — but it does so loudly rather than
+quietly: it writes bare templates, prints an uppercase warning naming the
+archive directory and the validation error, and **exits non-zero** so neither a
+human nor a script can read the run as clean. The values are still in the
+archive; copy back the ones you want and run `prx doctor`.
+
+#### Vector recall candidate cap
+
+Cosine similarity has no index, so vector recall scores a bounded window of the
+newest embedded memories rather than the whole table:
+
+```toml
+[memory]
+# Embedded memories one vector recall may score. Default: 2000.
+vector_candidate_cap = 2000
+```
+
+This is a genuine trade-off, not a formality. In a store holding **more**
+embedded memories than the cap, an old-but-highly-relevant memory is never
+scored and therefore never recalled — no matter how well it matches. Raise the
+cap to buy recall with per-turn latency; lower it to buy latency with recall.
+Vector recall emits a warning the first time a recall actually hits the cap, so
+a store that has outgrown its setting says so:
+
+```
+Vector recall hit its candidate cap: older embedded memories are no longer
+scored and cannot be recalled. Raise [memory] vector_candidate_cap to score
+more of the store.
+```
+
+The window is ordered by insertion (`rowid`), not by `updated_at`. `updated_at`
+is a local-offset RFC 3339 string ordered as text, so a DST transition, a
+machine timezone change, or a store shared between processes in different zones
+reorders whole blocks of rows and truncates the wrong ones. "Newest" here
+therefore means most recently **created**, not most recently touched.
 
 ### SQLite Connection Pool
 

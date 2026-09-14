@@ -1194,12 +1194,15 @@ impl EffectExecutor {
                 // 5a-6: pass the tool registry through (None → the driver degrades to a plain text stream).
                 let tools_registry = deps.tools_registry.as_ref().map(Arc::clone);
                 let tool_security_policy = Arc::clone(&deps.tool_security_policy);
+                // Validation enforces the document this provider actually put
+                // on the wire; see `ToolExecutionContext::schema_dialect`.
                 let tool_execution_context = chat_tool_execution_context(
                     tool_security_policy.as_ref(),
                     turn_spawn_ctx.as_ref(),
                     provider_turn_task_id,
                     &draft_id,
-                );
+                )
+                .with_schema_dialect(provider.tool_schema_dialect());
                 let request_event_fabric = MemoryFabric::new(
                     Arc::clone(&deps.memory),
                     tool_execution_context.envelope.workspace_id.clone(),
