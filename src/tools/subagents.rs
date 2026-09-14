@@ -359,7 +359,7 @@ impl Tool for SubagentsTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        crate::tools::schema::with_action_requirements(
+        crate::tools::schema::with_default_action_requirements(
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -395,6 +395,7 @@ impl Tool for SubagentsTool {
                 "required": []
             }),
             "action",
+            "list",
             &[
                 crate::tools::schema::ActionRequirement {
                     action: "kill",

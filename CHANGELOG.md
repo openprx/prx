@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.123] - 14 September 2026
+
+### Fixed
+
+- Enforce the published tool schema on the production execution path. The
+  canonical validator existed since 0.8.110 but every call site was inside
+  `#[cfg(test)]`: the shipped pipeline checked only the root `required` list, so
+  an out-of-range action, a missing action-specific field, a wrong scalar type
+  or an undeclared property reached the executor. `ToolExecutionService::execute`
+  now validates each call against its own descriptor schema — the same document
+  the provider was shown — for native, skill, MCP alias and WASM plugin tools
+  alike. Rejection happens before the approval prompt and before any backend
+  runs, produces an `InvalidArguments` outcome naming every offending path so the
+  model can correct itself, and is audited like any other terminal outcome.
+  Validation is fail-open on JSON Schema keywords PRX does not model and
+  fail-closed on the ones it does, so richer dynamic MCP and WASM contracts stay
+  callable. Contracts are compiled once per tool name and schema fingerprint, so
+  per-call validation does not re-derive rules and a re-advertised alias with a
+  changed contract is recompiled rather than checked against stale ones.
+- Stop the published schema from contradicting the executor for tools with a
+  default action. `sessions_spawn`, `mcp_call`, `message_send` (both
+  implementations), `subagents` and `managed_session` no longer declare the
+  discriminator as a root `required` field — the executor has always accepted
+  its absence — and instead publish the default and bind that action's required
+  fields when it is omitted. Without this, turning on runtime enforcement would
+  have rejected calls that were valid before, and omitting the action would have
+  escaped its field requirements entirely.
+
 ## [0.8.122] - 14 September 2026
 
 ### Changed
@@ -267,17 +295,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Align executor and schema contracts for alternative inputs, action-specific
   messaging, Xin task updates, cron one-shot scheduling, and integration
   parameter constraints.
-- Validate schema-valued additional properties and exclusive alternatives
-  before executor dispatch.
+- Extend the canonical contract validator to schema-valued additional
+  properties and exclusive alternatives. (Corrected in 0.8.123: the validator
+  was reachable only from tests until runtime enforcement landed.)
 
 ## [0.8.110] - 12 September 2026
 
 ### Changed
 
-- Add a canonical tool-argument contract layer that publishes and enforces
-  action-specific requirements, alternative field sets, nested requirements,
-  scalar and union types, enums, lengths, numeric bounds, and unknown-field
-  rejection before executor dispatch.
+- Add a canonical tool-argument contract layer that publishes action-specific
+  requirements, alternative field sets, nested requirements, scalar and union
+  types, enums, lengths, numeric bounds, and unknown-field rejection.
+  (Corrected in 0.8.123: this release published those contracts to providers
+  but did not enforce them at runtime; the production pipeline still checked
+  only the root `required` list.)
 - Give OS-process session workers the same general agentic orchestration
   surfaces as task-mode children, including sessions, sub-agent management,
   daemon messaging, image analysis, configuration reload, and Gateway controls,

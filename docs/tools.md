@@ -140,14 +140,31 @@ represented by independent public-name proxies and remain executable.
 
 Every provider-visible tool uses an object JSON Schema. Multi-action tools
 publish discriminator-specific required fields through canonical conditional
-clauses. The same canonical schema is evaluated immediately before execution,
-including nested required fields, scalar types, enums, string/array lengths,
-numeric bounds, union types, unknown-field rejection, and alternative
-required-field sets. A structurally invalid call is rejected before the
-executor can produce side effects and the model is told which paths must be
-corrected. Executor checks remain as defense in depth.
+clauses. `ToolExecutionService::execute` — the single path every native, skill,
+MCP alias and WASM plugin call takes — evaluates that same published schema
+against the model's arguments before the policy decision is acted on, before any
+approval prompt, and before the executor runs. Validation covers nested required
+fields, scalar types, enums, constants, string/array lengths, numeric bounds,
+union types, unknown-field rejection where the schema closes its property set,
+and alternative required-field sets. A structurally invalid call is rejected
+with an `InvalidArguments` outcome that names every offending path, is recorded
+in the tool execution audit like any other terminal outcome, and never reaches
+the backend. Executor checks remain as defense in depth.
+
+Validation is fail-open on JSON Schema keywords PRX does not model and
+fail-closed on the ones it does: a dynamic MCP or WASM contract that uses
+`pattern`, `format`, `propertyNames` or similar keeps working, and only the
+modelled constraints bind. Each contract is compiled once per tool name and
+schema fingerprint, so a re-advertised alias with a changed contract is
+recompiled rather than checked against stale rules.
 See [Tool Schema and Child Capability Parity](tool-schema-and-child-capability-parity.md)
 for the architecture and acceptance matrix.
+
+A tool whose executor applies a default action does not make the discriminator
+a required field; the published schema carries the default and applies that
+action's required fields when it is omitted. This covers `sessions_spawn`
+(`spawn`), `mcp_call` (`call`), `message_send` (`send`), `subagents` (`list`)
+and `managed_session` (`list`).
 
 `skills_list` reports active and disabled skills, their origin/loading mode,
 and whether each supported `SKILL.toml` tool is executable through the skill
@@ -184,7 +201,8 @@ Markdown hydration uses stable content anchors instead of line-number keys.
 `mcp_status` performs discovery without calling a remote tool and reports each
 server's transport, tool list, last refresh, and retained configuration or
 discovery error. `mcp_call` also accepts `action: list|status|refresh`; its
-backward-compatible default action is `call`. Discovery runs before the
+backward-compatible default action is `call`, and omitting `action` is still a
+valid call that is validated against the `call` contract. Discovery runs before the
 provider-facing specs are selected. If an alias is discovered after an
 entrypoint's immutable execution catalog was created, the execution service
 requires a matching live backend spec before dispatching that alias through the

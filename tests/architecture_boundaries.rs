@@ -808,3 +808,47 @@ fn src_and_tests_carry_no_cjk_characters() {
         offenders.join("\n")
     );
 }
+
+/// The published tool schema is a runtime gate, not documentation.
+///
+/// `validate_tool_arguments` used to be reachable only from `#[cfg(test)]`
+/// mirrors, while the production pipeline checked nothing but the root
+/// `required` list. This guard fails if that regresses: the shipped
+/// `ToolExecutionService::execute` must still validate every call against the
+/// descriptor's own schema, before approval and before any backend runs.
+#[test]
+fn tool_arguments_are_schema_validated_on_the_production_execution_path() {
+    let root = repository_root();
+    let execution = fs::read_to_string(root.join("src/tools/execution.rs")).expect("read src/tools/execution.rs");
+    let production = execution
+        .find("#[cfg(test)]\nmod tests {")
+        .map_or(execution.as_str(), |offset| &execution[..offset]);
+
+    let validator = function_body(production, "validate_command_arguments");
+    assert!(
+        validator.contains("validate_tool_arguments("),
+        "the production argument gate no longer calls the canonical schema validator; \
+         a tool call that violates its published contract would reach its executor"
+    );
+    assert!(
+        validator.contains("descriptor.parameters"),
+        "the production argument gate must validate against the descriptor's published schema, \
+         not a second hand-written rule set"
+    );
+
+    let execute = function_body(production, "execute");
+    assert!(
+        execute.contains("validate_command_arguments("),
+        "ToolExecutionService::execute no longer validates arguments; every entry point funnels \
+         through it, so removing the call disables schema enforcement everywhere"
+    );
+
+    let schema = fs::read_to_string(root.join("src/tools/schema.rs")).expect("read src/tools/schema.rs");
+    let schema_production = schema
+        .find("#[cfg(test)]\nmod tests {")
+        .map_or(schema.as_str(), |offset| &schema[..offset]);
+    assert!(
+        schema_production.contains("pub fn compiled_tool_schema("),
+        "the per-tool compiled-schema cache is gone; every production call would recompile its contract"
+    );
+}

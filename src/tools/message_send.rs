@@ -204,7 +204,7 @@ pub(crate) const MESSAGE_SEND_TOOL_NAME: &str = "message_send";
 
 /// Parameter schema for a channel-owned `message_send` implementation.
 fn channel_message_send_parameters_schema() -> serde_json::Value {
-    let mut schema = crate::tools::schema::with_action_requirements(
+    let mut schema = crate::tools::schema::with_default_action_requirements(
         json!({
             "type": "object",
             "additionalProperties": false,
@@ -266,6 +266,7 @@ fn channel_message_send_parameters_schema() -> serde_json::Value {
             "required": ["action"]
         }),
         "action",
+        "send",
         &[
             crate::tools::schema::ActionRequirement {
                 action: "send",
@@ -315,7 +316,8 @@ fn daemon_message_send_parameters_schema() -> serde_json::Value {
             "action": {
                 "type": "string",
                 "enum": ["send"],
-                "description": "Send text through a configured PRX daemon channel."
+                "default": "send",
+                "description": "Send text through a configured PRX daemon channel. Defaults to 'send' when omitted."
             },
             "channel": {
                 "type": "string",
@@ -338,7 +340,7 @@ fn daemon_message_send_parameters_schema() -> serde_json::Value {
                 "description": "Ask the destination channel to deliver the text as voice when supported."
             }
         },
-        "required": ["action", "channel", "target", "message"]
+        "required": ["channel", "target", "message"]
     })
 }
 
@@ -1260,18 +1262,23 @@ mod tests {
     }
 
     #[test]
-    fn parameters_schema_has_required_action() {
+    fn parameters_schema_defaults_the_action_and_binds_its_contract() {
         let (ch, _) = DummyChannel::new();
         let tool = MessageSendTool::new(ch, test_security(AutonomyLevel::Full));
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
+        // The executor treats an omitted action as 'send', so the contract
+        // publishes that default instead of demanding the discriminator.
         let required = schema["required"].as_array().unwrap();
-        assert!(required.iter().any(|v| v.as_str() == Some("action")));
+        assert!(!required.iter().any(|v| v.as_str() == Some("action")));
+        assert_eq!(schema["properties"]["action"]["default"], "send");
         assert!(!crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "send"})).is_empty());
+        assert!(!crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty());
         assert!(
             crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "send", "message": "hello"}))
                 .is_empty()
         );
+        assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"message": "hello"})).is_empty());
     }
 
     /// Both message_send schemas owe the model the same thing `cron` and

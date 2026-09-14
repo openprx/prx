@@ -1016,7 +1016,7 @@ impl Tool for McpTool {
             }
         }
 
-        crate::tools::schema::with_action_requirements(
+        crate::tools::schema::with_default_action_requirements(
             json!({
                 "type": "object",
                 "properties": {
@@ -1038,6 +1038,7 @@ impl Tool for McpTool {
                 "additionalProperties": false
             }),
             "action",
+            "call",
             &[crate::tools::schema::ActionRequirement {
                 action: "call",
                 required: &["server", "tool"],
@@ -1578,10 +1579,20 @@ mod tests {
         for action in ["call", "list", "status", "refresh"] {
             assert!(actions.iter().any(|value| value == action));
         }
-        assert_eq!(schema["required"], json!(["action"]));
+        // The executor defaults to 'call', so the published contract must not
+        // make the discriminator mandatory.
+        assert_eq!(schema["required"], json!([]));
+        assert_eq!(schema["properties"]["action"]["default"], "call");
         let issues = crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "call"}));
         assert!(issues.iter().any(|issue| issue.path == "$.server"));
         assert!(issues.iter().any(|issue| issue.path == "$.tool"));
+        // Omitting the action selects 'call', so its requirements still bind.
+        let implicit = crate::tools::schema::validate_tool_arguments(&schema, &json!({}));
+        assert!(implicit.iter().any(|issue| issue.path == "$.server"));
+        assert!(implicit.iter().any(|issue| issue.path == "$.tool"));
+        assert!(
+            crate::tools::schema::validate_tool_arguments(&schema, &json!({"server": "s", "tool": "t"})).is_empty()
+        );
     }
 
     #[test]

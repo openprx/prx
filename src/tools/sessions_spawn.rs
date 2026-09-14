@@ -2195,7 +2195,7 @@ impl Tool for SessionsSpawnTool {
             .filter(|(_, cfg)| cfg.spawn_enabled.unwrap_or(true))
             .map(|(name, _)| name.as_str())
             .collect::<Vec<_>>();
-        crate::tools::schema::with_action_requirements(
+        crate::tools::schema::with_default_action_requirements(
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -2301,6 +2301,7 @@ impl Tool for SessionsSpawnTool {
                 "required": ["action"]
             }),
             "action",
+            "spawn",
             &[
                 crate::tools::schema::ActionRequirement {
                     action: "spawn",
@@ -7180,8 +7181,11 @@ mod tests {
         let (ch, _) = RecordingChannel::new();
         let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
         let schema = tool.parameters_schema();
+        // The executor treats an omitted action as 'spawn', so the published
+        // contract defaults it rather than requiring it.
         let required = schema["required"].as_array().unwrap();
-        assert!(required.contains(&json!("action")));
+        assert!(!required.contains(&json!("action")));
+        assert_eq!(schema["properties"]["action"]["default"], "spawn");
         assert!(schema["properties"]["action"].is_object());
         assert!(schema["properties"]["task"].is_object());
         assert!(schema["properties"]["run_id"].is_object());
@@ -7198,6 +7202,10 @@ mod tests {
         assert!(enum_strs.contains(&"history"));
         let issues = crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "spawn"}));
         assert!(issues.iter().any(|issue| issue.path == "$.task"));
+        // An omitted action selects 'spawn', so 'task' is still required.
+        let implicit = crate::tools::schema::validate_tool_arguments(&schema, &json!({}));
+        assert!(implicit.iter().any(|issue| issue.path == "$.task"));
+        assert!(crate::tools::schema::validate_tool_arguments(&schema, &json!({"task": "do it"})).is_empty());
         assert!(enum_strs.contains(&"steer"));
     }
 

@@ -11,7 +11,8 @@ Completed in version 0.8.110:
   admission checks;
 - action-specific schema migration for the native multi-action surfaces listed
   below;
-- preflight rejection before runtime scope and approval injection;
+- preflight rejection before runtime scope and approval injection (published in
+  0.8.110 but only reachable from tests until 0.8.123, see below);
 - task/process selection parity for multiple aliases exported by one dynamic
   router;
 - on-demand dynamic discovery before resolving explicit child allowlists;
@@ -33,6 +34,18 @@ Completed in version 0.8.111:
   exclusive action alternatives;
 - routed both Gemini native-tool serialization paths through the shared Gemini
   schema projection.
+
+Completed in version 0.8.123:
+
+- runtime enforcement of the canonical contract on the production execution
+  path: `ToolExecutionService::execute` validates every native, skill, MCP alias
+  and WASM plugin call against its own descriptor schema before approval and
+  before executor dispatch, and audits the rejection;
+- removal of the root `required` discriminator from tools whose executor applies
+  a default action, so enforcement does not reject previously valid calls and an
+  omitted action is still held to its action contract;
+- per tool-name/schema-fingerprint compilation of contracts, so validating every
+  call does not re-derive rules from the schema document.
 
 Remaining architecture work:
 

@@ -51,8 +51,11 @@
 //! // }
 //! ```
 //!
+use parking_lot::RwLock;
 use serde_json::{Map, Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{DefaultHasher, Hasher};
+use std::sync::{Arc, LazyLock};
 
 /// One discriminator-specific set of required tool arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +108,58 @@ pub fn with_action_requirements(
             .or_insert_with(|| Value::Array(Vec::new()));
         if let Some(existing) = existing.as_array_mut() {
             existing.extend(conditions);
+        }
+    }
+    schema
+}
+
+/// Attach action requirements for a tool whose executor applies a default
+/// action when the discriminator is omitted.
+///
+/// Two things differ from [`with_action_requirements`]. The discriminator is
+/// dropped from the root `required` list, because omitting it is a supported
+/// call shape and the published contract must say so. And the default action's
+/// guard does not itself require the discriminator, so an omitted action is
+/// held to exactly the same field requirements as the explicit spelling —
+/// otherwise runtime enforcement would leave the most common call shape
+/// unchecked.
+pub fn with_default_action_requirements(
+    mut schema: Value,
+    discriminator: &str,
+    default_action: &str,
+    requirements: &[ActionRequirement<'_>],
+) -> Value {
+    if let Some(root) = schema.as_object_mut() {
+        if let Some(required) = root.get_mut("required").and_then(Value::as_array_mut) {
+            required.retain(|name| name.as_str() != Some(discriminator));
+        }
+        if let Some(property) = root
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+            .and_then(|properties| properties.get_mut(discriminator))
+            .and_then(Value::as_object_mut)
+        {
+            property.insert("default".to_string(), Value::String(default_action.to_string()));
+            if let Some(Value::String(description)) = property.get_mut("description")
+                && !description.contains("when omitted")
+            {
+                description.push_str(&format!(" Defaults to '{default_action}' when omitted."));
+            }
+        }
+    }
+    let mut schema = with_action_requirements(schema, discriminator, requirements);
+    if let Some(conditions) = schema.get_mut("allOf").and_then(Value::as_array_mut) {
+        for condition in conditions.iter_mut() {
+            let guards_default = condition
+                .get("if")
+                .and_then(|guard| guard.get("properties"))
+                .and_then(|properties| properties.get(discriminator))
+                .and_then(|property| property.get("const"))
+                .and_then(Value::as_str)
+                == Some(default_action);
+            if guards_default && let Some(guard) = condition.get_mut("if").and_then(Value::as_object_mut) {
+                guard.remove("required");
+            }
         }
     }
     schema
@@ -229,51 +284,16 @@ pub struct ArgumentValidationIssue {
     pub message: String,
 }
 
-/// Validate the canonical JSON Schema subset used by PRX tool contracts.
-///
-/// This is deliberately not a general JSON Schema engine. It covers the
-/// structures PRX emits: object/array/scalar types, required fields, enums,
-/// constants, oneOf, and action requirements expressed as allOf if/then pairs.
-#[must_use]
-pub fn validate_tool_arguments(schema: &Value, arguments: &Value) -> Vec<ArgumentValidationIssue> {
-    let mut issues = Vec::new();
-    validate_value(schema, arguments, "$", &mut issues);
-    issues
+/// Compiled `type` constraint, keeping the original spelling for the message.
+#[derive(Debug, Clone)]
+struct CompiledTypeConstraint {
+    names: Vec<String>,
+    display: String,
 }
 
-fn validate_value(schema: &Value, value: &Value, path: &str, issues: &mut Vec<ArgumentValidationIssue>) {
-    if let Some(any_of) = schema.get("anyOf").and_then(Value::as_array) {
-        let any_valid = any_of.iter().any(|candidate| {
-            let mut candidate_issues = Vec::new();
-            validate_value(candidate, value, path, &mut candidate_issues);
-            candidate_issues.is_empty()
-        });
-        if !any_valid {
-            issues.push(ArgumentValidationIssue {
-                path: path.to_string(),
-                message: "does not contain any accepted required-field set".to_string(),
-            });
-        }
-    }
-    if let Some(one_of) = schema.get("oneOf").and_then(Value::as_array) {
-        let matching = one_of
-            .iter()
-            .filter(|candidate| {
-                let mut candidate_issues = Vec::new();
-                validate_value(candidate, value, path, &mut candidate_issues);
-                candidate_issues.is_empty()
-            })
-            .count();
-        if matching != 1 {
-            issues.push(ArgumentValidationIssue {
-                path: path.to_string(),
-                message: "must match exactly one accepted schema".to_string(),
-            });
-        }
-    }
-
-    if let Some(expected) = schema.get("type") {
-        let matches_type = |expected: &str| match expected {
+impl CompiledTypeConstraint {
+    fn matches(&self, value: &Value) -> bool {
+        self.names.iter().any(|name| match name.as_str() {
             "object" => value.is_object(),
             "array" => value.is_array(),
             "string" => value.is_string(),
@@ -281,174 +301,419 @@ fn validate_value(schema: &Value, value: &Value, path: &str, issues: &mut Vec<Ar
             "number" => value.is_number(),
             "boolean" => value.is_boolean(),
             "null" => value.is_null(),
+            // An unrecognised type name is a keyword this validator does not
+            // model, so it must not reject an otherwise well formed call.
             _ => true,
+        })
+    }
+}
+
+/// How a compiled object schema treats properties it does not declare.
+#[derive(Debug, Clone, Default)]
+enum CompiledAdditionalProperties {
+    #[default]
+    Unconstrained,
+    Forbidden,
+    Schema(Box<CompiledToolSchema>),
+}
+
+/// One compiled `allOf` entry.
+#[derive(Debug, Clone)]
+enum CompiledCondition {
+    /// An `allOf` member without `if`, applied unconditionally.
+    Always(Box<CompiledToolSchema>),
+    /// An `if` / `then` / `else` triple, which is how PRX expresses
+    /// action-specific requirements.
+    Branch {
+        condition: Box<CompiledToolSchema>,
+        then_schema: Option<Box<CompiledToolSchema>>,
+        else_schema: Option<Box<CompiledToolSchema>>,
+    },
+}
+
+/// The canonical JSON Schema subset used by PRX tool contracts, pre-resolved
+/// into direct field access.
+///
+/// This is deliberately not a general JSON Schema engine. It covers the
+/// structures PRX emits: object/array/scalar types, required fields, enums,
+/// constants, `anyOf`/`oneOf`, bounds, `additionalProperties`, and action
+/// requirements expressed as `allOf` `if`/`then` pairs.
+///
+/// Compilation is *fail-open on unknown keywords*: a keyword this subset does
+/// not model is dropped at compile time, so a dynamic MCP or WASM schema that
+/// uses richer JSON Schema still validates against the parts PRX understands
+/// instead of rejecting the whole call. It is *fail-closed on known
+/// violations*: every keyword that is modelled is enforced.
+#[derive(Debug, Clone, Default)]
+pub struct CompiledToolSchema {
+    any_of: Option<Vec<Self>>,
+    one_of: Option<Vec<Self>>,
+    type_constraint: Option<CompiledTypeConstraint>,
+    const_value: Option<Value>,
+    enum_values: Option<Vec<Value>>,
+    min_length: Option<u64>,
+    max_length: Option<u64>,
+    minimum: Option<f64>,
+    maximum: Option<f64>,
+    min_items: Option<u64>,
+    max_items: Option<u64>,
+    required: Vec<String>,
+    properties: BTreeMap<String, Self>,
+    additional_properties: CompiledAdditionalProperties,
+    conditions: Vec<CompiledCondition>,
+    items: Option<Box<Self>>,
+}
+
+impl CompiledToolSchema {
+    /// Compile one schema document into its enforceable rules.
+    #[must_use]
+    pub fn compile(schema: &Value) -> Self {
+        let mut compiled = Self::default();
+        let Some(object) = schema.as_object() else {
+            return compiled;
         };
-        let type_matches = expected.as_str().is_some_and(matches_type)
-            || expected
-                .as_array()
-                .is_some_and(|types| types.iter().filter_map(Value::as_str).any(matches_type));
-        if !type_matches {
+        if let Some(any_of) = object.get("anyOf").and_then(Value::as_array) {
+            compiled.any_of = Some(any_of.iter().map(Self::compile).collect());
+        }
+        if let Some(one_of) = object.get("oneOf").and_then(Value::as_array) {
+            compiled.one_of = Some(one_of.iter().map(Self::compile).collect());
+        }
+        if let Some(expected) = object.get("type") {
+            let names = expected.as_str().map_or_else(
+                || {
+                    expected.as_array().map_or_else(Vec::new, |types| {
+                        types.iter().filter_map(Value::as_str).map(str::to_string).collect()
+                    })
+                },
+                |name| vec![name.to_string()],
+            );
+            compiled.type_constraint = Some(CompiledTypeConstraint {
+                names,
+                display: expected.to_string(),
+            });
+        }
+        compiled.const_value = object.get("const").cloned();
+        compiled.enum_values = object.get("enum").and_then(Value::as_array).cloned();
+        compiled.min_length = object.get("minLength").and_then(Value::as_u64);
+        compiled.max_length = object.get("maxLength").and_then(Value::as_u64);
+        compiled.minimum = object.get("minimum").and_then(Value::as_f64);
+        compiled.maximum = object.get("maximum").and_then(Value::as_f64);
+        compiled.min_items = object.get("minItems").and_then(Value::as_u64);
+        compiled.max_items = object.get("maxItems").and_then(Value::as_u64);
+        if let Some(required) = object.get("required").and_then(Value::as_array) {
+            compiled.required = required.iter().filter_map(Value::as_str).map(str::to_string).collect();
+        }
+        if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+            compiled.properties = properties
+                .iter()
+                .map(|(name, property)| (name.clone(), Self::compile(property)))
+                .collect();
+        }
+        compiled.additional_properties = match object.get("additionalProperties") {
+            Some(Value::Bool(false)) => CompiledAdditionalProperties::Forbidden,
+            Some(schema) if schema.is_object() => CompiledAdditionalProperties::Schema(Box::new(Self::compile(schema))),
+            _ => CompiledAdditionalProperties::Unconstrained,
+        };
+        if let Some(conditions) = object.get("allOf").and_then(Value::as_array) {
+            compiled.conditions = conditions
+                .iter()
+                .map(|condition| {
+                    condition.get("if").map_or_else(
+                        || CompiledCondition::Always(Box::new(Self::compile(condition))),
+                        |if_schema| CompiledCondition::Branch {
+                            condition: Box::new(Self::compile(if_schema)),
+                            then_schema: condition.get("then").map(|schema| Box::new(Self::compile(schema))),
+                            else_schema: condition.get("else").map(|schema| Box::new(Self::compile(schema))),
+                        },
+                    )
+                })
+                .collect();
+        }
+        compiled.items = object.get("items").map(|schema| Box::new(Self::compile(schema)));
+        compiled
+    }
+
+    /// Validate one argument document against this contract.
+    #[must_use]
+    pub fn validate_tool_arguments(&self, arguments: &Value) -> Vec<ArgumentValidationIssue> {
+        let mut issues = Vec::new();
+        self.validate(arguments, "$", &mut issues);
+        issues
+    }
+
+    fn matches(&self, value: &Value) -> bool {
+        let mut issues = Vec::new();
+        self.validate(value, "$", &mut issues);
+        issues.is_empty()
+    }
+
+    fn validate(&self, value: &Value, path: &str, issues: &mut Vec<ArgumentValidationIssue>) {
+        if let Some(any_of) = self.any_of.as_ref()
+            && !any_of.iter().any(|candidate| candidate.matches(value))
+        {
             issues.push(ArgumentValidationIssue {
                 path: path.to_string(),
-                message: format!("must be of type {expected}"),
+                message: "does not contain any accepted required-field set".to_string(),
+            });
+        }
+        if let Some(one_of) = self.one_of.as_ref()
+            && one_of.iter().filter(|candidate| candidate.matches(value)).count() != 1
+        {
+            issues.push(ArgumentValidationIssue {
+                path: path.to_string(),
+                message: "must match exactly one accepted schema".to_string(),
+            });
+        }
+
+        if let Some(constraint) = self.type_constraint.as_ref()
+            && !constraint.matches(value)
+        {
+            issues.push(ArgumentValidationIssue {
+                path: path.to_string(),
+                message: format!("must be of type {}", constraint.display),
             });
             return;
         }
-    }
 
-    if let Some(expected) = schema.get("const")
-        && value != expected
-    {
-        issues.push(ArgumentValidationIssue {
-            path: path.to_string(),
-            message: format!("must equal {expected}"),
-        });
-    }
-
-    if let Some(text) = value.as_str() {
-        let length = text.chars().count() as u64;
-        if let Some(minimum) = schema.get("minLength").and_then(Value::as_u64)
-            && length < minimum
+        if let Some(expected) = self.const_value.as_ref()
+            && value != expected
         {
             issues.push(ArgumentValidationIssue {
                 path: path.to_string(),
-                message: format!("must contain at least {minimum} character(s)"),
+                message: format!("must equal {expected}"),
             });
         }
-        if let Some(maximum) = schema.get("maxLength").and_then(Value::as_u64)
-            && length > maximum
-        {
-            issues.push(ArgumentValidationIssue {
-                path: path.to_string(),
-                message: format!("must contain at most {maximum} character(s)"),
-            });
-        }
-    }
 
-    if let Some(number) = value.as_f64() {
-        if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64)
-            && number < minimum
-        {
-            issues.push(ArgumentValidationIssue {
-                path: path.to_string(),
-                message: format!("must be at least {minimum}"),
-            });
-        }
-        if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64)
-            && number > maximum
-        {
-            issues.push(ArgumentValidationIssue {
-                path: path.to_string(),
-                message: format!("must be at most {maximum}"),
-            });
-        }
-    }
-    if let Some(allowed) = schema.get("enum").and_then(Value::as_array)
-        && !allowed.contains(value)
-    {
-        issues.push(ArgumentValidationIssue {
-            path: path.to_string(),
-            message: format!("must be one of {}", Value::Array(allowed.clone())),
-        });
-    }
-
-    if let Some(object) = value.as_object() {
-        validate_required(schema, object, path, issues);
-        let properties = schema.get("properties").and_then(Value::as_object);
-        if let Some(properties) = properties {
-            for (name, property_schema) in properties {
-                if let Some(property_value) = object.get(name) {
-                    validate_value(property_schema, property_value, &format!("{path}.{name}"), issues);
-                }
-            }
-        }
-        if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false) {
-            for name in object
-                .keys()
-                .filter(|name| properties.is_none_or(|properties| !properties.contains_key(*name)))
+        if let Some(text) = value.as_str() {
+            let length = text.chars().count() as u64;
+            if let Some(minimum) = self.min_length
+                && length < minimum
             {
                 issues.push(ArgumentValidationIssue {
-                    path: format!("{path}.{name}"),
-                    message: "is not an accepted property".to_string(),
+                    path: path.to_string(),
+                    message: format!("must contain at least {minimum} character(s)"),
                 });
             }
-        } else if let Some(additional_schema) = schema.get("additionalProperties").filter(|value| value.is_object()) {
-            for (name, property_value) in object
-                .iter()
-                .filter(|(name, _)| properties.is_none_or(|properties| !properties.contains_key(*name)))
+            if let Some(maximum) = self.max_length
+                && length > maximum
             {
-                validate_value(additional_schema, property_value, &format!("{path}.{name}"), issues);
+                issues.push(ArgumentValidationIssue {
+                    path: path.to_string(),
+                    message: format!("must contain at most {maximum} character(s)"),
+                });
             }
         }
-        if let Some(conditions) = schema.get("allOf").and_then(Value::as_array) {
-            for condition in conditions {
-                let Some(if_schema) = condition.get("if") else {
-                    validate_value(condition, value, path, issues);
-                    continue;
-                };
-                let mut condition_issues = Vec::new();
-                validate_value(if_schema, value, path, &mut condition_issues);
-                if condition_issues.is_empty() {
-                    if let Some(then_schema) = condition.get("then") {
-                        validate_value(then_schema, value, path, issues);
+
+        if let Some(number) = value.as_f64() {
+            if let Some(minimum) = self.minimum
+                && number < minimum
+            {
+                issues.push(ArgumentValidationIssue {
+                    path: path.to_string(),
+                    message: format!("must be at least {minimum}"),
+                });
+            }
+            if let Some(maximum) = self.maximum
+                && number > maximum
+            {
+                issues.push(ArgumentValidationIssue {
+                    path: path.to_string(),
+                    message: format!("must be at most {maximum}"),
+                });
+            }
+        }
+
+        if let Some(allowed) = self.enum_values.as_ref()
+            && !allowed.contains(value)
+        {
+            issues.push(ArgumentValidationIssue {
+                path: path.to_string(),
+                message: format!("must be one of {}", Value::Array(allowed.clone())),
+            });
+        }
+
+        if let Some(object) = value.as_object() {
+            for name in self.required.iter().filter(|name| !object.contains_key(*name)) {
+                issues.push(ArgumentValidationIssue {
+                    path: format!("{path}.{name}"),
+                    message: "is required".to_string(),
+                });
+            }
+            for (name, property) in &self.properties {
+                if let Some(property_value) = object.get(name) {
+                    property.validate(property_value, &format!("{path}.{name}"), issues);
+                }
+            }
+            match &self.additional_properties {
+                CompiledAdditionalProperties::Unconstrained => {}
+                CompiledAdditionalProperties::Forbidden => {
+                    for name in object.keys().filter(|name| !self.properties.contains_key(*name)) {
+                        issues.push(ArgumentValidationIssue {
+                            path: format!("{path}.{name}"),
+                            message: "is not an accepted property".to_string(),
+                        });
                     }
-                } else if let Some(else_schema) = condition.get("else") {
-                    validate_value(else_schema, value, path, issues);
+                }
+                CompiledAdditionalProperties::Schema(additional) => {
+                    for (name, property_value) in object.iter().filter(|(name, _)| !self.properties.contains_key(*name))
+                    {
+                        additional.validate(property_value, &format!("{path}.{name}"), issues);
+                    }
+                }
+            }
+            for condition in &self.conditions {
+                match condition {
+                    CompiledCondition::Always(schema) => schema.validate(value, path, issues),
+                    CompiledCondition::Branch {
+                        condition,
+                        then_schema,
+                        else_schema,
+                    } => {
+                        if condition.matches(value) {
+                            if let Some(then_schema) = then_schema {
+                                then_schema.validate(value, path, issues);
+                            }
+                        } else if let Some(else_schema) = else_schema {
+                            else_schema.validate(value, path, issues);
+                        }
+                    }
                 }
             }
         }
-    }
 
-    if let Some(items) = value.as_array()
-        && let Some(item_schema) = schema.get("items")
-    {
-        for (index, item) in items.iter().enumerate() {
-            validate_value(item_schema, item, &format!("{path}[{index}]"), issues);
-        }
-    }
-    if let Some(items) = value.as_array() {
-        let length = items.len() as u64;
-        if let Some(minimum) = schema.get("minItems").and_then(Value::as_u64)
-            && length < minimum
-        {
-            issues.push(ArgumentValidationIssue {
-                path: path.to_string(),
-                message: format!("must contain at least {minimum} item(s)"),
-            });
-        }
-        if let Some(maximum) = schema.get("maxItems").and_then(Value::as_u64)
-            && length > maximum
-        {
-            issues.push(ArgumentValidationIssue {
-                path: path.to_string(),
-                message: format!("must contain at most {maximum} item(s)"),
-            });
+        if let Some(items) = value.as_array() {
+            if let Some(item_schema) = self.items.as_ref() {
+                for (index, item) in items.iter().enumerate() {
+                    item_schema.validate(item, &format!("{path}[{index}]"), issues);
+                }
+            }
+            let length = items.len() as u64;
+            if let Some(minimum) = self.min_items
+                && length < minimum
+            {
+                issues.push(ArgumentValidationIssue {
+                    path: path.to_string(),
+                    message: format!("must contain at least {minimum} item(s)"),
+                });
+            }
+            if let Some(maximum) = self.max_items
+                && length > maximum
+            {
+                issues.push(ArgumentValidationIssue {
+                    path: path.to_string(),
+                    message: format!("must contain at most {maximum} item(s)"),
+                });
+            }
         }
     }
 }
 
-fn validate_required(
-    schema: &Value,
-    object: &Map<String, Value>,
-    path: &str,
-    issues: &mut Vec<ArgumentValidationIssue>,
-) {
-    let Some(required) = schema.get("required").and_then(Value::as_array) else {
-        return;
-    };
-    for name in required.iter().filter_map(Value::as_str) {
-        if !object.contains_key(name) {
-            issues.push(ArgumentValidationIssue {
-                path: format!("{path}.{name}"),
-                message: "is required".to_string(),
-            });
+/// Validate the canonical JSON Schema subset used by PRX tool contracts.
+///
+/// Callers on a hot path should hold a [`CompiledToolSchema`] instead, or go
+/// through [`compiled_tool_schema`], which caches one per tool name.
+#[must_use]
+pub fn validate_tool_arguments(schema: &Value, arguments: &Value) -> Vec<ArgumentValidationIssue> {
+    CompiledToolSchema::compile(schema).validate_tool_arguments(arguments)
+}
+
+/// Process-wide compiled-schema cache, keyed by public tool name.
+///
+/// The stored fingerprint is what makes the key safe for dynamic MCP, WASM and
+/// skill aliases: a router that re-advertises the same name with a different
+/// contract misses the cached entry and is recompiled instead of validated
+/// against a stale rule set.
+static COMPILED_TOOL_SCHEMAS: LazyLock<RwLock<HashMap<String, (u64, Arc<CompiledToolSchema>)>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Upper bound on cached contracts. Reached only by a runtime that cycles
+/// through thousands of distinct dynamic alias names; the cache is then dropped
+/// wholesale rather than growing without limit.
+const COMPILED_TOOL_SCHEMA_CACHE_CAPACITY: usize = 4096;
+
+/// Structural fingerprint of a schema document.
+///
+/// Walks the document without allocating a serialization of it, and is stable
+/// across processes for the same content because `serde_json` maps iterate in
+/// key order.
+fn hash_schema(value: &Value, hasher: &mut impl Hasher) {
+    match value {
+        Value::Null => hasher.write_u8(0),
+        Value::Bool(flag) => {
+            hasher.write_u8(1);
+            hasher.write_u8(u8::from(*flag));
+        }
+        Value::Number(number) => {
+            hasher.write_u8(2);
+            if let Some(number) = number.as_i64() {
+                hasher.write_i64(number);
+            } else if let Some(number) = number.as_u64() {
+                hasher.write_u64(number);
+            } else {
+                hasher.write_u64(number.as_f64().unwrap_or_default().to_bits());
+            }
+        }
+        Value::String(text) => {
+            hasher.write_u8(3);
+            hasher.write(text.as_bytes());
+        }
+        Value::Array(items) => {
+            hasher.write_u8(4);
+            hasher.write_usize(items.len());
+            for item in items {
+                hash_schema(item, hasher);
+            }
+        }
+        Value::Object(entries) => {
+            hasher.write_u8(5);
+            hasher.write_usize(entries.len());
+            for (key, entry) in entries {
+                hasher.write(key.as_bytes());
+                hash_schema(entry, hasher);
+            }
         }
     }
 }
 
 #[must_use]
-pub fn format_argument_validation_error(tool_name: &str, issues: &[ArgumentValidationIssue]) -> String {
-    let mut lines = vec![format!("Error: invalid arguments for tool '{tool_name}'.")];
+fn schema_fingerprint(schema: &Value) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hash_schema(schema, &mut hasher);
+    hasher.finish()
+}
+
+/// Compile `schema` once per (tool name, schema fingerprint) and reuse it.
+///
+/// Every production tool call validates its arguments, so the compile step must
+/// not repeat per call. Fingerprinting is a non-allocating walk of the schema;
+/// compiling is not, which is what the cache saves.
+#[must_use]
+pub fn compiled_tool_schema(tool_name: &str, schema: &Value) -> Arc<CompiledToolSchema> {
+    let fingerprint = schema_fingerprint(schema);
+    {
+        let cache = COMPILED_TOOL_SCHEMAS.read();
+        if let Some((cached_fingerprint, compiled)) = cache.get(tool_name)
+            && *cached_fingerprint == fingerprint
+        {
+            return Arc::clone(compiled);
+        }
+    }
+    let compiled = Arc::new(CompiledToolSchema::compile(schema));
+    let mut cache = COMPILED_TOOL_SCHEMAS.write();
+    if cache.len() >= COMPILED_TOOL_SCHEMA_CACHE_CAPACITY && !cache.contains_key(tool_name) {
+        cache.clear();
+    }
+    cache.insert(tool_name.to_string(), (fingerprint, Arc::clone(&compiled)));
+    compiled
+}
+
+/// Render validation issues for a model, without an `Error:` prefix.
+///
+/// Callers that report through a channel which already prefixes failures use
+/// this; [`format_argument_validation_error`] is the prefixed spelling.
+#[must_use]
+pub fn describe_argument_validation_issues(tool_name: &str, issues: &[ArgumentValidationIssue]) -> String {
+    let mut lines = vec![format!("invalid arguments for tool '{tool_name}'.")];
     lines.extend(
         issues
             .iter()
@@ -456,6 +721,12 @@ pub fn format_argument_validation_error(tool_name: &str, issues: &[ArgumentValid
     );
     lines.push("Read the tool schema and retry with corrected arguments.".to_string());
     lines.join("\n")
+}
+
+/// Render validation issues as a model-facing tool error.
+#[must_use]
+pub fn format_argument_validation_error(tool_name: &str, issues: &[ArgumentValidationIssue]) -> String {
+    format!("Error: {}", describe_argument_validation_issues(tool_name, issues))
 }
 
 /// Keywords that Gemini rejects for tool schemas.
@@ -1135,6 +1406,88 @@ pub(crate) mod action_contract {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_schema_keywords_are_ignored_rather_than_rejected() {
+        // Dynamic MCP and WASM contracts use richer JSON Schema than PRX
+        // emits. An unmodelled keyword must not fail a call, while a keyword
+        // that is modelled must still bind in the same document.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "pattern": "^[0-9]{4}$", "format": "uuid"},
+                "count": {"type": "integer", "multipleOf": 3},
+                "tags": {"type": "array", "uniqueItems": true, "contains": {"const": "x"}}
+            },
+            "required": ["code"],
+            "propertyNames": {"pattern": "^[a-z]+$"},
+            "dependentRequired": {"code": ["count"]},
+            "not": {"required": ["count"]},
+            "unevaluatedProperties": false
+        });
+        assert!(
+            validate_tool_arguments(&schema, &json!({"code": "not-digits", "count": 5, "tags": ["a", "a"]})).is_empty(),
+            "an unmodelled keyword must not reject a structurally sound call"
+        );
+        let issues = validate_tool_arguments(&schema, &json!({"count": "five"}));
+        assert!(issues.iter().any(|issue| issue.path == "$.code"));
+        assert!(issues.iter().any(|issue| issue.path == "$.count"));
+    }
+
+    #[test]
+    fn default_action_requirements_bind_when_the_discriminator_is_omitted() {
+        let schema = with_default_action_requirements(
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["call", "list"], "description": "What to do."},
+                    "server": {"type": "string"}
+                },
+                "required": ["action"]
+            }),
+            "action",
+            "call",
+            &[ActionRequirement {
+                action: "call",
+                required: &["server"],
+            }],
+        );
+        assert_eq!(schema["required"], json!([]));
+        assert_eq!(schema["properties"]["action"]["default"], "call");
+        assert!(
+            schema["properties"]["action"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("Defaults to 'call' when omitted.")),
+            "the published description must state the default the executor applies"
+        );
+        assert!(validate_tool_arguments(&schema, &json!({"server": "s"})).is_empty());
+        assert!(validate_tool_arguments(&schema, &json!({"action": "list"})).is_empty());
+        let implicit = validate_tool_arguments(&schema, &json!({}));
+        assert!(implicit.iter().any(|issue| issue.path == "$.server"));
+    }
+
+    #[test]
+    fn the_compiled_schema_cache_follows_the_contract_not_just_the_tool_name() {
+        // A dynamic alias may be re-advertised under the same public name with
+        // a different contract. Keying on the name alone would validate the new
+        // contract against stale rules.
+        let name = "mcp__cache_fixture__probe";
+        let first = json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]});
+        let second = json!({"type": "object", "properties": {"b": {"type": "integer"}}, "required": ["b"]});
+
+        let compiled = compiled_tool_schema(name, &first);
+        assert!(compiled.validate_tool_arguments(&json!({"a": "x"})).is_empty());
+        assert!(!compiled.validate_tool_arguments(&json!({"b": 1})).is_empty());
+        assert!(
+            Arc::ptr_eq(&compiled, &compiled_tool_schema(name, &first)),
+            "an unchanged contract must be served from the cache"
+        );
+
+        let recompiled = compiled_tool_schema(name, &second);
+        assert!(!Arc::ptr_eq(&compiled, &recompiled));
+        assert!(recompiled.validate_tool_arguments(&json!({"b": 1})).is_empty());
+        assert!(!recompiled.validate_tool_arguments(&json!({"a": "x"})).is_empty());
+    }
 
     #[test]
     fn test_remove_unsupported_keywords() {

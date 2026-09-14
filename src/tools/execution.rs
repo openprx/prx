@@ -1520,6 +1520,26 @@ impl ToolExecutionService {
             );
         }
 
+        // Structural validation runs before approval on purpose: a call that
+        // cannot legally execute must never reach an approval prompt, a
+        // reservation, or a backend. This is the one production gate for the
+        // published schema, and every entry point funnels through here.
+        if let Err(error) = validate_command_arguments(&command.arguments, &descriptor) {
+            return self.finish(
+                &command,
+                &context,
+                input_sha256,
+                Some(descriptor),
+                Some(decision),
+                ToolExecutionStatus::InvalidArguments,
+                format!("Error: {error}"),
+                None,
+                Some(error),
+                None,
+                started,
+            );
+        }
+
         let mut runtime_approval_granted = false;
         let mut runtime_grant = None;
         if decision == ToolExecutionDecision::Ask {
@@ -1591,13 +1611,8 @@ impl ToolExecutionService {
             }
         };
 
-        let arguments = match normalize_arguments(
-            &command.arguments,
-            &descriptor,
-            &context,
-            runtime_approval_granted,
-            runtime_grant,
-        ) {
+        let arguments = match normalize_arguments(&command.arguments, &context, runtime_approval_granted, runtime_grant)
+        {
             Ok(arguments) => arguments,
             Err(error) => {
                 return self.finish(
@@ -1932,9 +1947,39 @@ pub fn strip_runtime_only_args(root: &mut serde_json::Map<String, serde_json::Va
     root.retain(|key, _| !is_runtime_only_arg(key));
 }
 
+/// Enforce a tool's published schema against caller-supplied arguments.
+///
+/// The descriptor's `parameters` document is the single truth source: native,
+/// skill, MCP alias and WASM plugin tools all reach this with the exact schema
+/// the provider was shown, so there is no second, hand-written rule set to
+/// drift. Runtime-only keys are removed first because the runtime authors them
+/// after validation and they are intentionally absent from public schemas.
+fn validate_command_arguments(arguments: &serde_json::Value, descriptor: &ToolDescriptor) -> Result<(), String> {
+    let Some(root) = arguments.as_object() else {
+        return Err("tool arguments must be a JSON object".to_string());
+    };
+    let sanitized;
+    let candidate = if root.keys().any(|key| is_runtime_only_arg(key)) {
+        let mut root = root.clone();
+        strip_runtime_only_args(&mut root);
+        sanitized = serde_json::Value::Object(root);
+        &sanitized
+    } else {
+        arguments
+    };
+    let compiled = crate::tools::schema::compiled_tool_schema(&descriptor.public_name, &descriptor.parameters);
+    let issues = compiled.validate_tool_arguments(candidate);
+    if issues.is_empty() {
+        return Ok(());
+    }
+    Err(crate::tools::schema::describe_argument_validation_issues(
+        &descriptor.public_name,
+        &issues,
+    ))
+}
+
 fn normalize_arguments(
     arguments: &serde_json::Value,
-    descriptor: &ToolDescriptor,
     context: &ToolExecutionContext,
     runtime_approval_granted: bool,
     runtime_grant: Option<serde_json::Value>,
@@ -1944,20 +1989,9 @@ fn normalize_arguments(
         .as_object_mut()
         .ok_or_else(|| "tool arguments must be a JSON object".to_string())?;
 
-    if let Some(required) = descriptor
-        .parameters
-        .get("required")
-        .and_then(serde_json::Value::as_array)
-    {
-        let missing = required
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .filter(|name| !root.contains_key(*name))
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            return Err(format!("missing required tool parameters: {}", missing.join(", ")));
-        }
-    }
+    // Structural validation against `descriptor.parameters` already ran in
+    // `ToolExecutionService::execute`, before approval. Re-checking here would
+    // be a second, divergent rule set.
 
     // Single source of truth: drop every runtime-only key an external caller
     // may have supplied before re-injecting the authoritative ones below.
@@ -3128,6 +3162,227 @@ mod tests {
         assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
     }
 
+    /// A tool published with the full canonical contract surface: an action
+    /// enum, action-specific required fields, a typed field, a closed property
+    /// set, and a JSON Schema keyword this validator does not model.
+    struct ContractTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for ContractTool {
+        fn name(&self) -> &str {
+            "contract_tool"
+        }
+
+        fn description(&self) -> &str {
+            "contract fixture"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            crate::tools::schema::with_default_action_requirements(
+                serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["publish", "list"],
+                            "description": "What to do."
+                        },
+                        "topic": {"type": "string", "description": "Topic to publish to."},
+                        "limit": {"type": "integer", "minimum": 1, "description": "Page size."},
+                        // `pattern` is deliberately unmodelled by the PRX
+                        // validator: an unknown keyword must not reject a call.
+                        "tag": {"type": "string", "pattern": "^[0-9]+$", "description": "Free-form tag."}
+                    }
+                }),
+                "action",
+                "publish",
+                &[crate::tools::schema::ActionRequirement {
+                    action: "publish",
+                    required: &["topic"],
+                }],
+            )
+        }
+
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.execute_named(self.name(), args).await
+        }
+
+        async fn execute_named(&self, _name: &str, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: "executed".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    fn contract_service(calls: &Arc<AtomicUsize>) -> ToolExecutionService {
+        ToolExecutionService::new(
+            vec![Arc::new(ContractTool {
+                calls: Arc::clone(calls),
+            })],
+            Arc::new(FixedPolicy {
+                decision: ToolExecutionDecision::Allow,
+                stages: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(FixedApproval {
+                decision: approved(),
+                stages: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(AdapterOwnedPreparation),
+            Arc::new(TracingToolExecutionAudit),
+        )
+    }
+
+    async fn contract_outcome(arguments: serde_json::Value) -> (ToolExecutionOutcome, usize) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = contract_service(&calls);
+        let outcome = service
+            .execute(ToolExecutionCommand::new("contract_tool", arguments), context(), None)
+            .await;
+        let observed = calls.load(Ordering::SeqCst);
+        (outcome, observed)
+    }
+
+    #[tokio::test]
+    async fn production_path_rejects_out_of_range_enum_before_the_backend_runs() {
+        let (outcome, calls) = contract_outcome(serde_json::json!({"action": "delete_everything"})).await;
+        assert_eq!(outcome.status, ToolExecutionStatus::InvalidArguments);
+        assert_eq!(calls, 0, "a contract violation must not reach the executor");
+        assert!(
+            outcome.model_content.contains("$.action"),
+            "the model needs the offending field name: {}",
+            outcome.model_content
+        );
+        assert!(
+            outcome.error.as_deref().is_some_and(|error| error.contains("$.action")),
+            "the audit record must carry the same issue"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_path_rejects_missing_action_specific_required_field() {
+        let (outcome, calls) = contract_outcome(serde_json::json!({"action": "publish"})).await;
+        assert_eq!(outcome.status, ToolExecutionStatus::InvalidArguments);
+        assert_eq!(calls, 0);
+        assert!(
+            outcome.model_content.contains("$.topic") && outcome.model_content.contains("is required"),
+            "action-specific requirement not reported: {}",
+            outcome.model_content
+        );
+    }
+
+    #[tokio::test]
+    async fn production_path_rejects_wrong_argument_types_and_unknown_properties() {
+        let (outcome, calls) = contract_outcome(serde_json::json!({"action": "list", "limit": "ten"})).await;
+        assert_eq!(outcome.status, ToolExecutionStatus::InvalidArguments);
+        assert_eq!(calls, 0);
+        assert!(
+            outcome.model_content.contains("$.limit"),
+            "type error not reported: {}",
+            outcome.model_content
+        );
+
+        let (outcome, calls) = contract_outcome(serde_json::json!({"action": "list", "nope": 1})).await;
+        assert_eq!(outcome.status, ToolExecutionStatus::InvalidArguments);
+        assert_eq!(calls, 0);
+        assert!(
+            outcome.model_content.contains("$.nope"),
+            "closed property set not enforced: {}",
+            outcome.model_content
+        );
+    }
+
+    #[tokio::test]
+    async fn production_path_accepts_contract_respecting_calls() {
+        let (outcome, calls) =
+            contract_outcome(serde_json::json!({"action": "publish", "topic": "ops", "limit": 5})).await;
+        assert_eq!(outcome.status, ToolExecutionStatus::Succeeded, "{:?}", outcome.error);
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn production_path_passes_unmodelled_schema_keywords_through() {
+        // `pattern` is not part of the validated subset. Fail-open on an
+        // unknown keyword keeps dynamic MCP and WASM contracts callable.
+        let (outcome, calls) = contract_outcome(serde_json::json!({"action": "list", "tag": "not-digits"})).await;
+        assert_eq!(outcome.status, ToolExecutionStatus::Succeeded, "{:?}", outcome.error);
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn production_path_applies_the_default_action_contract_when_action_is_omitted() {
+        // The executor defaults to `publish`, so an omitted action stays legal
+        // and is held to the `publish` contract rather than escaping it.
+        let (outcome, calls) = contract_outcome(serde_json::json!({"topic": "ops"})).await;
+        assert_eq!(outcome.status, ToolExecutionStatus::Succeeded, "{:?}", outcome.error);
+        assert_eq!(calls, 1);
+
+        let (outcome, calls) = contract_outcome(serde_json::json!({"limit": 3})).await;
+        assert_eq!(outcome.status, ToolExecutionStatus::InvalidArguments);
+        assert_eq!(calls, 0);
+        assert!(
+            outcome.model_content.contains("$.topic"),
+            "the default action's requirements must bind: {}",
+            outcome.model_content
+        );
+
+        let (outcome, calls) = contract_outcome(serde_json::json!({"action": "list", "limit": 0})).await;
+        assert_eq!(outcome.status, ToolExecutionStatus::InvalidArguments);
+        assert_eq!(calls, 0);
+        assert!(outcome.model_content.contains("$.limit"), "{}", outcome.model_content);
+    }
+
+    #[tokio::test]
+    async fn production_path_validates_dynamic_alias_contracts_with_their_own_schema() {
+        let enabled = Arc::new(AtomicBool::new(true));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = ToolExecutionService::new(
+            vec![Arc::new(LateAliasTool {
+                enabled: Arc::clone(&enabled),
+                calls: Arc::clone(&calls),
+            })],
+            Arc::new(FixedPolicy {
+                decision: ToolExecutionDecision::Allow,
+                stages: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(FixedApproval {
+                decision: approved(),
+                stages: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(AdapterOwnedPreparation),
+            Arc::new(TracingToolExecutionAudit),
+        );
+
+        let rejected = service
+            .execute(
+                ToolExecutionCommand::new("mcp__late__navigate", serde_json::json!({"url": 7})),
+                context(),
+                None,
+            )
+            .await;
+        assert_eq!(rejected.status, ToolExecutionStatus::InvalidArguments);
+        assert!(rejected.model_content.contains("$.url"), "{}", rejected.model_content);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let accepted = service
+            .execute(
+                ToolExecutionCommand::new(
+                    "mcp__late__navigate",
+                    serde_json::json!({"url": "https://example.test"}),
+                ),
+                context(),
+                None,
+            )
+            .await;
+        assert_eq!(accepted.status, ToolExecutionStatus::Succeeded, "{:?}", accepted.error);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn invalid_arguments_are_typed_and_adapter_is_not_called() {
         let fixture = fixture();
@@ -3148,7 +3403,9 @@ mod tests {
 
         assert_eq!(outcome.status, ToolExecutionStatus::InvalidArguments);
         assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(&*fixture.stages.lock(), &["policy", "preparation", "audit"]);
+        // Validation now precedes approval and preparation, so a structurally
+        // invalid call never reaches either.
+        assert_eq!(&*fixture.stages.lock(), &["policy", "audit"]);
     }
 
     #[tokio::test]
@@ -3382,24 +3639,10 @@ mod local_operator_scope_tests {
         .with_chat_id(chat_id)
     }
 
-    fn descriptor() -> ToolDescriptor {
-        ToolDescriptor {
-            public_name: "gateway".to_string(),
-            backend_name: "gateway".to_string(),
-            description: "gateway".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
-            tier: ToolTier::Core,
-            categories: Vec::new(),
-            effect: ToolEffect::Act,
-            adapter: ToolAdapterKind::Native,
-            availability: CapabilityAvailability::ready("test"),
-        }
-    }
-
     /// Run the real injection path and read back the marker the tool would see.
     fn injected_trust(context: &ToolExecutionContext, caller_args: serde_json::Value) -> bool {
-        let normalized = normalize_arguments(&caller_args, &descriptor(), context, false, None)
-            .expect("normalize_arguments accepts a JSON object");
+        let normalized =
+            normalize_arguments(&caller_args, context, false, None).expect("normalize_arguments accepts a JSON object");
         normalized
             .get("_prx_scope_trusted")
             .and_then(serde_json::Value::as_bool)
@@ -3522,7 +3765,6 @@ mod local_operator_scope_tests {
                 "_prx_anything_else": "forged",
                 "_zc_approval_granted": true,
             }),
-            &descriptor(),
             &remote,
             false,
             None,
