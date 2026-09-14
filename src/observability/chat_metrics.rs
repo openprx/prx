@@ -1,21 +1,24 @@
-//! S2.5 T2.5-2: chat 路径专用 Prometheus 指标 + tracing helper.
+//! S2.5 T2.5-2: Prometheus metrics for the chat path, plus a tracing helper.
 //!
-//! 指标:
-//! - `prx_chat_actions_total{action_kind}`   每个 dispatch 的 Action 类型计数
-//! - `prx_chat_effects_total{effect_kind}`   每个 Effect 执行的类型计数
-//! - `prx_chat_stream_chunks_total`          stream 累计 chunk 计数
-//! - `prx_chat_dispatch_drops_total{reason}` try_dispatch 失败原因（P1-A 预留）
+//! Metrics:
+//! - `prx_chat_actions_total{action_kind}`   Action count per dispatch, by kind
+//! - `prx_chat_effects_total{effect_kind}`   Effect execution count, by kind
+//! - `prx_chat_stream_chunks_total`          cumulative stream chunk count
+//! - `prx_chat_dispatch_drops_total{reason}` try_dispatch failures, by reason (P1-A)
 //!
-//! 使用独立 Registry（不与 `PrometheusObserver` 的 Registry 合并），避免改动现有
-//! observer 接线。注册失败（理论上不会发生，名字与 label 都是 compile-time-constant）
-//! 时静默降级为 None，counter helper 走 no-op；调用方无需处理 Result。
+//! These live in their own Registry rather than the `PrometheusObserver` one,
+//! so the existing observer wiring stays untouched. Registration cannot
+//! realistically fail (names and labels are compile-time constants); if it
+//! does, the metric degrades silently to `None`, the counter helpers become
+//! no-ops, and callers never have to handle a `Result`.
 
 use prometheus::{IntCounter, IntCounterVec, Opts, Registry};
 use std::sync::LazyLock;
 
 static CHAT_REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
 
-/// 构造 `IntCounterVec` 并尝试注册；失败返回 `None`（避免在生产路径 panic）.
+/// Build an `IntCounterVec` and try to register it; `None` on failure, so the
+/// production path never panics.
 fn try_build_counter_vec(name: &str, help: &str, labels: &[&str]) -> Option<IntCounterVec> {
     let opts = Opts::new(name, help);
     let metric = IntCounterVec::new(opts, labels).ok()?;
@@ -23,7 +26,7 @@ fn try_build_counter_vec(name: &str, help: &str, labels: &[&str]) -> Option<IntC
     Some(metric)
 }
 
-/// 构造 `IntCounter` 并尝试注册；失败返回 `None`。
+/// Build an `IntCounter` and try to register it; `None` on failure.
 fn try_build_counter(name: &str, help: &str) -> Option<IntCounter> {
     let metric = IntCounter::new(name, help).ok()?;
     let _ = CHAT_REGISTRY.register(Box::new(metric.clone()));
@@ -61,35 +64,36 @@ static DISPATCH_DROPS_TOTAL: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| 
     )
 });
 
-/// 累加 chat Action 计数指标（注册失败时静默 no-op）.
+/// Bump the chat Action counter; a no-op when registration failed.
 pub fn inc_action(kind: &str) {
     if let Some(m) = ACTIONS_TOTAL.as_ref() {
         m.with_label_values(&[kind]).inc();
     }
 }
 
-/// 累加 chat Effect 计数指标。
+/// Bump the chat Effect counter.
 pub fn inc_effect(kind: &str) {
     if let Some(m) = EFFECTS_TOTAL.as_ref() {
         m.with_label_values(&[kind]).inc();
     }
 }
 
-/// 累加 stream chunk 计数指标。
+/// Bump the stream chunk counter.
 pub fn inc_stream_chunk() {
     if let Some(m) = STREAM_CHUNKS_TOTAL.as_ref() {
         m.inc();
     }
 }
 
-/// 累加 dispatch drop 计数指标（P1-A 由 dispatch_or_log 调用）.
+/// Bump the dispatch-drop counter; called by `dispatch_or_log` (P1-A).
 pub fn inc_dispatch_drop(reason: &str) {
     if let Some(m) = DISPATCH_DROPS_TOTAL.as_ref() {
         m.with_label_values(&[reason]).inc();
     }
 }
 
-/// 读 chat Action 计数（测试用：返回当前 kind 的累计值，注册失败时返回 0）.
+/// Read the chat Action counter (tests only): the running total for `kind`,
+/// or 0 when registration failed.
 #[cfg(test)]
 #[must_use]
 pub fn get_action_count(kind: &str) -> u64 {
@@ -99,7 +103,7 @@ pub fn get_action_count(kind: &str) -> u64 {
         .unwrap_or_default()
 }
 
-/// 读 chat Effect 计数（测试用）.
+/// Read the chat Effect counter (tests only).
 #[cfg(test)]
 #[must_use]
 pub fn get_effect_count(kind: &str) -> u64 {
@@ -109,14 +113,14 @@ pub fn get_effect_count(kind: &str) -> u64 {
         .unwrap_or_default()
 }
 
-/// 读 stream chunk 累计（测试用）.
+/// Read the cumulative stream chunk counter (tests only).
 #[cfg(test)]
 #[must_use]
 pub fn get_stream_chunks_count() -> u64 {
     STREAM_CHUNKS_TOTAL.as_ref().map(IntCounter::get).unwrap_or_default()
 }
 
-/// 读 dispatch drops 计数（测试用，P1-A 验证）.
+/// Read the dispatch-drop counter (tests only, P1-A verification).
 #[cfg(test)]
 #[must_use]
 pub fn get_dispatch_drops_count(reason: &str) -> u64 {
@@ -126,7 +130,8 @@ pub fn get_dispatch_drops_count(reason: &str) -> u64 {
         .unwrap_or_default()
 }
 
-/// 取 chat 模块独立 Registry 引用（由 gateway /metrics handler 合并到 PrometheusObserver registry 暴露，S2.5 P1-A）。
+/// The chat module's own Registry. The gateway's /metrics handler merges it
+/// with the PrometheusObserver registry for exposition (S2.5 P1-A).
 #[must_use]
 pub fn chat_registry() -> &'static Registry {
     &CHAT_REGISTRY
@@ -136,7 +141,7 @@ pub fn chat_registry() -> &'static Registry {
 mod tests {
     use super::*;
 
-    /// S2.5 T2.5-2: actions_total 计数递增正确（单 kind）.
+    /// S2.5 T2.5-2: actions_total increments correctly for a single kind.
     #[test]
     fn s2_5_t2_5_2_dispatch_metrics_increment() {
         let kind = "s2_5_test_action";
@@ -147,7 +152,7 @@ mod tests {
         assert_eq!(after - before, 2);
     }
 
-    /// S2.5 T2.5-2: stream_chunks_total 单 chunk 递增 1.
+    /// S2.5 T2.5-2: stream_chunks_total goes up by one per chunk.
     #[test]
     fn s2_5_t2_5_2_stream_chunks_metric_per_chunk() {
         let before = get_stream_chunks_count();
@@ -158,7 +163,7 @@ mod tests {
         assert_eq!(after - before, 3);
     }
 
-    /// S2.5 T2.5-2: effects_total 不同 kind 标签独立计数.
+    /// S2.5 T2.5-2: effects_total counts each kind label independently.
     #[test]
     fn s2_5_t2_5_2_effect_metrics_per_kind() {
         let k1 = "s2_5_RequestRedraw_test";

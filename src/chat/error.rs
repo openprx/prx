@@ -1,14 +1,18 @@
-//! S2.5 T2.5-1: chat 模块三层错误分层 + 顶层聚合。
+//! S2.5 T2.5-1: the chat module's three error layers plus one top-level
+//! aggregate.
 //!
-//! 不重写 `providers::traits::StreamError`（保留 5 变体不动，避免破坏 4 个 provider）。
-//! `TransportError` 通过 `From<StreamError>` 桥接，`TransportError::is_retryable`
-//! 关联方法迁出 `dispatcher.rs::stream_error_is_retryable`（原 fn 保留为 thin wrapper）。
+//! `providers::traits::StreamError` is deliberately left alone (its five
+//! variants stay as they are, so none of the providers break).
+//! `TransportError` bridges from it through `From<StreamError>`, and
+//! `TransportError::is_retryable` is the method form of what used to be
+//! `dispatcher.rs::stream_error_is_retryable` (kept there as a thin wrapper).
 
 use thiserror::Error;
 
 use crate::providers::traits::StreamError;
 
-/// Provider 语义错误：由上游 LLM 服务返回的业务级错误。
+/// Provider semantic errors: business-level failures reported by the upstream
+/// LLM service.
 #[derive(Debug, Error)]
 pub enum ProviderError {
     #[error("provider returned semantic error: {0}")]
@@ -21,10 +25,10 @@ pub enum ProviderError {
     ContextOverflow(String),
 }
 
-/// Transport 错误：网络/IO/SSE/JSON 解析等传输层故障。
+/// Transport errors: network / IO / SSE / JSON-parsing failures.
 ///
-/// 通过 `From<StreamError>` 从 `providers::traits::StreamError` 桥接，
-/// 关联方法 `is_retryable` 与 `dispatcher.rs::stream_error_is_retryable` 同源。
+/// Bridged from `providers::traits::StreamError` through `From<StreamError>`;
+/// `is_retryable` is the same rule as `dispatcher.rs::stream_error_is_retryable`.
 #[derive(Debug, Error)]
 pub enum TransportError {
     #[error("transport HTTP error: {0}")]
@@ -55,9 +59,10 @@ pub enum TransportError {
 }
 
 impl TransportError {
-    /// 判断错误是否值得重试。
+    /// Whether this error is worth retrying.
     ///
-    /// 与 `dispatcher.rs::stream_error_is_retryable` 同源（Http/Io 视为瞬时故障 retryable）。
+    /// Same rule as `dispatcher.rs::stream_error_is_retryable`: Http / Io count
+    /// as transient and are retryable.
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         matches!(self, Self::Http(_) | Self::Io(_) | Self::RateLimited { .. })
@@ -85,7 +90,7 @@ impl From<StreamError> for TransportError {
     }
 }
 
-/// UI 层错误：终端渲染、输入解析、隔离区呈现等。
+/// UI-layer errors: terminal rendering, input parsing, quarantine display.
 #[derive(Debug, Error)]
 pub enum UiError {
     #[error("ui render failed: {0}")]
@@ -98,7 +103,7 @@ pub enum UiError {
     Terminal(String),
 }
 
-/// 顶层 chat 聚合错误：将三层 + IO/Anyhow 统一封装。
+/// The top-level chat error: the three layers plus IO / anyhow in one type.
 #[derive(Debug, Error)]
 pub enum ChatError {
     #[error(transparent)]
@@ -117,13 +122,16 @@ pub enum ChatError {
     Other(#[from] anyhow::Error),
 }
 
-// 注：不为 ChatError 显式 impl From<_> for anyhow::Error —— anyhow 已为所有
-// `E: std::error::Error + Send + Sync + 'static` 提供 blanket 实现，ChatError
-// 通过 thiserror::Error derive 自动满足约束，调用点 `?` 直接桥接到
-// `anyhow::Result`。如需直接抽出 ChatError::Other 的内部 anyhow::Error，
-// 使用 helper `into_anyhow` 而非 `From`，避免与 blanket 冲突 (E0119)。
+// Note: `From<ChatError> for anyhow::Error` is deliberately not implemented.
+// anyhow already provides a blanket impl for every
+// `E: std::error::Error + Send + Sync + 'static`, and the `thiserror::Error`
+// derive makes ChatError satisfy that, so `?` bridges straight into
+// `anyhow::Result` at the call site. To pull the inner `anyhow::Error` back out
+// of `ChatError::Other`, use the `into_anyhow` helper rather than a `From`
+// impl, which would collide with the blanket one (E0119).
 impl ChatError {
-    /// 将 ChatError 转为 `anyhow::Error`，Other 变体透传，其他变体经 trait object 包装。
+    /// Convert a ChatError into an `anyhow::Error`: `Other` passes through
+    /// unchanged, every other variant is wrapped as a trait object.
     #[must_use]
     pub fn into_anyhow(self) -> anyhow::Error {
         match self {
@@ -188,8 +196,9 @@ mod tests {
 
     #[test]
     fn s2_5_t2_5_1_transport_is_retryable_matches_legacy() {
-        // 关联方法 is_retryable 与 dispatcher.rs::stream_error_is_retryable 同源:
-        // Http / Io → retryable，其余三类 → non-retryable。
+        // is_retryable follows the same rule as
+        // dispatcher.rs::stream_error_is_retryable: Http / Io are retryable,
+        // the other three are not.
         let http = TransportError::Http("conn reset".to_string());
         assert!(http.is_retryable());
 
@@ -220,7 +229,7 @@ mod tests {
 
     #[test]
     fn s2_5_t2_5_1_chat_error_aggregate_from() {
-        // Provider/Transport/Ui 三类都能 ? 桥接到 ChatError。
+        // All three of Provider / Transport / Ui bridge into ChatError with `?`.
         let provider_chat: ChatError = ProviderError::Semantic("x".to_string()).into();
         assert!(matches!(provider_chat, ChatError::Provider(_)));
 
@@ -230,21 +239,23 @@ mod tests {
         let ui_chat: ChatError = UiError::Render("z".to_string()).into();
         assert!(matches!(ui_chat, ChatError::Ui(_)));
 
-        // StreamError → ChatError 经 TransportError 桥接.
+        // StreamError reaches ChatError through TransportError.
         let stream_chat: ChatError = StreamError::Io(std::io::Error::other("eof")).into();
         match stream_chat {
             ChatError::Transport(TransportError::Io(_)) => {}
             other => panic!("expected ChatError::Transport(Io), got {other:?}"),
         }
 
-        // ChatError → anyhow::Error 经 helper into_anyhow（Other 分支透传不双重包装）.
+        // ChatError reaches anyhow::Error through into_anyhow; the Other arm
+        // passes through instead of being wrapped twice.
         let anyhow_err = ChatError::Other(anyhow::anyhow!("plain")).into_anyhow();
         assert_eq!(anyhow_err.to_string(), "plain");
 
         let wrapped = ChatError::Session("missing id".to_string()).into_anyhow();
         assert!(wrapped.to_string().contains("missing id"));
 
-        // 验证 anyhow blanket From<ChatError> 通过 ? 桥接的能力 — 显式 map_err 到 anyhow::Error。
+        // anyhow's blanket From<ChatError> must carry a `?` bridge; map_err
+        // spells the conversion out explicitly.
         let typed: Result<(), ChatError> = Err(ChatError::Session("bridge".to_string()));
         let bridged: anyhow::Result<()> = typed.map_err(Into::into);
         assert!(bridged.is_err());

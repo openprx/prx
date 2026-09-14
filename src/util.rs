@@ -103,10 +103,10 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_cjk_characters() {
-        // CJK characters (Chinese - each is 3 bytes)
-        let s = "这是一个测试消息用来触发崩溃的中文"; // 21 characters
-        let result = truncate_with_ellipsis(s, 16);
+    fn test_truncate_three_byte_characters() {
+        // Three-byte characters, 21 of them.
+        let s = "\u{20ac}".repeat(21);
+        let result = truncate_with_ellipsis(&s, 16);
         assert!(result.ends_with("..."));
         assert!(result.is_char_boundary(result.len() - 1));
     }
@@ -121,8 +121,8 @@ mod tests {
     #[test]
     fn test_truncate_unicode_edge_case() {
         // Mix of 1-byte, 2-byte, 3-byte, and 4-byte characters
-        let s = "aé你好🦀"; // 1 + 1 + 2 + 2 + 4 bytes = 10 bytes, 5 chars
-        assert_eq!(truncate_with_ellipsis(s, 3), "aé你...");
+        let s = "a\u{e9}\u{20ac}\u{2192}\u{1f980}"; // 1 + 2 + 3 + 3 + 4 bytes = 13 bytes, 5 chars
+        assert_eq!(truncate_with_ellipsis(s, 3), "a\u{e9}\u{20ac}...");
     }
 
     #[test]

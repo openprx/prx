@@ -23,7 +23,7 @@ pub fn infer_router_intent(task_intent: TaskIntent, message: &str) -> RouterInte
     let lower = message.to_lowercase();
 
     if [
-        "代码", "code", "debug", "编译", "函数", "class", "fn ", "impl", "cargo", "npm",
+        "code", "debug", "compile", "build", "function", "class", "fn ", "impl", "cargo", "npm",
     ]
     .iter()
     .any(|keyword| lower.contains(keyword))
@@ -31,16 +31,31 @@ pub fn infer_router_intent(task_intent: TaskIntent, message: &str) -> RouterInte
         return RouterIntent::Code;
     }
 
-    if ["总结", "摘要", "翻译", "summary", "translate"]
-        .iter()
-        .any(|keyword| lower.contains(keyword))
+    if [
+        "summary",
+        "summarize",
+        "summarise",
+        "abstract",
+        "translate",
+        "translation",
+    ]
+    .iter()
+    .any(|keyword| lower.contains(keyword))
     {
         return RouterIntent::Summary;
     }
 
-    if ["分析", "analyze", "评估", "对比", "compare"]
-        .iter()
-        .any(|keyword| lower.contains(keyword))
+    if [
+        "analyze",
+        "analyse",
+        "analysis",
+        "evaluate",
+        "assess",
+        "compare",
+        "comparison",
+    ]
+    .iter()
+    .any(|keyword| lower.contains(keyword))
     {
         return RouterIntent::Analysis;
     }
@@ -69,8 +84,38 @@ mod tests {
     #[test]
     fn infer_code_intent_from_keywords() {
         assert_eq!(
-            infer_router_intent(TaskIntent::Stream, "请 debug 这段 cargo build 错误"),
+            infer_router_intent(TaskIntent::Stream, "please debug this cargo build error"),
             RouterIntent::Code
+        );
+    }
+
+    #[test]
+    fn infer_summary_and_analysis_intents_from_english_keywords() {
+        assert_eq!(
+            infer_router_intent(TaskIntent::Stream, "write a summary of this thread"),
+            RouterIntent::Summary
+        );
+        assert_eq!(
+            infer_router_intent(TaskIntent::Stream, "translate the release notes"),
+            RouterIntent::Summary
+        );
+        assert_eq!(
+            infer_router_intent(TaskIntent::Stream, "compare the two rollout plans"),
+            RouterIntent::Analysis
+        );
+        assert_eq!(
+            infer_router_intent(TaskIntent::Stream, "evaluate the migration risk"),
+            RouterIntent::Analysis
+        );
+    }
+
+    /// A request the English table cannot read stays on the neutral default
+    /// rather than being forced into a specialised bucket.
+    #[test]
+    fn requests_without_english_keywords_fall_back_to_conversation() {
+        assert_eq!(
+            infer_router_intent(TaskIntent::Stream, "Ol\u{e1}, tudo bem?"),
+            RouterIntent::Conversation
         );
     }
 

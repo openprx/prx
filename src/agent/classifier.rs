@@ -249,14 +249,14 @@ mod tests {
             default_intent: TaskRoutingIntentConfig::Simple,
             rules: vec![
                 TaskRoutingRule {
-                    keywords: vec!["分析".into()],
+                    keywords: vec!["analyze".into()],
                     intent: TaskRoutingIntentConfig::Stream,
                     model_hint: Some("fast".into()),
                     sub_agent_model: None,
                     priority: 1,
                 },
                 TaskRoutingRule {
-                    keywords: vec!["分析".into(), "修复".into()],
+                    keywords: vec!["analyze".into(), "fix".into()],
                     intent: TaskRoutingIntentConfig::Delegate,
                     model_hint: None,
                     sub_agent_model: Some("claude-opus-4-6".into()),
@@ -265,7 +265,7 @@ mod tests {
             ],
         };
 
-        let result = classify_intent(&config, "请分析并修复这个 bug");
+        let result = classify_intent(&config, "please analyze and fix this bug");
         assert_eq!(result.intent, TaskIntent::Delegate);
         assert_eq!(result.model_hint.as_deref(), Some("claude-opus-4-6"));
     }
@@ -277,7 +277,7 @@ mod tests {
             rules: vec![],
         };
 
-        let result = classify_intent(&config, "今天天气如何");
+        let result = classify_intent(&config, "how is the weather today");
         assert_eq!(result.intent, TaskIntent::Simple);
         assert!(result.model_hint.is_none());
     }

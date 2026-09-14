@@ -907,7 +907,7 @@ mod tests {
 
     #[test]
     fn truncate_unicode_safe() {
-        let s = "你好世界！测试数据会被截断吗";
+        let s = "\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}, \u{44d}\u{442}\u{43e} \u{434}\u{43b}\u{438}\u{43d}\u{43d}\u{430}\u{44f} \u{441}\u{442}\u{440}\u{43e}\u{43a}\u{430}";
         let out = truncate_for_log(s, 4);
         // Should take exactly 4 chars + "..."
         assert!(out.ends_with("..."));

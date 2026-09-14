@@ -153,45 +153,46 @@ pub enum ToolCallChunkStatus {
 
 /// A tool call surfaced through a streaming response.
 ///
-/// **5a-5 协议层**: 当 provider 在 SSE 流中识别到 LLM 要调用工具，emit 一个
-/// 携带 `tool_calls` 的 `StreamChunk`。`index` 用来区分单轮内并发 tool call。
+/// **5a-5 protocol layer**: when a provider detects in the SSE stream that the LLM wants to call a
+/// tool, it emits a `StreamChunk` carrying `tool_calls`. `index` distinguishes concurrent tool calls
+/// within a single turn.
 ///
-/// **S3 T3-0 协议扩展（双阶段）**: 引入 `status` + `arguments_delta` 两个字段，
-/// 在保持向后兼容的前提下支持增量（incremental）发布工具参数：
+/// **S3 T3-0 protocol extension (two-phase)**: adds the two fields `status` + `arguments_delta`,
+/// supporting incremental publication of tool arguments while staying backward compatible:
 ///
-/// 1. **Legacy / Completion 协议**（OpenAI/Anthropic 当前实现）: provider 在
-///    SSE 累积完成后 emit 单个 `status = Completed`、`args = 完整 JSON`、
-///    `arguments_delta = None` 的 chunk。driver 直接读取 `args` 执行。
-/// 2. **Streaming / Incremental 协议**（S3 T3-2 才有 provider 真实启用）:
-///    provider 在解析到第一个 `input_json_delta` 时 emit 一个或多个
-///    `status = Streaming`、`args = ""`、`arguments_delta = Some(片段)` 的 chunk，
-///    最后一个 chunk 必须是 `status = Completed`、`args = 完整 JSON`、
-///    `arguments_delta = None`。driver 聚合所有 deltas 应等于 Completed.args。
+/// 1. **Legacy / Completion protocol** (current OpenAI/Anthropic implementations): after the SSE
+///    accumulation completes, the provider emits a single chunk with `status = Completed`,
+///    `args = <full JSON>` and `arguments_delta = None`. The driver reads `args` and executes directly.
+/// 2. **Streaming / Incremental protocol** (only really enabled by providers from S3 T3-2 on): when the
+///    provider parses the first `input_json_delta` it emits one or more chunks with
+///    `status = Streaming`, `args = ""` and `arguments_delta = Some(fragment)`; the last chunk must be
+///    `status = Completed`, `args = <full JSON>`, `arguments_delta = None`. The driver's aggregation of
+///    all deltas must equal Completed.args.
 ///
-/// **不变量**:
-/// - `id` 与 `name` 在同一 tool call 的整个 chunk 序列中必须保持一致；
-/// - 任意时刻，`Streaming` chunk 与对应 `Completed` chunk 共享相同 `index`；
-/// - `Completed.arguments_delta` 必须为 `None`；
-/// - `Streaming.args` 应为 `""`（消费端不依赖该字段）；
-/// - 旧 provider 不需要任何改动（构造器 `ToolCallChunk::new` 默认 `Completed`）。
+/// **Invariants**:
+/// - `id` and `name` must stay identical across the whole chunk sequence of one tool call;
+/// - at any time, a `Streaming` chunk and its matching `Completed` chunk share the same `index`;
+/// - `Completed.arguments_delta` must be `None`;
+/// - `Streaming.args` should be `""` (consumers do not rely on this field);
+/// - old providers need no change at all (the `ToolCallChunk::new` constructor defaults to `Completed`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ToolCallChunk {
-    /// LLM 给出的 tool_call_id（用作 result 回填的关联键）.
+    /// The tool_call_id given by the LLM (the correlation key used when feeding the result back).
     pub id: String,
-    /// 工具名（必须匹配 tools_registry 注册的 ToolSpec.name）.
+    /// Tool name (must match the ToolSpec.name registered in tools_registry).
     pub name: String,
-    /// 完整参数 JSON 字符串（provider 已经把 SSE delta 拼成完整 JSON）.
+    /// Full argument JSON string (the provider has already joined the SSE deltas into complete JSON).
     ///
-    /// 在 `Streaming` 状态下应为空串；在 `Completed` 状态下为完整 JSON。
+    /// Should be an empty string in the `Streaming` state; the full JSON in the `Completed` state.
     pub args: String,
-    /// 同一轮内并发 tool call 的序号（0..N）.
+    /// Sequence number of concurrent tool calls within one turn (0..N).
     pub index: usize,
-    /// **S3 T3-0**: 增量协议参数片段。仅在 `status = Streaming` 时为 `Some`，
-    /// 携带本次 SSE 帧的 `arguments` 增量子串；`Completed` 时必须为 `None`。
+    /// **S3 T3-0**: incremental-protocol argument fragment. `Some` only when `status = Streaming`,
+    /// carrying the `arguments` delta substring of this SSE frame; must be `None` when `Completed`.
     pub arguments_delta: Option<String>,
-    /// **S3 T3-0**: 双阶段协议生命周期标记。
-    /// 默认 `Completed`，保证旧 provider 与 `ToolCallChunk::new` 路径
-    /// 无需改动即继续工作。
+    /// **S3 T3-0**: two-phase protocol lifecycle marker.
+    /// Defaults to `Completed` so that old providers and the `ToolCallChunk::new` path keep working
+    /// without changes.
     pub status: ToolCallChunkStatus,
 }
 
@@ -241,9 +242,9 @@ impl ToolCallChunk {
 /// The default chat consumer drops reasoning from the live stream and only
 /// preserves the final aggregated text + reasoning in conversation history.
 ///
-/// **5a-5 扩展**：新增 `tool_calls` 字段（默认空 vec，向后兼容）。当 provider
-/// 在 streaming 中识别 LLM 要调用工具，emit 一个携带 tool_calls 的 chunk；
-/// driver 检测到非空 tool_calls 时进入工具回合循环。
+/// **5a-5 extension**: adds the `tool_calls` field (defaults to an empty vec, backward compatible).
+/// When a provider detects during streaming that the LLM wants to call a tool it emits a chunk
+/// carrying tool_calls; when the driver sees a non-empty tool_calls it enters the tool turn loop.
 #[derive(Debug, Clone, Default)]
 pub struct StreamChunk {
     /// Visible text delta for this chunk (assistant's "spoken" output).
@@ -265,8 +266,8 @@ pub struct StreamChunk {
     /// **5a-5**: Tool calls surfaced in this chunk. Empty for ordinary text;
     /// non-empty when the provider has parsed a tool_use block from the stream.
     ///
-    /// Provider 负责把所有 SSE event 累积成完整 tool_call (id + name + args)
-    /// 再 emit 单个 chunk；driver 不做增量解析。
+    /// The provider is responsible for accumulating all SSE events into a complete tool_call
+    /// (id + name + args) before emitting a single chunk; the driver does no incremental parsing.
     pub tool_calls: Vec<ToolCallChunk>,
     /// Reliable/router wrappers attach one completed network-attempt event here.
     /// Content adapters leave it `None`; callers then synthesize one direct
@@ -305,9 +306,9 @@ impl StreamChunk {
 
     /// **5a-5**: Create a non-final chunk carrying tool calls only.
     ///
-    /// Provider 在 streaming 中识别 LLM 要调用工具时，emit 此变体。`delta` 留空
-    /// 让 UI 不把 tool_call 当文本 token 渲染。driver 检测到 `tool_calls.is_empty()
-    /// == false` 时进入工具执行回合。
+    /// A provider emits this variant when it detects during streaming that the LLM wants to call a
+    /// tool. `delta` is left empty so the UI does not render the tool_call as text tokens. The driver
+    /// enters the tool execution turn when it sees `tool_calls.is_empty() == false`.
     pub const fn tool_call_chunk(calls: Vec<ToolCallChunk>) -> Self {
         Self {
             delta: String::new(),
@@ -1207,7 +1208,7 @@ mod tests {
         assert!(message.contains("non-prompt-guided"));
     }
 
-    // ─── 5a-5 StreamChunk + ToolCallChunk 协议层契约测试 ────────────────────
+    // ─── 5a-5 StreamChunk + ToolCallChunk protocol-layer contract tests ────────
 
     #[test]
     fn tool_call_chunk_new_constructs_fields() {
@@ -1266,18 +1267,19 @@ mod tests {
 
     #[test]
     fn stream_chunk_default_is_backwards_compatible() {
-        // Default impl 是协议向后兼容的保证：所有 provider 即便不感知 5a-5
-        // 也能编译 — 字段被默认补 Vec::new()，has_tool_calls() == false.
+        // The Default impl is what guarantees protocol backward compatibility: every provider still
+        // compiles even if it is unaware of 5a-5 — the field is defaulted to Vec::new() and
+        // has_tool_calls() == false.
         let c = StreamChunk::default();
         assert!(c.delta.is_empty());
         assert!(c.tool_calls.is_empty());
         assert!(!c.has_tool_calls());
     }
 
-    // ─── S3 T3-0 双阶段（Streaming / Completed）协议契约测试 ────────────────
+    // ─── S3 T3-0 two-phase (Streaming / Completed) protocol contract tests ─────
 
-    /// 协议自洽：Streaming chunks 的 `arguments_delta` 累加值必须等于最后
-    /// `Completed` chunk 的 `args`；`id` 与 `name` 在序列内贯穿一致。
+    /// Protocol self-consistency: the accumulated `arguments_delta` of the Streaming chunks must equal
+    /// the `args` of the final `Completed` chunk; `id` and `name` stay identical across the sequence.
     #[test]
     fn streaming_to_completed_aggregates_arguments() {
         let chunk1 = ToolCallChunk {
@@ -1305,19 +1307,28 @@ mod tests {
             status: ToolCallChunkStatus::Completed,
         };
 
-        // 聚合：driver 端会实现，这里先验证协议自洽。
+        // Aggregation: the driver side implements this; here we only verify protocol self-consistency.
         let mut aggregated = String::new();
         for c in [&chunk1, &chunk2] {
             if let Some(delta) = c.arguments_delta.as_ref() {
                 aggregated.push_str(delta);
             }
         }
-        assert_eq!(aggregated, chunk_final.args, "Streaming 累积应等于 Completed 的 args");
-        assert_eq!(chunk1.id, chunk_final.id, "tool id 必须贯穿全 chunk 序列");
-        assert_eq!(chunk1.name, chunk_final.name, "tool name 必须贯穿全 chunk 序列");
+        assert_eq!(
+            aggregated, chunk_final.args,
+            "Streaming accumulation must equal the args of Completed"
+        );
+        assert_eq!(
+            chunk1.id, chunk_final.id,
+            "tool id must stay identical across the chunk sequence"
+        );
+        assert_eq!(
+            chunk1.name, chunk_final.name,
+            "tool name must stay identical across the chunk sequence"
+        );
         assert_eq!(
             chunk1.index, chunk_final.index,
-            "tool index 在 Streaming/Completed 间必须一致",
+            "tool index must be identical between Streaming and Completed",
         );
         assert_eq!(chunk1.status, ToolCallChunkStatus::Streaming);
         assert_eq!(chunk_final.status, ToolCallChunkStatus::Completed);
@@ -1327,8 +1338,8 @@ mod tests {
         );
     }
 
-    /// 旧 provider 风格（只发 `Completed`）继续合法 —— `ToolCallChunk::new`
-    /// 默认即 `Completed` + `arguments_delta = None`。
+    /// The old provider style (emitting only `Completed`) stays valid — `ToolCallChunk::new`
+    /// already defaults to `Completed` + `arguments_delta = None`.
     #[test]
     fn legacy_completed_only_still_valid() {
         let chunk = ToolCallChunk::new("tool_1", "search", r#"{"query":"hello"}"#, 0);
@@ -1336,14 +1347,14 @@ mod tests {
         assert!(chunk.arguments_delta.is_none());
         assert_eq!(chunk.args, r#"{"query":"hello"}"#);
 
-        // 序列化兼容：旧 provider emit 的 chunk 仍可正常 round-trip。
+        // Serialization compatibility: a chunk emitted by an old provider still round-trips fine.
         let json = serde_json::to_string(&chunk).expect("serialize legacy chunk");
         let parsed: ToolCallChunk = serde_json::from_str(&json).expect("deserialize legacy chunk");
         assert_eq!(parsed, chunk);
     }
 
-    /// `ToolCallChunkStatus::default()` 必须是 `Completed`，否则 derive(Default)
-    /// 派生的 `ToolCallChunk::default()` 会破坏 5a-5 已有测试的不变量。
+    /// `ToolCallChunkStatus::default()` must be `Completed`, otherwise the derive(Default) generated
+    /// `ToolCallChunk::default()` would break the invariants of the existing 5a-5 tests.
     #[test]
     fn default_status_is_completed() {
         let status = ToolCallChunkStatus::default();
@@ -1355,8 +1366,8 @@ mod tests {
         assert!(chunk.args.is_empty());
     }
 
-    /// 便捷构造器：`streaming_delta` 应产生 `Streaming` chunk，`args` 为空，
-    /// `arguments_delta = Some(...)`，保留 `id` / `name` / `index`。
+    /// Convenience constructor: `streaming_delta` must produce a `Streaming` chunk with empty `args`,
+    /// `arguments_delta = Some(...)`, preserving `id` / `name` / `index`.
     #[test]
     fn streaming_delta_constructor_shape() {
         let chunk = ToolCallChunk::streaming_delta("call_x", "edit", r#"{"path":"#, 3);

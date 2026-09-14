@@ -1751,8 +1751,10 @@ const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8"
 
 /// GET /metrics — Prometheus text exposition format
 async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
-    // 合并 PrometheusObserver 主 registry + chat_metrics 独立 registry (S2.5 P1-A).
-    // chat 4 个 counter 独立于 observer 物理隔离，必须显式合并才能被 scrape 到。
+    // Merge the PrometheusObserver's main registry with the separate
+    // chat_metrics registry (S2.5 P1-A). The four chat counters live in a
+    // registry that is physically isolated from the observer, so they have to
+    // be merged explicitly or a scrape never sees them.
     let chat_reg = crate::observability::chat_metrics::chat_registry();
     let body = state
         .observer
@@ -1761,7 +1763,7 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
         .downcast_ref::<crate::observability::PrometheusObserver>()
         .map_or_else(
             || {
-                // observer 非 Prometheus 时，chat 指标仍需暴露。
+                // The chat metrics still have to be exposed when the observer is not Prometheus.
                 format!(
                     "# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n{}",
                     crate::observability::prometheus::encode_registries(&[chat_reg])
@@ -3734,7 +3736,7 @@ mod tests {
         assert_eq!(normalize_max_keys(1, 10_000), 1);
     }
 
-    /// D2 / 修3 regression: `persist_pairing_tokens` must base the persisted/published
+    /// D2 / fix 3 regression: `persist_pairing_tokens` must base the persisted/published
     /// config on the HOT SharedConfig (D) snapshot, NOT the cached C Mutex. On the
     /// reload-only paths C lags D; if persist cloned a stale C, saved it, and re-stored
     /// it, every field a prior hot-reload changed would be silently reverted on disk AND
@@ -6066,7 +6068,7 @@ mod tests {
         ));
     }
 
-    /// S2.5 P1-A: /metrics 端点在 PrometheusObserver 模式下包含 chat counter 指标.
+    /// S2.5 P1-A: the /metrics endpoint carries the chat counters in PrometheusObserver mode.
     #[tokio::test]
     async fn s2_5_p1c_metrics_endpoint_exposes_chat_counters() {
         let prom = Arc::new(crate::observability::PrometheusObserver::try_new().unwrap());
@@ -6074,7 +6076,8 @@ mod tests {
             prom.as_ref(),
             &crate::observability::ObserverEvent::HeartbeatTick,
         );
-        // 递增 4 个 chat counter（使用唯一 label 避免与其他测试累计值干扰）
+        // Bump all four chat counters, with labels unique to this test so other
+        // tests' accumulated values cannot interfere.
         crate::observability::chat_metrics::inc_action("s2_5_p1c_test_kind");
         crate::observability::chat_metrics::inc_effect("s2_5_p1c_test_effect");
         crate::observability::chat_metrics::inc_stream_chunk();
@@ -6117,12 +6120,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        // PrometheusObserver 自身指标仍在
+        // The observer's own metrics are still there.
         assert!(
             text.contains("prx_heartbeat_ticks_total"),
             "observer metrics must be present"
         );
-        // chat 4 个 counter 名都要出现
+        // All four chat counter names must appear.
         assert!(text.contains("prx_chat_actions_total"), "chat actions counter missing");
         assert!(text.contains("prx_chat_effects_total"), "chat effects counter missing");
         assert!(
@@ -6135,10 +6138,10 @@ mod tests {
         );
     }
 
-    /// S2.5 P1-A: /metrics 端点在 NoopObserver 模式下仍暴露 chat counter 指标.
+    /// S2.5 P1-A: the /metrics endpoint still exposes the chat counters in NoopObserver mode.
     #[tokio::test]
     async fn s2_5_p1c_metrics_endpoint_exposes_chat_when_observer_noop() {
-        // 触发 LazyLock 初始化，确保 4 个 counter 注册到 CHAT_REGISTRY
+        // Force the LazyLock initialisation so all four counters register in CHAT_REGISTRY.
         crate::observability::chat_metrics::inc_action("s2_5_p1c_noop_kind");
         crate::observability::chat_metrics::inc_effect("s2_5_p1c_noop_effect");
         crate::observability::chat_metrics::inc_stream_chunk();
@@ -6180,12 +6183,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        // noop observer 降级路径：仍含 hint 前缀
+        // The noop-observer fallback path still carries the hint prefix.
         assert!(
             text.contains("Prometheus backend not enabled"),
             "hint prefix must be present"
         );
-        // chat counter 名也要出现（即使 noop observer）
+        // The chat counter names must appear too, even with a noop observer.
         assert!(
             text.contains("prx_chat_actions_total"),
             "chat actions counter missing with noop observer"

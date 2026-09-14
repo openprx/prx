@@ -3176,7 +3176,7 @@ impl Memory for PostgresMemory {
             let rls_system = super::principal::is_system_principal(&principal.user_id);
             // FIX-P0-23 (#4 F4): persist topic_id instead of hard-coded NULL.
             // Prefer the explicit metadata topic_id; fall back to source_event_id
-            // (source_event_id 兜底) so a write still threads back to its
+            // (source_event_id as the fallback) so a write still threads back to its
             // originating event for Project-visibility scope resolution.
             let topic_id = metadata.topic_id.clone().or_else(|| metadata.source_event_id.clone());
             let stmt = format!(

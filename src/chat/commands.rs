@@ -1724,9 +1724,9 @@ mod mode_tests {
     fn export_redacts_session_content_without_losing_unicode_or_tool_shape() {
         let secret = "AKIAABCDEFGHIJKLMNOP";
         let mut session = crate::chat::session::ChatSession::new("provider", "model");
-        session.title = format!("导出 {secret} ✅");
+        session.title = format!("\u{42d}\u{43a}\u{441}\u{43f}\u{43e}\u{440}\u{442} {secret} ✅");
         session.add_assistant_turn(
-            &format!("Unicode 保留：你好 🌍；secret={secret}"),
+            &format!("Unicode preserved: \u{41f}\u{440}\u{438}\u{432}\u{435}\u{442} 🌍; secret={secret}"),
             vec![crate::chat::session::ToolCallSummary {
                 name: "shell".to_string(),
                 args_preview: format!(r#"{{"password":"tiny","cmd":"echo {secret} مرحبا","count":2}}"#),
@@ -1740,7 +1740,7 @@ mod mode_tests {
         let markdown = export_session_body_in_unique_tempdir(&session, "md");
         assert!(!json.contains(secret));
         assert!(!markdown.contains(secret));
-        assert!(json.contains("你好"));
+        assert!(json.contains("\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}"));
         let decoded: crate::chat::session::ChatSession = serde_json::from_str(&json).unwrap();
         let tool_call = decoded
             .turns

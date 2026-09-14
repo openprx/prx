@@ -142,7 +142,8 @@ const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 8;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 1_280;
 /// 🟡 Behavior-limits Phase 1: raised 2400 -> 9600 (4x).
 const CHANNEL_HISTORY_COMPACT_TOTAL_CHARS: usize = 9_600;
-const SIGNAL_IMAGE_UNCERTAINTY_FALLBACK: &str = "无法确认，请提供更清晰图片或补充说明";
+const SIGNAL_IMAGE_UNCERTAINTY_FALLBACK: &str =
+    "I could not identify this image with confidence. Please send a clearer picture or add some context.";
 const SIGNAL_VISION_PREFLIGHT_CONFIDENCE_THRESHOLD: f64 = 0.60;
 const SIGNAL_VISION_PREFLIGHT_TIMEOUT_SECS: u64 = 45;
 
@@ -7546,7 +7547,7 @@ BTC is currently around $65,000 based on latest tool output."#
             if call_index == 0 {
                 Ok(String::new())
             } else {
-                Ok("这是维生素C产品包装。".to_string())
+                Ok("This is vitamin C product packaging.".to_string())
             }
         }
     }
@@ -9202,8 +9203,8 @@ BTC is currently around $65,000 based on latest tool output."#
         let responses = response_messages(&sent_messages);
         assert_eq!(responses.len(), 1);
         let response = responses.first().unwrap();
-        assert!(response.contains("无法确认，请提供更清晰图片或补充说明"));
-        assert!(!response.contains("维生素C"));
+        assert!(response.contains(SIGNAL_IMAGE_UNCERTAINTY_FALLBACK));
+        assert!(!response.contains("vitamin C"));
         assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 1);
     }
 

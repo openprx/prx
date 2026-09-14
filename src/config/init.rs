@@ -905,7 +905,7 @@ fn routing_template(spec: Spec) -> String {
 # Query classification: auto-route user messages
 [query_classification]
 # [[query_classification.rules]]
-# pattern = "translate|翻译"
+# pattern = "translate|summarize"
 # hint = "fast"
 
 # Task routing: classify work by intent

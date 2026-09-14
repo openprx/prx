@@ -1,4 +1,4 @@
-//! Configuration for the xin (心) autonomous task engine.
+//! Configuration for the xin autonomous task engine.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -9,7 +9,7 @@ const fn default_interval_minutes() -> u32 {
 const fn default_stale_timeout_minutes() -> u32 {
     60
 }
-/// Configuration for the xin (心) autonomous task engine (`[xin]`).
+/// Configuration for the xin autonomous task engine (`[xin]`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct XinConfig {

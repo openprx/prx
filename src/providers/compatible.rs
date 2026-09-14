@@ -2361,7 +2361,7 @@ mod tests {
     fn stream_decoder_survives_split_multibyte_characters() {
         let mut decoder = SseTextDecoder::new(STREAM_DECODER_LABEL);
         let mut buf = String::new();
-        let bytes = "\u{4e2d}".as_bytes();
+        let bytes = "\u{20ac}".as_bytes();
         assert_eq!(bytes.len(), 3);
 
         decoder
@@ -2371,7 +2371,7 @@ mod tests {
         assert_eq!(decoder.pending_len(), 2, "test: the split tail is carried, not dropped");
 
         decoder.push(&bytes[2..], &mut buf).expect("test: character completes");
-        assert_eq!(buf, "\u{4e2d}");
+        assert_eq!(buf, "\u{20ac}");
         decoder.finish().expect("test: stream ends on a character boundary");
 
         // Genuinely invalid input must still fail, tagged with this provider.
@@ -3777,10 +3777,10 @@ mod tests {
 
         // Case 4: multi-byte UTF-8 right before the newline. `drain(..=pos)`
         // is byte-indexed; the splitter must remain panic-free even when the
-        // last code point uses 3 bytes (e.g. `中`).
-        let mut b4 = String::from("中\n中\n");
+        // last code point uses 3 bytes (e.g. `\u{20ac}`).
+        let mut b4 = String::from("\u{20ac}\n\u{20ac}\n");
         let lines = split_lines(&mut b4);
-        assert_eq!(lines, vec!["中\n".to_string(), "中\n".to_string()]);
+        assert_eq!(lines, vec!["\u{20ac}\n".to_string(), "\u{20ac}\n".to_string()]);
         assert!(b4.is_empty());
     }
 

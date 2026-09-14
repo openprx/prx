@@ -309,7 +309,7 @@ pub struct Config {
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
 
-    /// Xin (心) autonomous task engine configuration (`[xin]`).
+    /// Xin autonomous task engine configuration (`[xin]`).
     #[serde(default)]
     pub xin: crate::xin::XinConfig,
 
@@ -4919,9 +4919,9 @@ pub struct WacliConfig {
     /// Bot's own phone number (digits), used for `@<number>` mention detection.
     #[serde(default)]
     pub bot_number: Option<String>,
-    /// Bot 的 WhatsApp LID（群内 @mention 时使用）。
-    /// 可填裸数字 `263767598346470` 或完整形式 `263767598346470@lid`。
-    /// 设备后缀（`:3` 等）会自动去除。
+    /// The bot's own WhatsApp LID, used for @mention detection inside groups.
+    /// Accepts either the bare digits `263767598346470` or the full
+    /// `263767598346470@lid` form; a device suffix such as `:3` is stripped.
     #[serde(default)]
     pub bot_lid: Option<String>,
     /// Treat messages authored by the linked account in WhatsApp's Message

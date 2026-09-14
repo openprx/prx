@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.122] - 14 September 2026
+
+### Changed
+
+- Make `src/` and `tests/` English-only. Every behavioural keyword table that
+  used to carry Chinese entries is now English with a language-neutral
+  fallback, so no natural language is privileged over any other: capability
+  routing, router intent classification, automix confidence, the channel
+  pre-gate's interrogative and social-noise tables, memory topic/greeting
+  classification, the memory autosave blocklist and the sensitive-content
+  patterns. Where a table no longer reads a request, the existing default
+  applies - the pre-gate falls through to its classifier and fails open, the
+  router returns its default category, automix keeps its base confidence, and
+  capability routing stays unrouted, which publishes the caller's fallback
+  surface rather than trimming on a guess. The pre-gate answer parser gained
+  explicit negated phrases ("should not reply", "no need to reply") so a
+  verbose negative no longer parses as the affirmative token it contains.
+  User-visible copy, test fixtures, assertion messages and comments are
+  English too; fixtures that need multi-byte input use language-neutral
+  substitutes. A new `architecture_boundaries` guard fails the build on any CJK
+  character in `src/` or `tests/`, literal or `\u{...}`-escaped.
+
 ## [0.8.121] - 13 September 2026
 
 ### Fixed

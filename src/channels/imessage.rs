@@ -892,7 +892,7 @@ mod tests {
             conn.execute("INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')", [])
                 .unwrap();
             conn.execute(
-                "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (10, 1, 'Hello 🦀 世界 مرحبا', 0)",
+                "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (10, 1, 'Hello 🦀 \u{41c}\u{438}\u{440} مرحبا', 0)",
                 [],
             )
             .unwrap();
@@ -900,7 +900,7 @@ mod tests {
 
         let result = fetch_new_messages(&db_path, 0).await.unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].2, "Hello 🦀 世界 مرحبا");
+        assert_eq!(result[0].2, "Hello 🦀 \u{41c}\u{438}\u{440} مرحبا");
     }
 
     #[tokio::test]

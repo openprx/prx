@@ -390,7 +390,7 @@ async fn turn_delegates_heavy_task_to_sessions_spawn_tool() {
         .task_routing_config(TaskRoutingConfig {
             default_intent: TaskRoutingIntentConfig::Simple,
             rules: vec![TaskRoutingRule {
-                keywords: vec!["修复".into(), "部署".into()],
+                keywords: vec!["fix".into(), "deploy".into()],
                 intent: TaskRoutingIntentConfig::Delegate,
                 model_hint: None,
                 sub_agent_model: Some("claude-opus-4-6".into()),
@@ -400,9 +400,9 @@ async fn turn_delegates_heavy_task_to_sessions_spawn_tool() {
         .build()
         .unwrap();
 
-    let response = agent.turn("请帮我修复这个 bug").await.unwrap();
+    let response = agent.turn("please fix this bug for me").await.unwrap();
 
-    assert!(response.contains("任务 run-123"));
+    assert!(response.contains("task run-123"));
     let calls = calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0]["action"], "spawn");

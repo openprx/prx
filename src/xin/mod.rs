@@ -1,4 +1,4 @@
-//! `xin` (心) — the autonomous task heartbeat engine.
+//! `xin` — the autonomous task heartbeat engine.
 //!
 //! A configurable timer-driven engine that manages system-level autonomous tasks:
 //! health checks, memory evolution, fitness reports, and user-defined work units.

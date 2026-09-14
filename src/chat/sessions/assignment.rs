@@ -1932,7 +1932,7 @@ mod tests {
         let bounded = bound_summary(&huge);
         assert!(bounded.len() <= MAX_SUMMARY_BYTES, "bounded to {}", bounded.len());
         assert!(bounded.ends_with("to fit the result field)"));
-        let wide = "漢".repeat(MAX_SUMMARY_BYTES);
+        let wide = "\u{20ac}".repeat(MAX_SUMMARY_BYTES);
         assert!(bound_summary(&wide).len() <= MAX_SUMMARY_BYTES);
     }
 

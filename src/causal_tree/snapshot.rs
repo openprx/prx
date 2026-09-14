@@ -243,8 +243,8 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn test_multibyte_truncation_safe() {
-        // Each '中' is 3 bytes in UTF-8.  Build a 600-char string.
-        let msg: String = "中".repeat(600);
+        // Each '\u{20ac}' is 3 bytes in UTF-8.  Build a 600-char string.
+        let msg: String = "\u{20ac}".repeat(600);
         let truncated = truncate_to_chars(&msg, GOAL_MAX_CHARS);
 
         // Must be exactly GOAL_MAX_CHARS characters (not bytes).

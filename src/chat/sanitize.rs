@@ -211,10 +211,10 @@ mod tests {
 
     #[test]
     fn truncate_respects_utf8_char_boundaries() {
-        // Create a string of multi-byte CJK chars where MAX_TOOL_OUTPUT_BYTES
+        // Create a string of 3-byte characters where MAX_TOOL_OUTPUT_BYTES
         // would land mid-character
-        let cjk = "你".repeat(5000); // each '你' = 3 bytes → 15000 bytes
-        let result = truncate_large_output(&cjk);
+        let wide = "\u{20ac}".repeat(5000); // each '\u{20ac}' = 3 bytes -> 15000 bytes
+        let result = truncate_large_output(&wide);
         assert!(result.contains("[... truncated"));
         // The truncated portion must be valid UTF-8 (no panic from slicing)
         assert!(result.is_char_boundary(0)); // trivially true, but validates result is valid
@@ -222,7 +222,7 @@ mod tests {
 
     #[test]
     fn sanitization_is_bounded_and_idempotent() {
-        let input = format!("Authorization: Bearer token-secret\n{}", "你".repeat(5_000));
+        let input = format!("Authorization: Bearer token-secret\n{}", "\u{20ac}".repeat(5_000));
         let once = sanitize_for_persistence(&input);
         let twice = sanitize_for_persistence(&once);
         assert!(once.len() <= MAX_TOOL_OUTPUT_BYTES);

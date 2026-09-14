@@ -641,7 +641,7 @@ mod tests {
         assert!(Box::new(ImmediateRunner).run(token).await.is_ok());
     }
 
-    // ── Signal whitelist regression (§3.3.4 速查表). The four long-running,
+    // ── Signal whitelist regression (§3.3.4 quick reference). The four long-running,
     //    gracefully-interruptible modes opt in; chat / interactive agent / all
     //    query+management commands must NOT bind a dispatch signal task. ──
 

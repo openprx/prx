@@ -212,10 +212,10 @@ impl Provider for RouterProvider {
         self.providers.iter().any(|(_, provider)| provider.supports_streaming())
     }
 
-    /// 把 `stream_chat_with_history` 转发到被路由的具体 provider，
-    /// 与 `chat_with_history` 的行为对齐。否则默认 trait 实现会回退到
-    /// "unknown does not support streaming" 错误 chunk，
-    /// 让 Step 5a-4 dispatcher driver 路径（依赖 streaming）无法工作。
+    /// Forward `stream_chat_with_history` to the routed concrete provider, matching the
+    /// behaviour of `chat_with_history`. Otherwise the default trait implementation would
+    /// fall back to an "unknown does not support streaming" error chunk, which breaks the
+    /// Step 5a-4 dispatcher driver path (it depends on streaming).
     fn stream_chat_with_history(
         &self,
         messages: &[ChatMessage],
@@ -233,7 +233,7 @@ impl Provider for RouterProvider {
             .boxed();
         };
         let Some((_, provider)) = self.providers.get(provider_idx) else {
-            // resolve() 永远返回有效 idx；防御性兜底返回错误 chunk 而非 panic.
+            // resolve() always returns a valid idx; defensively return an error chunk instead of panicking.
             return futures::stream::once(async move {
                 Err(super::traits::StreamError::Provider(format!(
                     "RouterProvider: resolved provider index {provider_idx} out of bounds"
@@ -295,20 +295,21 @@ impl Provider for RouterProvider {
 #[cfg(any(test, feature = "test-mock"))]
 pub(crate) struct MockEnvProvider {
     response: String,
-    /// 5a-6: 当设置 `OPENPRX_MOCK_TOOL_CALL=name:args_json` 时，第一次 streaming
-    /// 调用产生 `ToolCallChunk`(name, args)，后续调用返回 `response` 文本。
-    /// 让 PTY E2E 能验证 driver 完整 tool turn 闭环（call → execute → continue → final）。
-    /// `None` 时维持原 5a-2 行为（直接返回 response 文本）.
+    /// 5a-6: when `OPENPRX_MOCK_TOOL_CALL=name:args_json` is set, the first streaming call
+    /// emits a `ToolCallChunk`(name, args) and later calls return the `response` text.
+    /// This lets PTY E2E verify the driver's full tool turn loop (call → execute → continue → final).
+    /// When `None`, the original 5a-2 behaviour is kept (return the response text directly).
     tool_call_spec: Option<MockToolCallSpec>,
-    /// 流式调用计数器，决定本次 emit tool_call 还是 final text。
+    /// Streaming call counter; decides whether this call emits a tool_call or the final text.
     call_counter: Arc<AtomicUsize>,
-    /// S5 P0-1: 完整流式脚本（JSON 序列化 chunks 列表）。设置后 stream 按
-    /// 脚本逐 chunk emit，绕过 response / tool_call_spec 路径。
+    /// S5 P0-1: full streaming script (a JSON-serialized list of chunks). When set, the stream
+    /// emits the scripted chunks one by one, bypassing the response / tool_call_spec paths.
     script: Option<MockScript>,
-    /// S5 P0-1: provider flavor hint — 仅用于日志识别，不改变 chunk 内容
-    /// (anthropic / openai / gemini)，方便 PTY 测试覆盖不同协议路径的回归。
+    /// S5 P0-1: provider flavor hint — only used for log identification, it does not change chunk
+    /// content (anthropic / openai / gemini); it lets PTY tests cover regressions on the different
+    /// protocol paths.
     flavor: Option<String>,
-    /// S5 P0-1: 每个 chunk 间的延迟（ms），cancel-mid-stream 测试窗口用。
+    /// S5 P0-1: delay between chunks (ms), used as the cancel-mid-stream test window.
     delay_ms_per_chunk: u64,
     /// Prompt-substring keyed initial stream delay for visible-turn concurrency demos.
     delay_ms_by_prompt: Vec<(String, u64)>,
@@ -326,9 +327,9 @@ struct MockToolCallSpec {
     args: String,
 }
 
-/// S5 P0-1: 完整脚本，描述一次 stream 中按顺序 emit 的 chunks.
+/// S5 P0-1: full script describing the chunks emitted, in order, during one stream.
 ///
-/// JSON 序列化形态：
+/// JSON serialized form:
 /// ```json
 /// {"chunks":[
 ///   {"delta":"Hello "},
@@ -365,7 +366,7 @@ struct MockScriptTool {
     args: String,
 }
 
-/// S5 P0-1: 把单个 `MockChunk` 映射到 `StreamChunk`（按优先级：tool > final > reasoning > delta）.
+/// S5 P0-1: map a single `MockChunk` to a `StreamChunk` (priority order: tool > final > reasoning > delta).
 #[cfg(any(test, feature = "test-mock"))]
 fn script_chunk_to_stream(mc: &MockChunk, idx: usize) -> StreamChunk {
     use crate::providers::traits::ToolCallChunk;
@@ -437,8 +438,9 @@ impl MockEnvProvider {
     /// sentinel — an empty mock response would never satisfy any PTY
     /// `expect` matcher and would silently turn into a hang.
     ///
-    /// 5a-6: 读取 `OPENPRX_MOCK_TOOL_CALL` 控制 streaming 是否在首次返回 tool_call.
-    /// 格式: `name:args_json` (e.g. `shell:{"cmd":"ls"}`). 解析失败回退为无 tool_call.
+    /// 5a-6: reads `OPENPRX_MOCK_TOOL_CALL` to control whether streaming returns a tool_call on the
+    /// first call. Format: `name:args_json` (e.g. `shell:{"cmd":"ls"}`). On a parse failure it falls
+    /// back to no tool_call.
     pub(crate) fn from_env() -> Self {
         const DEFAULT_SENTINEL: &str = "[MOCK-DEFAULT-RESPONSE][MOCK-END]";
         let response = match std::env::var("OPENPRX_MOCK_RESPONSE") {
@@ -461,7 +463,7 @@ impl MockEnvProvider {
                 args: args.to_string(),
             })
         });
-        // S5 P0-1: 完整流式脚本，优先级最高（绕过 response / tool_call_spec）
+        // S5 P0-1: full streaming script, highest priority (bypasses response / tool_call_spec).
         let script = std::env::var("OPENPRX_MOCK_SCRIPT").ok().and_then(|raw| {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
@@ -470,11 +472,11 @@ impl MockEnvProvider {
             match serde_json::from_str::<MockScript>(trimmed) {
                 Ok(s) if !s.chunks.is_empty() => Some(s),
                 Ok(_) => {
-                    tracing::warn!("OPENPRX_MOCK_SCRIPT 解析成功但 chunks 为空，忽略");
+                    tracing::warn!("OPENPRX_MOCK_SCRIPT parsed successfully but chunks is empty, ignoring");
                     None
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "OPENPRX_MOCK_SCRIPT 解析失败，回退默认路径");
+                    tracing::warn!(error = %e, "OPENPRX_MOCK_SCRIPT parse failed, falling back to the default path");
                     None
                 }
             }
@@ -575,15 +577,16 @@ impl Provider for MockEnvProvider {
         Ok(())
     }
 
-    /// 显式实现 streaming：把 `response` 作为单个 delta 推送 + final 标记。
+    /// Explicit streaming implementation: push `response` as a single delta plus a final marker.
     ///
-    /// 仅在 `test-mock` 启用下编译。PRX_CHAT_REDUX_DRIVER 路径的 PTY 验证依赖这里
-    /// 真返回 chunk（默认 trait 实现返回错误 chunk "unknown does not support streaming"）。
+    /// Only compiled when `test-mock` is enabled. PTY verification of the PRX_CHAT_REDUX_DRIVER path
+    /// relies on this really returning chunks (the default trait implementation returns an error
+    /// chunk "unknown does not support streaming").
     ///
-    /// 5a-6: 当 `OPENPRX_MOCK_TOOL_CALL=name:args` 设置且 `call_counter == 0` 时，首次
-    /// 调用返回单个 `ToolCallChunk` (无 delta 文本) — driver 收到后执行 tool，把
-    /// tool_result 喂回 history，再次调 stream_chat_with_history（此时 counter == 1），
-    /// 返回 `response` 文本作为最终答复，turn 闭环。
+    /// 5a-6: when `OPENPRX_MOCK_TOOL_CALL=name:args` is set and `call_counter == 0`, the first call
+    /// returns a single `ToolCallChunk` (no delta text) — the driver executes the tool, feeds the
+    /// tool_result back into history and calls stream_chat_with_history again (counter == 1 this
+    /// time), which returns the `response` text as the final answer, closing the turn.
     fn stream_chat_with_history(
         &self,
         messages: &[ChatMessage],
@@ -598,12 +601,15 @@ impl Provider for MockEnvProvider {
         let response = self.response.clone();
         let initial_delay = mock_delay_ms_for_messages(&self.delay_ms_by_prompt, messages);
 
-        // S5 P0-1: SCRIPT 路径优先 — 按脚本顺序 emit chunks，支持 reasoning / tool / delta /
-        // is_final 混搭。flavor 仅记日志（实际协议适配由 driver 与各 provider impl 负责）。
+        // S5 P0-1: the SCRIPT path takes priority — emit chunks in script order, supporting a mix of
+        // reasoning / tool / delta / is_final. flavor is only logged (actual protocol adaptation is the
+        // job of the driver and each provider impl).
         //
-        // 关键：第一次调用按脚本 emit，**第二次及以后**只输出 final（避免 tool_call 无限重放
-        // 导致 driver 重复请求）。脚本含 tool_call 时尤其重要：driver
-        // 执行 tool → 喂回 tool_result → 再次调 stream_chat_with_history，本次不该再发 tool_call.
+        // Key point: the first call emits per the script, while the **second and later** calls emit only
+        // final (to avoid replaying the tool_call forever and making the driver repeat requests). This
+        // matters most when the script contains a tool_call: the driver executes the tool → feeds the
+        // tool_result back → calls stream_chat_with_history again, and this call must not send another
+        // tool_call.
         if let Some(script) = self.script.as_ref() {
             if let Some(flavor) = &self.flavor {
                 tracing::debug!(flavor = %flavor, call = counter_val, "mock SCRIPT stream start");
@@ -616,7 +622,8 @@ impl Provider for MockEnvProvider {
                     .map(|(idx, mc)| Ok(script_chunk_to_stream(mc, idx)))
                     .collect()
             } else {
-                // 续轮：emit 脚本里的所有 delta（拼回 sentinel）+ final，不重放 tool.
+                // Follow-up turn: emit every delta from the script (re-assembling the sentinel) plus
+                // final, without replaying the tool.
                 let mut out: Vec<StreamResult<StreamChunk>> = script
                     .chunks
                     .iter()

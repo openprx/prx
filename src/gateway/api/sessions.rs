@@ -1281,7 +1281,7 @@ mod tests {
         );
     }
 
-    /// D2 /修3 regression: `post_config` merges the incoming delta onto the hot
+    /// D2 / fix 3 regression: `post_config` merges the incoming delta onto the hot
     /// SharedConfig (D), NOT the cached C Mutex. We seed D with a hot field value that
     /// differs from C, POST an unrelated delta, and assert the hot field SURVIVES — if
     /// the merge had used stale C as its base it would silently revert the hot field.
@@ -1332,7 +1332,7 @@ mod tests {
         assert!((state.config.load_full().default_temperature - 0.42).abs() < 1e-9);
     }
 
-    /// D2 / 修1: the `/api/config/reload` route builds its OWN authorization gate from
+    /// D2 / fix 1: the `/api/config/reload` route builds its OWN authorization gate from
     /// the hot SharedConfig (D). Publishing ReadOnly to D causes the reload's gate to
     /// deny, proving reload authz reads D and not the stale C Mutex.
     ///
@@ -1405,7 +1405,7 @@ mod tests {
 
         // Inspect the error BODY: it must be the authorization-gate signature, NOT an IO
         // failure. This distinguishes "blocked by read-only authz" from "failed to load
-        // config", which is the whole point of the D2/修1 fix.
+        // config", which is the whole point of the D2 / fix 1 change.
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .expect("read reload error body");

@@ -1022,7 +1022,7 @@ fn test_chat_plain_apply_env_override_cannot_bypass_interactive_confirmation() {
     );
 }
 
-/// 6. Chinese (CJK) characters in the mock response must appear contiguously
+/// 6. East Asian wide (CJK) characters in the mock response must appear contiguously
 /// — no phantom space between each character (regression guard for the
 /// `insert_before` wide-char bug fixed by enabling the `scrolling-regions`
 /// ratatui feature).
@@ -1031,11 +1031,11 @@ fn test_chat_plain_apply_env_override_cannot_bypass_interactive_confirmation() {
 /// stdout verbatim, which lets the PTY scraper check the raw byte sequence.
 #[test]
 #[serial(prx_chat_pty)]
-fn test_chat_chinese_response_no_extra_spaces() {
-    // The mock response: 8 CJK chars with no ASCII filler in between.
-    // If the wide-char bug is present, the captured output will contain
-    // "你 好 世 界" (one space after each glyph).
-    let response = "你好世界欢迎PRX";
+fn test_chat_wide_characters_response_no_extra_spaces() {
+    // The mock response: 6 wide CJK chars with no ASCII filler in between.
+    // If the wide-char bug is present, the captured output will contain one
+    // space after each glyph.
+    let response = "\u{ac00}\u{ac01}\u{ac02}\u{ac03}\u{ac04}\u{ac05}PRX";
     let (mut sg, _guard) = spawn_chat(&["--plain"], &[("OPENPRX_MOCK_RESPONSE", response)]);
     let session = sg.session();
 
@@ -1043,8 +1043,8 @@ fn test_chat_chinese_response_no_extra_spaces() {
     drain_with_dsr(session, Duration::from_millis(200));
 
     session.send("hi\r").expect("send hi");
-    // Wait until the first CJK character appears in the output.
-    let captured = read_until_with_dsr(session, "你", TURN_TIMEOUT);
+    // Wait until the first wide CJK character appears in the output.
+    let captured = read_until_with_dsr(session, "\u{ac00}", TURN_TIMEOUT);
 
     // Strip ANSI escape sequences from the captured buffer so we compare
     // plain text only. The DSR reply (`ESC[1;1R`) and reedline SGR codes
@@ -1052,16 +1052,16 @@ fn test_chat_chinese_response_no_extra_spaces() {
     let ansi_re = regex::Regex::new(r"\x1b\[[^a-zA-Z]*[a-zA-Z]").expect("ansi regex");
     let plain = ansi_re.replace_all(&captured, "").to_string();
 
-    // The Chinese substring must appear as a contiguous run (no spaces).
+    // The wide-char substring must appear as a contiguous run (no spaces).
     assert!(
-        plain.contains("你好世界欢迎PRX"),
-        "Chinese response should contain contiguous '你好世界欢迎PRX' (no inter-character spaces). \
-         Plain output: {plain:?}"
+        plain.contains("\u{ac00}\u{ac01}\u{ac02}\u{ac03}\u{ac04}\u{ac05}PRX"),
+        "wide-char response should contain the six wide chars contiguously (no inter-character \
+         spaces). Plain output: {plain:?}"
     );
     // Explicit negative: spaces between consecutive CJK chars would indicate
     // the phantom-space bug has regressed.
     assert!(
-        !plain.contains("你 好") && !plain.contains("好 世"),
+        !plain.contains("\u{ac00} \u{ac01}") && !plain.contains("\u{ac01} \u{ac02}"),
         "phantom spaces detected between CJK chars in response. Plain output: {plain:?}"
     );
 
@@ -1069,21 +1069,21 @@ fn test_chat_chinese_response_no_extra_spaces() {
     let _ = wait_for_exit(session, EXIT_TIMEOUT);
 }
 
-// ─── Pure 模式 PTY E2E 覆盖 ─────────────────────────────────────────────────
+// ─── Pure-mode PTY E2E coverage ─────────────────────────────────────────────
 //
-// reducer/driver 单路由是默认路径，session 持久化由 reducer 的
-// `Effect::SaveSession` 接管。
+// The single reducer/driver route is the default path, and session persistence is
+// taken over by the reducer's `Effect::SaveSession`.
 //
-// 这两个测试是 Pure-only 路径的关键防回归：
-//   - mock_response_works: 验证 Pure 模式端到端对话能跑通（输入→驱动→渲染）
-//   - tool_call_completes: 验证 driver 自动 attach tools_registry
+// These two tests are the key regression guards for the Pure-only path:
+//   - mock_response_works: an end-to-end Pure-mode conversation runs (input -> driver -> render)
+//   - tool_call_completes: the driver attaches tools_registry automatically
 
 #[test]
 #[serial(prx_chat_pty)]
 fn test_chat_pure_mock_response_works() {
-    // Pure 模式 + mock provider：用户输入 → driver streams →
-    // reducer StreamCompleted → SaveSession Effect →
-    // memory.store（本测试只断言 sentinel 渲染到 PTY，持久化由单测覆盖）.
+    // Pure mode + mock provider: user input -> driver streams ->
+    // reducer StreamCompleted -> SaveSession Effect -> memory.store (this test only
+    // asserts the sentinel renders to the PTY; persistence is covered by unit tests).
     let sentinel = "[MOCK-PURE]";
     let (mut sg, _guard) = spawn_chat(&[], &[("OPENPRX_MOCK_RESPONSE", sentinel)]);
     let session = sg.session();
@@ -1093,17 +1093,20 @@ fn test_chat_pure_mock_response_works() {
     let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
     assert!(
         captured.contains(sentinel),
-        "Pure 模式下 mock 回复应渲染. captured:\n{captured}"
+        "the mock reply must render in Pure mode. captured:\n{captured}"
     );
     session.send("/exit\r").expect("send /exit");
-    assert!(wait_for_exit(session, EXIT_TIMEOUT), "Pure 模式下 /exit 应干净退出");
+    assert!(
+        wait_for_exit(session, EXIT_TIMEOUT),
+        "/exit must exit cleanly in Pure mode"
+    );
 }
 
 #[test]
 #[serial(prx_chat_pty)]
 fn test_chat_pure_tool_call_completes() {
-    // Pure 模式 + 真 tools_registry：driver 必须默认 attach tools_registry
-    // 才能完成 tool turn 闭环。
+    // Pure mode + the real tools_registry: the driver must attach tools_registry by
+    // default for the tool turn to close the loop.
     let sentinel = "[MOCK-PURE-TOOL-ROUND-2]";
     let (mut sg, _guard) = spawn_chat(
         &[],
@@ -1119,17 +1122,18 @@ fn test_chat_pure_tool_call_completes() {
     let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
     assert!(
         captured.contains(sentinel),
-        "Pure 模式 driver tool-call 闭环应返回 final sentinel. captured:\n{captured}"
+        "the Pure-mode driver tool-call loop must return the final sentinel. captured:\n{captured}"
     );
     session.send("/exit\r").expect("send /exit");
     assert!(
         wait_for_exit(session, EXIT_TIMEOUT),
-        "Pure 模式工具回合后 /exit 应干净退出"
+        "/exit must exit cleanly after a Pure-mode tool turn"
     );
 }
 
-/// chat::run 级集成测试 — Pure 模式跑完整 turn + /exit，验证 reducer 单源持久化路径.
-/// 单独的 reducer 单测无法触达 chat::run 主循环的退出分支；本测试通过真 PTY 走完整路径.
+/// chat::run level integration test — runs a full Pure-mode turn plus /exit and checks the
+/// reducer's single-source persistence path. Reducer unit tests on their own cannot reach the
+/// exit branch of the chat::run main loop; this test walks the full path through a real PTY.
 #[test]
 #[serial(prx_chat_pty)]
 fn s4_a_p1_pure_exit_after_turn_chat_run_level() {
@@ -1139,19 +1143,19 @@ fn s4_a_p1_pure_exit_after_turn_chat_run_level() {
     read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
     drain_with_dsr(session, Duration::from_millis(200));
 
-    // turn 1: 完整 user → assistant final
+    // turn 1: full user -> assistant final
     session.send("hi\r").expect("send hi");
     let captured1 = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
     assert!(
         captured1.contains(sentinel),
-        "Pure chat::run 应渲染 turn 1 sentinel. captured:\n{captured1}"
+        "Pure chat::run must render the turn 1 sentinel. captured:\n{captured1}"
     );
 
-    // /exit 必须穿过 chat::run 主循环 break + legacy_exit_save_enabled=false 路径
+    // /exit must go through the chat::run main-loop break + legacy_exit_save_enabled=false path
     session.send("/exit\r").expect("send /exit");
     assert!(
         wait_for_exit(session, EXIT_TIMEOUT),
-        "Pure chat::run 完整 turn 后 /exit 应在 {EXIT_TIMEOUT:?} 内干净退出"
+        "after a full Pure chat::run turn, /exit must exit cleanly within {EXIT_TIMEOUT:?}"
     );
 }
 
@@ -1239,7 +1243,7 @@ fn test_chat_session_resume_last_restores_saved_turns() {
 #[test]
 #[serial(prx_chat_pty)]
 fn test_chat_pure_double_ctrl_c_exits_cleanly() {
-    // Pure 模式下双 Ctrl+C 不能 hang round 2.
+    // A double Ctrl+C must not hang round 2 in Pure mode.
     let (mut sg, _guard) = spawn_chat(&[], &[]);
     let session = sg.session();
     read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
@@ -1258,47 +1262,53 @@ fn test_chat_pure_double_ctrl_c_exits_cleanly() {
     let captured = read_until_with_dsr(session, "Exiting...", EXIT_TIMEOUT);
     assert!(
         captured.contains("Exiting..."),
-        "Pure 模式下双 Ctrl+C 应输出 Exiting...; captured:\n{captured}"
+        "a double Ctrl+C must print Exiting... in Pure mode; captured:\n{captured}"
     );
     let exit_deadline = Duration::from_secs(6);
     assert!(
         wait_for_exit(session, exit_deadline),
-        "Pure 模式下双 Ctrl+C 应在 {exit_deadline:?} 内退出"
+        "a double Ctrl+C must exit within {exit_deadline:?} in Pure mode"
     );
 }
 
-// ─── S4-A Commit 0: ratatui 真路径最小 E2E ────────────────────────────────────
+// ─── S4-A Commit 0: minimal E2E over the real ratatui path ───────────────────
 //
-// 现有 14 个 PTY 测试都把 `PRX_TUI=0` 注入子进程，落在 reedline + BufRead
-// fallback；ratatui 真路径（`run_tui_unified_loop`）零回归保护。S4-A 切换
-// 渲染源前必须先有真路径回归保护，故新增 3 个测试覆盖：
-//   - banner 渲染（启动可见）
-//   - mock response 流式渲染
-//   - double Ctrl+C 退出
+// All 14 existing PTY tests inject `PRX_TUI=0` into the child process and land on the
+// reedline + BufRead fallback, leaving the real ratatui path (`run_tui_unified_loop`)
+// with zero regression coverage. S4-A must have regression coverage of the real path
+// before switching the render source, hence these 3 added tests:
+//   - banner rendering (visible at startup)
+//   - streaming mock response rendering
+//   - double Ctrl+C exit
 //
-// 通过 `extra_env` 注入 `PRX_TUI=1` 覆盖默认 `PRX_TUI=0`，让 chat::run
-// 走 `TerminalGuard::enter()` + `spawn_tui_unified_loop`。ratatui 用
-// `Viewport::Inline` 不进 alt-screen，bytes 仍走主缓冲可被 PTY scraper
-// 抓到。banner 通过 `chat_mirror.lock().push_system_message(&banner)` +
-// 后续 `terminal.insert_before` 写到 stdout（mod.rs:1084 + 2590）.
+// Injecting `PRX_TUI=1` through `extra_env` overrides the default `PRX_TUI=0` and makes
+// chat::run take `TerminalGuard::enter()` + `spawn_tui_unified_loop`. ratatui uses
+// `Viewport::Inline` and does not enter the alt-screen, so the bytes still go to the main
+// buffer where the PTY scraper can capture them. The banner goes out through
+// `chat_mirror.lock().push_system_message(&banner)` followed by `terminal.insert_before`
+// writing to stdout (mod.rs:1084 + 2590).
 
 #[test]
 #[serial(prx_chat_pty)]
 fn test_chat_s4_a_0_ratatui_banner_visible_via_real_path() {
-    // PRX_TUI=1 强制走 ratatui 真路径。banner 通过 insert_before 写入主屏
-    // scrollback，PTY scraper 能拿到 "mock/mock" 字串。
+    // PRX_TUI=1 forces the real ratatui path. The banner is written into the main-screen
+    // scrollback through insert_before, so the PTY scraper can pick up "mock/mock".
     let (mut sg, _guard) = spawn_chat(&[], &[("PRX_TUI", "1")]);
     let session = sg.session();
 
     let captured = read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
-    assert!(captured.contains("prx "), "banner 应以 `prx ` 起头, got:\n{captured}");
+    assert!(
+        captured.contains("prx "),
+        "banner must start with `prx `, got:\n{captured}"
+    );
     assert!(
         captured.contains("mock/mock"),
-        "banner 应包含 `mock/mock`, got:\n{captured}"
+        "banner must contain `mock/mock`, got:\n{captured}"
     );
 
-    // 双 Ctrl+C 退出（/exit 在 ratatui 路径下也工作，但发送 \r 后 ratatui
-    // raw mode 的 line discipline 与 reedline 不同，用 SIGINT*2 更稳）.
+    // Exit with a double Ctrl+C (/exit also works on the ratatui path, but after sending
+    // \r ratatui's raw-mode line discipline differs from reedline's, so SIGINT*2 is more
+    // reliable).
     session
         .get_process_mut()
         .signal(expectrl::Signal::SIGINT)
@@ -1314,9 +1324,9 @@ fn test_chat_s4_a_0_ratatui_banner_visible_via_real_path() {
 #[test]
 #[serial(prx_chat_pty)]
 fn test_chat_s4_a_0_ratatui_mock_response_via_real_path() {
-    // ratatui 真路径下，用户输入 → mock provider 流式回 sentinel → ratatui
-    // 把 ConversationLine::Assistant insert_before 到主屏。PTY scraper
-    // 应能在主屏看到 sentinel。
+    // On the real ratatui path: user input -> the mock provider streams back the sentinel
+    // -> ratatui insert_before's the ConversationLine::Assistant onto the main screen. The
+    // PTY scraper must see the sentinel on the main screen.
     let sentinel = "[S4A0-RATATUI-MOCK]";
     let (mut sg, _guard) = spawn_chat(&[], &[("OPENPRX_MOCK_RESPONSE", sentinel), ("PRX_TUI", "1")]);
     let session = sg.session();
@@ -1324,12 +1334,12 @@ fn test_chat_s4_a_0_ratatui_mock_response_via_real_path() {
     read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
     drain_with_dsr(session, Duration::from_millis(300));
 
-    // ratatui raw mode 下 Enter 仍是 \r（crossterm KeyCode::Enter）.
+    // In ratatui raw mode Enter is still \r (crossterm KeyCode::Enter).
     session.send("hi\r").expect("send hi");
     let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
     assert!(
         captured.contains(sentinel),
-        "ratatui 真路径下 mock 回复应渲染. captured:\n{captured}"
+        "the mock reply must render on the real ratatui path. captured:\n{captured}"
     );
 
     session
@@ -1395,8 +1405,9 @@ fn test_chat_ratatui_resume_picker_selects_saved_session() {
 #[test]
 #[serial(prx_chat_pty)]
 fn test_chat_s4_a_0_ratatui_double_ctrl_c_exit_via_real_path() {
-    // ratatui 真路径下双 Ctrl+C 退出语义 — `run_tui_unified_loop` 内
-    // `KeyDispatch::InterruptTurn` 分支 + shutdown.cancel() 路径.
+    // Double Ctrl+C exit semantics on the real ratatui path — the
+    // `KeyDispatch::InterruptTurn` branch inside `run_tui_unified_loop` plus the
+    // shutdown.cancel() path.
     let (mut sg, _guard) = spawn_chat(&[], &[("PRX_TUI", "1")]);
     let session = sg.session();
 
@@ -1416,31 +1427,34 @@ fn test_chat_s4_a_0_ratatui_double_ctrl_c_exit_via_real_path() {
     let exit_deadline = Duration::from_secs(6);
     assert!(
         wait_for_exit(session, exit_deadline),
-        "ratatui 真路径下双 Ctrl+C 应在 {exit_deadline:?} 内退出"
+        "a double Ctrl+C on the real ratatui path must exit within {exit_deadline:?}"
     );
 }
 
-// ─── ratatui 真路径 + Pure 模式 snapshot 端到端 ─────────────────────────────
+// ─── Real ratatui path + Pure-mode snapshot, end to end ─────────────────────
 //
-// 验证:
-//   - reducer 单源驱动 ratatui 渲染 (UiSnapshot watch 路径)
-//   - banner / mock response / tool call / 中文 都能正确渲染
+// Checks that:
+//   - the reducer as single source drives ratatui rendering (UiSnapshot watch path)
+//   - banner / mock response / tool call / wide characters all render correctly
 
 #[test]
 #[serial(prx_chat_pty)]
 fn test_chat_s4_a_6_pure_snapshot_renders_banner_via_real_path() {
-    // ratatui 真路径 + Pure 模式. banner 通过 reducer SystemMessageAdded
-    // 写入 ui.conversation_lines, dispatcher 推 snapshot 到 watch,
-    // run_tui_unified_loop 通过 RenderSource::Snapshot 读取并 insert_before
-    // 到主屏 — PTY scraper 应能拿到 "mock/mock" 字符串.
+    // Real ratatui path + Pure mode. The banner is written into ui.conversation_lines by
+    // the reducer's SystemMessageAdded, the dispatcher pushes the snapshot to the watch,
+    // and run_tui_unified_loop reads it through RenderSource::Snapshot and insert_before's
+    // it onto the main screen — the PTY scraper must pick up the "mock/mock" string.
     let (mut sg, _guard) = spawn_chat(&[], &[("PRX_TUI", "1")]);
     let session = sg.session();
 
     let captured = read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
-    assert!(captured.contains("prx "), "banner 应以 `prx ` 起头, got:\n{captured}");
+    assert!(
+        captured.contains("prx "),
+        "banner must start with `prx `, got:\n{captured}"
+    );
     assert!(
         captured.contains("mock/mock"),
-        "Pure 模式 ratatui 真路径下 banner 应含 `mock/mock`, got:\n{captured}"
+        "the banner must contain `mock/mock` on the Pure-mode real ratatui path, got:\n{captured}"
     );
 
     session
@@ -1458,10 +1472,11 @@ fn test_chat_s4_a_6_pure_snapshot_renders_banner_via_real_path() {
 #[test]
 #[serial(prx_chat_pty)]
 fn test_chat_s4_a_6_pure_snapshot_mock_response_via_real_path() {
-    // Pure 模式 + ratatui 真路径下流式 mock 回复:
-    // 用户输入 → drive_start_turn_stream dispatch StreamChunkReceived /
-    // StreamCompleted → reducer push ConversationLine::Assistant →
-    // dispatcher 推 UiSnapshot → run_tui_unified_loop insert_before 主屏.
+    // Streaming mock reply on the Pure mode + real ratatui path:
+    // user input -> drive_start_turn_stream dispatches StreamChunkReceived /
+    // StreamCompleted -> the reducer pushes ConversationLine::Assistant ->
+    // the dispatcher pushes a UiSnapshot -> run_tui_unified_loop insert_before's the
+    // main screen.
     let sentinel = "[S4A6-PURE-RATATUI]";
     let (mut sg, _guard) = spawn_chat(&[], &[("OPENPRX_MOCK_RESPONSE", sentinel), ("PRX_TUI", "1")]);
     let session = sg.session();
@@ -1473,7 +1488,7 @@ fn test_chat_s4_a_6_pure_snapshot_mock_response_via_real_path() {
     let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
     assert!(
         captured.contains(sentinel),
-        "Pure ratatui 真路径下 mock 回复应渲染. captured:\n{captured}"
+        "the mock reply must render on the Pure ratatui real path. captured:\n{captured}"
     );
 
     session
@@ -1491,10 +1506,10 @@ fn test_chat_s4_a_6_pure_snapshot_mock_response_via_real_path() {
 #[test]
 #[serial(prx_chat_pty)]
 fn test_chat_s4_a_6_pure_snapshot_tool_call_via_real_path() {
-    // Pure 模式 + ratatui 真路径下 tool turn 闭环:
-    // 第一轮 LLM dispatch ToolStarted → reducer push ToolResult Running →
-    // driver 执行 tool → ToolFinished → reducer 更新 ToolResult Done →
-    // 第二轮 LLM emit final sentinel.
+    // Tool turn loop on the Pure mode + real ratatui path:
+    // round one, the LLM dispatches ToolStarted -> the reducer pushes ToolResult Running ->
+    // the driver runs the tool -> ToolFinished -> the reducer updates ToolResult to Done ->
+    // round two, the LLM emits the final sentinel.
     let sentinel = "[S4A6-PURE-TOOL]";
     let (mut sg, _guard) = spawn_chat(
         &[],
@@ -1513,7 +1528,7 @@ fn test_chat_s4_a_6_pure_snapshot_tool_call_via_real_path() {
     let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
     assert!(
         captured.contains(sentinel),
-        "Pure ratatui 真路径 tool-call 闭环应返回 final sentinel. captured:\n{captured}"
+        "the Pure ratatui real-path tool-call loop must return the final sentinel. captured:\n{captured}"
     );
 
     session
@@ -1530,9 +1545,10 @@ fn test_chat_s4_a_6_pure_snapshot_tool_call_via_real_path() {
 
 #[test]
 #[serial(prx_chat_pty)]
-fn test_chat_s4_a_6_pure_snapshot_chinese_no_extra_spaces_via_real_path() {
-    // Pure + ratatui 真路径下中文（CJK）响应应字节级正确, 无 phantom space.
-    let response = "你好世界S4A6";
+fn test_chat_s4_a_6_pure_snapshot_wide_characters_no_extra_spaces_via_real_path() {
+    // On the Pure + real ratatui path a wide-char (CJK) response must be byte-accurate,
+    // with no phantom space.
+    let response = "\u{ac00}\u{ac01}\u{ac02}\u{ac03}S4A6";
     let (mut sg, _guard) = spawn_chat(&[], &[("OPENPRX_MOCK_RESPONSE", response), ("PRX_TUI", "1")]);
     let session = sg.session();
 
@@ -1540,17 +1556,17 @@ fn test_chat_s4_a_6_pure_snapshot_chinese_no_extra_spaces_via_real_path() {
     drain_with_dsr(session, Duration::from_millis(300));
 
     session.send("hi\r").expect("send hi");
-    let captured = read_until_with_dsr(session, "你", TURN_TIMEOUT);
-    // 剥离 ANSI escape 后断言中文连续.
+    let captured = read_until_with_dsr(session, "\u{ac00}", TURN_TIMEOUT);
+    // Strip ANSI escapes, then assert the wide chars are contiguous.
     let ansi_re = regex::Regex::new(r"\x1b\[[^a-zA-Z]*[a-zA-Z]").expect("ansi regex");
     let plain = ansi_re.replace_all(&captured, "").to_string();
     assert!(
-        plain.contains("你好世界S4A6"),
-        "Pure ratatui 真路径下中文应连续, plain:\n{plain}"
+        plain.contains("\u{ac00}\u{ac01}\u{ac02}\u{ac03}S4A6"),
+        "wide chars must stay contiguous on the Pure ratatui real path, plain:\n{plain}"
     );
     assert!(
-        !plain.contains("你 好") && !plain.contains("好 世"),
-        "phantom space 应不存在, plain:\n{plain}"
+        !plain.contains("\u{ac00} \u{ac01}") && !plain.contains("\u{ac01} \u{ac02}"),
+        "no phantom space may be present, plain:\n{plain}"
     );
 
     session
@@ -1565,13 +1581,14 @@ fn test_chat_s4_a_6_pure_snapshot_chinese_no_extra_spaces_via_real_path() {
     let _ = wait_for_exit(session, EXIT_TIMEOUT);
 }
 
-// ─── S5 P0-1: 协议级 PTY 回归 (anthropic / openai / gemini flavor) ─────────────
+// ─── S5 P0-1: protocol-level PTY regression (anthropic / openai / gemini flavor) ─
 //
-// 无 API key 时真实 LLM 不可达，本组测试通过 MockEnvProvider OPENPRX_MOCK_SCRIPT
-// 在 streaming 路径 emit 完整脚本（delta + reasoning + tool + final），覆盖
-// driver 在不同 provider flavor 下的协议层回归。详见 docs/release-notes-0.4.0.md。
+// Real LLMs are unreachable without an API key, so this group emits a complete script
+// (delta + reasoning + tool + final) on the streaming path through MockEnvProvider's
+// OPENPRX_MOCK_SCRIPT, covering the driver's protocol-layer regressions across provider
+// flavors. See docs/release-notes-0.4.0.md for details.
 
-/// S5 P0-1: anthropic flavor 完整 turn — 多个 delta + reasoning + final.
+/// S5 P0-1: a full anthropic-flavor turn — several deltas + reasoning + final.
 #[test]
 #[serial(prx_chat_pty)]
 fn s5_release_p0_1_anthropic_full_turn_via_real_path() {
@@ -1593,16 +1610,17 @@ fn s5_release_p0_1_anthropic_full_turn_via_real_path() {
     let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
     assert!(
         captured.contains(sentinel),
-        "anthropic flavor 应汇出 sentinel. captured:\n{captured}"
+        "the anthropic flavor must emit the sentinel. captured:\n{captured}"
     );
     session.send("/exit\r").expect("send /exit");
     assert!(
         wait_for_exit(session, EXIT_TIMEOUT),
-        "anthropic flavor /exit 应干净退出"
+        "/exit must exit cleanly on the anthropic flavor"
     );
 }
 
-/// S5 P0-1: openai flavor 含 tool_call 的 turn — driver 必须执行 tool 再续 text.
+/// S5 P0-1: an openai-flavor turn containing a tool_call — the driver must run the tool
+/// and then continue the text.
 #[test]
 #[serial(prx_chat_pty)]
 fn s5_release_p0_1_openai_tool_call_turn_via_real_path() {
@@ -1624,10 +1642,13 @@ fn s5_release_p0_1_openai_tool_call_turn_via_real_path() {
     let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
     assert!(
         captured.contains(sentinel),
-        "openai flavor tool turn 应最终汇出 sentinel. captured:\n{captured}"
+        "the openai-flavor tool turn must eventually emit the sentinel. captured:\n{captured}"
     );
     session.send("/exit\r").expect("send /exit");
-    assert!(wait_for_exit(session, EXIT_TIMEOUT), "openai flavor /exit 应干净退出");
+    assert!(
+        wait_for_exit(session, EXIT_TIMEOUT),
+        "/exit must exit cleanly on the openai flavor"
+    );
 }
 
 /// b2 core evidence 1, through the real binary: a single model tool call fans
@@ -1673,11 +1694,11 @@ fn b2_sessions_spawn_batch_fans_out_three_subtasks_via_real_path() {
     );
 }
 
-/// S5 P0-1: gemini flavor cancel-mid-stream — 第一个 chunk 出现后双 Ctrl+C.
+/// S5 P0-1: gemini-flavor cancel-mid-stream — double Ctrl+C after the first chunk appears.
 #[test]
 #[serial(prx_chat_pty)]
 fn s5_release_p0_1_gemini_cancel_midstream_via_real_path() {
-    // 10 chunks * 100ms = 1s 总时长，足够双 Ctrl+C 落在中间.
+    // 10 chunks * 100ms = 1s total, long enough for the double Ctrl+C to land mid-stream.
     let script = r#"{"chunks":[{"delta":"g1 "},{"delta":"g2 "},{"delta":"g3 "},{"delta":"g4 "},{"delta":"g5 "},{"delta":"g6 "},{"delta":"g7 "},{"delta":"g8 "},{"delta":"g9 "},{"delta":"g10"},{"is_final":true}]}"#;
     let (mut sg, _guard) = spawn_chat(
         &[],
@@ -1703,7 +1724,7 @@ fn s5_release_p0_1_gemini_cancel_midstream_via_real_path() {
         .expect("second SIGINT");
     assert!(
         wait_for_exit(session, EXIT_TIMEOUT),
-        "gemini flavor cancel-mid-stream 应在 {EXIT_TIMEOUT:?} 内退出"
+        "gemini-flavor cancel-mid-stream must exit within {EXIT_TIMEOUT:?}"
     );
 }
 

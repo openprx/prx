@@ -3563,18 +3563,18 @@ mod tests {
 
     /// The bug this guards: signal-cli's SSE body arrives in HTTP chunks whose
     /// boundaries fall wherever the network puts them. Decoding each chunk on
-    /// its own rejects both halves of a split CJK character, and the rejected
+    /// its own rejects both halves of a split multi-byte character, and the rejected
     /// chunk used to be dropped with only a `debug!` line — the message lost
     /// text, or never arrived at all, with nothing to alert anyone.
     #[tokio::test]
-    async fn sse_chunk_boundary_inside_a_chinese_character_keeps_the_message_intact() {
-        let message = "你好，请帮我看一下这段流式传输的中文内容是否完整无缺失";
+    async fn sse_chunk_boundary_inside_a_multibyte_character_keeps_the_message_intact() {
+        let message = "\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}, check that this streamed \u{20ac}\u{20ac}\u{20ac} payload arrives whole";
         let body = sse_record(message);
         let text = String::from_utf8(body.clone()).expect("test: body is utf-8");
 
         // Cut one byte into a 3-byte character, and prove the cut really is
         // mid-character instead of trusting the arithmetic.
-        let split = text.find("中文内容").expect("test: marker present") + 1;
+        let split = text.find("\u{20ac}\u{20ac}\u{20ac}").expect("test: marker present") + 1;
         assert!(
             !text.is_char_boundary(split),
             "test setup: byte {split} must fall inside a character"
@@ -3606,11 +3606,11 @@ mod tests {
     /// every well-formed event behind the bad byte along with it.
     #[tokio::test]
     async fn sse_malformed_bytes_are_reported_and_never_swallow_the_record() {
-        let head = r#"data: {"envelope":{"source":"+1111111111","sourceNumber":"+1111111111","timestamp":1700000000000,"dataMessage":{"message":"前半段"#;
+        let head = "data: {\"envelope\":{\"source\":\"+1111111111\",\"sourceNumber\":\"+1111111111\",\"timestamp\":1700000000000,\"dataMessage\":{\"message\":\"head-\u{20ac}";
         let mut body = head.as_bytes().to_vec();
         // A stray continuation byte: no amount of waiting can make this valid.
         body.push(0x80);
-        body.extend_from_slice(r#"后半段中文内容","timestamp":1700000000000}}}"#.as_bytes());
+        body.extend_from_slice("-tail-\u{20ac}\",\"timestamp\":1700000000000}}}".as_bytes());
         body.extend_from_slice(b"\n\n");
 
         let logs = Arc::new(Mutex::new(Vec::new()));
@@ -3632,7 +3632,7 @@ mod tests {
             .expect("one bad byte must not cost the whole record");
         assert_eq!(
             received.content.lines().next(),
-            Some(format!("前半段{}后半段中文内容", char::REPLACEMENT_CHARACTER).as_str()),
+            Some(format!("head-\u{20ac}{}-tail-\u{20ac}", char::REPLACEMENT_CHARACTER).as_str()),
             "damage must be marked in place, with every good byte around it kept, got {:?}",
             received.content
         );
@@ -3652,9 +3652,12 @@ mod tests {
     /// good. Reconnecting without a word would hide it, so it is reported.
     #[tokio::test]
     async fn sse_stream_ending_mid_character_is_reported() {
-        let mut body = sse_record("完整的一条消息");
+        let mut body = sse_record("a complete single message");
         // Trailing half of a 3-byte character, then a clean end of body.
-        let half = "界".as_bytes().get(..2).expect("test: 界 is three bytes wide");
+        let half = "\u{20ac}"
+            .as_bytes()
+            .get(..2)
+            .expect("test: the euro sign is three bytes wide");
         body.extend_from_slice(half);
 
         let logs = Arc::new(Mutex::new(Vec::new()));

@@ -1,10 +1,11 @@
-//! Redux-like Action 代数. 所有状态变更必须通过 reduce 应用.
+//! Redux-like Action algebra. Every state change must be applied through reduce.
 //!
-//! [`Action`] 是单一事件代数，覆盖 chat 主循环中所有状态变更点（共 23 个变体）。
-//! 设计原则:
-//! - 所有变体必须 `Send + Sync`（通过 channel 跨任务传递）
-//! - 不携带 Provider/Memory/Channel 句柄（那些是 Effect 执行器的依赖）
-//! - Clone 而非 Copy（含 String/CancellationToken）
+//! [`Action`] is the single event algebra, covering every state-change point of the chat main loop
+//! (23 variants in total).
+//! Design principles:
+//! - every variant must be `Send + Sync` (they are passed across tasks over channels)
+//! - they carry no Provider/Memory/Channel handles (those are dependencies of the Effect executor)
+//! - Clone rather than Copy (they contain String/CancellationToken)
 
 use crossterm::event::KeyEvent;
 use tokio_util::sync::CancellationToken;
@@ -211,27 +212,28 @@ pub fn format_provider_worker_tokens_compact(tokens: u64) -> String {
     }
 }
 
-/// 历史导航方向。
+/// History navigation direction.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum HistoryDir {
-    /// 向上（更旧）
+    /// Upwards (older)
     Up,
-    /// 向下（更新）
+    /// Downwards (newer)
     Down,
 }
 
-/// 历史 compaction 触发原因（用于 trace / 测试断言）.
+/// Why a history compaction was triggered (used for trace / test assertions).
 ///
-/// S2-B Step 1: 加入 `HistoryCompacted` Action 时同步引入，让 reducer
-/// 能在 trace 里区分是 context-overflow 自动 compaction 还是用户/测试手动触发，
-/// 同时让单元测试断言 reason 字段穿透 Effect::LogTrace 输出。
+/// S2-B Step 1: introduced together with the `HistoryCompacted` Action so the reducer can tell in the
+/// trace whether this was an automatic context-overflow compaction or a manual user/test trigger, and
+/// so unit tests can assert that the reason field reaches the `Effect::LogTrace` output.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactReason {
-    /// context window 超限自动 compaction（chat::run 主循环 overflow 重试路径）.
+    /// Automatic compaction after exceeding the context window (the chat::run main-loop overflow
+    /// retry path).
     ContextOverflow,
-    /// 用户手动触发（如 /compact 命令，预留给后续 step）.
+    /// Manually triggered by the user (e.g. a /compact command, reserved for a later step).
     Manual,
 }
 
@@ -247,71 +249,75 @@ pub enum ProviderUsageRecordKind {
     Incremental,
 }
 
-/// 单一事件代数，所有状态变更必须通过 reduce 应用.
+/// The single event algebra; every state change must be applied through reduce.
 ///
-/// `Send + Sync`（通过 channel 跨任务传递），无 `Box<dyn>` 即可表达全部 case。
-/// Step 1: 类型骨架，Step 2-5 逐步接入调用路径。
+/// `Send + Sync` (passed across tasks over channels), and every case is expressible without
+/// `Box<dyn>`. Step 1: the type skeleton; Steps 2-5 wire it into the call paths one by one.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum Action {
-    // ── 输入路径 ────────────────────────────────────────────────
-    /// 键盘原始事件
+    // ── Input path ──────────────────────────────────────────────
+    /// Raw keyboard event
     KeyPressed(KeyEvent),
-    /// 括号粘贴
+    /// Bracketed paste
     PasteReceived(String),
-    /// 终端尺寸变化
+    /// Terminal size change
     TerminalResized { w: u16, h: u16 },
-    /// dispatcher 解析出的提交（用户按下 Enter）
+    /// A submission parsed by the dispatcher (the user pressed Enter)
     InputSubmitted(String),
     /// Replace the visible draft buffer without submitting it.
     InputReplaced(String),
-    /// Up/Down 历史导航
+    /// Up/Down history navigation
     HistoryNavigated(HistoryDir),
-    /// Esc — 取消当前输入
+    /// Esc — cancel the current input
     InputCancelled,
 
-    // ── 槽命令 ──────────────────────────────────────────────────
-    /// 用户输入了斜杠命令（/plan、/clear 等）
+    // ── Slash commands ──────────────────────────────────────────
+    /// The user entered a slash command (/plan, /clear, ...)
     SlashCommandIssued { cmd: String, args: String },
-    /// 模式切换（/plan /edit /auto）
+    /// Mode switch (/plan /edit /auto)
     ModeChanged(ChatMode),
-    /// 模型在线切换（/model <name>）— BUG-07.
+    /// Online model switch (/model <name>) — BUG-07.
     ///
-    /// reducer 更新 `session.model`，让 status bar 立刻反映新 model；真正影响
-    /// 后续 LLM turn 的 model 由主循环把新值写入 `EffectDeps` 的热替换 slot
-    /// （同 provider 换 model）。仅记账 + RequestRedraw，不产生其他副作用。
+    /// The reducer updates `session.model` so the status bar reflects the new model immediately; what
+    /// actually affects the model of later LLM turns is the main loop writing the new value into the
+    /// hot-swap slot of `EffectDeps` (same provider, different model). This only does bookkeeping plus
+    /// RequestRedraw and produces no other side effects.
     ModelChanged { model: String },
-    /// Provider 在线切换（/provider <name> [model]）— Bug #3.
+    /// Online provider switch (/provider <name> [model]) — Bug #3.
     ///
-    /// reducer 更新 `session.provider`（必要时连带 `session.model`），让 status bar
-    /// 与会话快照立刻反映新 provider；真正影响后续 LLM turn 的 provider 实例由主循环
-    /// 重建并写入 `ProviderSlot` 热替换 slot 完成（reducer 不持有 provider 实例，故只
-    /// 负责 UI / session 账本）。`model` 为 `Some` 时表示切换同时改了 model（命令带了
-    /// 兼容 model 参数或当前 model 已变），reducer 一并同步 `session.model`。
+    /// The reducer updates `session.provider` (and `session.model` when needed) so the status bar and
+    /// the session snapshot reflect the new provider immediately; what actually affects the provider
+    /// instance of later LLM turns is the main loop rebuilding it and writing it into the
+    /// `ProviderSlot` hot-swap slot (the reducer holds no provider instance, so it only owns the
+    /// UI / session ledger). A `Some` `model` means the switch also changed the model (the command
+    /// carried a compatible model argument, or the current model already changed), and the reducer
+    /// syncs `session.model` along with it.
     ProviderChanged { provider: String, model: Option<String> },
-    /// 清除当前会话的上下文（/clear）。/new 使用 SessionLoaded 切换到新会话。
+    /// Clear the context of the current session (/clear). /new uses SessionLoaded to switch to a new
+    /// session.
     HistoryCleared,
-    /// 清除历史并在同一 UI snapshot 中追加用户可见回执。
+    /// Clear the history and append a user-visible receipt in the same UI snapshot.
     HistoryClearedWithNotice { notice: String },
 
-    // ── LLM 流式 ────────────────────────────────────────────────
-    /// 新一轮 LLM 推理开始，携带 draft_id 和取消令牌
+    // ── LLM streaming ───────────────────────────────────────────
+    /// A new LLM inference turn starts, carrying the draft_id and cancellation token
     TurnStarted {
         draft_id: String,
         cancel: CancellationToken,
     },
-    /// Step 5a-3 Phase A — 真主导路径：发起 LLM 流式 turn.
+    /// Step 5a-3 Phase A — the truly leading path: start a streaming LLM turn.
     ///
-    /// 与 [`Self::TurnStarted`] 的关系:
-    /// - `TurnStarted` 是历史 Action，仅用于 reducer 状态初始化（设置 draft、注册
-    ///   active_cancel、置位 generating），由 chat::run 主循环在调用旧 `run_tool_call_loop`
-    ///   之前同步投递；不发射 `Effect::StartTurn`
-    /// - `StartLLMTurn` 携带完整 `history` 快照，reducer 在初始化 draft 之外**同时**
-    ///   发射 `Effect::StartTurn { draft_id, history, cancel }`，由 EffectExecutor
-    ///   真接 `provider.stream_chat_with_history`
+    /// Relationship to [`Self::TurnStarted`]:
+    /// - `TurnStarted` is the historical Action, used only for reducer state initialization (set the
+    ///   draft, register active_cancel, raise generating); the chat::run main loop dispatches it
+    ///   synchronously before calling the old `run_tool_call_loop`, and it emits no `Effect::StartTurn`
+    /// - `StartLLMTurn` carries a full `history` snapshot, and besides initializing the draft the
+    ///   reducer **also** emits `Effect::StartTurn { draft_id, history, cancel }`, which the
+    ///   EffectExecutor really wires to `provider.stream_chat_with_history`
     ///
-    /// Phase A 阶段两者并存，主循环仍由旧路径主导；Phase B 之后旧路径删除，
-    /// `TurnStarted` 由 `StartLLMTurn` 完全取代。
+    /// During Phase A both coexist and the main loop is still led by the old path; after Phase B the
+    /// old path is deleted and `TurnStarted` is fully replaced by `StartLLMTurn`.
     StartLLMTurn {
         /// Main turn scheduler identity for this provider execution. `None`
         /// preserves non-chat/test callers, but live chat should pass the
@@ -357,13 +363,13 @@ pub enum Action {
         /// `None` keeps non-chat/test callers on the driver's history fallback.
         routing_input: Option<String>,
     },
-    /// 收到一个 streaming 增量块
+    /// Received one streaming delta chunk
     StreamChunkReceived {
         draft_id: String,
         delta: String,
         version: u64,
     },
-    /// 收到一段 reasoning ("thinking") 增量.
+    /// Received a reasoning ("thinking") delta.
     ///
     /// Carries only the delta: the reducer keeps a character counter plus a
     /// bounded tail on the draft so the TUI can show live thinking progress.
@@ -381,7 +387,7 @@ pub enum Action {
     },
     /// Provider-reported or estimated usage for a streaming turn.
     StreamUsageMetered { draft_id: String, usage: TokenUsage },
-    /// streaming 完成，携带最终文本和 reasoning 摘要
+    /// Streaming completed, carrying the final text and the reasoning summary
     StreamCompleted {
         draft_id: String,
         final_text: String,
@@ -395,17 +401,17 @@ pub enum Action {
         final_text: String,
         reasoning: String,
     },
-    /// streaming 失败
+    /// Streaming failed
     StreamFailed {
         draft_id: String,
         err: String,
         retryable: bool,
     },
-    /// streaming 被取消
+    /// Streaming was cancelled
     StreamCancelled { draft_id: String },
 
-    // ── 工具事件 ────────────────────────────────────────────────
-    /// 工具调用开始
+    // ── Tool events ─────────────────────────────────────────────
+    /// A tool call started
     ToolStarted {
         task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
         sequence: Option<u64>,
@@ -413,7 +419,7 @@ pub enum Action {
         name: String,
         args: String,
     },
-    /// 工具调用结束
+    /// A tool call finished
     ToolFinished {
         task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
         sequence: Option<u64>,
@@ -423,69 +429,72 @@ pub enum Action {
         duration_ms: u64,
         result: Option<String>,
     },
-    /// 工具调用进度
+    /// Tool call progress
     ToolProgress { iteration: usize },
-    /// **S3 T3-1**: driver 请求 UI 对某工具调用做 approval（supervised autonomy 模式下触发）.
+    /// **S3 T3-1**: the driver asks the UI to approve a tool call (triggered in supervised autonomy
+    /// mode).
     ///
-    /// reducer 仅产生 `Effect::RequestApproval`，driver 自身通过 oneshot rx 等响应。
-    /// `tool_id` 即 LLM 给出的 `tool_call_id`，用于将响应 [`Self::ToolApprovalReceived`]
-    /// 关联到具体 pending oneshot。
+    /// The reducer only produces `Effect::RequestApproval`; the driver itself waits for the response
+    /// on a oneshot rx. `tool_id` is the `tool_call_id` given by the LLM, used to correlate the
+    /// response [`Self::ToolApprovalReceived`] with the specific pending oneshot.
     ToolApprovalRequested {
         task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
         tool_id: String,
         name: String,
         args: String,
     },
-    /// **S3 T3-1**: UI / EffectExecutor 把用户审批结果回投给 driver.
+    /// **S3 T3-1**: the UI / EffectExecutor posts the user's approval decision back to the driver.
     ///
-    /// dispatcher 接收此 Action 时将通过 `approval_response_tx`（注入到 driver 的
-    /// 单 mpsc 入口）把决策转给等待中的 driver；driver 端按 `tool_id` 对应到
-    /// pending oneshot::Sender<bool> 并 resolve。
+    /// When the dispatcher receives this Action it forwards the decision to the waiting driver over
+    /// `approval_response_tx` (the single mpsc entry point injected into the driver); the driver side
+    /// matches it by `tool_id` to the pending oneshot::Sender<bool> and resolves it.
     ToolApprovalReceived { tool_id: String, approved: bool },
     /// Clear any visible approval prompt without approving anything.
     ///
     /// Used when a session switch fail-closes outstanding approval routes before
     /// swapping per-session state.
     ToolApprovalCleared,
-    /// **S3 T3-1**: 网络瞬时故障重试尝试通知（仅作 UI / trace 用，不变状态）.
+    /// **S3 T3-1**: notification of a retry attempt after a transient network failure (for UI / trace
+    /// only, it does not change state).
     ///
-    /// `attempt` 从 1 起计数（第 1 次失败 → attempt=1 之后开始 sleep 重试）。
-    /// 失败原因放在 `reason`，便于 UI 显示。
+    /// `attempt` is counted from 1 (the 1st failure → attempt=1, after which the retry sleep starts).
+    /// The failure cause goes into `reason` so the UI can display it.
     StreamRetryAttempt { attempt: u8, reason: String },
 
-    // ── 会话 ────────────────────────────────────────────────────
-    /// 会话加载完毕
+    // ── Session ─────────────────────────────────────────────────
+    /// The session finished loading
     SessionLoaded(ChatSession),
-    /// 会话已持久化
+    /// The session has been persisted
     SessionSaved { id: String },
-    /// 切换到指定会话
+    /// Switch to the given session
     SessionSwitched { id: String },
-    /// 请求 reducer 持久化用户回合（写入 session.turns + LLM history）
+    /// Ask the reducer to persist the user turn (writes session.turns + LLM history)
     RecordUserTurn(String),
-    /// 请求 reducer 持久化助手回合（写入 session.turns + LLM history）
+    /// Ask the reducer to persist the assistant turn (writes session.turns + LLM history)
     RecordAssistantTurn {
         task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
         content: String,
     },
-    /// 请求 reducer append 一条 system 消息到 `session.history`（用于 `/clear` 后
-    /// 重建 system prompt 等场景）.
+    /// Ask the reducer to append one system message to `session.history` (for cases such as rebuilding
+    /// the system prompt after `/clear`).
     ///
-    /// S2-C Step 2: 与 legacy `history.push(ChatMessage::system(...))` 对齐。
-    /// 仅做 append — 不做 upsert，覆盖首位 system 的场景请用
+    /// S2-C Step 2: matches legacy `history.push(ChatMessage::system(...))`.
+    /// Append only — no upsert; for overwriting the leading system message use
     /// [`Self::SetLeadingSystemPrompt`].
     RecordSystemMessage { content: String },
-    /// 请求 reducer set/replace 首位 system prompt — 若 history 为空则 push，
-    /// 否则替换 `history[0]`（要求其为 system role）.
+    /// Ask the reducer to set/replace the leading system prompt — push when history is empty,
+    /// otherwise replace `history[0]` (which must have the system role).
     ///
-    /// S2-C Step 2: 与 chat::mod 主循环 `if history.is_empty() { push } else {
-    /// first_mut = system }` 语义对齐 — 这是每轮 turn 都会跑的 system prompt
-    /// 重建路径（technique selection 后的 prompt 注入），不能用 append 表达。
+    /// S2-C Step 2: matches the semantics of the chat::mod main loop's `if history.is_empty() { push }
+    /// else { first_mut = system }` — this is the system prompt rebuild path that runs on every turn
+    /// (the prompt injection after technique selection), and it cannot be expressed with append.
     SetLeadingSystemPrompt { content: String },
-    /// 请求 reducer 对 LLM context history 做 compaction（保留 system + 近 N 条 + 总预算）.
+    /// Ask the reducer to compact the LLM context history (keep system + the last N messages + a total
+    /// budget).
     ///
-    /// S2-B Step 1: 与 chat::mod 的 `compact_chat_history` 语义对齐 —
-    /// reducer 内完成 truncation，无副作用，只产生 LogTrace。`reason` 字段供
-    /// 测试断言与 trace 区分 context-overflow vs manual 路径。
+    /// S2-B Step 1: matches the semantics of chat::mod's `compact_chat_history` — the truncation
+    /// happens inside the reducer, with no side effects, producing only a LogTrace. The `reason` field
+    /// lets test assertions and the trace tell the context-overflow path from the manual one.
     HistoryCompacted { reason: CompactReason },
     /// Apply an async provider-backed compaction result computed by the Redux
     /// driver. The reducer remains pure: it only validates the guard token and
@@ -510,28 +519,32 @@ pub enum Action {
         dropped_messages: usize,
     },
 
-    // ── UI 折叠/展开 ───────────────────────────────────────────
-    /// Tab — 折叠/展开工具卡片
+    // ── UI fold/unfold ──────────────────────────────────────────
+    /// Tab — fold/unfold the tool card
     ToolCardFoldToggled,
     /// Legacy direct action for tests/tools that explicitly fold reasoning.
     /// `Ctrl+R` no longer maps here; P6b2 reserves it for reverse-search.
     ReasoningFoldToggled,
-    /// 请求重绘
+    /// Request a redraw
     RedrawRequested,
-    /// 系统消息已追加到 UI mirror（banner / slash command 输出 / 错误提示等）.
+    /// A system message has been appended to the UI mirror (banner / slash command output / error
+    /// notice, ...).
     ///
-    /// S2-C Step 2: 与 legacy `chat_mirror.lock().push_system_message(text)` 双写 —
-    /// reducer 把消息 push 到 `ui.conversation_lines` 作为 Redux 自有 UI 账本.
-    /// **注意**: 真实可见的 TUI 仍由 `chat_mirror` 渲染，本 Action 仅供 Redux 路径
-    /// 维护一致的 UI 状态镜像 + 测试断言；S2-D/E 切闸到 Redux 单源时再删除 legacy mirror.
+    /// S2-C Step 2: dual-written with legacy `chat_mirror.lock().push_system_message(text)` — the
+    /// reducer pushes the message into `ui.conversation_lines` as Redux's own UI ledger.
+    /// **Note**: the actually visible TUI is still rendered from `chat_mirror`; this Action only keeps
+    /// a consistent UI state mirror for the Redux path plus test assertions. The legacy mirror is
+    /// removed once S2-D/E switches over to Redux as the single source.
     SystemMessageAdded { text: String },
-    /// Pure 模式下用户提交内容的视觉 echo — reducer push 一条 ConversationLine::User
-    /// 到 ui.conversation_lines。legacy 模式由 chat_mirror.push_user_message 承担，
-    /// Pure 模式守卫跳过 mirror 写后用此 Action 让 reducer 单源接管 echo。
+    /// The visual echo of what the user submitted in Pure mode — the reducer pushes one
+    /// ConversationLine::User into ui.conversation_lines. In legacy mode chat_mirror.push_user_message
+    /// does this; the Pure-mode guard skips the mirror write and uses this Action so the reducer takes
+    /// over the echo as the single source.
     UserMessageEchoed(String),
-    /// 后台会话常驻状态行更新（v1b）。`summary` 为空表示无后台会话（隐藏该行）。
-    /// 由 chat 主循环在轮询 registry 后按需 dispatch（仅在内容变化时），reducer
-    /// 把它写入 `ui.sessions_status`，经 `build_ui_snapshot` 反映到 renderer。
+    /// Update of the persistent background-session status line (v1b). An empty `summary` means there
+    /// is no background session (the line is hidden). The chat main loop dispatches it as needed after
+    /// polling the registry (only when the content changed), and the reducer writes it into
+    /// `ui.sessions_status`, which reaches the renderer through `build_ui_snapshot`.
     SessionsStatusUpdated { summary: String },
     /// P1 sessions strip entries. This stays separate from the aggregate
     /// `sessions_status` text so the renderer does not parse display strings.
@@ -575,27 +588,29 @@ pub enum Action {
         usage_kind: ProviderUsageRecordKind,
         record: MainSessionTokenUsageRecord,
     },
-    /// 记录一个进入终态（或退出时被中断）的后台会话摘要（v4）。由 chat 主循环
-    /// 在 `poll_finished` surface 每个 finished session 时、以及退出时为仍 running
-    /// 的 session 各 dispatch 一次。reducer 把摘要 upsert（去重 by id）进
-    /// `session.background_sessions`，随下次 `SaveSession` 落盘，reload 后展示。
-    /// **只记录摘要，绝不重建进程/sub-agent/PTY**。
+    /// Record the summary of a background session that reached a terminal state (or was interrupted on
+    /// exit) (v4). The chat main loop dispatches it once per finished session surfaced by
+    /// `poll_finished`, and once per still-running session on exit. The reducer upserts the summary
+    /// (deduplicated by id) into `session.background_sessions`, which is persisted by the next
+    /// `SaveSession` and displayed after a reload.
+    /// **Summaries only — never rebuild a process/sub-agent/PTY.**
     BackgroundSessionRecorded {
         summary: crate::chat::sessions::PersistedSessionSummary,
     },
-    /// 输入路由目标变更（v1.1b）。由 chat 主循环在 `/attach` / `/detach` 时
-    /// dispatch（它独占权威 `attached_follow`），reducer 写入 `ui.focus`，经快照
-    /// 驱动提示符的颜色+字形目标指示。`None` 等价 `FocusTarget::Main`。
+    /// The input routing target changed (v1.1b). Dispatched by the chat main loop on
+    /// `/attach` / `/detach` (it exclusively owns the authoritative `attached_follow`); the reducer
+    /// writes `ui.focus`, which drives the prompt's color + glyph target indicator through the
+    /// snapshot. `None` is equivalent to `FocusTarget::Main`.
     SessionFocusChanged { focus: crate::chat::sessions::FocusTarget },
-    /// Ctrl+G 打开 session switcher 弹层（v1.1b）。`entries` 为打开时的会话快照
-    /// （来自 1s 轮询缓存）。reducer 写入 `ui.switcher = Some(..)`。
+    /// Ctrl+G opens the session switcher overlay (v1.1b). `entries` is the session snapshot at open
+    /// time (from the 1s polling cache). The reducer writes `ui.switcher = Some(..)`.
     SwitcherOpened {
         entries: Vec<crate::chat::sessions::SwitcherEntry>,
     },
-    /// switcher 选中行移动（v1.1b）。`selected` 为新的高亮索引（已被 key 线程
-    /// 钳制到有效范围）。reducer 更新 `ui.switcher` 的 selected。
+    /// The switcher selection moved (v1.1b). `selected` is the new highlight index (already clamped to
+    /// a valid range by the key thread). The reducer updates `selected` of `ui.switcher`.
     SwitcherMoved { selected: usize },
-    /// 关闭 switcher 弹层（v1.1b）。reducer 写入 `ui.switcher = None`。
+    /// Close the switcher overlay (v1.1b). The reducer writes `ui.switcher = None`.
     SwitcherClosed,
     /// P7c: open the saved chat-session history picker. Distinct from the
     /// child-TUI Ctrl+G switcher.
@@ -607,23 +622,24 @@ pub enum Action {
     /// P7c: close the saved chat-session picker.
     SavedSessionPickerClosed,
 
-    // ── 退出 ────────────────────────────────────────────────────
-    /// 单击 Ctrl+C — 取消当前生成
+    // ── Exit ────────────────────────────────────────────────────
+    /// A single Ctrl+C — cancel the current generation
     CancelRequested,
     /// Cancel a specific visible provider turn by scheduler task id.
     CancelProviderTurn {
         task_id: crate::chat::turn_scheduler::TurnTaskId,
     },
-    /// 双击 Ctrl+C / Ctrl+D / SIGTERM — 优雅退出
+    /// Double Ctrl+C / Ctrl+D / SIGTERM — graceful shutdown
     ShutdownRequested,
-    /// 兜底强制退出
+    /// Last-resort forced exit
     ForceQuit,
 }
 
 impl Action {
-    /// S2.5 T2.5-2: 取 Action 变体名作为 `'static str` 用于 Prometheus label.
+    /// S2.5 T2.5-2: take the Action variant name as a `'static str` for use as a Prometheus label.
     ///
-    /// 与 reduce 大 match 对齐，所有变体单字符串，无分配。
+    /// Kept aligned with the big reduce match; every variant maps to a single string, with no
+    /// allocation.
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {

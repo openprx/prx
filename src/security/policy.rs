@@ -2080,7 +2080,7 @@ impl SecurityPolicy {
     ///    (per user / channel / chat_type). A scope denial is `Deny`,
     ///    independent of autonomy level.
     /// 2. **Autonomy level**:
-    ///    * `full`        → `Allow` (全放行; no prompt, no grant).
+    ///    * `full`        → `Allow` (allow everything; no prompt, no grant).
     ///    * `read_only`   → read-only tools `Allow`, everything else `Deny`.
     ///    * `supervised`  → read-only tools `Allow`, everything else `Ask`
     ///      (routes through `ApprovalManager` + `ApprovalGrantV2`).
@@ -4902,7 +4902,7 @@ mod tests {
     #[test]
     fn unicode_path_does_not_panic() {
         let policy = SecurityPolicy::default();
-        assert!(policy.is_path_allowed("文档/笔记.md"));
+        assert!(policy.is_path_allowed("\u{434}\u{43e}\u{43a}\u{443}\u{43c}\u{435}\u{43d}\u{442}\u{44b}/\u{437}\u{430}\u{43c}\u{435}\u{442}\u{43a}\u{438}.md"));
         assert!(policy.is_path_allowed("données/résumé.txt"));
     }
 }

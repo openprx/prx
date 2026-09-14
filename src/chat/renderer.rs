@@ -646,10 +646,10 @@ mod tests {
     }
 
     #[test]
-    fn display_width_cjk() {
-        // CJK characters are typically 2 columns wide
-        assert_eq!(display_width("你好"), 4);
-        assert_eq!(display_width("hello你好"), 9);
+    fn display_width_wide_characters() {
+        // East Asian Wide characters occupy 2 columns each.
+        assert_eq!(display_width("\u{ac00}\u{ac01}"), 4);
+        assert_eq!(display_width("hello\u{ac00}\u{ac01}"), 9);
     }
 
     #[test]
@@ -659,10 +659,10 @@ mod tests {
     }
 
     #[test]
-    fn wrap_text_cjk() {
-        // Each CJK char is width 2, so 5 chars = width 10
-        let lines = wrap_text("你好世界呀", 6);
-        assert!(lines.len() >= 2); // 10 width into max 6 → multiple lines
+    fn wrap_text_wide_characters() {
+        // Each wide char is width 2, so 5 of them = width 10.
+        let lines = wrap_text("\u{ac00}\u{ac01}\u{ac02}\u{ac03}\u{ac04}", 6);
+        assert!(lines.len() >= 2); // width 10 into max 6 -> multiple lines
     }
 
     // ---------------------------------------------------------------

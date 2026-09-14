@@ -1,4 +1,4 @@
-//! SQLite persistence for the xin (心) autonomous task engine.
+//! SQLite persistence for the xin autonomous task engine.
 //!
 //! DB path: `{workspace}/xin/tasks.db`
 //! Pattern follows `cron/store.rs`: `with_connection()` + `rusqlite::params!`.

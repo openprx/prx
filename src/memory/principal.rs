@@ -693,11 +693,12 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"\bssh\b").expect("compile regex: ssh keyword"),
         Regex::new(r"\bapi[_-]?key\b").expect("compile regex: api key keyword"),
-        Regex::new(r"密钥|私钥|秘钥").expect("compile regex: Chinese key/secret keywords"),
+        Regex::new(r"\bcredential(s)?\b").expect("compile regex: credential keyword"),
         Regex::new(r"\bpassw(or)?d\b").expect("compile regex: password keyword"),
         Regex::new(r"\btok(en)?\b").expect("compile regex: token keyword"),
         Regex::new(r"\bsecret\b").expect("compile regex: secret keyword"),
-        Regex::new(r"im-ops|服务器地址").expect("compile regex: server address keywords"),
+        Regex::new(r"im-ops|\bserver\s+address\b|\bhost(name)?\s+address\b")
+            .expect("compile regex: server address keywords"),
         Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b").expect("compile regex: IPv4 address pattern"),
         Regex::new(r"\bprivate[_\s]?key\b").expect("compile regex: private key keyword"),
     ]
@@ -921,9 +922,13 @@ mod tests {
         assert_eq!(classified.risk_signals, Vec::<String>::new());
     }
 
+    /// Detection runs after NFKC, so compatibility forms of the very same
+    /// keyword must not slip past the table.
     #[test]
-    fn matches_sensitive_patterns_detects_fullwidth_api_key() {
-        assert!(matches_sensitive_patterns("凭证是 ａｐｉ＿ｋｅｙ=abc123"));
+    fn matches_sensitive_patterns_detects_compatibility_forms_of_api_key() {
+        assert!(matches_sensitive_patterns(
+            "the value is \u{24d0}\u{24df}\u{24d8}_\u{24da}\u{24d4}\u{24e8}=abc123"
+        ));
     }
 
     #[test]
@@ -1438,7 +1443,7 @@ AND tp.user_id = $11\
 
         let inputs = vec![
             "normal text".to_string(),
-            "ＡＰＩＫＥＹ leaked".to_string(),
+            "\u{24b6}\u{24c5}\u{24be}\u{24c0}\u{24ba}\u{24ce} leaked".to_string(),
             "hello".to_string(),
         ];
         let filtered = post_filter(inputs, &principal, |s| s.as_str());

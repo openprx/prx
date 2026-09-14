@@ -83,7 +83,7 @@ async fn spawn_chunked_sse_server(body: Vec<u8>, split: usize) -> String {
 
 /// Build a long OpenAI-style SSE body whose byte `READ_BUFFER` falls *inside* a
 /// 3-byte character. Returns `(body, full_visible_text)`.
-fn chinese_sse_body() -> (Vec<u8>, String) {
+fn wide_char_sse_body() -> (Vec<u8>, String) {
     // Shift the body one byte at a time until byte 8192 lands strictly inside
     // a 3-byte character, which is exactly what an 8 KiB read did in production.
     for pad in 0..64_usize {
@@ -91,7 +91,7 @@ fn chinese_sse_body() -> (Vec<u8>, String) {
         body.push_str(&format!(":{}\n\n", "x".repeat(pad)));
         let mut visible = String::new();
         for i in 0..400 {
-            let piece = format!("流式响应第{}段中文内容需要完整解码", i % 10);
+            let piece = format!("streamed chunk {} \u{20ac}\u{20ac}\u{20ac} must decode whole", i % 10);
             visible.push_str(&piece);
             body.push_str(&format!(
                 "data: {}\n\n",
@@ -125,8 +125,8 @@ async fn collect_stream(provider: &OpenAiCompatibleProvider) -> Result<String, S
 /// Before the fix this test fails with `Invalid UTF-8: incomplete utf-8 byte
 /// sequence from index ...` and loses the entire answer.
 #[tokio::test]
-async fn chinese_sse_split_at_the_eight_kib_boundary_streams_intact() {
-    let (body, expected) = chinese_sse_body();
+async fn wide_char_sse_split_at_the_eight_kib_boundary_streams_intact() {
+    let (body, expected) = wide_char_sse_body();
     assert!(
         !std::str::from_utf8(&body).unwrap().is_char_boundary(READ_BUFFER),
         "test setup: byte {READ_BUFFER} must cut a character in half"
@@ -163,7 +163,7 @@ async fn stream_ending_mid_character_is_reported() {
     let mut body = b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n".to_vec();
     // Only the first two bytes of a 3-byte character, then a clean HTTP EOF:
     // the framing is intact, the text is not.
-    body.extend_from_slice(&"界".as_bytes()[..2]);
+    body.extend_from_slice(&"\u{20ac}".as_bytes()[..2]);
     let split = body.len() - 1;
 
     let url = spawn_chunked_sse_server(body, split).await;
@@ -216,11 +216,11 @@ fn provider_labels_are_preserved_in_decode_errors() {
         let mut decoder = SseTextDecoder::new(label);
         let mut out = String::new();
         // Split character: must succeed.
-        let bytes = "汉".as_bytes();
+        let bytes = "\u{20ac}".as_bytes();
         decoder.push(&bytes[..2], &mut out).unwrap();
         assert_eq!(decoder.pending_len(), 2);
         decoder.push(&bytes[2..], &mut out).unwrap();
-        assert_eq!(out, "汉");
+        assert_eq!(out, "\u{20ac}");
         // Malformed byte: must fail, and say which provider.
         let err = decoder.push(&[0x80], &mut out).unwrap_err().to_string();
         assert!(err.contains(label), "error must name the provider: {err}");

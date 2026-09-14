@@ -304,13 +304,13 @@ pub fn infer_project(content: &str) -> Option<String> {
     if lower.contains("prx") || lower.contains("openprx") || lower.contains("vano") {
         return Some("prx".to_string());
     }
-    if lower.contains("openpr") || lower.contains("治理") {
+    if lower.contains("openpr") || lower.contains("governance") {
         return Some("openpr".to_string());
     }
-    if lower.contains("lc") || lower.contains("彩票") {
+    if lower.contains("lc") || lower.contains("lottery") {
         return Some("lc".to_string());
     }
-    if lower.contains("sm") || lower.contains("量表") || lower.contains("心理") {
+    if lower.contains("sm") || lower.contains("questionnaire") || lower.contains("psychometric") {
         return Some("sm".to_string());
     }
     None
@@ -403,17 +403,28 @@ static EXTERNAL_TICKET_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(openpr|pr|issue|mr|ticket)[#:\-\s]*\d+\b").expect("external id regex must compile")
 });
 static TASK_WORDS: [&str; 12] = [
-    "bug", "修复", "部署", "实现", "开发", "问题", "需求", "fix", "deploy", "issue", "error", "todo",
+    "bug",
+    "fix",
+    "patch",
+    "deploy",
+    "implement",
+    "build",
+    "issue",
+    "error",
+    "todo",
+    "regression",
+    "release",
+    "rollout",
 ];
 static GREETINGS: [&str; 11] = [
-    "你好",
-    "谢谢",
+    "hi",
+    "hello",
+    "hey",
     "ok",
     "okay",
-    "好的",
-    "收到",
-    "嗯",
-    "哈哈",
+    "sure",
+    "noted",
+    "haha",
     "thanks",
     "thank you",
     "got it",
@@ -491,7 +502,7 @@ mod tests {
     fn resolve_topic_reuses_existing_by_fingerprint() {
         let (_tmp, conn) = setup_conn();
         let principal = base_principal("u-1");
-        let content = "修复 openpr CI 失败并提交补丁";
+        let content = "fix the failing openpr CI run and land the patch";
 
         let id1 = resolve_topic(&conn, content, &principal)
             .unwrap()
@@ -585,7 +596,7 @@ mod tests {
         let _lc_id = create_topic(&conn, "LC ticket", Some("lc"), Some("issue#88"), "fp-lc-88").unwrap();
 
         let principal = base_principal("u-2");
-        let resolved = resolve_topic(&conn, "openpr 处理 issue#88", &principal)
+        let resolved = resolve_topic(&conn, "openpr work on issue#88", &principal)
             .unwrap()
             .expect("topic should resolve");
         assert_eq!(resolved, openpr_id);
@@ -647,12 +658,12 @@ mod tests {
     #[test]
     fn needs_topic_and_infer_project_rules() {
         assert!(!needs_topic("ok"));
-        assert!(!needs_topic("谢谢"));
-        assert!(needs_topic("修复 openpr CI 失败"));
+        assert!(!needs_topic("thanks"));
+        assert!(needs_topic("fix openpr CI"));
 
-        assert_eq!(infer_project("openpr 治理优化"), Some("openpr".to_string()));
-        assert_eq!(infer_project("彩票风控 lc"), Some("lc".to_string()));
-        assert_eq!(infer_project("心理量表 sm"), Some("sm".to_string()));
+        assert_eq!(infer_project("openpr governance cleanup"), Some("openpr".to_string()));
+        assert_eq!(infer_project("lottery risk control lc"), Some("lc".to_string()));
+        assert_eq!(infer_project("psychometric questionnaire sm"), Some("sm".to_string()));
         assert_eq!(infer_project("openprx prx vano"), Some("prx".to_string()));
         assert_eq!(infer_project("unknown project"), None);
     }

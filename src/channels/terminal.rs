@@ -996,7 +996,7 @@ async fn terminal_input_loop(tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
             let mut lines = stdin.lock().lines();
             loop {
                 if stdin_is_tty {
-                    print!("prx〉");
+                    print!("prx> ");
                     let _ = io::stdout().flush();
                 }
                 let line = match lines.next() {
@@ -1192,7 +1192,7 @@ mod tests {
 
     #[test]
     fn sanitize_preserves_normal_text() {
-        let normal = "Hello, 你好世界! Line\nnewline\ttab";
+        let normal = "Hello, \u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}! Line\nnewline\ttab";
         let result = sanitize_terminal_output(normal);
         assert_eq!(result, normal);
     }

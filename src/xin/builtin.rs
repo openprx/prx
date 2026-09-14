@@ -1,4 +1,4 @@
-//! Built-in system task definitions and handler registry for xin (心).
+//! Built-in system task definitions and handler registry for xin.
 //!
 //! Each built-in task maps to an async handler that invokes existing PRX
 //! infrastructure (health checks, stale cleanup, and memory hygiene). Retired

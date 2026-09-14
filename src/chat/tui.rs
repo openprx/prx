@@ -3585,21 +3585,24 @@ impl crate::channels::terminal::TuiMirrorSink for TuiStateMirrorSink {
 
 // ── S4-A Commit 5: SnapshotDispatcherSink ───────────────────────────────────
 
-/// Pure 模式专用 Sink — UiActor 事件通过 `ChatDispatcher` 翻译为 Redux Action,
-/// 走 reducer 单一持久化路径; 不再写 `chat_mirror`.
+/// Pure-mode-only Sink — UiActor events are translated into Redux Actions through
+/// `ChatDispatcher` and take the reducer's single persistence path; `chat_mirror` is
+/// no longer written.
 ///
-/// 与 [`TuiStateMirrorSink`] 的关系: Pure 模式下两者互斥. Pure 模式的 LLM
-/// turn 主路径由 `drive_start_turn_stream` 直接 dispatch
+/// Relation to [`TuiStateMirrorSink`]: in Pure mode the two are mutually exclusive.
+/// The main LLM turn path in Pure mode dispatches
 /// `Action::TurnStarted` / `Action::StreamChunkReceived` / `Action::StreamCompleted` /
-/// `Action::ToolStarted` / `Action::ToolFinished` 给 reducer; UiActor 收到的
-/// 等价 UiEvent 仅是 channel-layer 镜像广播，若再翻译为 Action 重 dispatch
-/// 会导致 reducer 双写 conversation_lines / draft. 因此本 Sink 主体为 **no-op**
-/// (含 trace) — 真正写 reducer 的源头是 driver，Sink 仅消极 ack UiActor 事件.
+/// `Action::ToolStarted` / `Action::ToolFinished` to the reducer directly from
+/// `drive_start_turn_stream`; the equivalent UiEvents that reach UiActor are only a
+/// channel-layer mirror broadcast, and re-dispatching them as Actions would make the
+/// reducer double-write conversation_lines / draft. This Sink is therefore a **no-op**
+/// in its main body (trace only) — the real writer of the reducer is the driver, and
+/// the Sink merely acks UiActor events passively.
 ///
-/// `push_system` 是唯一对 chat::run 主循环侧的 fallback 路径:
-/// `UiEvent::ToolProgress` / `UiEvent::DraftCancelled` 经 UiActor 翻译为
-/// "step N/M" / "(cancelled)" 系统提示, 本 Sink 把它转 dispatch
-/// `Action::SystemMessageAdded` 让 reducer 把消息推到 UI 账本.
+/// `push_system` is the only fallback path towards the chat::run main loop:
+/// `UiEvent::ToolProgress` / `UiEvent::DraftCancelled` are translated by UiActor into
+/// "step N/M" / "(cancelled)" system notices, and this Sink re-dispatches them as
+/// `Action::SystemMessageAdded` so the reducer pushes the message into the UI ledger.
 pub struct SnapshotDispatcherSink {
     dispatcher: crate::chat::dispatcher::ChatDispatcher,
 }
@@ -3612,17 +3615,19 @@ impl SnapshotDispatcherSink {
 
 impl crate::channels::terminal::TuiMirrorSink for SnapshotDispatcherSink {
     fn push_assistant(&self, content: &str) {
-        // Pure 模式下 assistant 文本由 driver Action::StreamCompleted 经 reducer
-        // push 到 conversation_lines。UiActor 的 push_assistant 是 channel-layer
-        // 旁路镜像，重复 dispatch 会导致重复行。改为 trace 留观察痕迹。
+        // In Pure mode assistant text is pushed to conversation_lines by the driver's
+        // Action::StreamCompleted through the reducer. UiActor's push_assistant is a
+        // channel-layer side mirror; dispatching it again would duplicate lines, so we
+        // only leave a trace here for observability.
         tracing::trace!(
             site = "snapshot_sink.push_assistant",
             chars = content.chars().count(),
-            "Pure 模式忽略 UiActor 旁路 (reducer 单源)"
+            "Pure mode ignores the UiActor side path (reducer is the single source)"
         );
     }
     fn push_system(&self, content: &str) {
-        // 系统消息 (ToolProgress / DraftCancelled 等) 通过 reducer 单源写入 UI 账本.
+        // System messages (ToolProgress / DraftCancelled, ...) are written into the UI
+        // ledger through the reducer as the single source.
         let _ = self.dispatcher.dispatch_or_log(
             crate::chat::action::Action::SystemMessageAdded {
                 text: content.to_string(),
@@ -3631,24 +3636,26 @@ impl crate::channels::terminal::TuiMirrorSink for SnapshotDispatcherSink {
         );
     }
     fn push_tool_started(&self, tool_name: &str, args_full: &str) {
-        // driver 已 dispatch Action::ToolStarted；Pure 模式忽略 UiActor 旁路.
+        // The driver already dispatched Action::ToolStarted; Pure mode ignores the
+        // UiActor side path.
         tracing::trace!(
             site = "snapshot_sink.push_tool_started",
             tool = tool_name,
             args_len = args_full.chars().count(),
-            "Pure 模式忽略 UiActor 旁路 (driver 已 dispatch ToolStarted)"
+            "Pure mode ignores the UiActor side path (driver already dispatched ToolStarted)"
         );
     }
     fn mark_tool_finished(&self, tool_name: &str, success: bool, duration_ms: u64) -> bool {
-        // driver 已 dispatch Action::ToolFinished. 返回 false 让 UiActor 知道
-        // 本 sink 未"独立"更新任何卡片 — 实际更新在 reducer 内由 driver dispatch
-        // 的 Action 触发. UiActor 不再依赖此返回值做 fallback (real path).
+        // The driver already dispatched Action::ToolFinished. Returning false tells
+        // UiActor that this sink did not update any card "on its own" — the real update
+        // happens inside the reducer, triggered by the Action the driver dispatched.
+        // UiActor no longer relies on this return value for a fallback (real path).
         tracing::trace!(
             site = "snapshot_sink.mark_tool_finished",
             tool = tool_name,
             success,
             duration_ms,
-            "Pure 模式忽略 UiActor 旁路 (driver 已 dispatch ToolFinished)"
+            "Pure mode ignores the UiActor side path (driver already dispatched ToolFinished)"
         );
         false
     }
@@ -3656,7 +3663,7 @@ impl crate::channels::terminal::TuiMirrorSink for SnapshotDispatcherSink {
         tracing::trace!(
             site = "snapshot_sink.start_stream",
             draft_id,
-            "Pure 模式忽略 UiActor 旁路 (driver 已 dispatch TurnStarted)"
+            "Pure mode ignores the UiActor side path (driver already dispatched TurnStarted)"
         );
     }
     fn update_stream(&self, draft_id: &str, accumulated: &str, version: u64) {
@@ -3665,7 +3672,7 @@ impl crate::channels::terminal::TuiMirrorSink for SnapshotDispatcherSink {
             draft_id,
             version,
             chars = accumulated.chars().count(),
-            "Pure 模式忽略 UiActor 旁路 (driver 已 dispatch StreamChunkReceived)"
+            "Pure mode ignores the UiActor side path (driver already dispatched StreamChunkReceived)"
         );
     }
     fn finalize_stream(&self, draft_id: &str, final_text: &str) {
@@ -3673,14 +3680,14 @@ impl crate::channels::terminal::TuiMirrorSink for SnapshotDispatcherSink {
             site = "snapshot_sink.finalize_stream",
             draft_id,
             chars = final_text.chars().count(),
-            "Pure 模式忽略 UiActor 旁路 (driver 已 dispatch StreamCompleted)"
+            "Pure mode ignores the UiActor side path (driver already dispatched StreamCompleted)"
         );
     }
     fn cancel_stream(&self, draft_id: &str) {
         tracing::trace!(
             site = "snapshot_sink.cancel_stream",
             draft_id,
-            "Pure 模式忽略 UiActor 旁路 (driver 已 dispatch StreamCancelled)"
+            "Pure mode ignores the UiActor side path (driver already dispatched StreamCancelled)"
         );
     }
 }
@@ -3776,12 +3783,13 @@ fn build_args_preview(raw: &str, max_chars: usize, ellipsis: &str) -> String {
     format!("{truncated}{ellipsis}")
 }
 
-/// 渲染源抽象：让 fullscreen renderer 同时支持 `TuiState`（chat_mirror 路径）
-/// 与 `UiSnapshot`（S4-A Pure 模式 watch 路径）.
+/// Render-source abstraction: lets the fullscreen renderer support both `TuiState`
+/// (the chat_mirror path) and `UiSnapshot` (the S4-A Pure-mode watch path).
 ///
-/// S4-A Commit 2: 把渲染需要的最小字段集抽出来作为 trait，泛型化所有
-/// `&TuiState` 参数为 `&V: BottomChromeView`。本 commit 暂未切换渲染源，
-/// 仅泛型化函数签名 + 两个 impl，行为不变。
+/// S4-A Commit 2: extracts the minimal field set the renderer needs into a trait and
+/// generifies every `&TuiState` parameter into `&V: BottomChromeView`. This commit does
+/// not switch the render source yet; it only generifies the function signatures and adds
+/// the two impls, with no behaviour change.
 pub trait BottomChromeView {
     fn provider(&self) -> &str;
     fn model(&self) -> &str;
@@ -8387,7 +8395,7 @@ mod tests {
     fn folded_tool_card_preview_preserves_indent_and_shows_hidden_line_count() {
         let mut lines: Vec<Line<'_>> = Vec::new();
         let result = [
-            "    let value = \"你好你好你好你好你好你好你好你好\";",
+            "    let value = \"\u{ac00}\u{ac01}\u{ac02}\u{ac03}\u{ac04}\u{ac05}\u{ac06}\u{ac07}\";",
             "        println!(\"still indented\");",
             "    }",
             "extra hidden line one",
@@ -9489,11 +9497,11 @@ mod tests {
     #[test]
     fn p2_10_utf8_grapheme_safe_backspace() {
         let mut input = TuiInput::new();
-        // Three Chinese chars (3 bytes each in UTF-8).
-        type_str(&mut input, "你好吗");
+        // Three East Asian wide chars (3 bytes each in UTF-8).
+        type_str(&mut input, "\u{ac00}\u{ac01}\u{ac02}");
         assert_eq!(input.cursor, (0, 9));
         input.handle_key(key(KeyCode::Backspace));
-        assert_eq!(input.text(), "你好");
+        assert_eq!(input.text(), "\u{ac00}\u{ac01}");
         assert_eq!(input.cursor, (0, 6));
         // Move left then right: must land on char boundaries.
         input.handle_key(key(KeyCode::Left));
@@ -10443,7 +10451,11 @@ mod tests {
 
     #[test]
     fn saved_session_picker_row_truncates_to_unicode_width() {
-        let entry = saved_picker_entry("wide", "很长的会话标题 mixed ascii text", true);
+        let entry = saved_picker_entry(
+            "wide",
+            "\u{ac00}\u{ac01}\u{ac02}\u{ac03}\u{ac04}\u{ac05}\u{ac06} mixed ascii text",
+            true,
+        );
         let row = render_saved_session_picker_row(&entry, false, 18, false);
         assert!(
             UnicodeWidthStr::width(row.as_str()) <= 18,
@@ -11818,7 +11830,7 @@ mod tests {
             kind: "shell",
             origin: "user",
             status: "running",
-            title: "监控任务执行状态和输出窗口".to_string(),
+            title: "\u{ac00}".repeat(13),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             token_usage_records: Vec::new(),
@@ -11842,7 +11854,7 @@ mod tests {
 
     #[test]
     fn truncation_is_cjk_column_accurate() {
-        let line = truncate_chars_with_ellipsis("你好世界abc", 5, false);
+        let line = truncate_chars_with_ellipsis("\u{ac00}\u{ac01}\u{ac02}\u{ac03}abc", 5, false);
         assert!(
             UnicodeWidthStr::width(line.as_str()) <= 5,
             "wide chars must fit the column budget, got {:?} width {}",
@@ -11859,7 +11871,7 @@ mod tests {
         crate::chat::sessions::ActiveSessionView {
             seq,
             kind: "agent".to_string(),
-            title: "监控任务执行状态和输出窗口-with-a-long-title".to_string(),
+            title: "\u{ac00}".repeat(13) + "-with-a-long-title",
             lines,
             truncated: true,
             scroll_offset,
@@ -11961,7 +11973,7 @@ mod tests {
 
         let view = build_diff_view(
             "staged diff",
-            (0..24).map(|i| format!("+新增行{i}")).collect(),
+            (0..24).map(|i| format!("+\u{ac00}\u{ac01}\u{ac02}{i}")).collect(),
             true,
             usize::MAX,
         );
@@ -12508,14 +12520,14 @@ mod tests {
 
     #[test]
     fn input_wrap_ranges_respect_unicode_display_width() {
-        let line = "ab你好c";
+        let line = "ab\u{ac00}\u{ac01}c";
         let ranges = wrap_line_ranges(line, 4);
         let wrapped = ranges
             .iter()
             .map(|(start, end)| line.get(*start..*end).unwrap_or(""))
             .collect::<Vec<_>>();
 
-        assert_eq!(wrapped, vec!["ab你", "好c"]);
+        assert_eq!(wrapped, vec!["ab\u{ac00}", "\u{ac01}c"]);
         assert!(
             wrapped.iter().all(|row| UnicodeWidthStr::width(*row) <= 4),
             "wrapped rows fit display width: {wrapped:?}"
@@ -12705,11 +12717,11 @@ mod tests {
         // terminals also deliver single CJK chars as `KeyCode::Char(_)`
         // KeyEvents. Verify the dispatcher does not swallow them.
         let mut state = TuiState::new("p", "m");
-        for ch in "你好".chars() {
+        for ch in "\u{ac00}\u{ac01}".chars() {
             let out = dispatch_global_key(key(KeyCode::Char(ch)), &mut state);
             assert_eq!(out, KeyDispatch::Consumed);
         }
-        assert_eq!(state.input.text(), "你好");
+        assert_eq!(state.input.text(), "\u{ac00}\u{ac01}");
     }
 
     #[test]
@@ -12723,7 +12735,7 @@ mod tests {
         use ratatui::layout::Rect;
         let samples = [
             "I am a lightweight AI assistant built with Rust that can help you run terminal commands, read and write files, and manage projects.",
-            "你好，我是一个用 Rust 构建的轻量级 AI 助手，能帮你执行终端命令、读写文件、管理项目。",
+            "\u{ac00}\u{ac01},\u{ac02}\u{ac03}\u{ac04}\u{ac05} Rust \u{ac06}\u{ac07}\u{ac08} AI \u{ac09}\u{ac0a},\u{ac0b}\u{ac0c}\u{ac0d}\u{ac0e}.",
             "short",
             "a b c d e f g h i j k l m n o p q r s t u v w x y z one two three",
         ];
@@ -13146,26 +13158,38 @@ mod tests {
         state.start_stream("draft-thinking");
         state.stream_started_at_ms = Some(chrono::Utc::now().timestamp_millis().saturating_sub(3_000));
         let draft = state.streaming.as_mut().expect("test: draft present");
-        crate::chat::state::apply_reasoning_progress(draft, "让我先梳理调用链 ✅ ");
-        crate::chat::state::apply_reasoning_progress(draft, "再校验边界条件");
-        let expected_chars = "让我先梳理调用链 ✅ 再校验边界条件".chars().count();
+        crate::chat::state::apply_reasoning_progress(draft, "\u{ac00}\u{ac01}\u{ac02}\u{ac03} \u{2705} ");
+        crate::chat::state::apply_reasoning_progress(draft, "\u{ac04}\u{ac05}\u{ac06}");
+        let expected_chars = "\u{ac00}\u{ac01}\u{ac02}\u{ac03} \u{2705} \u{ac04}\u{ac05}\u{ac06}"
+            .chars()
+            .count();
 
         let mut scroll = FullscreenTranscriptScroll::default();
         let rows = fullscreen_rows(&state, 100, 18, &mut scroll);
         let rendered = rows.join("\n");
 
-        assert!(rendered.contains("Thinking"), "thinking 标签: {rows:?}");
-        assert!(!rendered.contains("Working"), "thinking 期间不再显示 Working: {rows:?}");
+        assert!(rendered.contains("Thinking"), "thinking label: {rows:?}");
+        assert!(
+            !rendered.contains("Working"),
+            "Working must not be shown while thinking: {rows:?}"
+        );
         assert!(
             rendered.contains(&format!("{expected_chars} chars")),
-            "实时字符数: {rows:?}"
+            "live character count: {rows:?}"
         );
-        assert!(rendered.contains('~'), "估算 token 数: {rows:?}");
-        assert!(rendered.contains("tok"), "估算 token 单位: {rows:?}");
-        assert!(rendered.contains("Esc to interrupt"), "中断提示保留: {rows:?}");
-        // 宽字符在测试行提取时按单元格展开，比较前去掉空白。
+        assert!(rendered.contains('~'), "estimated token count: {rows:?}");
+        assert!(rendered.contains("tok"), "estimated token unit: {rows:?}");
+        assert!(
+            rendered.contains("Esc to interrupt"),
+            "interrupt hint is preserved: {rows:?}"
+        );
+        // Wide chars are expanded cell by cell when the test extracts rows, so strip
+        // whitespace before comparing.
         let compact: String = rendered.chars().filter(|ch| !ch.is_whitespace()).collect();
-        assert!(compact.contains("再校验边界条件"), "一行实时预览: {rows:?}");
+        assert!(
+            compact.contains("\u{ac04}\u{ac05}\u{ac06}"),
+            "single-line live preview: {rows:?}"
+        );
     }
 
     #[test]
@@ -13179,10 +13203,13 @@ mod tests {
         let rows = fullscreen_rows(&state, 100, 18, &mut scroll);
         let rendered = rows.join("\n");
 
-        assert!(rendered.contains("Working"), "无 reasoning 时保持原样: {rows:?}");
+        assert!(
+            rendered.contains("Working"),
+            "stays unchanged when there is no reasoning: {rows:?}"
+        );
         assert!(
             !rendered.contains("Thinking ("),
-            "无 reasoning 时不显示 thinking 计数: {rows:?}"
+            "no thinking counter when there is no reasoning: {rows:?}"
         );
     }
 
@@ -13190,19 +13217,22 @@ mod tests {
     fn thinking_preview_is_bounded_to_one_clipped_line() {
         let mut draft = StreamingDraft::new("d");
         for round in 0..40 {
-            crate::chat::state::apply_reasoning_progress(&mut draft, &format!("段落 {round} 推理内容 😀\n"));
+            crate::chat::state::apply_reasoning_progress(
+                &mut draft,
+                &format!("\u{ac00}\u{ac01} {round} \u{ac02}\u{ac03}\u{ac04}\u{ac05} \u{1f600}\n"),
+            );
         }
         let preview = draft.reasoning_preview().expect("test: preview present");
-        assert!(!preview.contains('\n'), "预览折成一行: {preview}");
+        assert!(!preview.contains('\n'), "preview folds into a single line: {preview}");
         assert_eq!(
             draft.reasoning_tail.chars().count(),
             REASONING_TAIL_MAX_CHARS,
-            "尾巴有界"
+            "tail is bounded"
         );
         let clipped = crate::util::truncate_with_ellipsis(&preview, THINKING_PREVIEW_MAX_CHARS);
         assert!(
             clipped.chars().count() <= THINKING_PREVIEW_MAX_CHARS.saturating_add(3),
-            "渲染前再裁一次: {clipped}"
+            "clipped once more before rendering: {clipped}"
         );
     }
 
@@ -13874,11 +13904,11 @@ mod tests {
     #[test]
     #[cfg(feature = "terminal-tui")]
     fn cjk_buffer_diff_omits_continuation_cells() {
-        // Build a buffer containing a Chinese assistant message, then take
+        // Build a buffer containing a wide-char assistant message, then take
         // its diff against an empty buffer. The diff updates must not contain
         // continuation-cell spaces between consecutive CJK characters.
         let line = ConversationLine::Assistant {
-            content: "你好世界欢迎使用PRX".to_string(),
+            content: "\u{ac00}\u{ac01}\u{ac02}\u{ac03}\u{ac04}\u{ac05}\u{ac06}\u{ac07}PRX".to_string(),
         };
         let area = Rect {
             x: 0,
@@ -13904,11 +13934,11 @@ mod tests {
         let trimmed = row0_symbols.trim_end();
         // The diff must faithfully reconstruct the text (no phantom spaces).
         assert!(
-            trimmed.contains("你好世界欢迎使用PRX"),
+            trimmed.contains("\u{ac00}\u{ac01}\u{ac02}\u{ac03}\u{ac04}\u{ac05}\u{ac06}\u{ac07}PRX"),
             "diff path should emit CJK chars without inter-character spaces, got {trimmed:?}"
         );
         assert!(
-            !trimmed.contains("你 好") && !trimmed.contains("好 世"),
+            !trimmed.contains("\u{ac00} \u{ac01}") && !trimmed.contains("\u{ac01} \u{ac02}"),
             "phantom spaces detected in diff output: {trimmed:?}"
         );
     }
@@ -13919,7 +13949,7 @@ mod tests {
         // StreamingAssistant appends a block-cursor glyph (▌). Verify that
         // CJK content before the cursor is also contiguous in the diff path.
         let line = ConversationLine::StreamingAssistant {
-            content: "你好世界".to_string(),
+            content: "\u{ac00}\u{ac01}\u{ac02}\u{ac03}".to_string(),
         };
         let area = Rect {
             x: 0,
@@ -13942,11 +13972,11 @@ mod tests {
         // Assistant text now has an actor marker prefix; the CJK payload before
         // the cursor must still be contiguous in the diff output.
         assert!(
-            trimmed.contains("你好世界"),
+            trimmed.contains("\u{ac00}\u{ac01}\u{ac02}\u{ac03}"),
             "streaming CJK diff should be contiguous, got {trimmed:?}"
         );
         assert!(
-            !trimmed.contains("你 好") && !trimmed.contains("好 世"),
+            !trimmed.contains("\u{ac00} \u{ac01}") && !trimmed.contains("\u{ac01} \u{ac02}"),
             "phantom spaces detected in streaming diff output: {trimmed:?}"
         );
     }
@@ -13957,7 +13987,7 @@ mod tests {
         // User message is prefixed with `> ` in a styled Span. Verify the
         // full row (including prefix) is contiguous in the diff path.
         let line = ConversationLine::User {
-            content: "你好世界".to_string(),
+            content: "\u{ac00}\u{ac01}\u{ac02}\u{ac03}".to_string(),
         };
         let area = Rect {
             x: 0,
@@ -13977,13 +14007,13 @@ mod tests {
             }
         }
         let trimmed = row0.trim_end();
-        // Row 0: "> 你好世界"  (two-space prefix + content)
+        // Row 0: "> " prefix followed by the four wide chars.
         assert!(
-            trimmed.starts_with("> 你好世界"),
-            "user CJK diff should be '> 你好世界', got {trimmed:?}"
+            trimmed.starts_with("> \u{ac00}\u{ac01}\u{ac02}\u{ac03}"),
+            "user CJK diff should be '> ' followed by the four wide chars, got {trimmed:?}"
         );
         assert!(
-            !trimmed.contains("你 好"),
+            !trimmed.contains("\u{ac00} \u{ac01}"),
             "phantom spaces detected in user CJK diff: {trimmed:?}"
         );
     }
@@ -14010,14 +14040,15 @@ mod tests {
             s
         }
 
-        /// Parity 检查：相同 ChatState 同时映射到 TuiState（mirror 兼容字段）+ UiSnapshot 后，
-        /// `fullscreen_bottom_chrome_height` 在两种 view 上返回相同值.
+        /// Parity check: after the same ChatState is mapped into both TuiState (the
+        /// mirror-compatible field set) and UiSnapshot, `fullscreen_bottom_chrome_height`
+        /// returns the same value on both views.
         #[test]
         fn s4_a_2_fullscreen_bottom_chrome_height_parity_tui_vs_snapshot() {
             let mut state = make_state_with_lines();
             let snap = state.build_ui_snapshot(1);
 
-            // 构造与 snap 字段对齐的 TuiState（mirror 兼容字段集）.
+            // Build a TuiState aligned with snap's fields (mirror-compatible field set).
             let mut tui = TuiState::new(&state.session.provider, &state.session.model);
             tui.session_title = state.session.title.clone();
             tui.turn_count = state.ui.turn_count;
@@ -14029,11 +14060,11 @@ mod tests {
             assert_eq!(
                 fullscreen_bottom_chrome_height(&tui),
                 fullscreen_bottom_chrome_height(&snap),
-                "TuiState vs UiSnapshot 在同 fixture 下高度应一致"
+                "TuiState vs UiSnapshot must report the same height for the same fixture"
             );
         }
 
-        /// Parity 检查：streaming 状态下两种 view 的高度仍一致.
+        /// Parity check: the two views still report the same height while streaming.
         #[test]
         fn s4_a_2_fullscreen_bottom_chrome_height_parity_streaming() {
             let mut state = make_state_with_lines();
@@ -14058,15 +14089,19 @@ mod tests {
 
             let h_tui = fullscreen_bottom_chrome_height(&tui);
             let h_snap = fullscreen_bottom_chrome_height(&snap);
-            assert_eq!(h_tui, h_snap, "streaming 下高度应一致 (tui={h_tui}, snap={h_snap})");
+            assert_eq!(
+                h_tui, h_snap,
+                "heights must match while streaming (tui={h_tui}, snap={h_snap})"
+            );
             assert_eq!(
                 h_tui,
                 fullscreen_bottom_chrome_height(&TuiState::new(&state.session.provider, &state.session.model)),
-                "streaming 不应重复占用 fullscreen bottom chrome"
+                "streaming must not take up the fullscreen bottom chrome twice"
             );
         }
 
-        /// Parity 检查：BottomChromeView 各 getter 在 TuiState 与 UiSnapshot 上返回相同字段.
+        /// Parity check: every BottomChromeView getter returns the same field on
+        /// TuiState and on UiSnapshot.
         #[test]
         fn s4_a_2_view_getters_parity() {
             let mut state = make_state_with_lines();
@@ -14328,7 +14363,7 @@ mod tests {
             assert_eq!(
                 fullscreen_bottom_chrome_height(&tui),
                 fullscreen_bottom_chrome_height(&snap),
-                "tool card 状态下高度应一致"
+                "heights must match when a tool card is present"
             );
         }
     }
@@ -14344,13 +14379,14 @@ mod tests {
         use std::sync::Arc;
         use tokio_util::sync::CancellationToken;
 
-        /// 每个 UiEvent 翻译方法都不 panic, push_system 真 dispatch SystemMessageAdded.
+        /// No UiEvent translation method panics, and push_system really dispatches
+        /// SystemMessageAdded.
         #[tokio::test]
         async fn s4_a_5_snapshot_sink_each_event_maps_to_action() {
             let (dispatcher, mut rx) = ChatDispatcher::new();
             let sink = SnapshotDispatcherSink::new(dispatcher);
 
-            // 所有方法都不 panic — 大部分是 no-op trace.
+            // None of the methods panic — most of them are no-op traces.
             sink.push_assistant("hi");
             sink.push_tool_started("Bash", "{\"cmd\":\"ls\"}");
             let _ = sink.mark_tool_finished("Bash", true, 123);
@@ -14358,7 +14394,7 @@ mod tests {
             sink.update_stream("d-1", "He", 1);
             sink.finalize_stream("d-1", "Hello");
             sink.cancel_stream("d-1");
-            // push_system 应 dispatch SystemMessageAdded — 验证 channel 收到.
+            // push_system must dispatch SystemMessageAdded — check the channel receives it.
             sink.push_system("system note");
 
             let action = rx.recv().await.expect("dispatcher should receive SystemMessageAdded");
@@ -14368,24 +14404,26 @@ mod tests {
             }
         }
 
-        /// dispatch_or_log 路径在 channel 满时不 panic (Backpressured fallback).
+        /// The dispatch_or_log path does not panic when the channel is full
+        /// (Backpressured fallback).
         #[tokio::test]
         async fn s4_a_5_sink_handles_dispatcher_full_gracefully() {
             let (dispatcher, _rx) = ChatDispatcher::new();
             let sink = SnapshotDispatcherSink::new(dispatcher);
-            // 反复 push_system, channel cap 限制 (ACTION_CHANNEL_CAPACITY) 满后
-            // dispatch_or_log 走 backpressured 路径, 不 panic.
+            // Call push_system repeatedly; once the channel cap (ACTION_CHANNEL_CAPACITY)
+            // is reached, dispatch_or_log takes the backpressured path without panicking.
             for i in 0..2000 {
                 sink.push_system(&format!("note {i}"));
             }
-            // 通过即可 (不 panic / 不 hang).
+            // Reaching this point is the assertion (no panic / no hang).
         }
 
-        /// Pure 模式下 Stream UiEvent 经由 driver Action 进 reducer, snapshot.streaming
-        /// 应 Some(...) — Sink 自身不写，但 driver 路径走 reducer.
+        /// In Pure mode Stream UiEvents reach the reducer through driver Actions, so
+        /// snapshot.streaming must be Some(...) — the Sink itself writes nothing, but the
+        /// driver path goes through the reducer.
         ///
-        /// 此测试模拟 driver-style dispatch (TurnStarted → reducer 写 stream.draft),
-        /// 验证 snapshot.streaming.is_some() — 这是 Pure 模式的核心路径.
+        /// This test simulates a driver-style dispatch (TurnStarted → reducer writes
+        /// stream.draft) and checks snapshot.streaming.is_some() — the core Pure-mode path.
         #[test]
         fn s4_a_5_pure_streaming_propagates_to_snapshot() {
             let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
@@ -14397,14 +14435,14 @@ mod tests {
             let snap = state.build_ui_snapshot(1);
             assert!(
                 snap.streaming.is_some(),
-                "Pure 模式下 TurnStarted 应让 snapshot.streaming = Some"
+                "TurnStarted must set snapshot.streaming = Some in Pure mode"
             );
             let draft = snap.streaming.as_ref().expect("checked above");
             assert_eq!(draft.draft_id, "d-1");
         }
 
-        /// Pure 模式下 ToolStarted Action 进 reducer, snapshot.conversation_lines 出现
-        /// ToolResult 卡片 (Running).
+        /// In Pure mode a ToolStarted Action reaches the reducer and a ToolResult card
+        /// (Running) shows up in snapshot.conversation_lines.
         #[test]
         fn s4_a_5_pure_tool_card_appears_in_snapshot() {
             let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
@@ -14420,15 +14458,16 @@ mod tests {
                 snap.conversation_lines
                     .iter()
                     .any(|l| matches!(l, ConversationLine::ToolResult { tool_name, .. } if tool_name == "Bash")),
-                "Pure 模式下 ToolStarted 应让 snapshot 出现 Bash ToolResult 卡片"
+                "ToolStarted must make a Bash ToolResult card appear in the snapshot in Pure mode"
             );
         }
 
-        /// Pure 模式下 banner 走 SystemMessageAdded Action -> reducer push 一行;
-        /// chat_mirror 同时（其他模式）也写 — 但在 Pure 下 chat_mirror 应零写入.
+        /// In Pure mode the banner goes through a SystemMessageAdded Action and the
+        /// reducer pushes one line; chat_mirror also writes in the other modes — but under
+        /// Pure it must write nothing.
         ///
-        /// 此测试单元化验证 reducer 路径正确性: SystemMessageAdded → snapshot
-        /// 含 ConversationLine::System.
+        /// This test unit-checks the reducer path: SystemMessageAdded → snapshot contains
+        /// a ConversationLine::System.
         #[test]
         fn s4_a_5_pure_banner_via_dispatch_not_mirror() {
             let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
@@ -14442,7 +14481,7 @@ mod tests {
                 .any(|l| matches!(l, ConversationLine::System { content } if content.contains("mock/mock")));
             assert!(
                 has_banner,
-                "Pure 模式 banner 应通过 SystemMessageAdded 进 reducer, snapshot 含 System 行"
+                "the Pure-mode banner must reach the reducer via SystemMessageAdded, snapshot contains a System line"
             );
         }
     }

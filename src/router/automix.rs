@@ -22,10 +22,12 @@ impl ConfidenceChecker {
             "perhaps",
             "possibly",
             "might be",
-            "可能",
-            "也许",
-            "不确定",
-            "猜测",
+            "i think",
+            "probably",
+            "presumably",
+            "i guess",
+            "hard to say",
+            "cannot be certain",
         ];
 
         if low_confidence_markers
@@ -40,7 +42,16 @@ impl ConfidenceChecker {
         }
 
         let code_task_markers = [
-            "code", "rust", "python", "bug", "debug", "fix", "function", "函数", "代码", "调试", "修复",
+            "code",
+            "rust",
+            "python",
+            "bug",
+            "debug",
+            "fix",
+            "function",
+            "compile",
+            "stack trace",
+            "refactor",
         ];
         let is_code_task = code_task_markers.iter().any(|marker| question_lower.contains(marker));
         if is_code_task && answer.contains("```") {
@@ -60,7 +71,7 @@ impl ConfidenceChecker {
     }
 }
 
-/// 判断是否需要升级
+/// Whether a turn's confidence is low enough to escalate to a stronger model.
 pub fn should_escalate(confidence: f32, threshold: f32) -> bool {
     confidence < threshold
 }
@@ -97,6 +108,22 @@ mod tests {
             "Please fix this Rust code",
         );
         assert!(!should_escalate(confidence, 0.7));
+    }
+
+    /// The hedging table and the code-task table are English-only; both still
+    /// have to move the score in the direction they claim.
+    #[test]
+    fn english_hedging_and_code_markers_move_the_score() {
+        let hedged = ConfidenceChecker::check_rules("Probably fine, but I guess it is hard to say.", "answer this");
+        let plain = ConfidenceChecker::check_rules("This is the answer.", "answer this");
+        assert!(hedged < plain, "hedging must lower confidence: {hedged} vs {plain}");
+
+        let with_code = ConfidenceChecker::check_rules("```\nx\n```", "why does this fail to compile");
+        let without_code = ConfidenceChecker::check_rules("```\nx\n```", "tell me a story");
+        assert!(
+            with_code > without_code,
+            "a code question answered with a block must score higher: {with_code} vs {without_code}"
+        );
     }
 
     #[test]

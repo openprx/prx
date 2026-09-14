@@ -66,7 +66,7 @@ impl EvolutionProposalDraft {
         self.applied_at.is_some()
     }
 
-    /// True when a judge verdict is already recorded (重判 guard).
+    /// True when a judge verdict is already recorded (re-judgement guard).
     #[must_use]
     pub const fn is_judged(&self) -> bool {
         self.judge_verdict.is_some()

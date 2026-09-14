@@ -1232,7 +1232,7 @@ mod tests {
     fn stream_decoder_survives_split_multibyte_characters() {
         let mut decoder = SseTextDecoder::new(STREAM_DECODER_LABEL);
         let mut buf = String::new();
-        let bytes = "\u{4e2d}".as_bytes();
+        let bytes = "\u{20ac}".as_bytes();
         assert_eq!(bytes.len(), 3);
 
         decoder
@@ -1242,7 +1242,7 @@ mod tests {
         assert_eq!(decoder.pending_len(), 2, "test: the split tail is carried, not dropped");
 
         decoder.push(&bytes[2..], &mut buf).expect("test: character completes");
-        assert_eq!(buf, "\u{4e2d}");
+        assert_eq!(buf, "\u{20ac}");
         decoder.finish().expect("test: stream ends on a character boundary");
 
         // Genuinely invalid input must still fail, tagged with this provider.

@@ -274,7 +274,7 @@ async fn chat_driver_routes_capabilities_instead_of_publishing_the_whole_registr
 #[tokio::test]
 async fn chat_driver_keeps_the_whole_registry_when_the_message_names_no_capability() {
     let offered = offered_tools_for(
-        "\u{5e2e}\u{6211}\u{770b}\u{4e00}\u{4e0b}\u{8fd9}\u{6bb5}\u{600e}\u{4e48}\u{5199}",
+        "ay\u{fa}dame a revisar c\u{f3}mo qued\u{f3} esto",
         crate::config::ToolTieringConfig::default(),
     )
     .await;

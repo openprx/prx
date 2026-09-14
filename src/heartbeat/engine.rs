@@ -234,11 +234,11 @@ mod tests {
 
     #[test]
     fn parse_tasks_unicode() {
-        let content = "- Check email 📧\n- Review calendar 📅\n- 日本語タスク";
+        let content = "- Check email 📧\n- Review calendar 📅\n- \u{417}\u{430}\u{434}\u{430}\u{447}\u{430}";
         let tasks = HeartbeatEngine::parse_tasks(content);
         assert_eq!(tasks.len(), 3);
         assert!(tasks[0].contains("📧"));
-        assert!(tasks[2].contains("日本語"));
+        assert!(tasks[2].contains("\u{417}\u{430}\u{434}\u{430}\u{447}\u{430}"));
     }
 
     #[test]

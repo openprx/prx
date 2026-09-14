@@ -142,12 +142,12 @@ mod tests {
     }
 
     #[test]
-    fn cjk_text_is_not_corrupted() {
-        // Pure CJK / emoji chunk — must round-trip byte-for-byte and
+    fn multibyte_text_is_not_corrupted() {
+        // Pure multi-byte / emoji chunk — must round-trip byte-for-byte and
         // remain a borrowed slice (no multi-byte boundary issues, no
         // allocation).
         let tools = names(&["shell"]);
-        let input = "你好，世界！这是一段中文测试。日本語もある。🚀";
+        let input = "\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}, \u{43c}\u{438}\u{440}! \u{3a0}\u{3bf}\u{3bb}\u{3cd} \u{3ba}\u{3b1}\u{3bb}\u{3ac}. 🚀";
         let out = sanitize_stream_chunk(input, &tools);
         assert!(matches!(out, Cow::Borrowed(_)));
         assert_eq!(out.as_ref(), input);
@@ -301,7 +301,7 @@ mod tests {
         let input = "[OpenAI](https://openai.com) is a research lab.";
         let result = sanitize_stream_chunk(input, &tools);
         assert_eq!(result, input);
-        assert!(matches!(result, Cow::Borrowed(_)), "应走 Borrowed 短路");
+        assert!(matches!(result, Cow::Borrowed(_)), "must short-circuit to Borrowed");
     }
 
     #[test]
@@ -313,6 +313,9 @@ mod tests {
         let input = "line one\r\nline two\r\n";
         let result = sanitize_stream_chunk(input, &tools);
         assert_eq!(result, input);
-        assert!(matches!(result, Cow::Borrowed(_)), "CRLF chunk 应走 Borrowed 短路");
+        assert!(
+            matches!(result, Cow::Borrowed(_)),
+            "a CRLF chunk must short-circuit to Borrowed"
+        );
     }
 }

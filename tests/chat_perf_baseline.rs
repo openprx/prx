@@ -1,15 +1,17 @@
-//! S5 P0-2: Pure 模式 100-turn 性能基线.
+//! S5 P0-2: Pure-mode 100-turn performance baseline.
 //!
-//! 通过 `MockEnvProvider` 跑 100 次完整流式 turn，度量：
-//! - M1: chunk → snapshot 单步延迟 (per-chunk 端到端)
-//! - M2: end-to-end turn 延迟 (一次 stream call 全部 chunk 消费完)
-//! - M3: peak RSS 起始 vs 100 turn 后增长 (Linux `/proc/self/status` `VmHWM`)
+//! Runs 100 complete streaming turns through `MockEnvProvider` and measures:
+//! - M1: chunk → snapshot single-step latency (per-chunk, end to end)
+//! - M2: end-to-end turn latency (one stream call with all its chunks consumed)
+//! - M3: peak RSS at start vs the growth after 100 turns (Linux `/proc/self/status` `VmHWM`)
 //!
-//! 本次仅 sanity ceiling，不做相对阈值断言 (Codex 反馈：首次基线无对比意义)。
-//! v0.4.1+ 使用 2x 偏离规则。详见 docs/perf-baseline.md。
+//! This round only asserts sanity ceilings, no relative-threshold assertions (Codex
+//! feedback: a first baseline has nothing to compare against). v0.4.1+ uses the 2x
+//! deviation rule. See docs/perf-baseline.md for details.
 //!
-//! 仅 Linux 启用 RSS 度量 (其他平台返回 0)。`tests` 集成测试默认 release 缺省，
-//! 时间数值依赖宿主机；阈值给得很宽松，避免 CI 抖动假阳性。
+//! RSS measurement is enabled on Linux only (other platforms return 0). `tests`
+//! integration tests are not built in release by default, so the timings depend on the
+//! host; the thresholds are deliberately generous to avoid CI-jitter false positives.
 
 #![cfg(feature = "test-mock")]
 #![allow(unsafe_code)]
@@ -30,7 +32,7 @@ use openprx::providers::create_provider;
 use openprx::providers::traits::{ChatMessage, StreamOptions};
 use parking_lot::Mutex;
 
-/// p50/p95/p99 + peak RSS 采样.
+/// p50/p95/p99 + peak RSS sampling.
 struct PerfRecorder {
     samples: Mutex<Vec<Duration>>,
     peak_rss: AtomicU64,
@@ -80,7 +82,7 @@ impl PerfRecorder {
     }
 }
 
-/// 读 `/proc/self/status` 的 `VmHWM` (Linux); 其他平台返回 0.
+/// Reads `VmHWM` from `/proc/self/status` (Linux); returns 0 on other platforms.
 // The Linux implementation performs runtime file I/O; on non-Linux targets the
 // cfg-reduced body is constant, which would otherwise trigger a false-positive.
 #[allow(clippy::missing_const_for_fn)]
@@ -107,9 +109,10 @@ fn read_vmhwm_kb() -> u64 {
     }
 }
 
-/// S5 P0-2: 100-turn Pure 模式基线 — 时间 ceiling + RSS delta sanity.
+/// S5 P0-2: 100-turn Pure-mode baseline — time ceiling + RSS delta sanity.
 ///
-/// 仅断言宽松上限 (Codex 反馈：首次基线无相对阈值意义)：
+/// Only generous upper bounds are asserted (Codex feedback: a first baseline has no
+/// meaningful relative threshold):
 /// - p99 chunk→snapshot < 50ms
 /// - p99 end-to-end-turn < 500ms
 /// - `peak_rss_delta` < 100MB
@@ -117,10 +120,11 @@ fn read_vmhwm_kb() -> u64 {
 async fn s5_release_p0_2_pure_perf_baseline() {
     const N_TURNS: usize = 100;
 
-    // 固定 8 字节 mock response (规划要求).
-    // SAFETY: Rust 2024 把 std::env::set_var 标为 unsafe 因为它在多线程下不安全。
-    // 本测试在创建 provider 之前一次性写入；后续逻辑只读 env (provider::from_env)，
-    // 同进程其他测试不依赖此 env，故不存在并发竞争。
+    // Fixed 8-byte mock response (required by the plan).
+    // SAFETY: Rust 2024 marks std::env::set_var as unsafe because it is not safe under
+    // multiple threads. This test writes it exactly once, before the provider is created;
+    // the later logic only reads the env (provider::from_env), and no other test in the
+    // same process depends on this env var, so there is no concurrent race.
     unsafe {
         std::env::set_var("OPENPRX_MOCK_RESPONSE", "mock8byt");
     }
@@ -129,7 +133,7 @@ async fn s5_release_p0_2_pure_perf_baseline() {
     let recorder_chunk = PerfRecorder::new();
     let recorder_turn = PerfRecorder::new();
 
-    // 起始 RSS 基线.
+    // Starting RSS baseline.
     recorder_chunk.snapshot_rss();
     let rss_start = recorder_chunk.peak_rss_kb();
 
@@ -146,7 +150,7 @@ async fn s5_release_p0_2_pure_perf_baseline() {
         recorder_turn.record(turn_start.elapsed());
     }
 
-    // 终态 RSS.
+    // Final RSS.
     let recorder_rss = PerfRecorder::new();
     recorder_rss.snapshot_rss();
     let rss_end = recorder_rss.peak_rss_kb();
@@ -164,7 +168,7 @@ async fn s5_release_p0_2_pure_perf_baseline() {
     println!("  end-to-end-turn p50={p50_turn:?}  p95={p95_turn:?}  p99={p99_turn:?}");
     println!("  RSS start={rss_start}KB end={rss_end}KB delta={rss_delta_kb}KB");
 
-    // 写入 docs/perf-baseline.md (best-effort, 失败不让测试 fail).
+    // Write docs/perf-baseline.md (best-effort; a failure must not fail the test).
     let _ = write_baseline_doc(
         N_TURNS,
         p50_chunk,
@@ -178,7 +182,7 @@ async fn s5_release_p0_2_pure_perf_baseline() {
         rss_delta_kb,
     );
 
-    // Sanity ceiling 断言 — Codex 反馈不做相对阈值.
+    // Sanity ceiling assertions — per Codex feedback, no relative thresholds.
     assert!(
         p99_chunk < Duration::from_millis(50),
         "p99 chunk→snapshot < 50ms (got {p99_chunk:?})"
@@ -193,7 +197,7 @@ async fn s5_release_p0_2_pure_perf_baseline() {
     );
 }
 
-/// 自动写 docs/perf-baseline.md (首次写入 v0.4.0 基线).
+/// Writes docs/perf-baseline.md automatically (the v0.4.0 baseline on first run).
 #[allow(clippy::too_many_arguments)]
 fn write_baseline_doc(
     n_turns: usize,
@@ -210,49 +214,50 @@ fn write_baseline_doc(
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("docs")
         .join("perf-baseline.md");
-    // 已存在则不覆盖 (避免 CI 每次跑覆盖既有基线)；本地首次跑创建.
+    // Do not overwrite an existing file (so a CI run does not clobber the recorded
+    // baseline); the first local run creates it.
     if path.exists() {
         return Ok(());
     }
     let content = format!(
         "# OpenPRX Performance Baseline\n\
 \n\
-本文档记录 OpenPRX Pure 模式 100-turn 基线性能数字，作为 v0.4.0 首版基准。\n\
+This document records the OpenPRX Pure-mode 100-turn baseline performance numbers as the first v0.4.0 reference.\n\
 \n\
-## 度量方法\n\
+## Measurement method\n\
 \n\
-- 测试入口：`tests/chat_perf_baseline.rs::s5_release_p0_2_pure_perf_baseline`\n\
+- Test entry point: `tests/chat_perf_baseline.rs::s5_release_p0_2_pure_perf_baseline`\n\
 - Provider: `MockEnvProvider` (test-mock feature) + `OPENPRX_MOCK_RESPONSE=mock8byt`\n\
-- 度量项：\n\
-  - **M1 chunk→snapshot**: stream 每个 chunk 从 `next().await` 到消费完的耗时\n\
-  - **M2 end-to-end-turn**: 一次完整 stream call 的总耗时 (含 stream 构造 + 所有 chunk)\n\
-  - **M3 peak RSS delta**: Linux `/proc/self/status` 的 `VmHWM` 100 turn 前后差值\n\
-- 工具：无外部 crate (Codex 铁律 9，禁 criterion/wiremock/mockall)\n\
-- 阈值规则：v0.4.0 仅 sanity ceiling；v0.4.1+ 使用 2x 偏离规则与此基线对比\n\
+- Measured items:\n\
+  - **M1 chunk→snapshot**: for each stream chunk, the time from `next().await` until it is fully consumed\n\
+  - **M2 end-to-end-turn**: the total time of one complete stream call (stream construction + all chunks)\n\
+  - **M3 peak RSS delta**: the difference in Linux `/proc/self/status` `VmHWM` before and after 100 turns\n\
+- Tooling: no external crates (Codex rule 9 forbids criterion/wiremock/mockall)\n\
+- Threshold rule: v0.4.0 uses sanity ceilings only; v0.4.1+ compares against this baseline with the 2x deviation rule\n\
 \n\
-## v0.4.0 基线 (N={n_turns} turns)\n\
+## v0.4.0 baseline (N={n_turns} turns)\n\
 \n\
-| 度量 | p50 | p95 | p99 |\n\
+| Metric | p50 | p95 | p99 |\n\
 |------|-----|-----|-----|\n\
 | chunk→snapshot | {p50_chunk:?} | {p95_chunk:?} | {p99_chunk:?} |\n\
 | end-to-end-turn | {p50_turn:?} | {p95_turn:?} | {p99_turn:?} |\n\
 \n\
 **RSS** (Linux only):\n\
-- 起始 VmHWM: {rss_start_kb} KB\n\
-- 终态 VmHWM: {rss_end_kb} KB\n\
+- Starting VmHWM: {rss_start_kb} KB\n\
+- Final VmHWM: {rss_end_kb} KB\n\
 - delta: {rss_delta_kb} KB\n\
 \n\
 ## Sanity Ceilings (v0.4.0)\n\
 \n\
-- `p99 chunk→snapshot < 50ms` — mock provider 无网络，超过此值表明 dispatcher\n\
-  或 reducer 有不该有的同步阻塞\n\
-- `p99 end-to-end-turn < 500ms` — 100 turn 无网络下应远低于此值\n\
-- `peak_rss_delta < 100MB` — 100 turn 后内存增长 ≥100MB 表明潜在泄漏\n\
+- `p99 chunk→snapshot < 50ms` — the mock provider does no network I/O, so exceeding this means the dispatcher\n\
+  or the reducer has synchronous blocking it should not have\n\
+- `p99 end-to-end-turn < 500ms` — 100 turns without network should stay far below this value\n\
+- `peak_rss_delta < 100MB` — memory growth of ≥100MB after 100 turns indicates a potential leak\n\
 \n\
-## v0.4.1+ 对比规则\n\
+## v0.4.1+ comparison rule\n\
 \n\
-后续版本以本基线为参照，p99 / RSS delta 任一项偏离 >2x 则视为回归，\n\
-需在 PR 说明中给出原因或修复。\n\
+Later versions use this baseline as the reference: a deviation of >2x in either p99 or RSS delta counts as a regression,\n\
+and the PR description must give the cause or the fix.\n\
 "
     );
     std::fs::write(&path, content)

@@ -908,7 +908,7 @@ mod tests {
                             "from": "111",
                             "timestamp": "1",
                             "type": "text",
-                            "text": { "body": "Hello 👋 世界 🌍 مرحبا" }
+                            "text": { "body": "Hello 👋 \u{41c}\u{438}\u{440} 🌍 مرحبا" }
                         }]
                     }
                 }]
@@ -916,7 +916,7 @@ mod tests {
         });
         let msgs = ch.parse_webhook_payload(&payload);
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content, "Hello 👋 世界 🌍 مرحبا");
+        assert_eq!(msgs[0].content, "Hello 👋 \u{41c}\u{438}\u{440} 🌍 مرحبا");
     }
 
     #[test]

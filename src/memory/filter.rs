@@ -18,8 +18,7 @@ pub fn should_autosave_content_with_min(content: &str, min_chars: usize) -> bool
         "Check HEARTBEAT",
         "[cron:",
         "[Heartbeat Task]",
-        "心跳",
-        "系统健康",
+        "system health check",
         "HEARTBEAT_OK",
         "NO_REPLY",
         "no_reply",
@@ -216,7 +215,7 @@ fn pii_phone_regex() -> &'static Regex {
                 |
                 (?:\+\d{1,3}[-.\s])?(?:\(\d{2,4}\)|\d{2,4})[-.\s]\d{3,4}[-.\s]\d{4}\b
                 |
-                \b(?:phone|telephone|tel|mobile|call\s+me\s+at|电话|手机|联系)\s*[:：]?\s*\d{7,15}\b
+                \b(?:phone|telephone|tel|mobile|cell|call\s+me\s+at|reach\s+me\s+at)\s*:?\s*\d{7,15}\b
             )",
         )
         .expect("BUG: invalid hardcoded phone regex")
@@ -319,7 +318,7 @@ mod tests {
     fn filters_heartbeat_and_cron_noise() {
         assert!(!should_autosave_content("Check HEARTBEAT now"));
         assert!(!should_autosave_content("[cron:heartbeat] run task"));
-        assert!(!should_autosave_content("系统健康检查完成 HEARTBEAT_OK"));
+        assert!(!should_autosave_content("system health check finished HEARTBEAT_OK"));
     }
 
     #[test]

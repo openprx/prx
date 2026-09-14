@@ -1,4 +1,4 @@
-//! Core types for the xin (心) autonomous task engine.
+//! Core types for the xin autonomous task engine.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

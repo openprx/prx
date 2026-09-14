@@ -78,7 +78,7 @@ impl StreamBoundaryBuffer {
         if delta.is_empty() {
             return None;
         }
-        // S2.5 T2.5-2: chunk 计数指标（每个 non-empty delta 计 1）.
+        // S2.5 T2.5-2: chunk counter metric (one count per non-empty delta).
         crate::observability::chat_metrics::inc_stream_chunk();
         self.buf.push_str(delta);
         self.advance_scan();
@@ -348,9 +348,9 @@ mod tests {
 
     #[test]
     fn multibyte_utf8_not_split_mid_codepoint() {
-        // Chinese characters are 3-byte UTF-8. Feed enough to cross MIN_FLUSH_CHARS.
-        // Each `中` = 3 bytes; 30 of them = 90 bytes.
-        let s: String = "中".repeat(30);
+        // Feed enough 3-byte UTF-8 characters to cross MIN_FLUSH_CHARS.
+        // Each `\u{20ac}` = 3 bytes; 30 of them = 90 bytes.
+        let s: String = "\u{20ac}".repeat(30);
         let mut buf = StreamBoundaryBuffer::new();
         let out = buf.push(&s);
         // Whatever flushes must be valid UTF-8 (String::from guarantees) and

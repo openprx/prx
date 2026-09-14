@@ -9051,11 +9051,16 @@ source: tool_output\n\
     #[tokio::test]
     async fn store_unicode_and_emoji() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("emoji_key_🦀", "こんにちは 🚀 Ñoño", MemoryCategory::Core, None)
-            .await
-            .unwrap();
+        mem.store(
+            "emoji_key_🦀",
+            "\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442} 🚀 Ñoño",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
         let entry = mem.get("emoji_key_🦀").await.unwrap().unwrap();
-        assert_eq!(entry.content, "こんにちは 🚀 Ñoño");
+        assert_eq!(entry.content, "\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442} 🚀 Ñoño");
     }
 
     #[tokio::test]
@@ -9125,10 +9130,18 @@ source: tool_output\n\
     #[tokio::test]
     async fn recall_unicode_query() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("jp", "日本語のテスト", MemoryCategory::Core, None)
+        mem.store(
+            "ru",
+            "\u{420}\u{443}\u{441}\u{441}\u{43a}\u{438}\u{439} \u{442}\u{435}\u{441}\u{442}",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        let results = mem
+            .recall("\u{420}\u{443}\u{441}\u{441}\u{43a}\u{438}\u{439}", 10, None)
             .await
             .unwrap();
-        let results = mem.recall("日本語", 10, None).await.unwrap();
         assert!(!results.is_empty());
     }
 

@@ -119,16 +119,16 @@ impl IntentClassifier {
 }
 
 /// Return whether a keyword occurrence belongs to an explicit negative tool
-/// instruction such as "do not use browser or MCP" or "不要使用浏览器/MCP".
+/// instruction such as "do not use browser or MCP".
 ///
 /// Capability routing happens before the model sees the tool catalog, so a
 /// plain substring match on a forbidden capability is particularly harmful:
 /// the request "do not use MCP" used to cold-start every configured MCP server.
 /// Keep this deliberately narrow and clause-local. Positive mentions in a
-/// later sentence or after an explicit contrast ("but use MCP" / "但使用 MCP")
+/// later sentence or after an explicit contrast ("but use MCP")
 /// still activate the category.
 fn keyword_is_in_negative_instruction(message: &str, keyword_index: usize) -> bool {
-    const CLAUSE_BOUNDARIES: &[char] = &['.', '!', '?', ';', '\n', '\r', '。', '！', '？', '；'];
+    const CLAUSE_BOUNDARIES: &[char] = &['.', '!', '?', ';', '\n', '\r'];
     const NEGATIVE_MARKERS: &[&str] = &[
         "do not use",
         "don't use",
@@ -139,20 +139,18 @@ fn keyword_is_in_negative_instruction(message: &str, keyword_index: usize) -> bo
         "avoid using",
         "avoid",
         "no ",
-        "禁止使用",
-        "禁止调用",
-        "不要使用",
-        "不要调用",
-        "不使用",
-        "不调用",
-        "不得使用",
-        "不得调用",
-        "无需使用",
-        "无需调用",
-        "别用",
-        "别调用",
+        "never use",
+        "do not call",
+        "don't call",
+        "dont call",
+        "must not call",
+        "never call",
+        "no need to use",
+        "no need to call",
+        "refrain from using",
+        "refrain from calling",
     ];
-    const POSITIVE_PIVOTS: &[&str] = &[" but ", " instead ", " however ", "但", "但是", "而是", "改用"];
+    const POSITIVE_PIVOTS: &[&str] = &[" but ", " instead ", " however ", " rather ", " except "];
 
     let before = &message[..keyword_index];
     let clause_start = before
@@ -527,9 +525,7 @@ mod tests {
             "a greeting names no capability"
         );
         assert!(
-            CLASSIFIER
-                .classify("\u{4f60}\u{597d}\u{ff0c}\u{4eca}\u{5929}\u{5929}\u{6c14}\u{600e}\u{4e48}\u{6837}\u{ff1f}")
-                .is_empty(),
+            CLASSIFIER.classify("hola, \u{bf}c\u{f3}mo est\u{e1}s hoy?").is_empty(),
             "the keyword table is English-only, so a non-English request activates nothing"
         );
     }
@@ -595,12 +591,13 @@ mod tests {
         assert!(!cats.contains(&ToolCategory::Automation));
     }
 
-    /// The negative-instruction guard also has to hold when the sentence around
-    /// the English capability names is not English: those markers are the only
-    /// thing standing between "do not touch MCP" and a cold MCP start.
+    /// The negative-instruction guard clamps on byte offsets inside the
+    /// lowercased message, so it also has to hold when the surrounding prose is
+    /// multi-byte: those markers are the only thing standing between
+    /// "do not touch MCP" and a cold MCP start.
     #[test]
-    fn non_english_negative_capability_instructions_do_not_activate_categories() {
-        let cats = CLASSIFIER.classify("\u{8bfb}\u{53d6} PDF skill\u{ff1b}\u{4e0d}\u{8981}\u{8c03}\u{7528} MCP\u{3001}plugin \u{6216} WASM\u{3002}");
+    fn negative_capability_instructions_survive_multibyte_surroundings() {
+        let cats = CLASSIFIER.classify("Ol\u{e1}, read the PDF skill; do not call MCP, plugin \u{f6}r WASM.");
         assert!(cats.contains(&ToolCategory::System));
         assert!(!cats.contains(&ToolCategory::Automation));
     }
@@ -772,11 +769,7 @@ mod tests {
         let tools = probe_registry();
         let tiering = crate::config::ToolTieringConfig::default();
         assert_eq!(
-            selected_names(
-                &tools,
-                "\u{5e2e}\u{6211}\u{770b}\u{4e00}\u{4e0b}\u{8fd9}\u{4e2a}\u{600e}\u{4e48}\u{529e}",
-                &tiering
-            ),
+            selected_names(&tools, "ay\u{fa}dame a revisar esto, por favor", &tiering),
             vec!["probe_core", "probe_devops", "probe_web"],
             "a request the English keyword table cannot read must not be trimmed"
         );
@@ -865,9 +858,9 @@ mod tests {
         let tools = probe_registry();
         let base = crate::config::ToolTieringConfig::default();
         let exposure = SessionToolExposure::new();
-        // Chinese for "thanks, that is all" — an ordinary closing line that
+        // Spanish for "thanks, that is all" — an ordinary closing line that
         // activates no English category.
-        let unreadable = "\u{8c22}\u{8c22}\u{ff0c}\u{5c31}\u{8fd9}\u{4e9b}";
+        let unreadable = "gracias, eso es todo";
 
         let routed = exposure.sticky_surface(&base, &tools, "commit this change");
         let established = session_names(&tools, "commit this change", &routed);
@@ -913,7 +906,7 @@ mod tests {
         let tools = probe_registry();
         let base = crate::config::ToolTieringConfig::default();
         let exposure = SessionToolExposure::new();
-        let unreadable = "\u{8c22}\u{8c22}\u{ff0c}\u{5c31}\u{8fd9}\u{4e9b}";
+        let unreadable = "gracias, eso es todo";
 
         let opening = exposure.sticky_surface(&base, &tools, unreadable);
         assert_eq!(

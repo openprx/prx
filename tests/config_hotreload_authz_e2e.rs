@@ -4,7 +4,7 @@
 //!
 //!   file change → HotReloadManager (file watcher) → generation publish → authz reads
 //!
-//! works correctly after a hot-reload — the **"断链 1" repair** hard evidence.
+//! works correctly after a hot-reload — the hard evidence for the "broken chain 1" repair.
 //!
 //! # Design choice: real file watcher
 //!
@@ -147,7 +147,7 @@ fn register_authz_participant(shared: &SharedConfig) -> Arc<dyn ConfigGeneration
 /// 6. **Post-reload**: assert the same call is now **denied** with "read-only mode".
 ///
 /// This proves: file write → `notify` event → HotReloadManager.try_reload() →
-/// SharedConfig.store() → authz reads new policy — the complete "断链 1" chain.
+/// SharedConfig.store() → authz reads new policy — the complete "broken chain 1" chain.
 ///
 /// # Why SharedConfig is seeded explicitly rather than loaded from the file
 ///

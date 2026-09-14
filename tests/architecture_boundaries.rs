@@ -168,20 +168,30 @@ fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn rust_source_files() -> Vec<PathBuf> {
-    fn visit(dir: &Path, files: &mut Vec<PathBuf>) {
-        for entry in fs::read_dir(dir).unwrap_or_else(|error| panic!("read {}: {error}", dir.display())) {
-            let path = entry.expect("read directory entry").path();
-            if path.is_dir() {
-                visit(&path, files);
-            } else if path.extension().is_some_and(|extension| extension == "rs") {
-                files.push(path);
-            }
+fn collect_rust_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).unwrap_or_else(|error| panic!("read {}: {error}", dir.display())) {
+        let path = entry.expect("read directory entry").path();
+        if path.is_dir() {
+            collect_rust_files(&path, files);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            files.push(path);
         }
     }
+}
 
+fn rust_source_files() -> Vec<PathBuf> {
     let mut files = Vec::new();
-    visit(&repository_root().join("src"), &mut files);
+    collect_rust_files(&repository_root().join("src"), &mut files);
+    files.sort();
+    files
+}
+
+/// Every Rust file the repository owns: the crate sources and the integration
+/// tests.
+fn rust_source_and_test_files() -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_rust_files(&repository_root().join("src"), &mut files);
+    collect_rust_files(&repository_root().join("tests"), &mut files);
     files.sort();
     files
 }
@@ -744,4 +754,57 @@ fn context_handoff_has_one_production_owner_and_exact_lookup_is_registered() {
         fs::read_to_string(repository_root().join("src/agent/loop_.rs")).expect("read src/agent/loop_.rs");
     assert!(loop_source.contains("context_mode_uses_os_paging"));
     assert!(loop_source.contains("tool_specs.push(required)"));
+}
+
+/// The source tree is English-only: no Rust file under `src/` or `tests/` may
+/// carry a CJK character. That covers behavioural keyword tables, user-visible
+/// copy, test fixtures, assertion messages and comments alike — a keyword table
+/// that reads one natural language routes that language's users differently
+/// from everyone else, and a comment nobody on the project can read is a
+/// comment that stops being maintained.
+///
+/// The guard reads `\u{...}` escapes as well as literal characters, because the
+/// two produce the very same string at run time; without that, the rule would
+/// be one escape away from being bypassed.
+///
+/// Language-neutral substitutes exist for every legitimate use: `\u{20ac}` for a
+/// three-byte code point, a Hangul syllable for an East-Asian-wide column, or
+/// Cyrillic/Greek text for "some non-ASCII prose".
+#[test]
+fn src_and_tests_carry_no_cjk_characters() {
+    const CJK_RANGES: &[(u32, u32)] = &[(0x3000, 0x30ff), (0x3400, 0x9fff), (0xff00, 0xffef)];
+
+    fn is_cjk(value: u32) -> bool {
+        CJK_RANGES.iter().any(|(start, end)| value >= *start && value <= *end)
+    }
+
+    let mut offenders: Vec<String> = Vec::new();
+    for path in rust_source_and_test_files() {
+        let relative = relative_path(&path);
+        let source = fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {relative}: {error}"));
+        for (index, line) in source.lines().enumerate() {
+            let number = index + 1;
+            if let Some(found) = line.chars().find(|ch| is_cjk(*ch as u32)) {
+                offenders.push(format!("{relative}:{number}: literal U+{:04X}", found as u32));
+            }
+            let mut rest = line;
+            while let Some(start) = rest.find("\\u{") {
+                rest = &rest[start + 3..];
+                let Some(end) = rest.find('}') else { break };
+                if let Ok(value) = u32::from_str_radix(&rest[..end], 16)
+                    && is_cjk(value)
+                {
+                    offenders.push(format!("{relative}:{number}: escaped U+{value:04X}"));
+                }
+                rest = &rest[end + 1..];
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "source and tests must be free of CJK characters, found {}:\n{}",
+        offenders.len(),
+        offenders.join("\n")
+    );
 }

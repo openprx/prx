@@ -435,7 +435,7 @@ mod tests {
     fn unicode_secret_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let store = SecretStore::new(tmp.path(), true);
-        let secret = "sk-日本語テスト-émojis-🦀";
+        let secret = "sk-\u{41f}\u{440}\u{43e}\u{431}\u{430}-émojis-🦀";
 
         let encrypted = store.encrypt(secret).unwrap();
         let decrypted = store.decrypt(&encrypted).unwrap();
@@ -609,7 +609,7 @@ mod tests {
         let _ = store.encrypt("setup").unwrap();
         let key = store.load_or_create_key().unwrap();
 
-        let plaintext = "sk-日本語-émojis-🦀-тест";
+        let plaintext = "sk-\u{41f}\u{440}\u{43e}\u{431}\u{430}-émojis-🦀-тест";
         let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
         let legacy_value = format!("enc:{}", hex_encode(&ciphertext));
 

@@ -328,14 +328,14 @@ mod tests {
 
     #[test]
     fn unicode_content_is_preserved() {
-        let text = "# 日本語\n\nこんにちは世界\n\n## Émojis\n\n🦀 Rust is great 🚀";
+        let text = "# \u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}\n\n\u{41c}\u{438}\u{440} \u{438} \u{434}\u{440}\u{443}\u{436}\u{431}\u{430}\n\n## Émojis\n\n🦀 Rust is great 🚀";
         let chunks = chunk_markdown(text, 512);
         let all = chunks
             .iter()
             .map(|chunk| chunk.content.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(all.contains("こんにちは"));
+        assert!(all.contains("\u{41c}\u{438}\u{440}"));
         assert!(all.contains("🦀"));
     }
 

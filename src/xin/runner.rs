@@ -1,4 +1,4 @@
-//! Tick-based heartbeat runner for the xin (心) autonomous task engine.
+//! Tick-based heartbeat runner for the xin autonomous task engine.
 //!
 //! Follows the cron/scheduler.rs pattern:
 //! - Periodic interval tick

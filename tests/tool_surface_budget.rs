@@ -314,8 +314,8 @@ fn a_request_the_keyword_table_cannot_read_keeps_the_whole_registry() {
     // Three ordinary requests that contain no English capability keyword: two
     // non-English, one English small talk.
     let unrouted = [
-        "\u{5e2e}\u{6211}\u{628a}\u{8fd9}\u{6bb5}\u{6539}\u{5f97}\u{66f4}\u{7b80}\u{6d01}\u{4e00}\u{70b9}",
-        "\u{3053}\u{306e}\u{6587}\u{7ae0}\u{3092}\u{77ed}\u{304f}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}",
+        "haz que esto quede un poco m\u{e1}s breve",
+        "\u{43f}\u{43e}\u{436}\u{430}\u{43b}\u{443}\u{439}\u{441}\u{442}\u{430}, \u{441}\u{43e}\u{43a}\u{440}\u{430}\u{442}\u{438} \u{44d}\u{442}\u{43e}",
         "could you make that sound a little friendlier please",
     ];
     for message in unrouted {
@@ -491,7 +491,7 @@ fn a_chat_session_opening_on_an_unrouted_turn_keeps_the_whole_registry() {
 
     for follow_up in [
         "Now commit the changes in this repository with git.",
-        "\u{5e2e}\u{6211}\u{770b}\u{4e00}\u{4e0b}\u{8fd9}\u{4e2a}",
+        "ay\u{fa}dame a revisar esto",
         "Thanks, that is all.",
     ] {
         let specs = chat_turn_specs(&exposure, &tools, follow_up, &base);
@@ -524,7 +524,7 @@ fn a_stateless_entry_point_still_publishes_everything_on_an_unrouted_turn() {
 
     for message in [
         "Thanks, that is all.",
-        "\u{3053}\u{306e}\u{6587}\u{7ae0}\u{3092}\u{77ed}\u{304f}\u{3057}\u{3066}",
+        "\u{441}\u{43e}\u{43a}\u{440}\u{430}\u{442}\u{438} \u{44d}\u{442}\u{43e}\u{442} \u{442}\u{435}\u{43a}\u{441}\u{442}",
     ] {
         let specs = specs_for(&tools, message, &channel);
         assert_eq!(

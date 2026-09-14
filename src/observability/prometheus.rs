@@ -160,8 +160,9 @@ impl PrometheusObserver {
 
     /// Encode this observer's registry plus any extra registries into one Prometheus output.
     ///
-    /// 用于 /metrics 端点将 `chat_metrics::CHAT_REGISTRY` 等物理独立的 registry
-    /// 合并暴露，避免 scrape 丢失 (S2.5 P1-A).
+    /// Lets the /metrics endpoint expose physically separate registries such as
+    /// `chat_metrics::CHAT_REGISTRY` alongside this one, so a scrape loses
+    /// nothing (S2.5 P1-A).
     pub(crate) fn encode_with_extras(&self, extras: &[&Registry]) -> String {
         let mut all_families = self.registry.gather();
         for reg in extras {
@@ -171,13 +172,15 @@ impl PrometheusObserver {
     }
 }
 
-/// 将多个 registry 的 metrics 合并成 Prometheus 文本格式（供 noop observer 降级路径使用）.
+/// Encode the metrics of several registries into one Prometheus text body,
+/// for the noop-observer fallback path.
 pub(crate) fn encode_registries(registries: &[&Registry]) -> String {
     let families: Vec<_> = registries.iter().flat_map(|r| r.gather()).collect();
     encode_families(&families)
 }
 
-/// 内部：将 MetricFamily 列表编码为 Prometheus 文本格式；编码失败时 warn + 返回空串.
+/// Internal: encode a list of MetricFamily values as Prometheus text; on an
+/// encoding failure, warn and return an empty string.
 fn encode_families(families: &[prometheus::proto::MetricFamily]) -> String {
     let encoder = TextEncoder::new();
     let mut buf = Vec::new();

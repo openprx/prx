@@ -695,7 +695,8 @@ impl Agent {
             let task_id = self
                 .spawn_delegate_task(user_message, classify_result.model_hint.as_deref())
                 .await?;
-            let ack = format!("已收到，正在后台处理（任务 {task_id}），完成后会回传结果。");
+            let ack =
+                format!("Accepted; running in the background as task {task_id}. I will report back when it finishes.");
             // Record acknowledgment in history as well.
             self.history
                 .push(ConversationMessage::Chat(ChatMessage::assistant(ack.clone())));

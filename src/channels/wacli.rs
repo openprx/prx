@@ -784,7 +784,7 @@ pub struct WacliChannelConfig {
     pub bot_jid: Option<String>,
     /// Bot's own phone number (digits), used for `@<number>` mention detection.
     pub bot_number: Option<String>,
-    /// Bot 的 WhatsApp LID（裸数字或含 `@lid` 域名）。
+    /// The bot's own WhatsApp LID (bare digits, or with the `@lid` domain).
     pub bot_lid: Option<String>,
     /// Accept operator-authored messages in WhatsApp's Message Yourself chat.
     /// Outbound replies use wacli's explicit experimental self-send flag and
@@ -1566,14 +1566,14 @@ fn parse_timestamp(raw: Option<&str>) -> u64 {
         .unwrap_or(0)
 }
 
-/// 规范化 JID/LID 到裸 local part。
+/// Normalise a JID/LID down to its bare local part.
 ///
-/// 示例:
+/// Examples:
 /// - `"263767598346470@lid"` → `"263767598346470"`
 /// - `"263767598346470@lid:3"` → `"263767598346470"`
 /// - `"995551518602@s.whatsapp.net"` → `"995551518602"`
 /// - `"263767598346470"` → `"263767598346470"`
-/// - `""` → `""` (空值原样返回)
+/// - `""` -> `""` (an empty value is returned unchanged)
 fn normalize_jid_local(jid: &str) -> &str {
     let trimmed = jid.trim();
     let local = match trimmed.split_once('@') {
@@ -1622,11 +1622,11 @@ fn detect_mention(cfg: &WacliChannelConfig, text: &str, reply_to_sender_jid: &st
         .filter(|s| !s.is_empty());
     let bot_jid = cfg.bot_jid.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
-    // 文本 @mention 检测（手机号或 LID local part）
+    // Textual @mention detection (phone number or LID local part).
     let by_text = bot_num.is_some_and(|num| text.contains(&format!("@{num}")))
         || bot_lid_local.is_some_and(|lid| text.contains(&format!("@{lid}")));
 
-    // reply-to 检测：reply 的 sender 可能是 LID 或标准 JID 形式
+    // reply-to detection: a reply's sender can be in LID or standard JID form.
     let reply_jid_local = normalize_jid_local(reply_to_sender_jid.trim());
     let has_reply = !reply_to_sender_jid.trim().is_empty();
     let by_reply = has_reply
@@ -3199,7 +3199,7 @@ mod tests {
         assert!(ts > 1_700_000_000); // fell back to ~now
     }
 
-    // ── LID mention 测试 ──────────────────────────────────────────────
+    // ── LID mention tests ─────────────────────────────────────────────
 
     fn make_cfg_with_lid(bot_number: Option<&str>, bot_lid: Option<&str>, bot_jid: Option<&str>) -> WacliChannelConfig {
         WacliChannelConfig {
@@ -3226,7 +3226,7 @@ mod tests {
 
     #[test]
     fn test_mention_by_lid_with_domain_in_config() {
-        // config 里填了完整 LID（含 @lid 域），应自动规范化
+        // The config carries a full LID (with the @lid domain); it must be normalised.
         let cfg = make_cfg_with_lid(None, Some("263767598346470@lid"), None);
         assert!(detect_mention(&cfg, "hey @263767598346470 please help", ""));
     }
@@ -3261,7 +3261,7 @@ mod tests {
 
     #[test]
     fn test_bot_lid_none_no_panic() {
-        // bot_lid 为 None 时不 panic，不误匹配
+        // A `None` bot_lid must neither panic nor match by accident.
         let cfg = make_cfg_with_lid(Some("995551518602"), None, None);
         assert!(!detect_mention(&cfg, "hey @263767598346470 hello", ""));
     }

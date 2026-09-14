@@ -358,15 +358,15 @@ mod tests {
 
     #[test]
     fn three_byte_character_split_two_plus_one() {
-        let bytes = "中".as_bytes();
+        let bytes = "\u{20ac}".as_bytes();
         assert_eq!(bytes.len(), 3);
-        assert_eq!(decode_all(&[&bytes[..2], &bytes[2..]]).unwrap(), "中");
+        assert_eq!(decode_all(&[&bytes[..2], &bytes[2..]]).unwrap(), "\u{20ac}");
     }
 
     #[test]
     fn three_byte_character_split_one_plus_two() {
-        let bytes = "文".as_bytes();
-        assert_eq!(decode_all(&[&bytes[..1], &bytes[1..]]).unwrap(), "文");
+        let bytes = "\u{2192}".as_bytes();
+        assert_eq!(decode_all(&[&bytes[..1], &bytes[1..]]).unwrap(), "\u{2192}");
     }
 
     #[test]
@@ -381,10 +381,10 @@ mod tests {
     fn consecutive_incomplete_chunks_accumulate() {
         // Three separate chunks each carrying one byte of the same character,
         // with empty chunks interleaved.
-        let bytes = "汉".as_bytes();
+        let bytes = "\u{20ac}".as_bytes();
         assert_eq!(
             decode_all(&[&bytes[..1], b"", &bytes[1..2], b"", &bytes[2..]]).unwrap(),
-            "汉"
+            "\u{20ac}"
         );
     }
 
@@ -392,9 +392,9 @@ mod tests {
     fn chunk_ending_exactly_on_a_character_boundary_carries_nothing() {
         let mut decoder = Utf8StreamDecoder::new();
         let mut out = String::new();
-        decoder.push("中文".as_bytes(), &mut out).unwrap();
+        decoder.push("\u{20ac}\u{2192}".as_bytes(), &mut out).unwrap();
         assert_eq!(decoder.pending_len(), 0);
-        assert_eq!(out, "中文");
+        assert_eq!(out, "\u{20ac}\u{2192}");
         decoder.finish().unwrap();
     }
 
@@ -418,11 +418,11 @@ mod tests {
         let mut decoder = Utf8StreamDecoder::new();
         let mut out = String::new();
         let mut first = b"prefix ".to_vec();
-        first.extend_from_slice(&"中".as_bytes()[..2]);
+        first.extend_from_slice(&"\u{20ac}".as_bytes()[..2]);
         decoder.push(&first, &mut out).unwrap();
         assert_eq!(out, "prefix ", "valid prefix must not be held back");
-        decoder.push(&"中".as_bytes()[2..], &mut out).unwrap();
-        assert_eq!(out, "prefix 中");
+        decoder.push(&"\u{20ac}".as_bytes()[2..], &mut out).unwrap();
+        assert_eq!(out, "prefix \u{20ac}");
     }
 
     // --- genuinely invalid input must still be rejected ------------------
@@ -479,11 +479,11 @@ mod tests {
     fn valid_text_before_invalid_bytes_is_still_emitted() {
         let mut decoder = Utf8StreamDecoder::new();
         let mut out = String::new();
-        let mut chunk = "good 中文".as_bytes().to_vec();
+        let mut chunk = "good \u{20ac}\u{2192}".as_bytes().to_vec();
         chunk.push(0x80);
         let err = decoder.push(&chunk, &mut out).unwrap_err();
         assert!(matches!(err, Utf8StreamError::InvalidSequence { .. }));
-        assert_eq!(out, "good 中文");
+        assert_eq!(out, "good \u{20ac}\u{2192}");
     }
 
     #[test]
@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn stream_ending_mid_character_is_reported() {
-        let bytes = "中".as_bytes();
+        let bytes = "\u{20ac}".as_bytes();
         let err = decode_all(&[&bytes[..2]]).unwrap_err();
         match err {
             Utf8StreamError::TruncatedAtEnd { pending, .. } => assert_eq!(pending, 2),
@@ -516,7 +516,7 @@ mod tests {
         let mut decoder = Utf8StreamDecoder::new();
         let mut out = String::new();
         let mut chunk = b"hello ".to_vec();
-        chunk.extend_from_slice(&"界".as_bytes()[..1]);
+        chunk.extend_from_slice(&"\u{20ac}".as_bytes()[..1]);
         decoder.push(&chunk, &mut out).unwrap();
         assert_eq!(out, "hello ");
         assert!(decoder.finish().is_err(), "trailing partial byte must be reported");
@@ -534,11 +534,11 @@ mod tests {
     // --- the production scenario ----------------------------------------
 
     #[test]
-    fn eight_kib_boundary_split_of_chinese_text_decodes_intact() {
-        // Reproduces the shipped failure: a long Chinese answer read through an
-        // 8 KiB buffer, where byte 8192 lands inside a 3-byte character.
+    fn eight_kib_boundary_split_of_wide_char_text_decodes_intact() {
+        // Reproduces the shipped failure: a long answer of 3-byte characters
+        // read through an 8 KiB buffer, where byte 8192 lands inside one.
         const BUF: usize = 8192;
-        let text: String = "长回答内容测试汉字流式解码".repeat(2000);
+        let text: String = "\u{20ac}".repeat(26_000);
         let bytes = text.as_bytes();
         assert!(bytes.len() > BUF * 2);
         // Confirm the boundary really cuts a character in half.
@@ -559,7 +559,7 @@ mod tests {
             // is enough to make the recorded offset land *inside* a character,
             // exactly as it did upstream.
             let pad = if split % 3 == 0 { 1 } else { 0 };
-            let text: String = format!("{}{}", "x".repeat(pad), "流式响应中文内容".repeat(2000));
+            let text: String = format!("{}{}", "x".repeat(pad), "\u{20ac}".repeat(16_000));
             assert!(
                 !text.is_char_boundary(split),
                 "test setup: byte {split} must fall inside a character"
@@ -572,8 +572,8 @@ mod tests {
 
     #[test]
     fn every_single_byte_split_of_mixed_text_round_trips() {
-        // Exhaustive: mixed ASCII / CJK / emoji cut at every possible offset.
-        let text = "a中b文c𝄞d😀e漢字";
+        // Exhaustive: mixed ASCII / multi-byte / emoji cut at every possible offset.
+        let text = "a\u{20ac}b\u{2192}c𝄞d😀e\u{2713}\u{20ac}";
         let bytes = text.as_bytes();
         for split in 0..=bytes.len() {
             let decoded = decode_all(&[&bytes[..split], &bytes[split..]])
@@ -598,10 +598,10 @@ mod tests {
 
     #[test]
     fn lossy_carries_split_characters_without_replacing_anything() {
-        let bytes = "中文内容".as_bytes();
+        let bytes = "\u{20ac}\u{2192}\u{2713}\u{20ac}".as_bytes();
         for split in 0..=bytes.len() {
             let (text, replaced) = decode_all_lossy(&[&bytes[..split], &bytes[split..]]);
-            assert_eq!(text, "中文内容", "split at {split}");
+            assert_eq!(text, "\u{20ac}\u{2192}\u{2713}\u{20ac}", "split at {split}");
             assert_eq!(replaced, 0, "a split character is not corruption (split at {split})");
         }
     }
@@ -612,9 +612,9 @@ mod tests {
         // with it. Everything before *and after* it still has to arrive.
         let mut chunk = b"before".to_vec();
         chunk.push(0x80);
-        chunk.extend_from_slice("after中文".as_bytes());
+        chunk.extend_from_slice("after\u{20ac}\u{2192}".as_bytes());
         let (text, replaced) = decode_all_lossy(&[&chunk]);
-        assert_eq!(text, "before\u{fffd}after中文");
+        assert_eq!(text, "before\u{fffd}after\u{20ac}\u{2192}");
         assert_eq!(replaced, 1, "corruption must be counted, not hidden");
     }
 
@@ -636,12 +636,15 @@ mod tests {
     fn lossy_never_shortens_a_message_silently() {
         // Every byte of legitimate text on both sides of the damage is kept, so
         // a reader can never see a plausible-but-shorter message.
-        let mut chunk = "流式".as_bytes().to_vec();
+        let mut chunk = "\u{3b1}\u{3b2}".as_bytes().to_vec();
         chunk.extend_from_slice(&[0xC0, 0xAF]); // overlong '/'
-        chunk.extend_from_slice("解码".as_bytes());
+        chunk.extend_from_slice("\u{3b3}\u{3b4}".as_bytes());
         let (text, replaced) = decode_all_lossy(&[&chunk]);
         assert!(replaced >= 1);
-        assert!(text.contains("流式") && text.contains("解码"), "got {text:?}");
+        assert!(
+            text.contains("\u{3b1}\u{3b2}") && text.contains("\u{3b3}\u{3b4}"),
+            "got {text:?}"
+        );
     }
 
     #[test]
@@ -655,21 +658,21 @@ mod tests {
 
     #[test]
     fn lossy_terminates_when_every_byte_arrives_alone() {
-        let mut mixed = "a中b".as_bytes().to_vec();
+        let mut mixed = "a\u{20ac}b".as_bytes().to_vec();
         mixed.push(0xF8);
-        mixed.extend_from_slice("文c".as_bytes());
+        mixed.extend_from_slice("\u{2192}c".as_bytes());
         let chunks: Vec<&[u8]> = mixed.chunks(1).collect();
         let (text, replaced) = decode_all_lossy(&chunks);
         assert!(replaced >= 1);
-        assert!(text.starts_with("a中b"), "got {text:?}");
-        assert!(text.ends_with("文c"), "got {text:?}");
+        assert!(text.starts_with("a\u{20ac}b"), "got {text:?}");
+        assert!(text.ends_with("\u{2192}c"), "got {text:?}");
     }
 
     #[test]
     fn lossy_still_reports_a_truncated_tail_at_end_of_stream() {
         let mut decoder = Utf8StreamDecoder::new();
         let mut out = String::new();
-        let bytes = "界".as_bytes();
+        let bytes = "\u{20ac}".as_bytes();
         assert_eq!(decoder.push_lossy(&bytes[..2], &mut out), 0);
         assert!(
             decoder.finish().is_err(),
@@ -679,7 +682,7 @@ mod tests {
 
     #[test]
     fn byte_at_a_time_delivery_round_trips() {
-        let text = "网络分片不该破坏解码 😀 ok";
+        let text = "fragments \u{20ac}\u{2192}\u{2713} must not break decoding 😀 ok";
         let bytes = text.as_bytes();
         let chunks: Vec<&[u8]> = bytes.chunks(1).collect();
         assert_eq!(decode_all(&chunks).unwrap(), text);

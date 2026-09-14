@@ -391,7 +391,8 @@ async fn agent_handles_unicode_tool_arguments() {
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "echo".into(),
-            arguments: r#"{"message": "こんにちは世界 🌍"}"#.into(),
+            arguments: "{\"message\": \"\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442} \u{43c}\u{438}\u{440} \u{1f30d}\"}"
+                .into(),
         }]),
         text_response("Unicode tool executed"),
     ]));
