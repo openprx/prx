@@ -5995,6 +5995,122 @@ async fn resolve_runtime_config_dirs(
     ))
 }
 
+/// The config directory this process actually resolved, published once the CLI
+/// has decided it.
+///
+/// Most on-disk state is reached through [`Config::config_path`] and therefore
+/// already follows `--config-dir`. A few process-global artefacts (the runtime
+/// witness key, the session-worker secret) are initialised lazily from far
+/// inside the call graph, where no `Config` is in hand; without this they
+/// anchor on `$HOME/.openprx` and write into the operator's real configuration
+/// even when the run was pointed somewhere else entirely.
+static PROCESS_CONFIG_DIR: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
+
+fn process_config_dir_state() -> &'static RwLock<Option<PathBuf>> {
+    PROCESS_CONFIG_DIR.get_or_init(|| RwLock::new(None))
+}
+
+/// Publish the resolved config directory for this process.
+///
+/// First writer wins: the CLI publishes the explicit `--config-dir` before any
+/// config load, and the post-load publication of the fully resolved directory
+/// must not move state that has already been created under the explicit path.
+pub fn set_process_config_dir(dir: PathBuf) {
+    let state = process_config_dir_state();
+    let mut guard = state.write();
+    if guard.is_none() {
+        *guard = Some(dir);
+    }
+}
+
+/// The config directory published by [`set_process_config_dir`], if any.
+#[must_use]
+pub fn process_config_dir() -> Option<PathBuf> {
+    process_config_dir_state().read().clone()
+}
+
+/// Replace the published config directory and return the previous value, so a
+/// test can install a temporary directory and restore the process afterwards.
+#[cfg(test)]
+pub(crate) fn swap_process_config_dir_for_tests(dir: Option<PathBuf>) -> Option<PathBuf> {
+    std::mem::replace(&mut *process_config_dir_state().write(), dir)
+}
+
+/// Serialises every test that swaps the process-wide config directory, which is
+/// shared by the whole lib-test binary.
+#[cfg(test)]
+pub(crate) fn process_config_dir_test_lock() -> parking_lot::MutexGuard<'static, ()> {
+    static PROCESS_CONFIG_DIR_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    PROCESS_CONFIG_DIR_TEST_LOCK.lock()
+}
+
+/// Trim a directory-valued CLI argument, rejecting a present-but-blank value.
+fn trimmed_dir_arg<'a>(value: Option<&'a str>, flag: &str) -> Result<Option<&'a str>> {
+    match value {
+        None => Ok(None),
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("{flag} cannot be empty");
+            }
+            Ok(Some(trimmed))
+        }
+    }
+}
+
+/// Whether two init targets name the same directory.
+///
+/// Canonicalisation is best-effort: `prx init` legitimately targets a directory
+/// that does not exist yet, and a path that cannot be canonicalised is compared
+/// literally rather than silently treated as equal.
+fn init_targets_are_same_dir(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Resolve the directory `prx init` writes into.
+///
+/// Precedence: `init --dir` > the global `--config-dir` > `OPENPRX_CONFIG_DIR` /
+/// `OPENPRX_WORKSPACE` / the active-workspace marker > `~/.openprx`.
+///
+/// `init` rewrites a whole configuration generation, so the two explicit forms
+/// are never reconciled by guessing: naming different directories with `--dir`
+/// and `--config-dir` is an error. Before this existed, `init` read only its own
+/// `--dir` and silently rewrote the default directory whenever the run was
+/// scoped with `--config-dir`, which destroyed the structure of the operator's
+/// real configuration while leaving the requested directory untouched.
+pub async fn resolve_init_target_dir(
+    explicit_init_dir: Option<&str>,
+    explicit_config_dir: Option<&str>,
+) -> Result<PathBuf> {
+    let init_dir = trimmed_dir_arg(explicit_init_dir, "--dir")?;
+    let config_dir = trimmed_dir_arg(explicit_config_dir, "--config-dir")?;
+
+    if let (Some(init_dir), Some(config_dir)) = (init_dir, config_dir) {
+        if !init_targets_are_same_dir(Path::new(init_dir), Path::new(config_dir)) {
+            anyhow::bail!(
+                "conflicting init targets: --dir {init_dir} and --config-dir {config_dir} name \
+                 different directories. Pass only one: `prx init` rewrites a whole configuration \
+                 generation and will not guess which one you meant."
+            );
+        }
+    }
+
+    if let Some(dir) = init_dir {
+        return Ok(PathBuf::from(dir));
+    }
+
+    let (default_openprx_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
+    let (openprx_dir, _workspace_dir, _source) =
+        resolve_runtime_config_dirs(&default_openprx_dir, &default_workspace_dir, config_dir).await?;
+    Ok(openprx_dir)
+}
+
 fn decrypt_optional_secret(
     store: &crate::security::SecretStore,
     value: &mut Option<String>,
@@ -10366,5 +10482,214 @@ classifier_timeout_secs = 8
             ..ScopeConfig::default()
         };
         cfg.validate().expect("well-formed assignment entries load");
+    }
+
+    // ── `prx init` target resolution ────────────────────────────
+
+    /// Recursive `relative path -> (length, FNV-1a digest)` snapshot, used to
+    /// prove that a directory was not touched at all — not merely that it still
+    /// parses. Digested rather than kept verbatim so a failure prints a readable
+    /// diff instead of every byte of a configuration tree.
+    fn snapshot_dir(root: &Path) -> std::collections::BTreeMap<PathBuf, (usize, u64)> {
+        fn digest(bytes: &[u8]) -> u64 {
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for byte in bytes {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            hash
+        }
+
+        let mut snapshot = std::collections::BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if let Ok(bytes) = std::fs::read(&path) {
+                    let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+                    snapshot.insert(relative, (bytes.len(), digest(&bytes)));
+                }
+            }
+        }
+        snapshot
+    }
+
+    fn restore_home(original: Option<String>) {
+        match original {
+            Some(home) => test_set_env("HOME", home),
+            None => test_remove_env("HOME"),
+        }
+    }
+
+    #[test]
+    async fn init_with_config_dir_writes_there_and_leaves_the_default_dir_byte_identical() {
+        let _env_guard = env_override_lock().await;
+        let temp_home = std::env::temp_dir().join(format!("openprx_test_inithome_{}", uuid::Uuid::new_v4()));
+        let default_dir = temp_home.join(".openprx");
+        let fragments_dir = default_dir.join("config.d");
+        fs::create_dir_all(&fragments_dir).await.unwrap();
+        fs::write(&default_dir.join("config.toml"), "default_temperature = 0.31\n")
+            .await
+            .unwrap();
+        fs::write(&fragments_dir.join("agent.toml"), "[agent]\nmax_iterations = 41\n")
+            .await
+            .unwrap();
+        let before = snapshot_dir(&default_dir);
+        assert_eq!(before.len(), 2, "fixture must contain the files the regression rewrote");
+
+        let requested = temp_home.join("scoped-init");
+        let requested_arg = requested.to_string_lossy().into_owned();
+        let original_home = std::env::var("HOME").ok();
+        test_set_env("HOME", &temp_home);
+        test_remove_env("OPENPRX_CONFIG_DIR");
+        test_remove_env("OPENPRX_WORKSPACE");
+
+        let target = resolve_init_target_dir(None, Some(&requested_arg)).await.unwrap();
+
+        // The directory does not exist yet: `init` semantics create it.
+        assert!(!requested.exists());
+        let report = crate::config::init::Spec::Minimal
+            .generate_reported(&target, true)
+            .await
+            .unwrap();
+
+        restore_home(original_home);
+
+        assert_eq!(
+            snapshot_dir(&default_dir),
+            before,
+            "the default config dir must not be archived or rewritten"
+        );
+        assert!(!report.was_reset_to_templates());
+        assert_eq!(target, requested, "--config-dir must select the init target");
+        assert!(requested.join("config.toml").is_file(), "init must populate the target");
+        assert!(requested.join("workspace").is_dir());
+        assert!(
+            !default_dir.join("workspace").exists(),
+            "init must not scaffold a workspace in the default config dir"
+        );
+        let archives = std::fs::read_dir(&default_dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains("pre-"))
+            .count();
+        assert_eq!(archives, 0, "no archive of the default config may be created");
+
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
+    async fn init_rejects_dir_and_config_dir_naming_different_directories() {
+        let error = resolve_init_target_dir(Some("/tmp/openprx-a"), Some("/tmp/openprx-b"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("conflicting init targets"), "{error}");
+        assert!(error.contains("/tmp/openprx-a"), "{error}");
+        assert!(error.contains("/tmp/openprx-b"), "{error}");
+    }
+
+    #[test]
+    async fn init_accepts_dir_and_config_dir_naming_the_same_directory() {
+        let target = resolve_init_target_dir(Some("/tmp/openprx-same"), Some("/tmp/openprx-same"))
+            .await
+            .unwrap();
+        assert_eq!(target, PathBuf::from("/tmp/openprx-same"));
+    }
+
+    #[test]
+    async fn init_target_precedence_is_dir_then_config_dir_then_environment_then_default() {
+        let _env_guard = env_override_lock().await;
+        let temp_home = std::env::temp_dir().join(format!("openprx_test_initprec_{}", uuid::Uuid::new_v4()));
+        let env_dir = temp_home.join("from-env");
+        let cli_dir = temp_home.join("from-cli");
+        let dir_arg = temp_home.join("from-dir");
+        let env_arg = env_dir.to_string_lossy().into_owned();
+        let cli_arg = cli_dir.to_string_lossy().into_owned();
+        let dir_argument = dir_arg.to_string_lossy().into_owned();
+
+        let original_home = std::env::var("HOME").ok();
+        test_set_env("HOME", &temp_home);
+        test_remove_env("OPENPRX_WORKSPACE");
+        test_set_env("OPENPRX_CONFIG_DIR", &env_arg);
+
+        let cli_over_env = resolve_init_target_dir(None, Some(&cli_arg)).await.unwrap();
+        let dir_over_cli = resolve_init_target_dir(Some(&dir_argument), None).await.unwrap();
+        let env_only = resolve_init_target_dir(None, None).await.unwrap();
+        test_remove_env("OPENPRX_CONFIG_DIR");
+        let default_only = resolve_init_target_dir(None, None).await.unwrap();
+        restore_home(original_home);
+
+        assert_eq!(cli_over_env, cli_dir, "--config-dir outranks OPENPRX_CONFIG_DIR");
+        assert_eq!(dir_over_cli, dir_arg, "--dir outranks everything below it");
+        assert_eq!(env_only, env_dir, "OPENPRX_CONFIG_DIR outranks the default dir");
+        assert_eq!(default_only, temp_home.join(".openprx"), "default is ~/.openprx");
+
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
+    async fn init_target_rejects_blank_directory_arguments() {
+        let dir_error = resolve_init_target_dir(Some("   "), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(dir_error.contains("--dir cannot be empty"), "{dir_error}");
+        let config_dir_error = resolve_init_target_dir(None, Some("")).await.unwrap_err().to_string();
+        assert!(
+            config_dir_error.contains("--config-dir cannot be empty"),
+            "{config_dir_error}"
+        );
+    }
+
+    #[test]
+    async fn explicit_config_dir_keeps_every_config_derived_runtime_path_inside_it() {
+        let _env_guard = env_override_lock().await;
+        let temp_home = std::env::temp_dir().join(format!("openprx_test_scoped_{}", uuid::Uuid::new_v4()));
+        let scoped_dir = temp_home.join("scoped");
+        let scoped_arg = scoped_dir.to_string_lossy().into_owned();
+        fs::create_dir_all(&temp_home).await.unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        test_set_env("HOME", &temp_home);
+        test_remove_env("OPENPRX_CONFIG_DIR");
+        test_remove_env("OPENPRX_WORKSPACE");
+
+        let config = Config::load_or_init_with_config_dir(Some(&scoped_arg)).await.unwrap();
+
+        restore_home(original_home);
+
+        assert!(config.config_path.starts_with(&scoped_dir), "{:?}", config.config_path);
+        assert!(
+            config.workspace_dir.starts_with(&scoped_dir),
+            "{:?}",
+            config.workspace_dir
+        );
+        // Every dispatched subcommand derives its writes from these two paths;
+        // the daemon runtime files are the ones an operator notices first.
+        assert!(crate::daemon::state_file_path(&config).starts_with(&scoped_dir));
+        assert!(crate::daemon::lock_file_path(&config).starts_with(&scoped_dir));
+        assert!(
+            !temp_home.join(".openprx").exists(),
+            "a scoped run must not create the default config dir"
+        );
+
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
+    async fn process_config_dir_keeps_the_first_published_directory() {
+        let _lock = process_config_dir_test_lock();
+        let previous = swap_process_config_dir_for_tests(None);
+        set_process_config_dir(PathBuf::from("/tmp/openprx-first"));
+        set_process_config_dir(PathBuf::from("/tmp/openprx-second"));
+        let observed = process_config_dir();
+        swap_process_config_dir_for_tests(previous);
+        assert_eq!(observed, Some(PathBuf::from("/tmp/openprx-first")));
     }
 }

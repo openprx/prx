@@ -479,17 +479,21 @@ impl TelegramChannel {
             .collect()
     }
 
+    /// Re-read the on-disk configuration without the environment overlay, so a
+    /// write-back persists only what the file already held plus the new value.
+    ///
+    /// The directory is the one this process resolved, not `$HOME`: this path
+    /// ends in `config.save()`, so anchoring it on the home directory made a run
+    /// scoped with `--config-dir` write a newly paired identity into the
+    /// operator's default configuration instead of its own.
     async fn load_config_without_env() -> anyhow::Result<Config> {
-        let home = UserDirs::new()
-            .map(|u| u.home_dir().to_path_buf())
-            .context("Could not find home directory")?;
-        let openprx_dir = {
-            let primary = home.join(".openprx");
-            if primary.exists() {
-                primary
-            } else {
-                let legacy = home.join(".openprx");
-                if legacy.exists() { legacy } else { primary }
+        let openprx_dir = match crate::config::process_config_dir() {
+            Some(dir) => dir,
+            None => {
+                let home = UserDirs::new()
+                    .map(|u| u.home_dir().to_path_buf())
+                    .context("Could not find home directory")?;
+                home.join(".openprx")
             }
         };
         let config_path = openprx_dir.join("config.toml");

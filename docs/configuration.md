@@ -12,6 +12,32 @@ prx onboard --interactive
 prx config show
 ```
 
+## Choosing the Configuration Directory
+
+Every command accepts the global `--config-dir <DIR>`. It selects the whole
+configuration tree the run reads and writes: `config.toml`, `config.d/`,
+`workspace/`, `daemon.lock`, `daemon_state.json`, and the key material under
+`keys/`.
+
+`prx init` resolves its target directory in this order, highest first:
+
+1. `prx init --dir <DIR>` — the init-specific target;
+2. the global `--config-dir <DIR>`;
+3. `OPENPRX_CONFIG_DIR`, then `OPENPRX_WORKSPACE`, then the active-workspace
+   marker in `~/.openprx/active_workspace.toml`;
+4. `~/.openprx`.
+
+Giving `--dir` and `--config-dir` different directories is an error rather than
+a guess: `init` rewrites a whole configuration generation, and picking the wrong
+one destroys the structure of a configuration you did not mean to touch. A
+resolved target that does not exist yet is created.
+
+`prx init --force` regenerates the configuration it finds in the resolved
+directory, preserving the values you set explicitly (see below). When a live
+`prx daemon` is running out of that directory, `init --force` prints a notice
+that the daemon will hot-reload the regenerated configuration; it is a notice,
+not a block.
+
 ## Configuration Tree Transactions
 
 `config.toml` and the recognized files under `config.d/` form one effective

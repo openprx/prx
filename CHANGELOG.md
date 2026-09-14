@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.127] - 14 September 2026
+
+### Fixed
+
+- `prx --config-dir <DIR> init --force` no longer rewrites the default
+  configuration. The init branch read only its own `--dir` argument, so a run
+  scoped to another directory archived and regenerated `~/.openprx` instead —
+  reordering the operator's live configuration tree and deleting emptied tables
+  while leaving the requested directory untouched. `init` now resolves its
+  target through one shared precedence: `--dir`, then the global `--config-dir`,
+  then `OPENPRX_CONFIG_DIR` / `OPENPRX_WORKSPACE` / the active-workspace marker,
+  then `~/.openprx`. Passing `--dir` and `--config-dir` with different
+  directories is rejected rather than guessed, a blank value for either is
+  rejected, and a target that does not exist yet is created.
+- Key material now follows the resolved config directory instead of anchoring on
+  `$HOME`. The runtime witness key and the session-worker secret are created
+  lazily from call sites that hold no `Config`, so a run scoped with
+  `--config-dir` or `OPENPRX_CONFIG_DIR` still wrote `~/.openprx/keys/`. The CLI
+  now publishes the directory it resolved and both paths follow it, with the
+  historical `$HOME/.openprx` location kept as the fallback for library
+  embeddings and the existing path-override environment variables unchanged.
+
+### Added
+
+- `prx init --force` prints a notice when a live `prx daemon` is running out of
+  the resolved target directory, stating that the daemon will hot-reload the
+  regenerated configuration. Liveness is read from a held `daemon.lock` or a
+  freshly written `daemon_state.json`; the notice never blocks the run.
+- `docs/configuration.md` documents the configuration-directory precedence.
+
+
 ## [0.8.126] - 14 September 2026
 
 ### Security

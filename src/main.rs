@@ -1153,6 +1153,10 @@ async fn async_main() -> Result<()> {
         if config_dir.trim().is_empty() {
             bail!("--config-dir cannot be empty");
         }
+        // Publish the explicit directory before anything can lazily create
+        // process-global state (witness key, session-worker secret) that has no
+        // `Config` in hand and would otherwise anchor on `$HOME/.openprx`.
+        config::set_process_config_dir(std::path::PathBuf::from(config_dir.trim()));
     }
 
     // session-worker must stay stdout-clean for IPC JSON.
@@ -1181,15 +1185,18 @@ async fn async_main() -> Result<()> {
         return Ok(());
     }
 
-    // Init generates a fresh workspace — no existing config needed.
+    // Init generates a fresh workspace — no existing config needed. The target
+    // is resolved through the shared precedence (`--dir` > `--config-dir` >
+    // environment / active workspace > `~/.openprx`) so that a run scoped with
+    // `--config-dir` cannot rewrite the default configuration instead.
     if let Commands::Init { spec, dir, force } = &cli.command {
-        let target = match dir {
-            Some(d) => std::path::PathBuf::from(d),
-            None => directories::UserDirs::new()
-                .map(|u| u.home_dir().to_path_buf())
-                .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
-                .join(".openprx"),
-        };
+        let target = config::resolve_init_target_dir(dir.as_deref(), cli.config_dir.as_deref()).await?;
+        if *force && daemon::live_daemon_uses_config_dir(&target) {
+            println!(
+                "NOTE: a live daemon is running out of {}; it will hot-reload the regenerated configuration.",
+                target.display()
+            );
+        }
         return spec.generate(&target, *force).await;
     }
 
@@ -1382,6 +1389,13 @@ async fn async_main() -> Result<()> {
     } else {
         Config::load_or_init_with_config_dir(cli.config_dir.as_deref()).await?
     };
+
+    // Covers the resolutions the flag does not carry (`OPENPRX_CONFIG_DIR`,
+    // `OPENPRX_WORKSPACE`, the active-workspace marker). No-op when the flag
+    // already published the same directory.
+    if let Some(resolved_config_dir) = config.config_path.parent() {
+        config::set_process_config_dir(resolved_config_dir.to_path_buf());
+    }
 
     mode::dispatch(cli.command, config).await
 }

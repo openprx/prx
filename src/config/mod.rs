@@ -30,7 +30,8 @@ pub use schema::{
     StorageProviderConfig, StorageProviderSection, StreamMode, TaskRoutingConfig, TaskRoutingIntentConfig,
     TaskRoutingRule, TelegramConfig, ToolTieringConfig, TunnelConfig, UserPolicyConfig, WacliConfig, WebSearchConfig,
     WebhookConfig, WhatsAppConfig, apply_runtime_proxy_to_builder, bootstrap_max_blocking_threads,
-    build_runtime_proxy_client, build_runtime_proxy_client_with_timeouts, runtime_proxy_config,
+    build_runtime_proxy_client, build_runtime_proxy_client_with_timeouts, process_config_dir, resolve_init_target_dir,
+    runtime_proxy_config, set_process_config_dir,
 };
 
 #[cfg(test)]

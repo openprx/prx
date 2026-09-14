@@ -406,6 +406,50 @@ pub fn lock_file_path(config: &Config) -> PathBuf {
         .join("daemon.lock")
 }
 
+/// How recently `daemon_state.json` must have been written for the daemon that
+/// owns a config directory to count as live. The daemon rewrites it every
+/// `STATUS_FLUSH_SECONDS`; allowing four flushes tolerates a loaded host
+/// without reporting a daemon that exited minutes ago.
+const LIVE_DAEMON_STATE_MAX_AGE_SECONDS: u64 = STATUS_FLUSH_SECONDS * 4;
+
+/// Whether a live `prx daemon` is currently running out of `config_dir`.
+///
+/// Two independent signals, either of which is sufficient: the advisory lock in
+/// `daemon.lock` is still held by another process, or `daemon_state.json` was
+/// refreshed within the last few status flushes. Purely advisory — callers use
+/// this to warn, never to block, so every failure to read a signal is simply
+/// "no evidence of a live daemon".
+#[must_use]
+pub fn live_daemon_uses_config_dir(config_dir: &Path) -> bool {
+    daemon_lock_is_held(&config_dir.join("daemon.lock"))
+        || daemon_state_file_is_fresh(&config_dir.join("daemon_state.json"))
+}
+
+fn daemon_lock_is_held(path: &Path) -> bool {
+    let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(path) else {
+        return false;
+    };
+    // Taking the lock proves nobody else holds it; release it immediately so
+    // this probe never competes with a daemon that is starting concurrently.
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {
+            let _ = fs2::FileExt::unlock(&file);
+            false
+        }
+        Err(_) => true,
+    }
+}
+
+fn daemon_state_file_is_fresh(path: &Path) -> bool {
+    let Ok(modified) = std::fs::metadata(path).and_then(|metadata| metadata.modified()) else {
+        return false;
+    };
+    // A stamp in the future (clock skew) counts as fresh rather than stale.
+    std::time::SystemTime::now()
+        .duration_since(modified)
+        .map_or(true, |age| age.as_secs() <= LIVE_DAEMON_STATE_MAX_AGE_SECONDS)
+}
+
 /// Exclusive `flock` held for the entire lifetime of the daemon process.
 ///
 /// The kernel drops the lock when the descriptor is closed, which happens on a

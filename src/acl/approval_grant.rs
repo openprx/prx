@@ -91,7 +91,7 @@ pub struct WitnessSignature {
 
 /// On-disk persisted form of the Ed25519 witness key.
 ///
-/// Stored as JSON at `~/.openprx/keys/runtime_witness.key` with `0600`
+/// Stored as JSON at `<config dir>/keys/runtime_witness.key` with `0600`
 /// permissions. The secret is the PKCS#8 v2 DER (base64, standard alphabet);
 /// the public key is the raw 32-byte Ed25519 point (base64).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,14 +113,21 @@ pub struct WitnessKeyring {
 /// Process-global witness keyring, lazily initialised from disk on first use.
 static GLOBAL_WITNESS_KEYRING: OnceLock<WitnessKeyring> = OnceLock::new();
 
-/// Default on-disk location for the runtime witness key, relative to `$HOME`.
-/// Mirrors the PRX config dir convention (`.openprx`).
+/// Default on-disk location for the runtime witness key: the config directory
+/// this process resolved, falling back to `$HOME/.openprx` when the CLI has not
+/// published one (library embeddings, tests).
 #[must_use]
 fn default_witness_key_path() -> Option<PathBuf> {
     // `OPENPRX_WITNESS_KEY_PATH` lets tests / operators pin a deterministic
     // location without depending on `$HOME`.
     if let Some(explicit) = std::env::var_os("OPENPRX_WITNESS_KEY_PATH") {
         return Some(PathBuf::from(explicit));
+    }
+    // A run scoped with `--config-dir` (or `OPENPRX_CONFIG_DIR`) must keep its
+    // key material inside that directory instead of writing into the operator's
+    // default configuration.
+    if let Some(config_dir) = crate::config::process_config_dir() {
+        return Some(config_dir.join("keys").join("runtime_witness.key"));
     }
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     Some(home.join(".openprx").join("keys").join("runtime_witness.key"))
@@ -652,6 +659,29 @@ mod tests {
             workspace_id: "workspace".to_string(),
             session_key: Some("session-a".to_string()),
         }
+    }
+
+    #[test]
+    fn witness_key_follows_the_resolved_config_dir_instead_of_home() {
+        let _lock = crate::config::schema::process_config_dir_test_lock();
+        let scoped = std::path::PathBuf::from("/tmp/openprx-witness-scope");
+        let previous = crate::config::schema::swap_process_config_dir_for_tests(Some(scoped.clone()));
+        let scoped_path = default_witness_key_path();
+        crate::config::schema::swap_process_config_dir_for_tests(None);
+        let unscoped_path = default_witness_key_path();
+        crate::config::schema::swap_process_config_dir_for_tests(previous);
+
+        assert_eq!(
+            scoped_path,
+            Some(scoped.join("keys").join("runtime_witness.key")),
+            "a scoped run must keep its witness key inside the resolved config dir"
+        );
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        assert_eq!(
+            unscoped_path,
+            home.map(|home| home.join(".openprx").join("keys").join("runtime_witness.key")),
+            "without a published config dir the historical $HOME location is kept"
+        );
     }
 
     #[test]

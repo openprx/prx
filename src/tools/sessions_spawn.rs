@@ -4840,11 +4840,17 @@ fn generate_session_secret() -> [u8; 32] {
 
 /// Path to the persisted session-worker secret under the OpenPRX state dir.
 ///
-/// Mirrors `WitnessKeyring`'s convention: an explicit override env, else
-/// `$HOME/.openprx`. Uses `HOME` directly (no `dirs` dependency).
+/// Mirrors `WitnessKeyring`'s convention: an explicit override env, else the
+/// resolved config directory, else `$HOME/.openprx` (no `dirs` dependency).
 fn session_secret_path() -> Option<std::path::PathBuf> {
     if let Some(explicit) = std::env::var_os("OPENPRX_SESSION_WORKER_SECRET_PATH") {
         return Some(std::path::PathBuf::from(explicit));
+    }
+    // Follows the resolved config directory so the secret minted by a
+    // `--config-dir` run is the one its workers read back, and no run writes
+    // key material into a configuration it was told not to touch.
+    if let Some(config_dir) = crate::config::process_config_dir() {
+        return Some(config_dir.join("keys").join("session_worker.secret"));
     }
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
     Some(home.join(".openprx").join("keys").join("session_worker.secret"))
@@ -6343,6 +6349,29 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    #[test]
+    fn session_worker_secret_follows_the_resolved_config_dir_instead_of_home() {
+        let _lock = crate::config::schema::process_config_dir_test_lock();
+        let scoped = std::path::PathBuf::from("/tmp/openprx-secret-scope");
+        let previous = crate::config::schema::swap_process_config_dir_for_tests(Some(scoped.clone()));
+        let scoped_path = session_secret_path();
+        crate::config::schema::swap_process_config_dir_for_tests(None);
+        let unscoped_path = session_secret_path();
+        crate::config::schema::swap_process_config_dir_for_tests(previous);
+
+        assert_eq!(
+            scoped_path,
+            Some(scoped.join("keys").join("session_worker.secret")),
+            "a scoped run must keep its session-worker secret inside the resolved config dir"
+        );
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        assert_eq!(
+            unscoped_path,
+            home.map(|home| home.join(".openprx").join("keys").join("session_worker.secret")),
+            "without a published config dir the historical $HOME location is kept"
+        );
     }
 
     #[tokio::test]

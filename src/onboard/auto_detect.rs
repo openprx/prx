@@ -94,7 +94,14 @@ fn default_model_for_provider(provider: &str) -> String {
 }
 
 /// Resolve the OpenPRX config directory (same logic as config::schema).
+///
+/// A run scoped with `--config-dir` must detect credentials from its own
+/// directory; `~/.openprx` stays the answer for an unscoped run, which is what
+/// `prx go` relies on.
 fn openprx_config_dir() -> Option<PathBuf> {
+    if let Some(config_dir) = crate::config::process_config_dir() {
+        return Some(config_dir);
+    }
     directories::UserDirs::new().map(|u| u.home_dir().join(".openprx"))
 }
 
