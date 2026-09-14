@@ -356,6 +356,9 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         conversation_retention_days: 3,
         daily_retention_days: 7,
         embedding_provider: if embeddings_enabled { "local" } else { "none" }.to_string(),
+        // Onboarding writes the provider into the generated configuration, so
+        // this installation never depends on the serde default.
+        embedding_provider_explicit: true,
         embedding_model: if embeddings_enabled {
             "prx-local-hash-v1"
         } else {

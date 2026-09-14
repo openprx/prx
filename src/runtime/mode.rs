@@ -193,6 +193,21 @@ pub const fn should_bind_signal(command: &Commands) -> bool {
     )
 }
 
+/// Whether this mode starts a long-running agent runtime, and therefore should
+/// say out loud that its vector recall came from an upgraded default rather
+/// than from the operator's configuration.
+pub const fn starts_agent_runtime(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Chat { .. }
+            | Commands::Gateway { .. }
+            | Commands::Daemon { .. }
+            | Commands::Channel {
+                channel_command: ChannelCommands::Start
+            }
+    )
+}
+
 /// Spawn the process-level shutdown signal task for whitelisted modes. On unix
 /// this listens for both SIGINT (ctrl_c) and SIGTERM; elsewhere ctrl_c only.
 /// First signal cancels the root token, asking the active mode to drain.
@@ -262,6 +277,14 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
     crate::agent::idle::install(config.runtime.idle_hang_secs);
     if should_bind_signal(&command) {
         spawn_signal_task(root_shutdown.clone());
+    }
+    // An upgrade alone can turn on local vector recall, because the serde
+    // default for `memory.embedding_provider` flipped. Say so on every start of
+    // a long-running runtime until the operator writes the key either way.
+    if starts_agent_runtime(&command) {
+        if let Some(notice) = config.embedding_default_upgrade_notice() {
+            tracing::warn!("{notice}");
+        }
     }
     match command {
         Commands::Init { .. } => anyhow::bail!("BUG: Init command should have been handled earlier"),

@@ -28,6 +28,25 @@ use uuid::Uuid;
 
 const DEFAULT_CONVERSATION_LIMIT: usize = 50;
 const MAX_CONVERSATION_QUERY_LIMIT: usize = 500;
+/// Smallest number of embedded memories `vector_search` will ever score.
+///
+/// Cosine similarity cannot use an index, so the scan is bounded by recency.
+/// The floor is set well above any realistic per-turn working set: the bound
+/// exists to stop a very large memory store from making every turn slower, not
+/// to trim ordinary recall.
+const VECTOR_CANDIDATE_FLOOR: usize = 2_000;
+/// Candidates scored per requested result, above the floor.
+const VECTOR_CANDIDATE_MULTIPLIER: usize = 50;
+
+/// Recency-bounded candidate count for one vector recall.
+const fn vector_candidate_cap(limit: usize) -> usize {
+    let scaled = limit.saturating_mul(VECTOR_CANDIDATE_MULTIPLIER);
+    if scaled > VECTOR_CANDIDATE_FLOOR {
+        scaled
+    } else {
+        VECTOR_CANDIDATE_FLOOR
+    }
+}
 /// Placeholder dialect for D4 read-merge `session_key` predicate fragments.
 const SQLITE_DIALECT: crate::memory::session_predicate::PlaceholderDialect =
     crate::memory::session_predicate::PlaceholderDialect::Sqlite;
@@ -683,6 +702,10 @@ impl SqliteMemory {
             );
             CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
             CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(key);
+            -- Bounds the unindexed cosine scan in `vector_search` to the most
+            -- recently updated embedded memories.
+            CREATE INDEX IF NOT EXISTS idx_memories_embedding_recency
+                ON memories(updated_at DESC) WHERE embedding IS NOT NULL;
 
             -- FTS5 full-text search (BM25 scoring)
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -2763,7 +2786,9 @@ impl SqliteMemory {
             return Ok(cached);
         }
 
-        // Compute embedding (async I/O)
+        // Compute the embedding. Remote providers await network I/O here; the
+        // default local provider is synchronous CPU work that offloads itself to
+        // the blocking pool once a batch is large enough to matter.
         let embedding = self.embedder.embed_one(text).await?;
         if embedding.len() != self.embedder.dimensions() {
             anyhow::bail!(
@@ -2848,6 +2873,12 @@ impl SqliteMemory {
     ///
     /// Optional `category` and `session_id` filters reduce full-table scans
     /// when the caller already knows the scope of relevant memories.
+    ///
+    /// Cosine similarity has no index, so the candidate set is bounded by
+    /// recency (`idx_memories_embedding_recency`) before scoring: without a
+    /// bound this is O(N) over every embedded memory on a path that runs once
+    /// per turn. The bound is generous enough that it is inert for realistic
+    /// memory stores and only engages once recall would otherwise degrade.
     fn vector_search(
         conn: &Connection,
         query_embedding: &[f32],
@@ -2878,7 +2909,11 @@ impl SqliteMemory {
         if let Some(sid) = session_id {
             let _ = write!(sql, " AND session_id = ?{idx}");
             param_values.push(Box::new(sid.to_string()));
+            idx += 1;
         }
+        let candidate_cap = vector_candidate_cap(limit);
+        let _ = write!(sql, " ORDER BY updated_at DESC LIMIT ?{idx}");
+        param_values.push(Box::new(i64::try_from(candidate_cap).unwrap_or(i64::MAX)));
 
         let mut stmt = conn.prepare(&sql)?;
         let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(AsRef::as_ref).collect();
@@ -2889,8 +2924,10 @@ impl SqliteMemory {
         })?;
 
         let mut scored: Vec<(String, f32)> = Vec::new();
+        let mut candidates = 0usize;
         for row in rows {
             let (id, blob) = row?;
+            candidates += 1;
             let emb = vector::bytes_to_vec(&blob);
             if emb.len() != dimensions {
                 tracing::debug!(
@@ -2905,6 +2942,14 @@ impl SqliteMemory {
             if sim > 0.0 {
                 scored.push((id, sim));
             }
+        }
+
+        if candidates >= candidate_cap {
+            tracing::debug!(
+                candidate_cap,
+                limit,
+                "Vector recall reached its recency candidate cap; older embedded memories were not scored"
+            );
         }
 
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));

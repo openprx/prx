@@ -2919,6 +2919,14 @@ pub struct MemoryConfig {
     /// Embedding provider: "local" | "none" | "openai" | "custom:URL"
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
+    /// Internal presence bit populated by `Config::load_from_path`. The serde
+    /// default for `embedding_provider` flipped from `"none"` to `"local"`, so
+    /// the deserialized value alone cannot tell an operator who asked for local
+    /// vector recall from one who simply never wrote the key and was upgraded
+    /// into it.
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub embedding_provider_explicit: bool,
     /// Embedding model name (e.g. "text-embedding-3-small")
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
@@ -3082,6 +3090,7 @@ impl Default for MemoryConfig {
             conversation_retention_days: default_conversation_retention_days(),
             daily_retention_days: default_daily_retention_days(),
             embedding_provider: default_embedding_provider(),
+            embedding_provider_explicit: false,
             embedding_model: default_embedding_model(),
             embedding_dimensions: default_embedding_dims(),
             vector_weight: default_vector_weight(),
@@ -6125,7 +6134,27 @@ pub(crate) async fn migrate_config_legacy_secrets(config: &Config) -> Result<()>
     Ok(())
 }
 
+/// Upgrade notice for configurations written before the local vector recall
+/// default flip. Emitted by `prx doctor` and by the long-running runtimes.
+pub const EMBEDDING_DEFAULT_UPGRADE_NOTICE: &str = "embedding_provider not set; defaulting to local vector recall since 0.8.10x, \
+     set memory.embedding_provider = \"none\" to disable";
+
 impl Config {
+    /// Return the upgrade notice when this configuration inherited local vector
+    /// recall from the flipped default instead of asking for it.
+    ///
+    /// `None` once `memory.embedding_provider` is written explicitly, or when
+    /// the effective provider is disabled anyway.
+    pub fn embedding_default_upgrade_notice(&self) -> Option<&'static str> {
+        if self.memory.embedding_provider_explicit {
+            return None;
+        }
+        if self.memory.embedding_provider.trim().eq_ignore_ascii_case("none") {
+            return None;
+        }
+        Some(EMBEDDING_DEFAULT_UPGRADE_NOTICE)
+    }
+
     /// Turn a merged TOML tree into a `Config`.
     ///
     /// `config_path` is only used to tell an operator which file and line a
@@ -6173,20 +6202,24 @@ impl Config {
 
     fn validate_stored_merged(merged: toml::Value, config_path: &Path, workspace_dir: PathBuf) -> Result<()> {
         let compaction_max_context_explicit = agent_compaction_max_context_tokens_present(&merged);
+        let embedding_provider_explicit = memory_embedding_provider_present(&merged);
         let mut config = Self::deserialize_merged(merged, Some(config_path))?;
         config.config_path = config_path.to_path_buf();
         config.workspace_dir = workspace_dir;
         config.agent.compaction.max_context_tokens_explicit = compaction_max_context_explicit;
+        config.memory.embedding_provider_explicit = embedding_provider_explicit;
         config.validate()
     }
 
     pub(crate) fn load_from_path(config_path: &Path, workspace_dir: PathBuf) -> Result<Self> {
         let merged = read_merged_toml_with_gate(config_path)?;
         let compaction_max_context_explicit = agent_compaction_max_context_tokens_present(&merged);
+        let embedding_provider_explicit = memory_embedding_provider_present(&merged);
         let mut config = Self::deserialize_merged(merged, Some(config_path))?;
         config.config_path = config_path.to_path_buf();
         config.workspace_dir = workspace_dir;
         config.agent.compaction.max_context_tokens_explicit = compaction_max_context_explicit;
+        config.memory.embedding_provider_explicit = embedding_provider_explicit;
 
         let openprx_dir = config_path
             .parent()
@@ -6617,6 +6650,19 @@ impl Config {
         }
         Ok((main, fragments))
     }
+}
+
+/// Whether the stored configuration writes `memory.embedding_provider` (or its
+/// migrated legacy spelling `[memory.embedding].provider`) at all.
+fn memory_embedding_provider_present(config: &toml::Value) -> bool {
+    let Some(memory) = config.get("memory") else {
+        return false;
+    };
+    memory.get("embedding_provider").is_some()
+        || memory
+            .get("embedding")
+            .and_then(|embedding| embedding.get("provider"))
+            .is_some()
 }
 
 fn agent_compaction_max_context_tokens_present(config: &toml::Value) -> bool {
@@ -7556,6 +7602,86 @@ max_context = 1000000
         let loaded = Config::load_from_path(&config_path, dir.path().join("workspace")).unwrap();
         assert!(loaded.agent.compaction.max_context_tokens_explicit);
         assert_eq!(loaded.agent.compaction.max_context_tokens, 128_000);
+    }
+
+    #[test]
+    async fn pre_upgrade_config_inherits_local_vector_recall_and_says_so() {
+        // A configuration written before the default flipped has no
+        // `embedding_provider` key at all: upgrading the binary alone turns
+        // vector recall on, so the load has to be able to say that out loud.
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+default_temperature = 0.7
+
+[memory]
+backend = "sqlite"
+auto_save = true
+"#,
+        )
+        .unwrap();
+
+        let loaded = Config::load_from_path(&config_path, dir.path().join("workspace")).unwrap();
+        assert_eq!(loaded.memory.embedding_provider, "local");
+        assert!(!loaded.memory.embedding_provider_explicit);
+        let notice = loaded
+            .embedding_default_upgrade_notice()
+            .expect("an inherited default must be reported");
+        assert!(notice.contains("embedding_provider not set"));
+        assert!(notice.contains("local vector recall"));
+        assert!(notice.contains(r#"memory.embedding_provider = "none""#));
+    }
+
+    #[test]
+    async fn explicit_embedding_provider_silences_the_upgrade_notice() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+default_temperature = 0.7
+
+[memory]
+backend = "sqlite"
+auto_save = true
+embedding_provider = "local"
+"#,
+        )
+        .unwrap();
+
+        let loaded = Config::load_from_path(&config_path, dir.path().join("workspace")).unwrap();
+        assert_eq!(loaded.memory.embedding_provider, "local");
+        assert!(loaded.memory.embedding_provider_explicit);
+        assert!(loaded.embedding_default_upgrade_notice().is_none());
+    }
+
+    #[test]
+    async fn legacy_embedding_table_counts_as_an_explicit_provider() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+default_temperature = 0.7
+
+[memory]
+backend = "sqlite"
+auto_save = true
+
+[memory.embedding]
+provider = "none"
+model = "legacy"
+dimension = 512
+"#,
+        )
+        .unwrap();
+
+        let loaded = Config::load_from_path(&config_path, dir.path().join("workspace")).unwrap();
+        assert_eq!(loaded.memory.embedding_provider, "none");
+        assert!(loaded.memory.embedding_provider_explicit);
+        assert!(loaded.embedding_default_upgrade_notice().is_none());
     }
 
     #[test]

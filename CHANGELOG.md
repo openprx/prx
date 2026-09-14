@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.124] - 14 September 2026
+
+### Fixed
+
+- Stop `prx init --force` from resetting explicit configuration. Regenerating
+  the managed templates now refreshes structure, comments and defaults only:
+  every key written in `config.toml` or in a managed `config.d/*.toml` fragment
+  keeps its value, keys the template does not mention are carried into the table
+  they came from, and a value written in `config.toml` still out-ranks the
+  fragment template's default. The previous tree is copied to
+  `config.d.pre-<version>-<timestamp>/` before anything is written, preserved
+  keys are listed in the command output, and a preserved value this build can no
+  longer represent is reported as reset instead of disappearing. Previously the
+  templates were written verbatim, so an operator who had turned local vector
+  recall off lost that decision on the next `--force`.
+- Make the local vector recall default flip visible on upgrade. A configuration
+  written before 0.8.10x has no `memory.embedding_provider` key, so upgrading the
+  binary alone switched vector recall on. `prx doctor memory` now reports the
+  inherited default and `prx chat`, `prx daemon`, `prx gateway` and
+  `prx channel start` log it once at startup, naming the key that turns it off.
+  The notice disappears as soon as the key is written either way.
+
+### Changed
+
+- Generated memory templates state `embedding_provider`, `embedding_model` and
+  `embedding_dimensions` explicitly, with the line that turns vector recall off,
+  instead of only mentioning them in comments. A generated configuration no
+  longer depends on which side of the default flip the binary is on.
+- Move local embedding computation off the async runtime worker. The built-in
+  feature-hash provider is synchronous CPU work with no I/O; batches above an
+  inline budget are handed to the blocking pool, and the comment claiming the
+  call awaited I/O is corrected.
+- Bound the unindexed cosine scan in SQLite vector recall by recency instead of
+  scoring every embedded memory on every turn, backed by a partial index on
+  embedded rows. The bound is far above any realistic per-turn working set.
+
 ## [0.8.123] - 14 September 2026
 
 ### Fixed

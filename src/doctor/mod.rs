@@ -911,6 +911,10 @@ fn check_memory_diagnostics(config: &Config, items: &mut Vec<DiagItem>) {
         ));
     }
 
+    if let Some(notice) = config.embedding_default_upgrade_notice() {
+        items.push(DiagItem::warn("embedding", notice));
+    }
+
     let provider = config.memory.embedding_provider.trim();
     if provider.starts_with("custom:") {
         let url = provider.strip_prefix("custom:").unwrap_or("").trim();
@@ -1853,6 +1857,34 @@ mod tests {
     )]
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn memory_diagnostics_flag_vector_recall_inherited_from_the_flipped_default() {
+        let temp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = temp.path().to_path_buf();
+        config.memory.embedding_provider = "local".to_string();
+        config.memory.embedding_provider_explicit = false;
+
+        let mut items = Vec::new();
+        check_memory_diagnostics(&config, &mut items);
+        let notice = items
+            .iter()
+            .find(|item| item.message.contains("embedding_provider not set"))
+            .expect("doctor must report an inherited local vector recall default");
+        assert_eq!(notice.severity, Severity::Warn);
+        assert_eq!(notice.category, "embedding");
+
+        config.memory.embedding_provider_explicit = true;
+        let mut items = Vec::new();
+        check_memory_diagnostics(&config, &mut items);
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.message.contains("embedding_provider not set")),
+            "an explicit provider must not be reported as an inherited default"
+        );
+    }
 
     #[test]
     fn deployed_binary_check_accepts_the_runtime_path() {

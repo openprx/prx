@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 // ── Spec preset enum ────────────────────────────────────────────
 
@@ -28,7 +29,9 @@ impl Spec {
     /// Generate the full configuration tree into `target_dir`.
     pub async fn generate(self, target_dir: &Path, force: bool) -> Result<()> {
         // 1. Check for existing configuration
-        if target_dir.join("config.toml").exists() && !force {
+        let config_path = target_dir.join("config.toml");
+        let regenerating = config_path.exists();
+        if regenerating && !force {
             bail!(
                 "Configuration already exists at {}. Use --force to overwrite.",
                 target_dir.display()
@@ -52,14 +55,50 @@ impl Spec {
             ("observability.toml".to_string(), observability_template(self)),
         ];
 
-        // 3. Stage and validate the complete effective configuration, including
-        // any unknown user-owned fragments, before mutating the target.
-        let config_path = target_dir.join("config.toml");
+        // 3. Regenerating over an existing tree refreshes structure, comments and
+        // defaults only: every value an operator wrote explicitly is carried over.
+        // `--force` is a repair operation, not a reset.
+        let main_toml = main_config_template(self);
         let workspace_dir = target_dir.join("workspace");
-        let plan = super::files::plan_mutation(&config_path, &workspace_dir, main_config_template(self), fragments)?;
+        let (effective_main, effective_fragments) = if regenerating {
+            let archive = archive_previous_config(target_dir, &config_path)?;
+            match preserve_previous_settings(&config_path, &main_toml, &fragments) {
+                Ok((merged_main, merged_fragments, outcome)) => {
+                    report_preservation(&outcome, archive.as_deref());
+                    (merged_main, merged_fragments)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Could not read the previous configuration to preserve explicit settings ({error:#}); \
+                         regenerating from templates. Previous files: {}",
+                        archive
+                            .as_deref()
+                            .map_or_else(|| "not archived".to_string(), |path| path.display().to_string())
+                    );
+                    (main_toml.clone(), fragments.clone())
+                }
+            }
+        } else {
+            (main_toml.clone(), fragments.clone())
+        };
+
+        // 4. Stage and validate the complete effective configuration, including
+        // any unknown user-owned fragments, before mutating the target.
+        let plan = match super::files::plan_mutation(&config_path, &workspace_dir, effective_main, effective_fragments)
+        {
+            Ok(plan) => plan,
+            Err(error) if regenerating => {
+                tracing::warn!(
+                    "Preserved settings do not validate against this build ({error:#}); \
+                     regenerating from templates instead. Previous values remain in the archive directory."
+                );
+                super::files::plan_mutation(&config_path, &workspace_dir, main_toml, fragments)?
+            }
+            Err(error) => return Err(error),
+        };
         super::files::commit_mutation_atomically(plan).await?;
 
-        // 4. Create the non-config workspace structure only after the complete
+        // 5. Create the non-config workspace structure only after the complete
         // configuration generation has committed.
         std::fs::create_dir_all(&workspace_dir)
             .with_context(|| format!("Failed to create workspace in {}", target_dir.display()))?;
@@ -68,14 +107,14 @@ impl Spec {
                 .with_context(|| format!("Failed to create workspace/{subdir} in {}", target_dir.display()))?;
         }
 
-        // 5. Scaffold workspace .md files (default persona, skip existing)
+        // 6. Scaffold workspace .md files (default persona, skip existing)
         scaffold_workspace_defaults(&workspace_dir)?;
 
-        // 6. Set directory permissions (Unix only)
+        // 7. Set directory permissions (Unix only)
         #[cfg(unix)]
         set_directory_permissions(target_dir)?;
 
-        // 7. Log summary
+        // 8. Log summary
         tracing::info!("PRX configuration initialized ({spec})", spec = self.name());
         tracing::info!("  Config dir: {}", target_dir.display());
         tracing::info!("  Capabilities are always available; activation follows concrete configuration");
@@ -83,6 +122,422 @@ impl Spec {
         tracing::info!("  Workspace .md files scaffolded");
 
         Ok(())
+    }
+}
+
+// ── Explicit-setting preservation across `prx init --force` ──────
+//
+// Regenerating the managed templates is how `prx init --force` repairs stale
+// structure and refreshes comments. It must not be how an operator loses the
+// values they typed. Every key an operator wrote in `config.toml` or in a
+// managed `config.d/*.toml` fragment is carried into the regenerated tree: keys
+// the template also writes keep the operator's value, keys the template does
+// not mention are re-inserted into the table they came from. Templates supply
+// structure, comments and defaults only.
+
+/// Outcome of folding a previous configuration into freshly rendered templates.
+#[derive(Debug, Default)]
+struct PreservationOutcome {
+    kept: BTreeSet<String>,
+    dropped: BTreeSet<String>,
+}
+
+fn report_preservation(outcome: &PreservationOutcome, archive: Option<&Path>) {
+    if let Some(path) = archive {
+        tracing::info!("  Previous configuration archived to {}", path.display());
+    }
+    if outcome.kept.is_empty() {
+        tracing::info!("  No explicit settings differed from the regenerated templates");
+    } else {
+        tracing::info!(
+            "  Preserved {} explicit setting(s): {}",
+            outcome.kept.len(),
+            outcome.kept.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+    if !outcome.dropped.is_empty() {
+        tracing::warn!(
+            "  Reset {} setting(s) this build can no longer represent: {}",
+            outcome.dropped.len(),
+            outcome.dropped.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+}
+
+/// Copy the previous `config.toml` and every `config.d` fragment into a
+/// timestamped sibling directory before the regeneration touches them.
+fn archive_previous_config(target_dir: &Path, config_path: &Path) -> Result<Option<PathBuf>> {
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    let archive = target_dir.join(format!(
+        "config.d.pre-{}-{}",
+        env!("CARGO_PKG_VERSION"),
+        chrono::Local::now().format("%Y%m%d%H%M%S")
+    ));
+    std::fs::create_dir_all(&archive)
+        .with_context(|| format!("Failed to create config archive {}", archive.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("Failed to restrict config archive {}", archive.display()))?;
+    }
+
+    let mut sources = vec![config_path.to_path_buf()];
+    sources.extend(super::files::list_config_fragment_paths(config_path)?);
+    for source in sources {
+        let Some(name) = source.file_name() else {
+            continue;
+        };
+        let destination = archive.join(name);
+        std::fs::copy(&source, &destination).with_context(|| format!("Failed to archive {}", source.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("Failed to restrict archived {}", destination.display()))?;
+        }
+    }
+    Ok(Some(archive))
+}
+
+/// Fold the configuration currently on disk into freshly rendered templates.
+fn preserve_previous_settings(
+    config_path: &Path,
+    main_template: &str,
+    fragment_templates: &[(String, String)],
+) -> Result<(String, Vec<(String, String)>, PreservationOutcome)> {
+    let main_previous = read_toml_document(config_path)?;
+    let mut effective = main_previous.clone();
+    let mut fragment_previous: BTreeMap<String, toml::Value> = BTreeMap::new();
+    for path in super::files::list_config_fragment_paths(config_path)? {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if super::files::should_skip_fragment(name) {
+            continue;
+        }
+        let value = read_toml_document(&path)?;
+        super::files::deep_merge_toml(&mut effective, value.clone());
+        fragment_previous.insert(name.to_string(), value);
+    }
+
+    let empty = toml::Value::Table(toml::map::Map::new());
+    let mut outcome = PreservationOutcome::default();
+    let merged_main = apply_previous_settings(main_template, &main_previous, &effective, &mut outcome)?;
+    let mut merged_fragments = Vec::with_capacity(fragment_templates.len());
+    for (name, template) in fragment_templates {
+        let previous = fragment_previous.get(name).unwrap_or(&empty);
+        if template.trim().is_empty() {
+            // A preset that does not ship this fragment still must not delete an
+            // operator's settings: keep them under a header that says why the
+            // rest of the file is gone.
+            let mut probe = Vec::new();
+            collect_toml_leaves(previous, &mut Vec::new(), &mut probe);
+            if probe.is_empty() {
+                merged_fragments.push((name.clone(), template.clone()));
+                continue;
+            }
+            let placeholder = "# This preset does not generate this fragment.\n\
+                               # The settings below were carried over from the previous configuration.\n";
+            let merged = apply_previous_settings(placeholder, previous, &effective, &mut outcome)?;
+            merged_fragments.push((name.clone(), merged));
+            continue;
+        }
+        let merged = apply_previous_settings(template, previous, &effective, &mut outcome)?;
+        merged_fragments.push((name.clone(), merged));
+    }
+    Ok((merged_main, merged_fragments, outcome))
+}
+
+fn read_toml_document(path: &Path) -> Result<toml::Value> {
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("Failed to read configuration {}", path.display()))?;
+    let value = toml::from_str::<toml::Value>(&raw)
+        .with_context(|| format!("Failed to parse configuration {}", path.display()))?;
+    if !value.is_table() {
+        bail!("Configuration root must be a TOML table: {}", path.display());
+    }
+    Ok(value)
+}
+
+/// Collect every leaf (non-table) value with its full key path.
+///
+/// Empty tables carry no configuration, so regenerated structure always comes
+/// from the template.
+fn collect_toml_leaves(value: &toml::Value, prefix: &mut Vec<String>, out: &mut Vec<(Vec<String>, toml::Value)>) {
+    match value {
+        toml::Value::Table(table) => {
+            for (key, child) in table {
+                prefix.push(key.clone());
+                collect_toml_leaves(child, prefix, out);
+                prefix.pop();
+            }
+        }
+        other => out.push((prefix.clone(), other.clone())),
+    }
+}
+
+fn toml_lookup<'a>(root: &'a toml::Value, path: &[String]) -> Option<&'a toml::Value> {
+    let mut cursor = root;
+    for segment in path {
+        cursor = cursor.get(segment)?;
+    }
+    Some(cursor)
+}
+
+/// Render a TOML value in inline form, for the right-hand side of an assignment.
+fn render_toml_value(value: &toml::Value) -> Result<String> {
+    let mut rendered = String::new();
+    serde::Serialize::serialize(value, toml::ser::ValueSerializer::new(&mut rendered))
+        .context("Failed to render a preserved configuration value")?;
+    Ok(rendered)
+}
+
+fn is_bare_key_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+fn parse_bare_key_path(text: &str) -> Option<Vec<String>> {
+    let segments = text
+        .split('.')
+        .map(|segment| segment.trim().to_string())
+        .collect::<Vec<_>>();
+    segments
+        .iter()
+        .all(|segment| is_bare_key_segment(segment))
+        .then_some(segments)
+}
+
+/// Split a template line into TOML code and any trailing comment. The scan is
+/// quote-aware so a `#` inside a string is never mistaken for a comment.
+fn split_trailing_comment(line: &str) -> (&str, &str) {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for (index, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_double => escaped = true,
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '#' if !in_single && !in_double => return line.split_at(index),
+            _ => {}
+        }
+    }
+    (line, "")
+}
+
+/// Parse a `[table]` header into its key path. Array tables and quoted keys
+/// return `None`, which makes the rewriter leave that whole section verbatim.
+fn parse_table_header(trimmed: &str) -> Option<Vec<String>> {
+    let inner = trimmed.strip_prefix('[')?.strip_suffix(']')?;
+    if inner.starts_with('[') || inner.ends_with(']') {
+        return None;
+    }
+    parse_bare_key_path(inner)
+}
+
+/// Fold a previous configuration into a freshly rendered template.
+///
+/// * `template` — the newly rendered managed file.
+/// * `previous_file` — the previous contents of that same file.
+/// * `effective` — the previous merged configuration, so a value the operator
+///   wrote in a different file still wins over this template's default.
+fn apply_previous_settings(
+    template: &str,
+    previous_file: &toml::Value,
+    effective: &toml::Value,
+    outcome: &mut PreservationOutcome,
+) -> Result<String> {
+    let template_value =
+        toml::from_str::<toml::Value>(template).context("Generated configuration template is not valid TOML")?;
+
+    let mut template_leaves = Vec::new();
+    collect_toml_leaves(&template_value, &mut Vec::new(), &mut template_leaves);
+    let template_paths = template_leaves
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<BTreeSet<_>>();
+
+    let mut overrides = BTreeMap::new();
+    for (path, template_leaf) in &template_leaves {
+        let Some(current) = toml_lookup(effective, path) else {
+            continue;
+        };
+        if current.is_table() || current == template_leaf {
+            continue;
+        }
+        overrides.insert(path.clone(), current.clone());
+    }
+
+    let mut previous_leaves = Vec::new();
+    collect_toml_leaves(previous_file, &mut Vec::new(), &mut previous_leaves);
+    let mut leftovers: BTreeMap<Vec<String>, toml::Value> = BTreeMap::new();
+    for (path, value) in previous_leaves {
+        if template_paths.contains(&path) || toml_lookup(&template_value, &path).is_some() {
+            continue;
+        }
+        // A key whose parent the template writes as a scalar cannot be restored
+        // without producing invalid TOML.
+        if (1..path.len()).any(|len| path.get(..len).is_some_and(|prefix| template_paths.contains(prefix))) {
+            outcome.dropped.insert(path.join("."));
+            continue;
+        }
+        leftovers.insert(path, value);
+    }
+
+    render_merged_template(template, &overrides, &leftovers, outcome)
+}
+
+/// A rendered template section: its table path, and where it ends in the output.
+struct TemplateSection {
+    path: Option<Vec<String>>,
+    end: usize,
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_merged_template(
+    template: &str,
+    overrides: &BTreeMap<Vec<String>, toml::Value>,
+    leftovers: &BTreeMap<Vec<String>, toml::Value>,
+    outcome: &mut PreservationOutcome,
+) -> Result<String> {
+    let lines = template.lines().collect::<Vec<_>>();
+    let mut out: Vec<String> = Vec::new();
+    let mut sections: Vec<TemplateSection> = Vec::new();
+    let mut current: Option<Vec<String>> = Some(Vec::new());
+
+    let mut index = 0;
+    while let Some(line) = lines.get(index).copied() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            out.push(line.to_string());
+            index += 1;
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            sections.push(TemplateSection {
+                path: current.take(),
+                end: out.len(),
+            });
+            current = parse_table_header(trimmed);
+            out.push(line.to_string());
+            index += 1;
+            continue;
+        }
+
+        // An assignment, possibly spanning several lines. Grow the buffer until
+        // it parses, so a multi-line array is never mistaken for further keys.
+        let mut buffer = line.to_string();
+        let mut last = index;
+        while toml::from_str::<toml::Table>(&buffer).is_err() {
+            last += 1;
+            let Some(continuation) = lines.get(last) else {
+                bail!("Generated configuration template has an unparsable assignment: {line}");
+            };
+            buffer.push('\n');
+            buffer.push_str(continuation);
+        }
+
+        let (code, comment) = split_trailing_comment(line);
+        let key_text = code.split_once('=').map(|(key, _)| key.trim()).unwrap_or_default();
+        let key_path = parse_bare_key_path(key_text).and_then(|relative| {
+            current.as_ref().map(|prefix| {
+                let mut path = prefix.clone();
+                path.extend(relative);
+                path
+            })
+        });
+
+        if let Some((path, value)) = key_path.and_then(|path| overrides.get(&path).map(|value| (path, value))) {
+            let indent = &line[..line.len() - line.trim_start().len()];
+            let suffix = if last == index && !comment.is_empty() {
+                format!("  {}", comment.trim_end())
+            } else {
+                String::new()
+            };
+            out.push(format!("{indent}{key_text} = {}{suffix}", render_toml_value(value)?));
+            outcome.kept.insert(path.join("."));
+        } else {
+            for verbatim in lines.get(index..=last).unwrap_or_default() {
+                out.push((*verbatim).to_string());
+            }
+        }
+        index = last + 1;
+    }
+    sections.push(TemplateSection {
+        path: current,
+        end: out.len(),
+    });
+
+    // Group the keys the template does not mention by the table that owns them.
+    let mut grouped: BTreeMap<Vec<String>, Vec<(String, toml::Value)>> = BTreeMap::new();
+    for (path, value) in leftovers {
+        let Some((key, table)) = path.split_last() else {
+            continue;
+        };
+        grouped
+            .entry(table.to_vec())
+            .or_default()
+            .push((key.clone(), value.clone()));
+    }
+
+    let mut appended: Vec<(Vec<String>, Vec<(String, toml::Value)>)> = Vec::new();
+    let mut insertions: Vec<(usize, Vec<String>)> = Vec::new();
+    for (table, entries) in grouped {
+        if let Some(section) = sections.iter().find(|section| section.path.as_ref() == Some(&table)) {
+            let mut rendered = Vec::new();
+            for (key, value) in &entries {
+                rendered.push(format!("{key} = {}", render_toml_value(value)?));
+                outcome.kept.insert(leftover_label(&table, key));
+            }
+            let mut at = section.end;
+            while at > 0 && out.get(at - 1).is_some_and(|line| line.trim().is_empty()) {
+                at -= 1;
+            }
+            insertions.push((at, rendered));
+        } else {
+            appended.push((table, entries));
+        }
+    }
+    // Apply from the last insertion point backwards so earlier ones stay valid.
+    insertions.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    for (at, rendered) in insertions {
+        for line in rendered.into_iter().rev() {
+            out.insert(at, line);
+        }
+    }
+
+    for (table, entries) in appended {
+        out.push(String::new());
+        out.push("# Preserved from the previous configuration.".to_string());
+        if !table.is_empty() {
+            out.push(format!("[{}]", table.join(".")));
+        }
+        for (key, value) in entries {
+            out.push(format!("{key} = {}", render_toml_value(&value)?));
+            outcome.kept.insert(leftover_label(&table, &key));
+        }
+    }
+
+    let mut merged = out.join("\n");
+    merged.push('\n');
+    Ok(merged)
+}
+
+fn leftover_label(table: &[String], key: &str) -> String {
+    if table.is_empty() {
+        key.to_string()
+    } else {
+        format!("{}.{key}", table.join("."))
     }
 }
 
@@ -421,14 +876,36 @@ default_temperature = 0.7
 //   server   — production-ready defaults, moderate comments
 //   full     — all options shown, extensive comments
 
+/// Render the embedding block with the values this build actually defaults to.
+///
+/// The keys are written out explicitly rather than left commented: the default
+/// flipped from `"none"` to `"local"` in 0.8.10x, and a generated file that only
+/// mentions the setting in a comment leaves every reader guessing which side of
+/// that flip their installation is on.
+fn embedding_settings_block() -> String {
+    let defaults = crate::config::schema::MemoryConfig::default();
+    format!(
+        "# Local vector recall is credential-free and on by default.\n\
+         # Set embedding_provider = \"none\" to turn vector recall off and keep keyword search only.\n\
+         embedding_provider = \"{provider}\"\n\
+         embedding_model = \"{model}\"\n\
+         embedding_dimensions = {dimensions}\n",
+        provider = defaults.embedding_provider,
+        model = defaults.embedding_model,
+        dimensions = defaults.embedding_dimensions,
+    )
+}
+
 fn memory_template(spec: Spec) -> String {
+    let embedding = embedding_settings_block();
     match spec {
-        Spec::Minimal => r#"# Memory configuration (minimal)
+        Spec::Minimal => format!(
+            r#"# Memory configuration (minimal)
 
 [memory]
 backend = "sqlite"
 auto_save = true
-
+{embedding}
 [memory.events]
 record_user_messages = true
 record_assistant_messages = true
@@ -439,15 +916,16 @@ auto_promote_user_messages = true
 auto_promote_assistant_messages = false
 min_chars = 30
 "#
-        .into(),
+        ),
 
-        Spec::Server => r#"# Memory configuration (server)
+        Spec::Server => format!(
+            r#"# Memory configuration (server)
 # Backend: sqlite (recommended), markdown, or none
 
 [memory]
 backend = "sqlite"
 auto_save = true
-
+{embedding}
 [memory.events]
 record_user_messages = true
 record_assistant_messages = true
@@ -463,20 +941,17 @@ min_chars = 30
 [storage.provider.config]
 # Database path is auto-resolved to workspace/memory/
 "#
-        .into(),
+        ),
 
-        Spec::Full => r#"# Memory configuration (full)
+        Spec::Full => format!(
+            r#"# Memory configuration (full)
 # Backend options: sqlite (recommended), markdown, none
 # auto_save is a compatibility gate for semantic memory promotion.
 
 [memory]
 backend = "sqlite"
 auto_save = true
-# Credential-free local vector recall is enabled by default.
-# embedding_provider = "local"
-# embedding_model = "prx-local-hash-v1"
-# embedding_dimensions = 384
-# To use a richer external model instead:
+{embedding}# To use a richer external model instead:
 # embedding_provider = "custom:http://127.0.0.1:11434/v1"
 # embedding_model = "nomic-embed-text:latest"
 # embedding_dimensions = 768
@@ -499,7 +974,7 @@ min_chars = 30
 # Database path is auto-resolved to workspace/memory/
 # For external databases, set connection string here
 "#
-        .into(),
+        ),
     }
 }
 
@@ -1106,6 +1581,186 @@ acknowledge_single_provider_risk = false
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn every_memory_template_writes_the_embedding_provider_explicitly() {
+        let defaults = crate::config::schema::MemoryConfig::default();
+        for spec in [Spec::Minimal, Spec::Server, Spec::Full] {
+            let content = memory_template(spec);
+            assert!(
+                content.contains(&format!("\nembedding_provider = \"{}\"", defaults.embedding_provider)),
+                "{} template must state embedding_provider, not only comment it",
+                spec.name()
+            );
+            assert!(
+                content.contains(&format!("\nembedding_model = \"{}\"", defaults.embedding_model)),
+                "{} template must state embedding_model",
+                spec.name()
+            );
+            assert!(
+                content.contains(&format!("\nembedding_dimensions = {}", defaults.embedding_dimensions)),
+                "{} template must state embedding_dimensions",
+                spec.name()
+            );
+            assert!(
+                content.contains("embedding_provider = \"none\" to turn vector recall off"),
+                "{} template must say how to turn vector recall off",
+                spec.name()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn force_regeneration_preserves_an_explicitly_disabled_embedding_provider() {
+        let tmp = tempfile::tempdir().expect("test: create tempdir");
+        let dir = tmp.path();
+        Spec::Full.generate(dir, false).await.expect("test: generate full");
+
+        let memory_path = dir.join("config.d/memory.toml");
+        fs::write(
+            &memory_path,
+            "# Embeddings disabled for latency isolation.\n[memory]\nbackend = \"sqlite\"\nauto_save = true\nembedding_provider = \"none\"\n",
+        )
+        .expect("test: write operator memory fragment");
+
+        Spec::Full.generate(dir, true).await.expect("test: force regenerate");
+
+        let config = crate::config::Config::load_from_path(&dir.join("config.toml"), dir.join("workspace"))
+            .expect("test: regenerated config must load");
+        assert_eq!(
+            config.memory.embedding_provider, "none",
+            "prx init --force must not undo an explicit embedding_provider"
+        );
+        assert!(config.memory.embedding_provider_explicit);
+        assert!(config.embedding_default_upgrade_notice().is_none());
+        let regenerated = fs::read_to_string(&memory_path).expect("test: read regenerated fragment");
+        assert!(
+            regenerated.contains("# Memory configuration (full)"),
+            "the template comments must still be refreshed: {regenerated}"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_regeneration_preserves_values_written_in_the_main_config() {
+        let tmp = tempfile::tempdir().expect("test: create tempdir");
+        let dir = tmp.path();
+        Spec::Full.generate(dir, false).await.expect("test: generate full");
+
+        // A pre-0.8.10x tree: the fragment never mentioned the provider, and the
+        // operator disabled it from the main config file.
+        fs::write(
+            dir.join("config.d/memory.toml"),
+            "[memory]\nbackend = \"sqlite\"\nauto_save = true\n",
+        )
+        .expect("test: write legacy memory fragment");
+        let main_path = dir.join("config.toml");
+        let mut main = fs::read_to_string(&main_path).expect("test: read main config");
+        main.push_str("\n[memory]\nembedding_provider = \"none\"\n");
+        fs::write(&main_path, main).expect("test: write operator main config");
+
+        Spec::Full.generate(dir, true).await.expect("test: force regenerate");
+
+        let config = crate::config::Config::load_from_path(&main_path, dir.join("workspace"))
+            .expect("test: regenerated config must load");
+        assert_eq!(
+            config.memory.embedding_provider, "none",
+            "a fragment template must not out-rank a value the operator wrote in config.toml"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_regeneration_preserves_unrelated_explicit_settings() {
+        let tmp = tempfile::tempdir().expect("test: create tempdir");
+        let dir = tmp.path();
+        Spec::Full.generate(dir, false).await.expect("test: generate full");
+
+        let main_path = dir.join("config.toml");
+        let mut main = fs::read_to_string(&main_path).expect("test: read main config");
+        main.push_str("\ndefault_model = \"operator-model\"\n");
+        fs::write(&main_path, main.replace("default_model = \"claude-sonnet-4-6\"\n", ""))
+            .expect("test: write operator main config");
+        fs::write(
+            dir.join("config.d/memory.toml"),
+            "[memory]\nbackend = \"sqlite\"\nauto_save = false\nconversation_retention_days = 99\n[memory.events]\nrecord_tool_events = true\n",
+        )
+        .expect("test: write operator memory fragment");
+        fs::write(
+            dir.join("config.d/channels.toml"),
+            "[channels_config]\ncli = false\n[channels_config.telegram]\nbot_token = \"operator-token\"\nallowed_users = [\"alice\"]\n",
+        )
+        .expect("test: write operator channels fragment");
+
+        Spec::Full.generate(dir, true).await.expect("test: force regenerate");
+
+        let config = crate::config::Config::load_from_path(&main_path, dir.join("workspace"))
+            .expect("test: regenerated config must load");
+        assert_eq!(config.default_model.as_deref(), Some("operator-model"));
+        assert!(!config.memory.auto_save, "an explicit false must survive regeneration");
+        assert_eq!(config.memory.conversation_retention_days, 99);
+        assert!(config.memory.events.record_tool_events);
+        assert!(!config.channels_config.cli);
+        let telegram = config
+            .channels_config
+            .telegram
+            .as_ref()
+            .expect("test: telegram settings the template only comments must survive");
+        assert_eq!(telegram.bot_token, "operator-token");
+        assert_eq!(telegram.allowed_users, vec!["alice".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn switching_to_a_preset_without_a_fragment_still_keeps_operator_settings() {
+        let tmp = tempfile::tempdir().expect("test: create tempdir");
+        let dir = tmp.path();
+        Spec::Full.generate(dir, false).await.expect("test: generate full");
+        fs::write(
+            dir.join("config.d/channels.toml"),
+            "[channels_config]\ncli = true\n[channels_config.telegram]\nbot_token = \"operator-token\"\nallowed_users = [\"alice\"]\n",
+        )
+        .expect("test: write operator channels fragment");
+
+        Spec::Minimal
+            .generate(dir, true)
+            .await
+            .expect("test: force regenerate minimal");
+
+        let config = crate::config::Config::load_from_path(&dir.join("config.toml"), dir.join("workspace"))
+            .expect("test: regenerated config must load");
+        let telegram = config
+            .channels_config
+            .telegram
+            .as_ref()
+            .expect("test: a preset without a channels template must not delete channel settings");
+        assert_eq!(telegram.bot_token, "operator-token");
+    }
+
+    #[tokio::test]
+    async fn force_regeneration_archives_the_previous_configuration() {
+        let tmp = tempfile::tempdir().expect("test: create tempdir");
+        let dir = tmp.path();
+        Spec::Full.generate(dir, false).await.expect("test: generate full");
+        fs::write(
+            dir.join("config.d/memory.toml"),
+            "[memory]\nembedding_provider = \"none\"\n",
+        )
+        .expect("test: write operator memory fragment");
+
+        Spec::Full.generate(dir, true).await.expect("test: force regenerate");
+
+        let archive = fs::read_dir(dir)
+            .expect("test: read target dir")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("config.d.pre-"))
+            })
+            .expect("test: force regeneration must archive the previous configuration");
+        let archived = fs::read_to_string(archive.join("memory.toml")).expect("test: read archived fragment");
+        assert!(archived.contains("embedding_provider = \"none\""));
+        assert!(archive.join("config.toml").exists());
+    }
 
     #[test]
     fn spec_name_matches_variant() {

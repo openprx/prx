@@ -735,6 +735,42 @@ claiming the semantic quality of a dedicated embedding model. Set
 provider, model, or dimensions requires reindexing existing vector-bearing
 memory rows; stale vectors are not mixed with the active index.
 
+#### Upgrading from a configuration written before 0.8.10x
+
+`memory.embedding_provider` defaulted to `"none"` before 0.8.10x. A
+configuration that never wrote the key therefore turns local vector recall **on**
+when the binary is upgraded, with no configuration change: recall then spends
+one embedding computation and one similarity scan per turn. Nothing else about
+the memory store changes, and keyword/FTS recall is unaffected.
+
+`prx doctor memory` reports the inherited default, and `prx chat`, `prx daemon`,
+`prx gateway` and `prx channel start` log it once at startup:
+
+```
+embedding_provider not set; defaulting to local vector recall since 0.8.10x,
+set memory.embedding_provider = "none" to disable
+```
+
+Write the key either way to settle it and silence the notice:
+
+```toml
+[memory]
+embedding_provider = "none"   # keyword/FTS recall only
+```
+
+`prx init --force` regenerates the managed templates without resetting values:
+every key written in `config.toml` or a managed `config.d/*.toml` fragment keeps
+its value, keys the template does not mention are carried over, and the previous
+tree is copied to `config.d.pre-<version>-<timestamp>/` first. Templates supply
+structure, comments and defaults only. The preserved keys are listed in the
+command output; anything this build can no longer represent is reported as reset
+rather than dropped silently.
+
+Vector recall scores the most recently updated embedded memories rather than the
+whole table — cosine similarity has no index, so the candidate set is bounded by
+recency. The bound is far above any realistic per-turn working set and exists to
+keep a very large memory store from slowing every turn.
+
 ### SQLite Connection Pool
 
 The SQLite backend is the default. It does **not** use the PostgreSQL pool

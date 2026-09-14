@@ -62,6 +62,15 @@ pub struct LocalHashEmbedding {
     dims: usize,
 }
 
+/// Total input bytes an `embed` call hashes on the caller's task before it is
+/// moved to the blocking pool.
+///
+/// Feature hashing is synchronous CPU work with no I/O and no await point, so a
+/// large batch would otherwise occupy a runtime worker for its whole duration.
+/// A single short recall query costs far less than a task hand-off, so it stays
+/// inline; anything larger is offloaded.
+pub(crate) const LOCAL_EMBED_INLINE_BUDGET_BYTES: usize = 2048;
+
 impl LocalHashEmbedding {
     pub fn new(model: &str, dims: usize) -> Self {
         Self {
@@ -135,7 +144,24 @@ impl EmbeddingProvider for LocalHashEmbedding {
     }
 
     async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        Ok(texts.iter().map(|text| self.embed_text(text)).collect())
+        // Pure CPU, no I/O, no lock held across any await: either compute it
+        // here or hand the whole batch to the blocking pool, never a partially
+        // offloaded mixture.
+        let total_bytes = texts.iter().map(|text| text.len()).sum::<usize>();
+        if total_bytes <= LOCAL_EMBED_INLINE_BUDGET_BYTES {
+            return Ok(texts.iter().map(|text| self.embed_text(text)).collect());
+        }
+
+        let owned = texts.iter().map(|text| (*text).to_string()).collect::<Vec<_>>();
+        let offloaded = Self::new(&self.model, self.dims);
+        crate::runtime::blocking::spawn_blocking(move || {
+            owned
+                .iter()
+                .map(|text| offloaded.embed_text(text))
+                .collect::<Vec<Vec<f32>>>()
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("local embedding task failed: {error}"))
     }
 }
 
@@ -346,6 +372,51 @@ mod tests {
 
         let repeated = provider.embed_one("release deployment failed").await.unwrap();
         assert_eq!(first, &repeated);
+    }
+
+    #[tokio::test]
+    async fn large_local_batches_are_offloaded_and_match_the_inline_result() {
+        let provider = LocalHashEmbedding::new("prx-local-hash-v1", 384);
+        let long = "release deployment failed ".repeat(200);
+        assert!(
+            long.len() > LOCAL_EMBED_INLINE_BUDGET_BYTES,
+            "fixture must cross the offload threshold"
+        );
+        let short = "release deployment failed";
+        assert!(short.len() <= LOCAL_EMBED_INLINE_BUDGET_BYTES);
+
+        let offloaded = provider.embed(&[long.as_str()]).await.unwrap();
+        let inline = provider.embed_text(&long);
+        assert_eq!(offloaded.len(), 1);
+        assert_eq!(offloaded.first().unwrap(), &inline);
+
+        // The threshold must not change the result for either branch.
+        let inline_batch = provider.embed(&[short]).await.unwrap();
+        assert_eq!(inline_batch.first().unwrap(), &provider.embed_text(short));
+    }
+
+    #[tokio::test]
+    async fn offloaded_local_embedding_yields_before_it_finishes() {
+        // On a current-thread runtime the only way the first poll can be pending
+        // is if the hashing left this worker. Computing inline returns `Ready`
+        // on the first poll, so removing the offload fails this immediately.
+        use std::future::Future as _;
+
+        let provider = LocalHashEmbedding::new("prx-local-hash-v1", 384);
+        let long = "release deployment failed ".repeat(4000);
+        assert!(long.len() > LOCAL_EMBED_INLINE_BUDGET_BYTES);
+
+        let batch = [long.as_str()];
+        let mut future = std::pin::pin!(provider.embed(&batch));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            future.as_mut().poll(&mut context).is_pending(),
+            "a large local batch must be handed to the blocking pool, not hashed on the runtime worker"
+        );
+
+        let vectors = future.await.unwrap();
+        assert_eq!(vectors.len(), 1);
+        assert_eq!(vectors.first().unwrap(), &provider.embed_text(&long));
     }
 
     #[test]
