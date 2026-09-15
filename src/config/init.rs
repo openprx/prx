@@ -82,8 +82,16 @@ impl Spec {
         } else {
             None
         };
+        // Recorded before anything is written, because the sidecar this run
+        // writes describes this build's defaults, not the previous build's.
+        let previous_defaults = if regenerating {
+            read_managed_defaults(target_dir)
+        } else {
+            None
+        };
+        let managed_defaults = render_managed_defaults(&main_toml, &fragments)?;
         let (effective_main, effective_fragments) = if regenerating {
-            match preserve_previous_settings(&config_path, &main_toml, &fragments) {
+            match preserve_previous_settings(&config_path, &main_toml, &fragments, previous_defaults.as_ref()) {
                 Ok((merged_main, merged_fragments, outcome)) => {
                     report.record_preservation(&outcome, archive.as_deref());
                     (merged_main, merged_fragments)
@@ -120,6 +128,7 @@ impl Spec {
             Err(error) => return Err(error),
         };
         super::files::commit_mutation_atomically(plan).await?;
+        write_managed_defaults(target_dir, &managed_defaults)?;
 
         // 5. Create the non-config workspace structure only after the complete
         // configuration generation has committed.
@@ -169,6 +178,9 @@ pub struct InitReport {
     /// Set when the operator's values were discarded and bare templates were
     /// written instead. Carries the full explanation, including the archive.
     reset: Option<String>,
+    /// Keys the folder could not place in the regenerated tree. Each one is a
+    /// value the operator wrote that this run did not carry over.
+    unpreserved: Vec<String>,
 }
 
 impl InitReport {
@@ -204,10 +216,28 @@ impl InitReport {
         }
     }
 
+    /// Keys this run could not fold, in the order they are reported.
+    #[must_use]
+    pub fn unpreserved_keys(&self) -> &[String] {
+        &self.unpreserved
+    }
+
     /// A reset is a data-loss event, so it ends the command non-zero even
-    /// though the tree on disk is valid and usable.
+    /// though the tree on disk is valid and usable. Individual keys that could
+    /// not be folded are the same kind of loss on a smaller scale and end the
+    /// command the same way: silence is what made this class of bug survive.
     pub fn into_result(self) -> Result<()> {
-        self.reset.map_or_else(|| Ok(()), |reason| Err(anyhow::anyhow!(reason)))
+        if let Some(reason) = self.reset {
+            return Err(anyhow::anyhow!(reason));
+        }
+        if self.unpreserved.is_empty() {
+            return Ok(());
+        }
+        Err(anyhow::anyhow!(
+            "{} setting(s) could not be folded into the regenerated configuration: {}",
+            self.unpreserved.len(),
+            self.unpreserved.join(", ")
+        ))
     }
 
     fn record_preservation(&mut self, outcome: &PreservationOutcome, archive: Option<&Path>) {
@@ -225,11 +255,38 @@ impl InitReport {
                 outcome.kept.iter().cloned().collect::<Vec<_>>().join(", ")
             ));
         }
+        if !outcome.added_defaults.is_empty() {
+            self.notices.push(format!(
+                "  Added {} new default(s) this version ships: {}",
+                outcome.added_defaults.len(),
+                outcome.added_defaults.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if !outcome.refreshed.is_empty() {
+            self.notices.push(format!(
+                "  Reset {} unset setting(s) to refreshed defaults: {}",
+                outcome.refreshed.len(),
+                outcome.refreshed.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
         if !outcome.dropped.is_empty() {
             self.warnings.push(format!(
                 "WARNING: reset {} setting(s) this build can no longer represent: {}",
                 outcome.dropped.len(),
                 outcome.dropped.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if !outcome.unfoldable.is_empty() {
+            self.unpreserved = outcome.unfoldable.iter().cloned().collect();
+            self.warnings.push(format!(
+                "WARNING: could not fold {} setting(s) into the regenerated templates, so they now hold \
+                 this version's defaults: {}. Copy them back from {}.",
+                self.unpreserved.len(),
+                self.unpreserved.join(", "),
+                archive.map_or_else(
+                    || "the previous configuration (NOT ARCHIVED)".to_string(),
+                    |path| path.display().to_string()
+                )
             ));
         }
     }
@@ -260,11 +317,112 @@ impl InitReport {
 // not mention are re-inserted into the table they came from. Templates supply
 // structure, comments and defaults only.
 
+/// How many suffixed names `--force` will try before refusing to archive.
+const MAX_ARCHIVE_NAME_ATTEMPTS: u32 = 1000;
+
+/// Sidecar recording which values in the generated tree came from this build's
+/// templates. Without it `--force` cannot tell a value the operator typed from
+/// a default an older `prx init` wrote, and every stale default survives
+/// forever.
+const MANAGED_DEFAULTS_FILE: &str = ".init-defaults.toml";
+
 /// Outcome of folding a previous configuration into freshly rendered templates.
+///
+/// The three classifications an operator is shown are deliberately distinct:
+/// `kept` is a value they wrote and keeps winning, `added_defaults` is a key
+/// this build's templates introduced, and `refreshed` is a key they never
+/// touched whose shipped default has since moved. `dropped` and `unfoldable`
+/// are losses and are reported as warnings instead.
 #[derive(Debug, Default)]
 struct PreservationOutcome {
     kept: BTreeSet<String>,
+    added_defaults: BTreeSet<String>,
+    refreshed: BTreeSet<String>,
     dropped: BTreeSet<String>,
+    unfoldable: BTreeSet<String>,
+}
+
+/// Read the defaults the previous `prx init` recorded for this tree.
+///
+/// `None` means there is no usable record — an older tree, or a file the
+/// operator removed — and the fold then treats every value on disk as
+/// explicitly chosen, which is the safe direction.
+fn read_managed_defaults(target_dir: &Path) -> Option<BTreeMap<Vec<String>, toml::Value>> {
+    let raw = std::fs::read_to_string(target_dir.join(MANAGED_DEFAULTS_FILE)).ok()?;
+    let document = toml::from_str::<toml::Value>(&raw).ok()?;
+    let entries = document.get("entry")?.as_array()?;
+    let mut defaults = BTreeMap::new();
+    for entry in entries {
+        let Some(segments) = entry.get("path").and_then(toml::Value::as_array) else {
+            continue;
+        };
+        let Some(value) = entry.get("value") else {
+            continue;
+        };
+        let mut path = Vec::with_capacity(segments.len());
+        for segment in segments {
+            match segment.as_str() {
+                Some(segment) => path.push(segment.to_string()),
+                None => {
+                    path.clear();
+                    break;
+                }
+            }
+        }
+        if path.is_empty() {
+            continue;
+        }
+        defaults.insert(path, value.clone());
+    }
+    Some(defaults)
+}
+
+/// Render the sidecar for the templates this run is about to write. Paths are
+/// stored as explicit string arrays so a key containing a dot round-trips.
+fn render_managed_defaults(main_template: &str, fragment_templates: &[(String, String)]) -> Result<String> {
+    let mut leaves = Vec::new();
+    for source in std::iter::once(main_template).chain(fragment_templates.iter().map(|(_, body)| body.as_str())) {
+        let value =
+            toml::from_str::<toml::Value>(source).context("Generated configuration template is not valid TOML")?;
+        collect_toml_leaves(&value, &mut Vec::new(), &mut leaves);
+    }
+    let mut rendered = String::from(
+        "# Written by `prx init`. It records which values in this tree came from the
+         # shipped templates, so a later `prx init --force` can tell a value you wrote
+         # (preserved) from a default that has since changed (reset). Deleting this file
+         # only makes --force preserve every value currently on disk.
+",
+    );
+    rendered.push_str(&format!("generated_by = \"{}\"\n", env!("CARGO_PKG_VERSION")));
+    let mut seen = BTreeSet::new();
+    for (path, value) in &leaves {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let segments = toml::Value::Array(
+            path.iter()
+                .map(|segment| toml::Value::String(segment.clone()))
+                .collect::<Vec<_>>(),
+        );
+        rendered.push_str(&format!(
+            "\n[[entry]]\npath = {}\nvalue = {}\n",
+            render_toml_value(&segments)?,
+            render_toml_value(value)?
+        ));
+    }
+    Ok(rendered)
+}
+
+fn write_managed_defaults(target_dir: &Path, rendered: &str) -> Result<()> {
+    let path = target_dir.join(MANAGED_DEFAULTS_FILE);
+    std::fs::write(&path, rendered).with_context(|| format!("Failed to write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("Failed to set permissions on {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Copy the previous `config.toml` and every `config.d` fragment into a
@@ -273,13 +431,17 @@ fn archive_previous_config(target_dir: &Path, config_path: &Path) -> Result<Opti
     if !config_path.exists() {
         return Ok(None);
     }
-    let archive = target_dir.join(format!(
+    // Two `--force` runs inside the same second used to land on the same
+    // directory name, and `create_dir_all` + `fs::copy` overwrote the first
+    // archive with the second. The stamp now carries milliseconds and the
+    // directory is created exclusively, so a collision produces a second
+    // archive instead of destroying one.
+    let base = format!(
         "config.d.pre-{}-{}",
         env!("CARGO_PKG_VERSION"),
-        chrono::Local::now().format("%Y%m%d%H%M%S")
-    ));
-    std::fs::create_dir_all(&archive)
-        .with_context(|| format!("Failed to create config archive {}", archive.display()))?;
+        chrono::Local::now().format("%Y%m%d%H%M%S%3f")
+    );
+    let archive = create_unique_archive_dir(target_dir, &base)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -305,11 +467,34 @@ fn archive_previous_config(target_dir: &Path, config_path: &Path) -> Result<Opti
     Ok(Some(archive))
 }
 
+/// Create `target_dir/<base>`, falling back to `<base>-2`, `<base>-3`, ... when
+/// the name is taken. The directory is created exclusively, so a concurrent or
+/// same-millisecond `--force` never writes into an archive that already holds
+/// another run's files.
+fn create_unique_archive_dir(target_dir: &Path, base: &str) -> Result<PathBuf> {
+    for attempt in 1..=MAX_ARCHIVE_NAME_ATTEMPTS {
+        let candidate = if attempt == 1 {
+            target_dir.join(base)
+        } else {
+            target_dir.join(format!("{base}-{attempt}"))
+        };
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("Failed to create config archive {}", candidate.display()));
+            }
+        }
+    }
+    bail!("Failed to find a free config archive directory next to {base} in {MAX_ARCHIVE_NAME_ATTEMPTS} attempts")
+}
+
 /// Fold the configuration currently on disk into freshly rendered templates.
 fn preserve_previous_settings(
     config_path: &Path,
     main_template: &str,
     fragment_templates: &[(String, String)],
+    previous_defaults: Option<&BTreeMap<Vec<String>, toml::Value>>,
 ) -> Result<(String, Vec<(String, String)>, PreservationOutcome)> {
     let main_previous = read_toml_document(config_path)?;
     let mut effective = main_previous.clone();
@@ -328,7 +513,13 @@ fn preserve_previous_settings(
 
     let empty = toml::Value::Table(toml::map::Map::new());
     let mut outcome = PreservationOutcome::default();
-    let merged_main = apply_previous_settings(main_template, &main_previous, &effective, &mut outcome)?;
+    let merged_main = apply_previous_settings(
+        main_template,
+        &main_previous,
+        &effective,
+        previous_defaults,
+        &mut outcome,
+    )?;
     let mut merged_fragments = Vec::with_capacity(fragment_templates.len());
     for (name, template) in fragment_templates {
         let previous = fragment_previous.get(name).unwrap_or(&empty);
@@ -344,11 +535,11 @@ fn preserve_previous_settings(
             }
             let placeholder = "# This preset does not generate this fragment.\n\
                                # The settings below were carried over from the previous configuration.\n";
-            let merged = apply_previous_settings(placeholder, previous, &effective, &mut outcome)?;
+            let merged = apply_previous_settings(placeholder, previous, &effective, previous_defaults, &mut outcome)?;
             merged_fragments.push((name.clone(), merged));
             continue;
         }
-        let merged = apply_previous_settings(template, previous, &effective, &mut outcome)?;
+        let merged = apply_previous_settings(template, previous, &effective, previous_defaults, &mut outcome)?;
         merged_fragments.push((name.clone(), merged));
     }
     Ok((merged_main, merged_fragments, outcome))
@@ -405,15 +596,64 @@ fn is_bare_key_segment(segment: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
 }
 
-fn parse_bare_key_path(text: &str) -> Option<Vec<String>> {
-    let segments = text
-        .split('.')
-        .map(|segment| segment.trim().to_string())
-        .collect::<Vec<_>>();
-    segments
-        .iter()
-        .all(|segment| is_bare_key_segment(segment))
-        .then_some(segments)
+/// Decode a TOML key path — bare, quoted, dotted, or any mix — into the exact
+/// segments the TOML parser produced for the same text.
+///
+/// This used to be a hand-rolled bare-key scanner that returned `None` for any
+/// segment containing a quote. Every quoted key (`"my.key"`) and every quoted
+/// table header (`[channels_config."x.y"]`) therefore became invisible to the
+/// folder: the operator's value was neither carried over nor reported, it was
+/// simply reset. Delegating to the TOML grammar itself keeps this decoder and
+/// the parser that built `previous`/`effective` in exact agreement.
+fn parse_key_path(text: &str) -> Option<Vec<String>> {
+    let probe = format!("{text} = 0");
+    let mut cursor = toml::Value::Table(toml::from_str::<toml::Table>(&probe).ok()?);
+    let mut path = Vec::new();
+    loop {
+        let toml::Value::Table(table) = cursor else {
+            return (!path.is_empty()).then_some(path);
+        };
+        if table.len() != 1 {
+            return None;
+        }
+        let (key, value) = table.into_iter().next()?;
+        path.push(key);
+        cursor = value;
+    }
+}
+
+/// Render one decoded key segment back into TOML source, quoting and escaping
+/// whenever the segment is not a bare key. Re-emitting `x.y` unquoted would
+/// silently move the operator's value to a different path.
+fn render_key_segment(segment: &str) -> String {
+    if is_bare_key_segment(segment) {
+        return segment.to_string();
+    }
+    let mut out = String::with_capacity(segment.len() + 2);
+    out.push('"');
+    for ch in segment.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other if (other as u32) < 0x20 || other as u32 == 0x7f => {
+                out.push_str(&format!("\\u{:04X}", other as u32));
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Render a decoded key path back into TOML source.
+fn render_key_path(path: &[String]) -> String {
+    path.iter()
+        .map(|segment| render_key_segment(segment.as_str()))
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// Split a template line into TOML code and any trailing comment. The scan is
@@ -438,14 +678,15 @@ fn split_trailing_comment(line: &str) -> (&str, &str) {
     (line, "")
 }
 
-/// Parse a `[table]` header into its key path. Array tables and quoted keys
-/// return `None`, which makes the rewriter leave that whole section verbatim.
+/// Parse a `[table]` header into its key path. Array tables still return
+/// `None`, which makes the rewriter leave that whole section verbatim; quoted
+/// headers are decoded like any other key path.
 fn parse_table_header(trimmed: &str) -> Option<Vec<String>> {
     let inner = trimmed.strip_prefix('[')?.strip_suffix(']')?;
     if inner.starts_with('[') || inner.ends_with(']') {
         return None;
     }
-    parse_bare_key_path(inner)
+    parse_key_path(inner)
 }
 
 /// Fold a previous configuration into a freshly rendered template.
@@ -458,6 +699,7 @@ fn apply_previous_settings(
     template: &str,
     previous_file: &toml::Value,
     effective: &toml::Value,
+    previous_defaults: Option<&BTreeMap<Vec<String>, toml::Value>>,
     outcome: &mut PreservationOutcome,
 ) -> Result<String> {
     let template_value =
@@ -473,9 +715,23 @@ fn apply_previous_settings(
     let mut overrides = BTreeMap::new();
     for (path, template_leaf) in &template_leaves {
         let Some(current) = toml_lookup(effective, path) else {
+            // This build's templates introduce a key the previous tree never
+            // had: the new default is written, and the operator is told.
+            outcome.added_defaults.insert(render_key_path(path));
             continue;
         };
         if current.is_table() || current == template_leaf {
+            continue;
+        }
+        // The value on disk differs from this build's default. It is only the
+        // operator's if it also differs from the default the *previous* run of
+        // `prx init` wrote; otherwise it is a stale shipped default and the
+        // refreshed one takes effect, which is what `--force` promises.
+        if previous_defaults
+            .and_then(|defaults| defaults.get(path))
+            .is_some_and(|previous_default| previous_default == current)
+        {
+            outcome.refreshed.insert(render_key_path(path));
             continue;
         }
         overrides.insert(path.clone(), current.clone());
@@ -491,13 +747,22 @@ fn apply_previous_settings(
         // A key whose parent the template writes as a scalar cannot be restored
         // without producing invalid TOML.
         if (1..path.len()).any(|len| path.get(..len).is_some_and(|prefix| template_paths.contains(prefix))) {
-            outcome.dropped.insert(path.join("."));
+            outcome.dropped.insert(render_key_path(&path));
             continue;
         }
         leftovers.insert(path, value);
     }
 
-    render_merged_template(template, &overrides, &leftovers, outcome)
+    let (merged, applied) = render_merged_template(template, &overrides, &leftovers, outcome)?;
+    // Whatever the rewriter could not place stays the operator's value on
+    // paper and this build's default on disk. That is data loss, so it is
+    // named rather than left to be discovered later.
+    for path in overrides.keys() {
+        if !applied.contains(path) {
+            outcome.unfoldable.insert(render_key_path(path));
+        }
+    }
+    Ok(merged)
 }
 
 /// A rendered template section: its table path, and where it ends in the output.
@@ -512,8 +777,9 @@ fn render_merged_template(
     overrides: &BTreeMap<Vec<String>, toml::Value>,
     leftovers: &BTreeMap<Vec<String>, toml::Value>,
     outcome: &mut PreservationOutcome,
-) -> Result<String> {
+) -> Result<(String, BTreeSet<Vec<String>>)> {
     let lines = template.lines().collect::<Vec<_>>();
+    let mut applied: BTreeSet<Vec<String>> = BTreeSet::new();
     let mut out: Vec<String> = Vec::new();
     let mut sections: Vec<TemplateSection> = Vec::new();
     let mut current: Option<Vec<String>> = Some(Vec::new());
@@ -552,7 +818,7 @@ fn render_merged_template(
 
         let (code, comment) = split_trailing_comment(line);
         let key_text = code.split_once('=').map(|(key, _)| key.trim()).unwrap_or_default();
-        let key_path = parse_bare_key_path(key_text).and_then(|relative| {
+        let key_path = parse_key_path(key_text).and_then(|relative| {
             current.as_ref().map(|prefix| {
                 let mut path = prefix.clone();
                 path.extend(relative);
@@ -568,7 +834,8 @@ fn render_merged_template(
                 String::new()
             };
             out.push(format!("{indent}{key_text} = {}{suffix}", render_toml_value(value)?));
-            outcome.kept.insert(path.join("."));
+            outcome.kept.insert(render_key_path(&path));
+            applied.insert(path);
         } else {
             for verbatim in lines.get(index..=last).unwrap_or_default() {
                 out.push((*verbatim).to_string());
@@ -599,7 +866,7 @@ fn render_merged_template(
         if let Some(section) = sections.iter().find(|section| section.path.as_ref() == Some(&table)) {
             let mut rendered = Vec::new();
             for (key, value) in &entries {
-                rendered.push(format!("{key} = {}", render_toml_value(value)?));
+                rendered.push(format!("{} = {}", render_key_segment(key), render_toml_value(value)?));
                 outcome.kept.insert(leftover_label(&table, key));
             }
             let mut at = section.end;
@@ -623,24 +890,24 @@ fn render_merged_template(
         out.push(String::new());
         out.push("# Preserved from the previous configuration.".to_string());
         if !table.is_empty() {
-            out.push(format!("[{}]", table.join(".")));
+            out.push(format!("[{}]", render_key_path(&table)));
         }
         for (key, value) in entries {
-            out.push(format!("{key} = {}", render_toml_value(&value)?));
+            out.push(format!("{} = {}", render_key_segment(&key), render_toml_value(&value)?));
             outcome.kept.insert(leftover_label(&table, &key));
         }
     }
 
     let mut merged = out.join("\n");
     merged.push('\n');
-    Ok(merged)
+    Ok((merged, applied))
 }
 
 fn leftover_label(table: &[String], key: &str) -> String {
     if table.is_empty() {
-        key.to_string()
+        render_key_segment(key)
     } else {
-        format!("{}.{key}", table.join("."))
+        format!("{}.{}", render_key_path(table), render_key_segment(key))
     }
 }
 
@@ -1974,6 +2241,366 @@ mod tests {
         let archived = fs::read_to_string(archive.join("memory.toml")).expect("test: read archived fragment");
         assert!(archived.contains("embedding_provider = \"none\""));
         assert!(archive.join("config.toml").exists());
+    }
+
+    // ── Quoted keys and quoted table headers ─────────────────────
+    //
+    // The folder used to reject any key path containing a quote. The value was
+    // then neither carried over nor reported: the operator's setting simply
+    // became this build's default on the next `--force`.
+
+    #[tokio::test]
+    async fn force_regeneration_keeps_a_quoted_table_header_the_template_does_not_ship() {
+        let tmp = tempfile::tempdir().expect("test: create tempdir");
+        let dir = tmp.path();
+        Spec::Full.generate(dir, false).await.expect("test: generate full");
+
+        let main_path = dir.join("config.toml");
+        let mut main = fs::read_to_string(&main_path).expect("test: read main config");
+        // A real model name carries a dot, so this table can only be written
+        // with a quoted segment.
+        main.push_str("\n[cost.prices.\"gpt-4.1\"]\ninput = 1.5\noutput = 7.25\n");
+        fs::write(&main_path, main).expect("test: write operator main config");
+
+        let report = Spec::Full
+            .generate_reported(dir, true)
+            .await
+            .expect("test: force regenerate");
+        assert!(
+            !report.was_reset_to_templates(),
+            "a quoted header must fold, not trip the whole-tree reset: {:?}",
+            report.warnings()
+        );
+        assert!(
+            report.unpreserved_keys().is_empty(),
+            "nothing should have been unfoldable: {:?}",
+            report.unpreserved_keys()
+        );
+
+        let config = crate::config::Config::load_from_path(&main_path, dir.join("workspace"))
+            .expect("test: regenerated config must load");
+        let price = config
+            .cost
+            .prices
+            .get("gpt-4.1")
+            .expect("test: the quoted price table must survive --force");
+        assert!((price.input - 1.5).abs() < f64::EPSILON, "input price: {}", price.input);
+        assert!(
+            (price.output - 7.25).abs() < f64::EPSILON,
+            "output price: {}",
+            price.output
+        );
+        // The key must be re-emitted quoted; `cost.prices.gpt-4.1` would be a
+        // different path entirely.
+        let regenerated = fs::read_to_string(&main_path).expect("test: read regenerated main config");
+        assert!(
+            regenerated.contains("[cost.prices.\"gpt-4.1\"]"),
+            "the header must be re-emitted quoted: {regenerated}"
+        );
+        assert!(
+            report.notices().join("\n").contains("cost.prices.\"gpt-4.1\".input"),
+            "the preserved key must be named with its quoting: {:?}",
+            report.notices()
+        );
+    }
+
+    #[tokio::test]
+    async fn force_regeneration_keeps_a_quoted_key_inside_a_map_table() {
+        let tmp = tempfile::tempdir().expect("test: create tempdir");
+        let dir = tmp.path();
+        Spec::Full.generate(dir, false).await.expect("test: generate full");
+
+        let main_path = dir.join("config.toml");
+        let mut main = fs::read_to_string(&main_path).expect("test: read main config");
+        main.push_str("\n[reliability.model_fallbacks]\n\"gpt-4.1\" = [\"gpt-4o\", \"claude-sonnet-4-6\"]\n");
+        fs::write(&main_path, main).expect("test: write operator main config");
+
+        let report = Spec::Full
+            .generate_reported(dir, true)
+            .await
+            .expect("test: force regenerate");
+        assert!(
+            !report.was_reset_to_templates(),
+            "a quoted key must fold, not trip the whole-tree reset: {:?}",
+            report.warnings()
+        );
+
+        let config = crate::config::Config::load_from_path(&main_path, dir.join("workspace"))
+            .expect("test: regenerated config must load");
+        assert_eq!(
+            config.reliability.model_fallbacks.get("gpt-4.1").map(Vec::as_slice),
+            Some(["gpt-4o".to_string(), "claude-sonnet-4-6".to_string()].as_slice()),
+            "a quoted map key must keep both its name and its value"
+        );
+    }
+
+    /// The other half of the same bug: a *template* that writes a quoted key or
+    /// sits under a quoted header. No shipped template does today, so this
+    /// exercises the rewriter directly — the day one does, the operator's value
+    /// must win there too.
+    #[test]
+    fn a_template_written_quoted_key_takes_the_operator_value() {
+        let template =
+            "[agent]\n\"my.key\" = \"from-template\"\n\n[channels_config.\"x.y\"]\ntoken = \"from-template\"\n";
+        let previous = toml::from_str::<toml::Value>(
+            "[agent]\n\"my.key\" = \"from-operator\"\n\n[channels_config.\"x.y\"]\ntoken = \"from-operator\"\n",
+        )
+        .expect("test: parse previous configuration");
+        let mut outcome = PreservationOutcome::default();
+
+        let merged = apply_previous_settings(template, &previous, &previous, None, &mut outcome)
+            .expect("test: fold the previous configuration");
+
+        assert!(
+            outcome.unfoldable.is_empty(),
+            "every quoted key must be foldable: {:?}",
+            outcome.unfoldable
+        );
+        assert!(
+            merged.contains("\"my.key\" = \"from-operator\""),
+            "a quoted assignment must take the operator value: {merged}"
+        );
+        assert!(
+            merged.contains("token = \"from-operator\""),
+            "a key under a quoted header must take the operator value: {merged}"
+        );
+        let reparsed = toml::from_str::<toml::Value>(&merged).expect("test: the merged file must still parse");
+        assert_eq!(
+            reparsed
+                .get("channels_config")
+                .and_then(|table| table.get("x.y"))
+                .and_then(|table| table.get("token"))
+                .and_then(toml::Value::as_str),
+            Some("from-operator"),
+            "the value must land on the quoted path, not on a split one: {merged}"
+        );
+        assert!(outcome.kept.contains("agent.\"my.key\""), "kept: {:?}", outcome.kept);
+        assert!(
+            outcome.kept.contains("channels_config.\"x.y\".token"),
+            "kept: {:?}",
+            outcome.kept
+        );
+    }
+
+    /// Whatever the rewriter still cannot place is named and fails the command.
+    /// Silence is the defect this whole area was built around.
+    #[test]
+    fn a_setting_that_cannot_be_folded_is_named_and_exits_non_zero() {
+        // An array of tables is left verbatim by the rewriter, so an operator
+        // value there has nowhere to go.
+        let template = "[[route]]\nname = \"from-template\"\n";
+        let previous =
+            toml::from_str::<toml::Value>("[[route]]\nname = \"from-operator\"\n").expect("test: parse previous");
+        let mut outcome = PreservationOutcome::default();
+
+        let _merged = apply_previous_settings(template, &previous, &previous, None, &mut outcome)
+            .expect("test: fold the previous configuration");
+        assert_eq!(
+            outcome.unfoldable.iter().cloned().collect::<Vec<_>>(),
+            vec!["route".to_string()],
+            "an unplaceable override must be recorded, not dropped in silence"
+        );
+
+        let mut report = InitReport::default();
+        report.record_preservation(&outcome, None);
+        let warning = report
+            .warnings()
+            .iter()
+            .find(|line| line.contains("could not fold"))
+            .expect("test: the operator must be warned");
+        assert!(warning.contains("route"), "the warning must name the key: {warning}");
+        let error = report
+            .into_result()
+            .expect_err("test: an unfoldable setting must exit non-zero");
+        assert!(format!("{error:#}").contains("route"), "{error:#}");
+    }
+
+    // ── Archive directories ──────────────────────────────────────
+
+    #[test]
+    fn archive_directories_never_overwrite_one_another() {
+        let tmp = tempfile::tempdir().expect("test: create tempdir");
+        let first = create_unique_archive_dir(tmp.path(), "config.d.pre-0.0.0-20260915120000000")
+            .expect("test: first archive directory");
+        let second = create_unique_archive_dir(tmp.path(), "config.d.pre-0.0.0-20260915120000000")
+            .expect("test: second archive directory");
+
+        assert_ne!(
+            first, second,
+            "a second archive with the same stamp must get its own directory"
+        );
+        assert!(first.is_dir() && second.is_dir(), "both archives must exist");
+    }
+
+    #[tokio::test]
+    async fn two_force_runs_in_the_same_second_keep_both_archives() {
+        let tmp = tempfile::tempdir().expect("test: create tempdir");
+        let dir = tmp.path();
+        Spec::Full.generate(dir, false).await.expect("test: generate full");
+
+        let memory_path = dir.join("config.d/memory.toml");
+        fs::write(
+            &memory_path,
+            "[memory]\nbackend = \"sqlite\"\nembedding_model = \"first-model\"\n",
+        )
+        .expect("test: write the first operator fragment");
+        Spec::Full.generate(dir, true).await.expect("test: first force");
+        fs::write(
+            &memory_path,
+            "[memory]\nbackend = \"sqlite\"\nembedding_model = \"second-model\"\n",
+        )
+        .expect("test: write the second operator fragment");
+        Spec::Full.generate(dir, true).await.expect("test: second force");
+
+        let mut archived_models = fs::read_dir(dir)
+            .expect("test: read target dir")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("config.d.pre-"))
+            })
+            .map(|archive| fs::read_to_string(archive.join("memory.toml")).unwrap_or_default())
+            .collect::<Vec<_>>();
+        archived_models.sort();
+
+        assert_eq!(
+            archived_models.len(),
+            2,
+            "each --force run must keep its own archive, found: {archived_models:?}"
+        );
+        assert!(
+            archived_models.iter().any(|body| body.contains("first-model")),
+            "the first run's archive must survive the second run: {archived_models:?}"
+        );
+        assert!(
+            archived_models.iter().any(|body| body.contains("second-model")),
+            "the second run's archive must exist: {archived_models:?}"
+        );
+    }
+
+    // ── Default refresh semantics ────────────────────────────────
+
+    /// Read the value a freshly rendered template writes for `path`, so these
+    /// tests state the *rule* and never a copy of a shipped default.
+    fn template_default(template: &str, path: &[&str]) -> toml::Value {
+        let value = toml::from_str::<toml::Value>(template).expect("test: the template must be valid TOML");
+        let owned = path.iter().map(|segment| (*segment).to_string()).collect::<Vec<_>>();
+        toml_lookup(&value, &owned)
+            .cloned()
+            .unwrap_or_else(|| panic!("test: the template must write {path:?}"))
+    }
+
+    #[tokio::test]
+    async fn force_refresh_separates_preserved_added_and_reset_defaults() {
+        let tmp = tempfile::tempdir().expect("test: create tempdir");
+        let dir = tmp.path();
+        Spec::Full.generate(dir, false).await.expect("test: generate full");
+
+        let template = memory_template(Spec::Full);
+        let shipped_auto_save = template_default(&template, &["memory", "auto_save"]);
+        let shipped_record_tool_events = template_default(&template, &["memory", "events", "record_tool_events"]);
+
+        // The tree on disk holds two values that differ from this build's
+        // templates. Only one of them was ever typed by the operator.
+        fs::write(
+            dir.join("config.d/memory.toml"),
+            "[memory]\nbackend = \"sqlite\"\nauto_save = false\n\n[memory.events]\nrecord_tool_events = true\n",
+        )
+        .expect("test: write operator memory fragment");
+        // The sidecar says `auto_save = false` is what the *previous* templates
+        // shipped, so it is a stale default; `record_tool_events` is recorded at
+        // its shipped value, so the operator's `true` is their own choice.
+        fs::write(
+            dir.join(MANAGED_DEFAULTS_FILE),
+            "[[entry]]\npath = [\"memory\", \"auto_save\"]\nvalue = false\n\n\
+             [[entry]]\npath = [\"memory\", \"events\", \"record_tool_events\"]\nvalue = false\n",
+        )
+        .expect("test: write the previous defaults record");
+
+        let report = Spec::Full
+            .generate_reported(dir, true)
+            .await
+            .expect("test: force regenerate");
+        let notices = report.notices().join("\n");
+
+        let config = crate::config::Config::load_from_path(&dir.join("config.toml"), dir.join("workspace"))
+            .expect("test: regenerated config must load");
+        assert_eq!(
+            toml::Value::Boolean(config.memory.auto_save),
+            shipped_auto_save,
+            "a default the operator never changed must follow the template: {notices}"
+        );
+        assert_ne!(
+            toml::Value::Boolean(config.memory.events.record_tool_events),
+            shipped_record_tool_events,
+            "a value the operator wrote must win over a refreshed default: {notices}"
+        );
+
+        let reset_line = report
+            .notices()
+            .iter()
+            .find(|line| line.contains("refreshed defaults"))
+            .expect("test: the refreshed defaults must be reported");
+        assert!(reset_line.contains("memory.auto_save"), "{reset_line}");
+        let preserved_line = report
+            .notices()
+            .iter()
+            .find(|line| line.contains("Preserved"))
+            .expect("test: the preserved settings must be reported");
+        assert!(
+            preserved_line.contains("memory.events.record_tool_events"),
+            "{preserved_line}"
+        );
+        let added_line = report
+            .notices()
+            .iter()
+            .find(|line| line.contains("new default(s) this version ships"))
+            .expect("test: keys this version adds must be reported");
+        assert!(
+            added_line.contains("memory.embedding_provider"),
+            "a key absent from the previous tree is an added default: {added_line}"
+        );
+        // The three classes are disjoint.
+        assert!(!reset_line.contains("memory.events.record_tool_events"), "{reset_line}");
+        assert!(!preserved_line.contains("memory.auto_save"), "{preserved_line}");
+    }
+
+    #[tokio::test]
+    async fn without_a_defaults_record_every_current_value_is_preserved() {
+        let tmp = tempfile::tempdir().expect("test: create tempdir");
+        let dir = tmp.path();
+        Spec::Full.generate(dir, false).await.expect("test: generate full");
+        assert!(
+            dir.join(MANAGED_DEFAULTS_FILE).is_file(),
+            "prx init must record which values came from its own templates"
+        );
+
+        fs::write(
+            dir.join("config.d/memory.toml"),
+            "[memory]\nbackend = \"sqlite\"\nauto_save = false\n",
+        )
+        .expect("test: write operator memory fragment");
+        // A tree written by a build that had no record at all.
+        fs::remove_file(dir.join(MANAGED_DEFAULTS_FILE)).expect("test: remove the defaults record");
+
+        let report = Spec::Full
+            .generate_reported(dir, true)
+            .await
+            .expect("test: force regenerate");
+
+        let config = crate::config::Config::load_from_path(&dir.join("config.toml"), dir.join("workspace"))
+            .expect("test: regenerated config must load");
+        assert!(
+            !config.memory.auto_save,
+            "with no record of the previous defaults, every value on disk counts as the operator's"
+        );
+        assert!(
+            report.notices().iter().all(|line| !line.contains("refreshed defaults")),
+            "nothing may be reset without evidence that it was a shipped default: {:?}",
+            report.notices()
+        );
     }
 
     #[test]

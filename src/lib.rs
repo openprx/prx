@@ -468,6 +468,27 @@ pub enum XinStepCommands {
 
 #[cfg(test)]
 mod module_ownership_tests {
+    /// `prx chat` sends tracing to `chat.log` before the configuration is even
+    /// loaded, so the inherited-embedding-default warning that `dispatch` logs
+    /// is invisible to exactly the users who pay for it every turn. The binary
+    /// has to write it to the real stderr instead, before dispatch hands the
+    /// screen to the TUI.
+    #[test]
+    fn the_binary_prints_the_embedding_upgrade_notice_for_chat() {
+        let main = include_str!("main.rs");
+        let call = "chat::print_embedding_upgrade_notice_to_stderr(&config);";
+        let notice_at = main
+            .find(call)
+            .expect("main.rs must print the inherited embedding default for chat");
+        let dispatch_at = main
+            .find("mode::dispatch(cli.command, config).await")
+            .expect("main.rs must dispatch");
+        assert!(
+            notice_at < dispatch_at,
+            "the notice must be printed before dispatch redirects nothing and the TUI takes the screen"
+        );
+    }
+
     #[test]
     fn binary_imports_the_library_module_graph() {
         let main = include_str!("main.rs");

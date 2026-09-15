@@ -631,6 +631,39 @@ fn format_compact_feedback(
     }
 }
 
+/// One plain line saying that local vector recall is on because the shipped
+/// default changed under this installation, not because anyone asked for it.
+///
+/// Collapsing whitespace guarantees a single line: the notice is rendered both
+/// into the TUI transcript, where a newline would break the message frame, and
+/// onto stderr, where it has to stay one grep-able line.
+pub(crate) fn format_embedding_upgrade_notice(notice: &str) -> String {
+    format!("note > {}", notice.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// The line `prx chat` shows for an inherited embedding default, or `None`
+/// once the operator has written the key either way.
+pub(crate) fn chat_embedding_upgrade_notice(config: &Config) -> Option<String> {
+    config
+        .embedding_default_upgrade_notice()
+        .map(format_embedding_upgrade_notice)
+}
+
+/// Print the inherited-default notice where a `prx chat` user can actually see
+/// it, before the TUI takes the screen.
+///
+/// `prx chat` redirects *tracing* into `chat.log`, so the warning `dispatch`
+/// logs for every long-running runtime is the one thing chat users never read.
+/// The process stderr is not redirected, so this reaches the terminal.
+// stderr is the only channel this has: the log goes to a file and the TUI has
+// not started yet.
+#[allow(clippy::print_stderr)]
+pub fn print_embedding_upgrade_notice_to_stderr(config: &Config) {
+    if let Some(line) = chat_embedding_upgrade_notice(config) {
+        eprintln!("{line}");
+    }
+}
+
 /// One line telling the user that context was dropped and cannot be recovered.
 ///
 /// A `switch` rollover that cannot resolve exact provenance has no summary and
@@ -2671,6 +2704,45 @@ mod compact_command_tests {
 
     /// Plain (`--plain` / piped) chat has no transcript renderer, so the whole
     /// signal has to fit in the single line that gets printed.
+    #[test]
+    fn embedding_upgrade_notice_prints_as_one_plain_line() {
+        let notice = format_embedding_upgrade_notice(crate::config::EMBEDDING_DEFAULT_UPGRADE_NOTICE);
+        assert!(!notice.contains('\n'), "the notice must be a single line: {notice:?}");
+        assert!(
+            notice.contains("embedding_provider"),
+            "the notice must name the key to write: {notice}"
+        );
+        assert!(
+            notice.contains("\"none\""),
+            "the notice must say how to turn vector recall off: {notice}"
+        );
+        // Plain mode pipes it as exactly one line.
+        let piped = format_fallback_chat_output_for(&notice, false);
+        assert_eq!(piped.lines().count(), 1, "plain output must be one line: {piped:?}");
+    }
+
+    #[test]
+    fn the_chat_notice_appears_only_while_the_default_is_inherited() {
+        let mut config = crate::config::Config::default();
+        config.memory.embedding_provider = "local".to_string();
+        config.memory.embedding_provider_explicit = false;
+        let notice = chat_embedding_upgrade_notice(&config).expect("test: an inherited default must be announced");
+        assert!(notice.starts_with("note > "), "{notice}");
+
+        config.memory.embedding_provider_explicit = true;
+        assert!(
+            chat_embedding_upgrade_notice(&config).is_none(),
+            "a key the operator wrote must not be nagged about"
+        );
+
+        config.memory.embedding_provider_explicit = false;
+        config.memory.embedding_provider = "none".to_string();
+        assert!(
+            chat_embedding_upgrade_notice(&config).is_none(),
+            "vector recall that is off has no upgrade to announce"
+        );
+    }
+
     #[test]
     fn context_degraded_notice_prints_as_one_plain_line() {
         let notice = format_context_degraded_notice(7);
@@ -4861,6 +4933,15 @@ pub async fn run(
     // sub-agent, or PTY is revived (those belonged to the prior process and are
     // long gone); any session that was still running at last exit shows as
     // `interrupted`.
+    // ── Inherited embedding default ──────────────────────────────
+    // The same notice `main` wrote to stderr, repeated on the first screen of
+    // the session: the stderr line is behind the alternate screen for as long
+    // as the TUI runs, and this is the entry point where vector recall costs
+    // something every turn.
+    if let Some(embedding_notice) = chat_embedding_upgrade_notice(&config) {
+        surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &embedding_notice);
+    }
+
     if !chat_session.background_sessions.is_empty() {
         let recap = format_reloaded_background_sessions(&chat_session.background_sessions);
         surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &recap);

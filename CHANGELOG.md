@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.129] - 15 September 2026
+
+### Fixed
+
+- `prx init --force` no longer discards a value written under a quoted key or a
+  quoted table header. The folder decoded key paths with a bare-key scanner that
+  returned nothing for a segment containing a quote, so `[cost.prices."gpt-4.1"]`
+  and `"gpt-4.1" = [...]` were neither carried over nor reported: the operator's
+  value was replaced by the shipped default in silence. Key paths are now
+  decoded and re-emitted through the TOML grammar itself, and anything the
+  rewriter still cannot place is named on stderr and exits the command non-zero
+  rather than disappearing.
+- Two `prx init --force` runs in the same second each keep their own archive.
+  The archive directory was stamped to the second and created with
+  `create_dir_all`, so the second run copied over the first run's files and the
+  earlier configuration was gone. The stamp carries milliseconds, the directory
+  is created exclusively, and a taken name takes a numeric suffix.
+
+### Changed
+
+- `prx init --force` refreshes defaults that moved instead of pinning the ones an
+  older `prx init` wrote. `prx init` records the values its own templates produce
+  in `.init-defaults.toml` next to `config.toml`, which lets `--force` tell a
+  value the operator typed from an untouched default. The report now prints the
+  three outcomes separately: preserved explicit settings, defaults this version
+  adds, and untouched settings reset to a refreshed default. A tree with no such
+  record keeps every value currently on disk, as before.
+- `prx chat` shows the inherited embedding-default notice where a chat user can
+  read it: one stderr line before the TUI takes the screen, and one line on the
+  first screen of the session. The warning `dispatch` logs went to `chat.log`,
+  which is exactly where the interactive entry point never looks.
+
+### Added
+
+- Tests for `starts_agent_runtime`, which decides which entry points announce the
+  inherited embedding default and previously had none.
+
 ## [0.8.128] - 15 September 2026
 
 ### Security

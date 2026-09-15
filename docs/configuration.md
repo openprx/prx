@@ -777,6 +777,14 @@ embedding_provider not set; defaulting to local vector recall since 0.8.10x,
 set memory.embedding_provider = "none" to disable
 ```
 
+`prx chat` redirects its log to `chat.log`, so for that entry point the line is
+also written to stderr before the TUI takes the screen and shown once on the
+first screen of the session:
+
+```
+note > embedding_provider not set; defaulting to local vector recall since 0.8.10x, set memory.embedding_provider = "none" to disable
+```
+
 Write the key either way to settle it and silence the notice:
 
 ```toml
@@ -797,9 +805,49 @@ directory and every preserved key are listed on stdout:
 ```
 PRX configuration initialized (full)
   Config dir: /home/you/.openprx
-  Previous configuration archived to /home/you/.openprx/config.d.pre-0.8.126-20260914T101500
+  Previous configuration archived to /home/you/.openprx/config.d.pre-0.8.126-20260914101500123
   Preserved 4 explicit setting(s): memory.embedding_provider, ...
+  Added 2 new default(s) this version ships: memory.vector_candidate_cap, ...
+  Reset 1 unset setting(s) to refreshed defaults: agent.max_iterations
 ```
+
+##### What `--force` does to each key
+
+`--force` sorts every key in the managed templates into exactly one of three
+classes, and prints each class as its own line:
+
+| Class | What it means | What lands on disk |
+|---|---|---|
+| **preserved** | you wrote the value | your value |
+| **added-default** | this version ships a key your tree never had | the new default |
+| **reset** | you never changed the key and its shipped default has moved | the new default |
+
+Telling "you wrote it" apart from "an older `prx init` wrote it" needs a record
+of what the templates themselves produced, so `prx init` writes one next to
+`config.toml`:
+
+```
+~/.openprx/.init-defaults.toml     # mode 0600, not part of the merged config
+```
+
+Delete it and nothing breaks: `--force` then treats every value currently on
+disk as yours and refreshes no defaults at all — the conservative direction. A
+value you wrote that happens to equal the *previous* shipped default is
+indistinguishable from an untouched default and is refreshed with it.
+
+##### Quoted keys and archives
+
+Quoted keys and quoted table headers are ordinary configuration —
+`[cost.prices."gpt-4.1"]`, `[reliability.model_fallbacks]` with `"gpt-4.1" = [...]`
+— and are folded and re-emitted with their quoting intact. Anything `--force`
+still cannot place is named on stderr and makes the command exit non-zero; it is
+never dropped quietly.
+
+Each `--force` run gets its own archive. The stamp carries milliseconds and a
+taken name gets a `-2`, `-3` suffix, so two runs in the same second produce two
+archives rather than one overwriting the other. Archives are never cleaned up
+and they contain the encrypted credentials that were in the tree at the time, so
+prune `config.d.pre-*` yourself after a key rotation.
 
 If the preserved values cannot be validated against this build, `--force` still
 repairs the tree — that is what it is for — but it does so loudly rather than

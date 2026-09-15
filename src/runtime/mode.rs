@@ -697,6 +697,18 @@ mod tests {
         assert!(!should_bind_signal(&agent_single(false, false)));
     }
 
+    fn chat_command() -> Commands {
+        Commands::Chat {
+            provider: None,
+            model: None,
+            temperature: 0.7,
+            plain: false,
+            session: None,
+            continue_last: false,
+            list_sessions: false,
+        }
+    }
+
     #[test]
     fn whitelist_excludes_chat() {
         // chat owns ctrl_c internally (single-press cancel / double-press exit);
@@ -721,6 +733,50 @@ mod tests {
         assert!(!should_bind_signal(&Commands::Channel {
             channel_command: ChannelCommands::List
         }));
+    }
+
+    // ── starts_agent_runtime ─────────────────────────────────────
+    //
+    // This list decides whether an operator is told that local vector recall is
+    // on because the shipped default moved. Dropping an entry costs a silent
+    // per-turn embedding on that entry point, so every branch is pinned.
+
+    #[test]
+    fn long_running_runtimes_announce_the_inherited_embedding_default() {
+        assert!(starts_agent_runtime(&chat_command()));
+        assert!(starts_agent_runtime(&Commands::Gateway { port: None, host: None }));
+        assert!(starts_agent_runtime(&Commands::Daemon { port: None, host: None }));
+        assert!(starts_agent_runtime(&Commands::Channel {
+            channel_command: ChannelCommands::Start
+        }));
+    }
+
+    #[test]
+    fn short_lived_and_query_commands_do_not_announce_it() {
+        // `agent` runs one turn and exits, in either shape; the notice belongs
+        // on the entry points that keep paying for the default every turn.
+        assert!(!starts_agent_runtime(&agent_single(true, false)));
+        assert!(!starts_agent_runtime(&agent_single(false, false)));
+        // Only `channel start` is a runtime; the rest are queries.
+        assert!(!starts_agent_runtime(&Commands::Channel {
+            channel_command: ChannelCommands::Doctor
+        }));
+        assert!(!starts_agent_runtime(&Commands::Channel {
+            channel_command: ChannelCommands::List
+        }));
+        assert!(!starts_agent_runtime(&Commands::Status));
+        assert!(!starts_agent_runtime(&Commands::Providers));
+        assert!(!starts_agent_runtime(&Commands::Doctor { doctor_command: None }));
+    }
+
+    /// The two whitelists are deliberately different: chat owns its own ctrl_c
+    /// and must never get a dispatch-owned signal task, but it is exactly the
+    /// entry point that has to carry the notice.
+    #[test]
+    fn chat_is_the_one_command_the_two_whitelists_disagree_on() {
+        let chat = chat_command();
+        assert!(starts_agent_runtime(&chat));
+        assert!(!should_bind_signal(&chat));
     }
 
     #[test]

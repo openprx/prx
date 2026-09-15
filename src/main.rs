@@ -1397,6 +1397,15 @@ async fn async_main() -> Result<()> {
         config::set_process_config_dir(resolved_config_dir.to_path_buf());
     }
 
+    // `dispatch` logs the inherited-embedding-default notice for every
+    // long-running runtime, but chat's tracing has already been redirected into
+    // chat.log by this point, so for the one interactive entry point the
+    // warning went somewhere nobody looks. The process stderr is untouched by
+    // that redirect and the TUI has not taken the screen yet.
+    if matches!(&cli.command, Commands::Chat { .. }) {
+        chat::print_embedding_upgrade_notice_to_stderr(&config);
+    }
+
     mode::dispatch(cli.command, config).await
 }
 
