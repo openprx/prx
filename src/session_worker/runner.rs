@@ -1488,6 +1488,9 @@ where
                     // A resumed spawn-run process (not a turn root): children
                     // compute spawn_depth + 1, preserving the manifest depth chain.
                     is_turn_root: false,
+                    // A resumed worker re-reads its surface from the manifest;
+                    // the parent turn's channel exclusions are not part of it.
+                    channel_excluded_tools: Vec::new(),
                 },
                 fut,
             )

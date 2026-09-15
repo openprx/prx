@@ -1,4 +1,6 @@
 use super::ToolSpec;
+use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
 use std::fmt::Write;
 
 const HARDWARE_PROMPT_TOOL_NAMES: &[&str] = &[
@@ -30,6 +32,42 @@ pub fn render_hardware_access_guidance(tools: &[ToolSpec]) -> String {
         .to_string()
 }
 
+/// Content digest of one specification, used to break ties between entries
+/// that share a name.
+///
+/// Length-prefixed so `name`/`description` boundaries cannot be forged by
+/// concatenation, and computed over the serialized schema so two specs are
+/// equal here exactly when they would render identically.
+fn tool_spec_content_digest(spec: &ToolSpec) -> [u8; 32] {
+    let parameters = serde_json::to_vec(&spec.parameters).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    for field in [spec.name.as_bytes(), spec.description.as_bytes(), parameters.as_slice()] {
+        hasher.update(field.len().to_be_bytes());
+        hasher.update(field);
+    }
+    hasher.finalize().into()
+}
+
+/// Order two specifications so the result depends only on their contents:
+/// by name, then by content digest.
+fn compare_tool_specs(left: &ToolSpec, right: &ToolSpec) -> Ordering {
+    left.name.cmp(&right.name).then_with(|| {
+        if left.description == right.description && left.parameters == right.parameters {
+            Ordering::Equal
+        } else {
+            tool_spec_content_digest(left).cmp(&tool_spec_content_digest(right))
+        }
+    })
+}
+
+/// True when `ordered` (already name-sorted) carries two entries under one name.
+fn has_duplicate_names(ordered: &[&ToolSpec]) -> bool {
+    ordered.windows(2).any(|pair| match pair {
+        [left, right] => left.name == right.name,
+        _ => false,
+    })
+}
+
 /// Return the snapshot in canonical order: sorted by tool name, one entry per
 /// name.
 ///
@@ -39,12 +77,42 @@ pub fn render_hardware_access_guidance(tools: &[ToolSpec]) -> String {
 /// section a pure function of the exposed *set*, so two turns that expose the
 /// same tools produce byte-identical system prompts and the provider-side
 /// prefix cache keeps hitting.
+///
+/// Two entries may share a name and still differ (an MCP or WASM alias that
+/// shadows a built-in, or a middleware pass that rewrote one description). A
+/// plain "keep the first" dedup would then answer with whichever copy the
+/// registry happened to yield first, which is the one thing this function
+/// exists to rule out. Ties are therefore broken by content digest, so the
+/// surviving entry is a function of the set and not of its order.
 #[must_use]
 pub fn canonical_tool_order(tools: &[ToolSpec]) -> Vec<&ToolSpec> {
     let mut ordered: Vec<&ToolSpec> = tools.iter().collect();
     ordered.sort_by(|left, right| left.name.cmp(&right.name));
+    if !has_duplicate_names(&ordered) {
+        return ordered;
+    }
+    ordered.sort_by(|left, right| compare_tool_specs(left, right));
     ordered.dedup_by(|left, right| left.name == right.name);
     ordered
+}
+
+/// [`canonical_tool_order`] applied to an owned snapshot, in place.
+///
+/// The borrowing form is what the prompt renderers want; a caller that already
+/// owns the snapshot (the per-iteration compile in
+/// [`crate::agent::turn_context`]) would have to deep-copy every `ToolSpec` —
+/// tens of kilobytes of JSON schema per iteration — just to reach the same
+/// ordering. Sorting the owned vector reaches it with no allocation at all.
+pub fn canonicalize_tool_order(tools: &mut Vec<ToolSpec>) {
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    if !tools.windows(2).any(|pair| match pair {
+        [left, right] => left.name == right.name,
+        _ => false,
+    }) {
+        return;
+    }
+    tools.sort_by(|left, right| compare_tool_specs(left, right));
+    tools.dedup_by(|left, right| left.name == right.name);
 }
 
 /// Render the compact, authoritative capability inventory for one provider
@@ -194,6 +262,93 @@ mod tests {
             "duplicate names must not inflate the count: {rendered}"
         );
         assert_eq!(rendered.matches("`shell`").count(), 1);
+    }
+
+    fn spec_with(name: &str, description: &str, field: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.to_string(),
+            description: description.to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {field: {"type": "string"}}}),
+        }
+    }
+
+    /// Two entries under one name that genuinely differ — an alias shadowing a
+    /// built-in, or a middleware pass that rewrote one description. Which of
+    /// them survives must be decided by their contents, never by the order the
+    /// registry happened to yield them in.
+    ///
+    /// MUTATION GUARD: restore the plain `dedup_by` that keeps the first entry
+    /// and both assertions below go red.
+    #[test]
+    fn colliding_tool_names_collapse_to_the_same_entry_in_either_order() {
+        let registry_order = vec![
+            spec_with("shell", "run a shell command", "command"),
+            spec_with("file_read", "read a file", "path"),
+            spec_with("shell", "ALIAS shell that shadows the built-in", "cmd"),
+        ];
+        let mut alias_first = registry_order.clone();
+        alias_first.swap(0, 2);
+
+        let forward = canonical_tool_order(&registry_order);
+        let reversed = canonical_tool_order(&alias_first);
+
+        assert_eq!(forward.len(), 2, "one entry per name: {forward:?}");
+        assert_eq!(
+            forward.iter().map(|spec| spec.description.as_str()).collect::<Vec<_>>(),
+            reversed
+                .iter()
+                .map(|spec| spec.description.as_str())
+                .collect::<Vec<_>>(),
+            "the surviving entry must not depend on input order"
+        );
+        assert_eq!(
+            render_prompt_guided_tool_protocol(&registry_order),
+            render_prompt_guided_tool_protocol(&alias_first),
+            "a reordered collision must still render byte-identically"
+        );
+    }
+
+    /// The owned form must reach exactly the borrowing form's answer, including
+    /// the collision tie-break, because the compiled turn context uses it to
+    /// avoid a per-iteration deep copy.
+    #[test]
+    fn the_in_place_canonicalizer_matches_the_borrowing_one() {
+        let registry_order = vec![
+            spec_with("shell", "run a shell command", "command"),
+            spec_with("web_search", "search the web", "query"),
+            spec_with("shell", "ALIAS shell that shadows the built-in", "cmd"),
+            spec_with("file_read", "read a file", "path"),
+        ];
+        fn shape(specs: &[ToolSpec]) -> Vec<(&str, &str, String)> {
+            specs
+                .iter()
+                .map(|spec| {
+                    (
+                        spec.name.as_str(),
+                        spec.description.as_str(),
+                        spec.parameters.to_string(),
+                    )
+                })
+                .collect()
+        }
+        let borrowed = canonical_tool_order(&registry_order)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let expected = shape(&borrowed);
+
+        let mut owned = registry_order.clone();
+        canonicalize_tool_order(&mut owned);
+        let mut reversed = registry_order;
+        reversed.reverse();
+        canonicalize_tool_order(&mut reversed);
+
+        assert_eq!(shape(&owned), expected);
+        assert_eq!(
+            shape(&reversed),
+            expected,
+            "the in-place form must be order-independent too"
+        );
     }
 
     #[test]

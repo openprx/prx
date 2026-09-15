@@ -22,13 +22,20 @@
     clippy::indexing_slicing
 )]
 
-use crate::agent::loop_::{build_runtime_system_prompt, select_prompt_skills};
+use crate::agent::loop_::{
+    ChatMode, ToolLoopMemory, ToolLoopOutcome, build_runtime_system_prompt, run_tool_call_loop_outcome,
+    select_prompt_skills,
+};
 use crate::config::{Config, ToolTieringConfig};
 use crate::memory::embeddings::LocalHashEmbedding;
+use crate::providers::traits::{ChatMessage, ChatRequest, ChatResponse, Provider};
 use crate::skills::{SessionSkillExposure, Skill, SkillTool};
 use crate::tools::intent::{SessionToolExposure, SessionToolSurface, UnroutedToolPolicy, resolve_tools_for_intent};
 use crate::tools::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const MODEL: &str = "prefix-stability-model";
 
@@ -355,5 +362,153 @@ async fn the_real_system_prompt_is_a_pure_function_of_the_exposed_skill_set() {
         a,
         build_runtime_system_prompt(&config, MODEL, &dropped, true),
         "changing the exposed set must still change the prompt"
+    );
+}
+
+/// Records the system prefix of every provider request, and answers the first
+/// call with an empty response so the loop takes its corrective-retry path.
+struct RetryPrefixProvider {
+    calls: AtomicUsize,
+    system_digests: parking_lot::Mutex<Vec<String>>,
+    tail_roles: parking_lot::Mutex<Vec<String>>,
+    saw_late_system: parking_lot::Mutex<bool>,
+}
+
+impl RetryPrefixProvider {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            system_digests: parking_lot::Mutex::new(Vec::new()),
+            tail_roles: parking_lot::Mutex::new(Vec::new()),
+            saw_late_system: parking_lot::Mutex::new(false),
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for RetryPrefixProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        anyhow::bail!("the prefix stability fixture always uses the chat path")
+    }
+
+    async fn chat(&self, request: ChatRequest<'_>, _model: &str, _temperature: f64) -> anyhow::Result<ChatResponse> {
+        if request
+            .messages
+            .iter()
+            .enumerate()
+            .any(|(index, message)| message.role == "system" && index != 0)
+        {
+            *self.saw_late_system.lock() = true;
+        }
+        let system = request
+            .messages
+            .first()
+            .filter(|message| message.role == "system")
+            .map(|message| message.content.as_str())
+            .unwrap_or_default();
+        self.system_digests
+            .lock()
+            .push(format!("{:x}", Sha256::digest(system.as_bytes())));
+        if let Some(last) = request.messages.last() {
+            self.tail_roles.lock().push(format!("{}:{}", last.role, last.content));
+        }
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            // An empty answer with no tool calls: exactly what triggers the
+            // corrective retry that used to append request-local system context.
+            return Ok(ChatResponse {
+                text: Some(String::new()),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            });
+        }
+        Ok(ChatResponse {
+            text: Some("Recovered answer.".to_string()),
+            tool_calls: Vec::new(),
+            reasoning_content: None,
+        })
+    }
+}
+
+/// A corrective retry is the one place inside a turn that adds request-local
+/// instructions. Folding them into the leading system message rewrote the
+/// prefix every cache-aware provider keys on — on the turn that has already
+/// paid for one wasted provider call.
+///
+/// MUTATION GUARD: push the two retry instructions as `ChatMessage::system`
+/// again and the digest assertion goes red.
+#[tokio::test]
+async fn a_corrective_retry_round_does_not_move_the_system_prefix() {
+    let workspace = tempfile::TempDir::new().expect("fixture workspace");
+    let provider = RetryPrefixProvider::new();
+    let tools: Vec<Box<dyn Tool>> = Vec::new();
+    let mut history = vec![
+        ChatMessage::system("You are a helpful assistant.\n\n## Identity\n\nPRX."),
+        ChatMessage::user("what changed in rustls lately"),
+    ];
+
+    let (outcome, _trace) = run_tool_call_loop_outcome(
+        &provider,
+        &mut history,
+        Arc::new(tools),
+        &crate::observability::NoopObserver,
+        &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
+        "mock-provider",
+        MODEL,
+        0.0,
+        true,
+        None,
+        "terminal",
+        &crate::config::MultimodalConfig::default(),
+        2,
+        false,
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        ToolLoopMemory::none(),
+        ChatMode::default(),
+        None,
+        false,
+        None,
+    )
+    .await
+    .expect("the corrective retry must complete the turn");
+
+    assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "Recovered answer."));
+
+    let digests = provider.system_digests.lock().clone();
+    assert_eq!(digests.len(), 2, "the fixture must actually retry once");
+    assert_eq!(
+        digests[0], digests[1],
+        "the retry round must send a byte-identical system prefix"
+    );
+    assert!(
+        !*provider.saw_late_system.lock(),
+        "no request may carry a system message outside index 0"
+    );
+
+    // Fixture proof: the corrective instruction really did reach the retry, at
+    // the tail, so the assertion above is not passing because nothing was added.
+    let tails = provider.tail_roles.lock().clone();
+    assert!(
+        tails[1].starts_with("user:") && tails[1].contains("The previous assistant response was empty."),
+        "the retry instruction must ride at the tail of the request: {}",
+        tails[1]
+    );
+    assert!(
+        history
+            .iter()
+            .all(|message| !message.content.contains("The previous assistant response was empty.")),
+        "the corrective instruction must stay request-local"
     );
 }

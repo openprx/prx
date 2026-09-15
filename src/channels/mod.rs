@@ -3701,10 +3701,14 @@ async fn run_channel_turn(
     // itself a spawn). The session scope key mirrors the spawn scope convention
     // (channel:chat_id:sender) so children share the turn's session scope.
     let turn_spawn_session_scope_key = format!("{}:{}:{}", msg.channel, msg.reply_target, msg.sender);
+    // The channel surface's hidden tool names travel with the context: a
+    // sub-agent spawned from this turn answers the same conversation partner, so
+    // it runs behind the same boundary instead of the full operator surface.
     let turn_spawn_ctx = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
         turn_run_id.clone(),
         turn_spawn_session_scope_key,
-    );
+    )
+    .with_channel_excluded_tools(message_runtime.tool_tiering.always_exclude.clone());
     let turn_message_send_ctx = target_channel.as_ref().map(|channel| {
         crate::tools::message_send::MessageSendExecutionContext::new(
             Some(msg.reply_target.clone()),

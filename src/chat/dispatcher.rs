@@ -2367,18 +2367,34 @@ impl ReasoningProgressBatcher {
         self.last_emit_ms = Some(now_ms);
         Some(std::mem::take(&mut self.pending))
     }
+
+    /// Emit whatever is still buffered when the stream ends.
+    ///
+    /// Without this the last window's worth of reasoning — everything after the
+    /// final 120 ms boundary — was simply dropped, so the live counter stopped
+    /// short of the body the terminal action goes on to publish.
+    /// [`StreamChunkCoalescer`] has always had this; the reasoning batcher did
+    /// not.
+    fn flush(&mut self) -> Option<String> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        Some(std::mem::take(&mut self.pending))
+    }
 }
 
 struct ReduxToolLoopEventSink {
     provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
     draft_id: String,
     action_tx: mpsc::Sender<Action>,
-    version: AtomicU64,
+    version: Arc<AtomicU64>,
     /// Authoritative full reasoning body for this turn — the single source of
     /// truth replayed in the terminal action. The reducer only ever receives
     /// deltas for its live counter, never a second full copy.
     reasoning: Arc<ParkingMutex<String>>,
-    reasoning_progress: ParkingMutex<ReasoningProgressBatcher>,
+    /// Shared with the driver so the tail of the last throttle window is still
+    /// published when the loop returns.
+    reasoning_progress: Arc<ParkingMutex<ReasoningProgressBatcher>>,
 }
 
 #[async_trait]
@@ -2606,13 +2622,15 @@ async fn drive_start_turn_stream(
     }
 
     let reasoning = Arc::new(ParkingMutex::new(String::new()));
+    let reasoning_progress = Arc::new(ParkingMutex::new(ReasoningProgressBatcher::default()));
+    let stream_version = Arc::new(AtomicU64::new(0));
     let events: Arc<dyn crate::agent::loop_::ToolLoopEventSink> = Arc::new(ReduxToolLoopEventSink {
         provider_turn_task_id,
         draft_id: draft_id.clone(),
         action_tx: action_tx.clone(),
-        version: AtomicU64::new(0),
+        version: Arc::clone(&stream_version),
         reasoning: Arc::clone(&reasoning),
-        reasoning_progress: ParkingMutex::new(ReasoningProgressBatcher::default()),
+        reasoning_progress: Arc::clone(&reasoning_progress),
     });
     let runtime_adapter = crate::agent::loop_::ToolLoopRuntimeAdapter {
         events: Some(events),
@@ -2693,6 +2711,18 @@ async fn drive_start_turn_stream(
     };
 
     let final_text = outcome.into_text();
+    // Publish the tail of the last throttle window before the terminal action
+    // retires the draft: after it the reducer drops reasoning deltas as stale.
+    let trailing_reasoning = reasoning_progress.lock().flush();
+    if let Some(batch) = trailing_reasoning {
+        let _ = action_tx
+            .send(Action::StreamReasoningReceived {
+                draft_id: draft_id.clone(),
+                delta: batch,
+                version: stream_version.fetch_add(1, Ordering::Relaxed).saturating_add(1),
+            })
+            .await;
+    }
     if trace.tokens_used.is_reported()
         && action_tx
             .send(Action::StreamUsageMetered {
@@ -2745,509 +2775,6 @@ async fn drive_start_turn_stream(
         }
     };
     let _ = action_tx.send(terminal).await;
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-#[allow(clippy::too_many_arguments)]
-#[tracing::instrument(
-    skip_all,
-    fields(
-        draft_id = %draft_id,
-        model = %model,
-    )
-)]
-async fn drive_start_turn_stream_legacy(
-    provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
-    provider: Arc<dyn Provider>,
-    mut history: Vec<crate::providers::traits::ChatMessage>,
-    mut compaction_guard_history: Vec<crate::providers::traits::ChatMessage>,
-    model: String,
-    temperature: f64,
-    compaction_config: Option<crate::config::AgentCompactionConfig>,
-    cancel: CancellationToken,
-    draft_id: String,
-    action_tx: mpsc::Sender<Action>,
-    tools_registry: Option<Arc<Vec<Box<dyn crate::tools::Tool>>>>,
-    tool_execution_service: Option<Arc<ToolExecutionService>>,
-    tool_execution_context: ToolExecutionContext,
-    chat_mode: crate::agent::loop_::ChatMode,
-) {
-    let mut version: u64 = 0;
-    let mut accumulated = String::new();
-    let mut reasoning_buf = String::new();
-    let mut usage_accumulator = ProviderUsageAccumulator::new();
-    let mut last_compaction_feedback: Option<String> = None;
-    let mut last_injection_overbudget_feedback: Option<String> = None;
-    // tool_call_ids already executed (guards against re-running the same tool after a context overflow retry).
-    let mut executed_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // BUG-03: count how many times each unrecoverable tool-failure signature has
-    // been seen this turn. When the model re-issues the *same* permanently-blocked
-    // call (permission denied / not allowed / rejected …) the count climbs; once it
-    // recurs we stop the turn early instead of retrying indefinitely.
-    let mut unrecoverable_seen: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
-    let stream_tool_specs: Vec<crate::tools::ToolSpec> = build_dispatcher_tool_specs(tools_registry.as_deref());
-
-    'outer: loop {
-        if let Some(config) = compaction_config.as_ref() {
-            let budget = crate::agent::loop_::plan_context_budget(
-                &history,
-                config,
-                crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
-            );
-            if budget.over_hard_limit {
-                let turns_before = chat_history_turn_count(&history);
-                let tokens_before = super::estimate_chat_history_tokens(&history);
-                let injection_overbudget_diagnostic =
-                    redux_injection_overbudget_diagnostic_text(&history, &compaction_guard_history, config);
-                let compaction_off = matches!(config.mode, crate::config::AgentCompactionMode::Off);
-                let messages_before_rollover = history.len();
-                let outcome = if compaction_off {
-                    ContextRolloverOutcome::default()
-                } else {
-                    match apply_redux_context_rollover(
-                        provider.as_ref(),
-                        &mut history,
-                        &mut compaction_guard_history,
-                        &model,
-                        config,
-                        None,
-                        &action_tx,
-                        crate::chat::action::CompactReason::ContextOverflow,
-                        "redux_preflight",
-                    )
-                    .await
-                    {
-                        Ok(outcome) => outcome,
-                        Err(()) => return,
-                    }
-                };
-                let summary_replacement_len = outcome.replacement_len;
-                let after_compact = crate::agent::loop_::plan_context_budget(
-                    &history,
-                    config,
-                    crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
-                );
-                if compaction_off || after_compact.over_hard_limit {
-                    let trimmed = trim_redux_driver_context_budget_after_rollover(
-                        &mut history,
-                        &mut compaction_guard_history,
-                        config,
-                        summary_replacement_len,
-                    );
-                    tracing::warn!(
-                        before_used_tokens = budget.used_tokens,
-                        after_compact_tokens = after_compact.used_tokens,
-                        hard_limit = after_compact.available_input_tokens,
-                        compaction_off,
-                        summary_applied = summary_replacement_len.is_some(),
-                        trimmed,
-                        "redux driver context budget preflight remediated with summary-compaction/token-aware trim"
-                    );
-                }
-                if outcome.degraded
-                    && send_context_degraded_notice(
-                        &action_tx,
-                        crate::chat::action::CompactReason::ContextOverflow,
-                        messages_before_rollover.saturating_sub(history.len()),
-                    )
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-                if send_redux_injection_overbudget_diagnostic(
-                    &action_tx,
-                    injection_overbudget_diagnostic,
-                    "redux_preflight_injection_overbudget_diagnostic",
-                    &mut last_injection_overbudget_feedback,
-                )
-                .await
-                .is_err()
-                {
-                    return;
-                }
-                if send_redux_context_window_update(
-                    &action_tx,
-                    &history,
-                    config,
-                    "redux_preflight_context_window_updated",
-                )
-                .await
-                .is_err()
-                {
-                    return;
-                }
-                if send_redux_compaction_feedback(
-                    &action_tx,
-                    turns_before,
-                    tokens_before,
-                    &history,
-                    config,
-                    "redux_preflight_compaction_feedback",
-                    &mut last_compaction_feedback,
-                )
-                .await
-                .is_err()
-                {
-                    return;
-                }
-            } else if budget.over_warning {
-                tracing::info!(
-                    used_tokens = budget.used_tokens,
-                    warning_threshold = budget.warning_threshold_tokens,
-                    hard_limit = budget.available_input_tokens,
-                    "redux driver context budget warning threshold crossed"
-                );
-            }
-        }
-
-        // ── one stream pass + backoff retry ─────────────────────────
-        let pass = run_one_stream_pass_with_retry(
-            provider.as_ref(),
-            &history,
-            &model,
-            temperature,
-            &cancel,
-            &draft_id,
-            &action_tx,
-            &mut version,
-            &mut reasoning_buf,
-            &stream_tool_specs,
-        )
-        .await;
-
-        match pass {
-            StreamPassOutcome::Completed { iter_text, usage } => {
-                usage_accumulator.record(usage);
-                accumulated.push_str(&iter_text);
-                break 'outer;
-            }
-            StreamPassOutcome::ContextOverflow { err } => {
-                let turns_before_compaction = chat_history_turn_count(&history);
-                let tokens_before_compaction = super::estimate_chat_history_tokens(&history);
-                let compaction_feedback_before = compaction_config.as_ref().map(|config| {
-                    (
-                        chat_history_turn_count(&history),
-                        super::estimate_chat_history_tokens(&history),
-                        config.clone(),
-                    )
-                });
-                match compaction_config.as_ref() {
-                    Some(config) if matches!(config.mode, crate::config::AgentCompactionMode::Off) => {
-                        let trimmed = crate::agent::loop_::trim_history_to_context_budget(&mut history, config);
-                        tracing::warn!(
-                            trimmed,
-                            "redux driver context-overflow retry used trim-only because compaction mode is Off"
-                        );
-                    }
-                    Some(config) => {
-                        let messages_before_rollover = history.len();
-                        let outcome = match apply_redux_context_rollover(
-                            provider.as_ref(),
-                            &mut history,
-                            &mut compaction_guard_history,
-                            &model,
-                            config,
-                            None,
-                            &action_tx,
-                            crate::chat::action::CompactReason::ContextOverflow,
-                            "redux_overflow_retry",
-                        )
-                        .await
-                        {
-                            Ok(outcome) => outcome,
-                            Err(()) => return,
-                        };
-                        if outcome.replacement_len.is_none() {
-                            let trimmed = trim_redux_driver_context_budget_after_rollover(
-                                &mut history,
-                                &mut compaction_guard_history,
-                                config,
-                                None,
-                            );
-                            tracing::warn!(
-                                trimmed,
-                                "redux driver context-overflow retry summary unavailable; used token-aware trim"
-                            );
-                        }
-                        if outcome.degraded
-                            && send_context_degraded_notice(
-                                &action_tx,
-                                crate::chat::action::CompactReason::ContextOverflow,
-                                messages_before_rollover.saturating_sub(history.len()),
-                            )
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    None => {
-                        crate::chat::state::compact_history_in_place(&mut history);
-                        if let Err(e) = action_tx
-                            .send(Action::HistoryCompacted {
-                                reason: crate::chat::action::CompactReason::ContextOverflow,
-                            })
-                            .await
-                        {
-                            tracing::debug!(error = %e, "StartTurn: action_tx closed on compact-dispatch");
-                            return;
-                        }
-                    }
-                }
-                if let Some((turns_before, tokens_before, config)) = compaction_feedback_before {
-                    if send_redux_context_window_update(
-                        &action_tx,
-                        &history,
-                        &config,
-                        "redux_overflow_context_window_updated",
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return;
-                    }
-                    if send_redux_compaction_feedback(
-                        &action_tx,
-                        turns_before,
-                        tokens_before,
-                        &history,
-                        &config,
-                        "redux_overflow_compaction_feedback",
-                        &mut last_compaction_feedback,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return;
-                    }
-                }
-                let made_progress = chat_history_turn_count(&history) < turns_before_compaction
-                    || super::estimate_chat_history_tokens(&history) < tokens_before_compaction;
-                if !made_progress {
-                    let action = Action::StreamFailed {
-                        draft_id: draft_id.clone(),
-                        err: format!("context overflow and compaction made no progress: {err}"),
-                        retryable: false,
-                    };
-                    if let Err(e) = action_tx.send(action).await {
-                        tracing::debug!(error = %e, "StartTurn: action_tx closed on overflow-no-progress");
-                    }
-                    return;
-                }
-                continue 'outer;
-            }
-            StreamPassOutcome::TransientNetworkError { err } => {
-                // backoff was already exhausted inside run_one_stream_pass_with_retry, so fail hard directly.
-                let action = Action::StreamFailed {
-                    draft_id: draft_id.clone(),
-                    err,
-                    retryable: false,
-                };
-                if let Err(e) = action_tx.send(action).await {
-                    tracing::debug!(error = %e, "StartTurn: action_tx closed on net-exhausted");
-                }
-                return;
-            }
-            StreamPassOutcome::HardError { err, retryable } => {
-                let action = Action::StreamFailed {
-                    draft_id: draft_id.clone(),
-                    err,
-                    retryable,
-                };
-                if let Err(e) = action_tx.send(action).await {
-                    tracing::debug!(error = %e, "StartTurn: action_tx closed on hard-error");
-                }
-                return;
-            }
-            StreamPassOutcome::Cancelled | StreamPassOutcome::SenderClosed => return,
-            StreamPassOutcome::ToolCallRequested {
-                calls,
-                iter_text,
-                reasoning_content,
-                usage,
-            } => {
-                usage_accumulator.record(usage);
-                // Entering a tool round requires the canonical execution
-                // service assembled from the same registry advertised above.
-                if tool_execution_service.is_none() {
-                    let action = Action::StreamFailed {
-                        draft_id: draft_id.clone(),
-                        err: "redux driver: tool_calls received but no ToolExecutionService is available".to_string(),
-                        retryable: false,
-                    };
-                    if let Err(e) = action_tx.send(action).await {
-                        tracing::debug!(error = %e, "StartTurn: action_tx closed on missing tool service");
-                    }
-                    return;
-                }
-
-                // 1) Append the assistant tool_call to history. The OpenAI protocol serializes the assistant
-                //    tool_call as JSON with empty content; we use a more compact marker string that is compatible
-                //    with ChatMessage (which has no dedicated tool_calls field). legacy run_tool_call_loop uses
-                //    build_native_assistant_history for a richer format; here the driver degrades conservatively —
-                //    JSON gives full tool_call context next pass; use structured fields once provider native lands.
-                let assistant_payload = serde_json::json!({
-                    "tool_calls": calls.iter().map(|c| serde_json::json!({
-                        "id": c.id,
-                        "type": "function",
-                        "function": { "name": c.name, "arguments": c.args },
-                    })).collect::<Vec<_>>(),
-                    "content": iter_text,
-                    "reasoning_content": reasoning_content,
-                });
-                history.push(crate::providers::traits::ChatMessage {
-                    role: "assistant".to_string(),
-                    content: assistant_payload.to_string(),
-                });
-
-                // 2) Execute each tool call in order.
-                // BUG-03: signature of an unrecoverable failure that recurred this
-                // pass — set to stop the turn after history is fully populated.
-                let mut repeated_unrecoverable: Option<String> = None;
-                for call in calls {
-                    if executed_tool_ids.contains(&call.id) {
-                        tracing::debug!(
-                            tool_id = %call.id,
-                            "drive_start_turn_stream: skipping already-executed tool_id (retry idempotency)"
-                        );
-                        continue;
-                    }
-                    let call_name = call.name.clone();
-                    let outcome = execute_single_tool_call(
-                        provider_turn_task_id,
-                        tool_execution_service.as_deref(),
-                        &tool_execution_context,
-                        &call,
-                        &cancel,
-                        &action_tx,
-                        &draft_id,
-                        &mut history,
-                        compaction_config.as_ref(),
-                        chat_mode,
-                    )
-                    .await;
-                    match outcome {
-                        ToolExecOutcome::Done { unrecoverable } => {
-                            executed_tool_ids.insert(call.id.clone());
-                            if let Some(sig) = unrecoverable {
-                                let count = unrecoverable_seen.entry(sig.clone()).or_insert(0);
-                                *count = count.saturating_add(1);
-                                if *count >= 2 {
-                                    // The model already saw this exact block and
-                                    // re-issued the identical call — further LLM
-                                    // round-trips will not change the outcome.
-                                    tracing::info!(
-                                        tool = %call_name,
-                                        occurrences = *count,
-                                        "drive_start_turn_stream: repeated unrecoverable tool failure — stopping turn early (BUG-03)"
-                                    );
-                                    repeated_unrecoverable = Some(call_name.clone());
-                                }
-                            }
-                        }
-                        ToolExecOutcome::Cancelled | ToolExecOutcome::SenderClosed => return,
-                    }
-                }
-                if let Some(config) = compaction_config.as_ref() {
-                    let budget = crate::agent::loop_::plan_context_budget(
-                        &history,
-                        config,
-                        crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
-                    );
-                    if budget.over_hard_limit {
-                        let trimmed = crate::agent::loop_::trim_history_to_context_budget(&mut history, config);
-                        tracing::warn!(
-                            used_tokens = budget.used_tokens,
-                            hard_limit = budget.available_input_tokens,
-                            trimmed,
-                            "redux driver mid-turn context budget trim after tool results; summary parity deferred as ISS-011"
-                        );
-                    }
-                }
-                // BUG-03: if a permanently-blocked call was retried, fail the turn
-                // now with an actionable message rather than letting the LLM spin
-                // indefinitely. history already carries every tool
-                // result so the failure context is intact for any follow-up turn.
-                if let Some(tool_name) = repeated_unrecoverable {
-                    let action = Action::StreamFailed {
-                        draft_id: draft_id.clone(),
-                        err: format!(
-                            "stopped after a repeated unrecoverable tool failure ('{tool_name}' is blocked by policy/permissions); not retrying further"
-                        ),
-                        retryable: false,
-                    };
-                    if let Err(e) = action_tx.send(action).await {
-                        tracing::debug!(error = %e, "StartTurn: action_tx closed on unrecoverable-stop");
-                    }
-                    return;
-                }
-                // Continue to the next LLM pass. iter_text is already in the assistant message.
-            }
-        }
-    }
-
-    // P4b-1: task-scoped visible provider turns are persisted only after the
-    // ordered commit gate in chat::run. The dispatcher still emits usage and
-    // empty-response notices immediately, but its successful terminal action is
-    // a reducer no-op that only wakes TurnCompletionSignal. Non task-scoped
-    // tests/legacy paths keep the original RecordAssistantTurn -> StreamCompleted
-    // contract.
-    let tokens_used = usage_accumulator.finish();
-    if tokens_used.is_reported()
-        && let Err(e) = action_tx
-            .send(Action::StreamUsageMetered {
-                draft_id: draft_id.clone(),
-                usage: tokens_used.clone(),
-            })
-            .await
-    {
-        tracing::debug!(error = %e, "StartTurn: action_tx closed before StreamUsageMetered");
-        return;
-    }
-    let empty_assistant_response = crate::agent::loop_::is_empty_assistant_response(&accumulated, false);
-    if empty_assistant_response {
-        if let Err(e) = action_tx
-            .send(Action::SystemMessageAdded {
-                text: crate::agent::loop_::EMPTY_ASSISTANT_RESPONSE_MESSAGE.to_string(),
-            })
-            .await
-        {
-            tracing::debug!(error = %e, "StartTurn: action_tx closed before empty-response system message");
-            return;
-        }
-    } else if provider_turn_task_id.is_none() {
-        let record = Action::RecordAssistantTurn {
-            task_id: provider_turn_task_id,
-            content: accumulated.clone(),
-        };
-        if let Err(e) = action_tx.send(record).await {
-            tracing::debug!(error = %e, "StartTurn: action_tx closed before RecordAssistantTurn");
-            return;
-        }
-    }
-    let reasoning = if empty_assistant_response {
-        String::new()
-    } else {
-        reasoning_buf
-    };
-    let action = if provider_turn_task_id.is_some() {
-        Action::ProviderTurnReadyForCommit {
-            draft_id,
-            final_text: accumulated,
-            reasoning,
-        }
-    } else {
-        Action::StreamCompleted {
-            draft_id,
-            final_text: accumulated,
-            reasoning,
-        }
-    };
-    if let Err(e) = action_tx.send(action).await {
-        tracing::debug!(error = %e, "StartTurn: action_tx closed on completion");
-    }
 }
 
 /// **S3 T3-1**: result classification of one tool execution.
@@ -4315,6 +3842,33 @@ mod tests {
 
         // an empty delta triggers no publish
         assert!(batcher.push("", 9_999_999).is_none());
+    }
+
+    /// The tail of the last throttle window is the part a stream is most likely
+    /// to end inside: reasoning stops, the window never fills, and the counter
+    /// silently stayed short of the body published by the terminal action.
+    ///
+    /// MUTATION GUARD: make `flush` return `None` and the first assertion goes
+    /// red.
+    #[test]
+    fn reasoning_progress_batcher_flushes_the_final_window() {
+        let mut batcher = ReasoningProgressBatcher::default();
+        let first = batcher.push("thinking", 1_000).expect("test: first delta publishes");
+        assert_eq!(first, "thinking");
+
+        // Everything after this lands inside one unfinished window.
+        assert!(batcher.push(" about", 1_010).is_none());
+        assert!(batcher.push(" the answer", 1_020).is_none());
+
+        assert_eq!(
+            batcher.flush().as_deref(),
+            Some(" about the answer"),
+            "stream end must publish the buffered tail"
+        );
+        assert!(batcher.flush().is_none(), "a second flush has nothing left to publish");
+
+        // And a flush of an untouched batcher stays quiet.
+        assert!(ReasoningProgressBatcher::default().flush().is_none());
     }
 
     #[test]

@@ -48,7 +48,7 @@ pub(crate) struct RenderedToolSnapshot {
 #[derive(Debug)]
 struct CachedToolSnapshotRender {
     native_tools: bool,
-    tool_specs: Vec<ToolSpec>,
+    tool_specs: Arc<Vec<ToolSpec>>,
     rendered: Arc<RenderedToolSnapshot>,
 }
 
@@ -84,10 +84,12 @@ impl ToolSnapshotRenderCache {
         self.misses
     }
 
-    fn resolve(&mut self, native_tools: bool, tool_specs: &[ToolSpec]) -> Arc<RenderedToolSnapshot> {
+    /// `tool_specs` is shared rather than borrowed so a miss can keep the exact
+    /// snapshot it rendered without copying tens of kilobytes of JSON schema.
+    fn resolve(&mut self, native_tools: bool, tool_specs: &Arc<Vec<ToolSpec>>) -> Arc<RenderedToolSnapshot> {
         if let Some(entry) = self.entry.as_ref()
             && entry.native_tools == native_tools
-            && tool_specs_match(&entry.tool_specs, tool_specs)
+            && (Arc::ptr_eq(&entry.tool_specs, tool_specs) || tool_specs_match(&entry.tool_specs, tool_specs))
         {
             self.hits = self.hits.saturating_add(1);
             return Arc::clone(&entry.rendered);
@@ -97,7 +99,7 @@ impl ToolSnapshotRenderCache {
         let rendered = Arc::new(render_tool_snapshot(native_tools, tool_specs));
         self.entry = Some(CachedToolSnapshotRender {
             native_tools,
-            tool_specs: tool_specs.to_vec(),
+            tool_specs: Arc::clone(tool_specs),
             rendered: Arc::clone(&rendered),
         });
         rendered
@@ -163,7 +165,7 @@ fn render_tool_snapshot(native_tools: bool, tool_specs: &[ToolSpec]) -> Rendered
 #[derive(Clone, Debug)]
 pub(crate) struct CompiledToolContext {
     native_tools: bool,
-    tool_specs: Vec<ToolSpec>,
+    tool_specs: Arc<Vec<ToolSpec>>,
     allowed_tool_names: Arc<HashSet<String>>,
     rendered: Arc<RenderedToolSnapshot>,
 }
@@ -180,11 +182,14 @@ impl CompiledToolContext {
     /// anything is derived from it, so provider-native tool arrays, prompt
     /// sections and fingerprints are all byte-stable for a given exposed set
     /// regardless of the order intent routing happened to return.
+    ///
+    /// Canonicalization is done in place on the snapshot the caller already
+    /// owns: deriving it through the borrowing form instead cost one full deep
+    /// copy of every schema per tool-loop iteration.
     pub(crate) fn compile(native_tools: bool, tool_specs: Vec<ToolSpec>, cache: &mut ToolSnapshotRenderCache) -> Self {
-        let tool_specs = crate::tools::prompt::canonical_tool_order(&tool_specs)
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut tool_specs = tool_specs;
+        crate::tools::prompt::canonicalize_tool_order(&mut tool_specs);
+        let tool_specs = Arc::new(tool_specs);
         let allowed_tool_names = Arc::new(tool_specs.iter().map(|spec| spec.name.clone()).collect());
         let rendered = cache.resolve(native_tools, &tool_specs);
         Self {
@@ -307,6 +312,49 @@ mod tests {
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content, "hello");
         assert!(context.native_tool_specs().is_none());
+    }
+
+    /// Bloat guard: canonicalizing the snapshot must not copy it.
+    ///
+    /// The compiled context used to be derived through the borrowing
+    /// `canonical_tool_order`, which meant one deep copy of every `ToolSpec`
+    /// (tens of kilobytes of JSON schema) per tool-loop iteration, plus a second
+    /// copy into the render cache. Pointer identity is the only assertion that
+    /// can tell the two apart.
+    ///
+    /// MUTATION GUARD: restore `canonical_tool_order(&tool_specs).into_iter().cloned().collect()`
+    /// in `compile` and the first assertion goes red; restore `tool_specs.to_vec()`
+    /// in `ToolSnapshotRenderCache::resolve` and the second goes red.
+    #[test]
+    fn compiling_a_snapshot_moves_it_instead_of_copying_it() {
+        let specs = vec![spec("shell"), spec("file_read"), spec("web_search")];
+        let buffer = specs.as_ptr();
+        let mut cache = ToolSnapshotRenderCache::default();
+
+        let context = CompiledToolContext::compile(true, specs, &mut cache);
+
+        let exposed = context.native_tool_specs().expect("native specs");
+        assert_eq!(exposed.len(), 3);
+        assert!(
+            std::ptr::eq(exposed.as_ptr(), buffer),
+            "the caller's allocation must survive canonicalization, not be cloned into a new one"
+        );
+        assert!(
+            cache
+                .entry
+                .as_ref()
+                .is_some_and(|entry| Arc::ptr_eq(&entry.tool_specs, &context.tool_specs)),
+            "the render cache must share the compiled snapshot instead of copying it"
+        );
+
+        // And a second identical iteration must reuse the render, not redo it.
+        let repeat = CompiledToolContext::compile(
+            true,
+            vec![spec("shell"), spec("file_read"), spec("web_search")],
+            &mut cache,
+        );
+        assert_eq!(cache.hits(), 1, "an unchanged tool set must hit the memo");
+        assert_eq!(repeat.fingerprint().sha256, context.fingerprint().sha256);
     }
 
     #[test]

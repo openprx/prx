@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.130] - 15 September 2026
+
+### Fixed
+
+- A session whose `switch` rollover keeps degrading records one
+  `context.compaction.degraded` event per turn instead of one per tool-loop
+  iteration. The event id doubled as the idempotency key, so every call was a
+  guaranteed insert and the key could never reject anything; the key is now
+  derived from the turn, and the turn also claims the write once in process. The
+  pre-provider budget check alone runs on every iteration, so a long degraded
+  session used to open one synchronous write transaction per iteration for the
+  rest of its life.
+- A corrective retry no longer rewrites the system prefix of the request. The
+  "previous response was empty" and "previous response was a tool summary"
+  instructions were appended as request-local `system` messages, which the
+  front-coalescing pass then folded into the leading system message: the retry
+  round missed the provider-side prefix cache for the whole conversation, on the
+  one turn that had already paid for a wasted provider call. They ride at the
+  tail of the request instead, so the system message stays byte-identical and
+  every provider still sees exactly one system message at index 0.
+- `switch` compaction makes progress when the cold window is nothing but tool
+  round-trips. The boundary that keeps a tool result from being orphaned could
+  only walk backwards, so a window that sat entirely inside one long round-trip
+  chain walked back to the start, reported "nothing to compact", and left the
+  session silently running on the lossy trim from then on. The boundary now
+  walks forward to the first message that can head the hot window, and the
+  window folds into one handoff.
+- OS-paging no longer strands a tool result at the head of the hot window. An
+  eviction span that ended between an assistant `tool_calls` envelope and the
+  result answering it left an orphan every native provider rejects; the stranded
+  round-trip is paged out with its request, so the output stays recallable
+  instead of being dropped.
+- The chat thinking-progress batcher publishes its final window. Reasoning that
+  arrived after the last 120 ms boundary stayed in the buffer and never reached
+  the live counter, so the counter stopped short of the body the completed turn
+  goes on to show.
+
+### Changed
+
+- A sub-agent started by `sessions_spawn` or `delegate` inherits the tool
+  exclusions of the channel surface that spawned it. Sub-agent loops run without
+  tiering of their own, so a conversation partner on an IM channel could reach
+  the operations surface the channel hides simply by asking for a spawn. Names
+  an operator re-enables through `[tool_tiering] always_include` are unaffected,
+  and operator entry points (terminal chat, gateway, console) seed no exclusions.
+- The canonical tool order is a pure function of the exposed set even when two
+  entries share a name. Duplicate names were collapsed by keeping whichever copy
+  came first, so an MCP or WASM alias shadowing a built-in, or a middleware pass
+  that rewrote one description, made the rendered prompt depend on registry
+  order. Ties are broken by content digest instead.
+- Compiling a turn's tool context no longer copies the snapshot. Canonicalizing
+  it deep-copied every `ToolSpec` — tens of kilobytes of JSON schema — once per
+  tool-loop iteration, and the render cache copied it a second time; the
+  snapshot is sorted in place and shared.
+
+### Removed
+
+- The unreachable legacy chat stream driver (`#[cfg(test)]`-only, no callers).
+
 ## [0.8.129] - 15 September 2026
 
 ### Fixed

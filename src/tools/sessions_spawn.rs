@@ -412,6 +412,16 @@ pub(crate) struct SpawnExecutionContext {
     /// no context were seeded — so seeding a turn does not inflate the reported
     /// nesting of its children. A spawn run's child reports `+1`.
     pub(crate) is_turn_root: bool,
+    /// Tool names the turn's own surface hides, carried down the spawn tree.
+    ///
+    /// An IM channel turn runs under `tool_tiering.for_channel_surface()`, which
+    /// folds `channel_exclude` into `always_exclude` so a conversation partner
+    /// cannot reach the operations surface. A sub-agent used to be started with
+    /// no tiering at all, so `spawn` was a one-sentence way around that boundary
+    /// from the same conversation. Names the operator listed in
+    /// `always_include` are never in here: `for_channel_surface` keeps them
+    /// exposed, and this list is derived from its output.
+    pub(crate) channel_excluded_tools: Vec<String>,
 }
 
 impl SpawnExecutionContext {
@@ -429,8 +439,26 @@ impl SpawnExecutionContext {
             topic_id: None,
             source_message_event_id: None,
             is_turn_root: true,
+            channel_excluded_tools: Vec::new(),
         }
     }
+
+    /// Carry the turn surface's hidden tool names into everything it spawns.
+    #[must_use]
+    pub(crate) fn with_channel_excluded_tools(mut self, channel_excluded_tools: Vec<String>) -> Self {
+        self.channel_excluded_tools = channel_excluded_tools;
+        self
+    }
+}
+
+/// Tool names the ambient turn/run context hides from this loop.
+///
+/// Empty for the operator entry points (terminal chat, gateway, console), which
+/// seed no exclusions, and for any code running outside a spawn context.
+pub(crate) fn ambient_channel_excluded_tools() -> Vec<String> {
+    SPAWN_EXECUTION_CONTEXT
+        .try_with(|ctx| ctx.channel_excluded_tools.clone())
+        .unwrap_or_default()
 }
 
 tokio::task_local! {
@@ -2991,6 +3019,12 @@ impl SessionsSpawnTool {
             }
         });
         let parent_run_id = parent_exec_ctx.as_ref().map(|ctx| ctx.run_id.clone());
+        // Whatever the parent turn's surface hides stays hidden for everything
+        // this spawn produces, however deeply it nests.
+        let inherited_channel_exclusions = parent_exec_ctx
+            .as_ref()
+            .map(|ctx| ctx.channel_excluded_tools.clone())
+            .unwrap_or_default();
         let session_scope_key = spawn_session_scope_key(parent_exec_ctx.as_ref(), spawn_scope.as_ref());
 
         // This runtime caps neither how many sub-agents run at once, how deeply
@@ -3307,6 +3341,7 @@ impl SessionsSpawnTool {
                 // A spawn-run context (this run may itself spawn): its children
                 // compute spawn_depth + 1.
                 is_turn_root: false,
+                channel_excluded_tools: inherited_channel_exclusions.clone(),
             };
             let process_memory_fabric = memory_fabric.clone();
             let process_result_scope = spawn_scope_for_event.clone();
@@ -3642,6 +3677,7 @@ impl SessionsSpawnTool {
             // A spawn-run context (this run may itself spawn): its children
             // compute spawn_depth + 1.
             is_turn_root: false,
+            channel_excluded_tools: inherited_channel_exclusions.clone(),
         };
         let task_memory_fabric = memory_fabric.clone();
         let task_result_scope = spawn_scope_for_event.clone();
@@ -8332,6 +8368,7 @@ mod tests {
                         topic_id: None,
                         source_message_event_id: None,
                         is_turn_root: false,
+                        channel_excluded_tools: Vec::new(),
                     },
                     async { tool.execute(with_spawn_grant(json!({"task": "nested"}))).await },
                 )
@@ -8413,6 +8450,7 @@ mod tests {
                     topic_id: None,
                     source_message_event_id: None,
                     is_turn_root: false,
+                    channel_excluded_tools: Vec::new(),
                 },
                 async { tool.execute(with_spawn_grant(json!({"task": "nested"}))).await },
             )

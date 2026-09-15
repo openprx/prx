@@ -405,6 +405,18 @@ pub(crate) struct DocumentIngestRuntime {
     source_message_event_id: Option<String>,
     session_key: Option<String>,
     legacy_session_key: Option<String>,
+    /// Stable identity of the turn this runtime serves.
+    ///
+    /// The runtime is built once per turn, so the incoming message event id
+    /// identifies it; entry points without one (agent runs, cron) mint a value
+    /// here instead, which is per-turn for the same reason.
+    turn_key: String,
+    /// Set the first time this turn records a `context.compaction.degraded`
+    /// event. The pre-provider budget check runs on every tool-loop iteration
+    /// and the overflow retry adds four more call sites, so a session that
+    /// stays degraded used to open one synchronous write transaction per
+    /// iteration, forever.
+    degradation_recorded: Arc<std::sync::atomic::AtomicBool>,
     agent_id: Option<String>,
     persona_id: Option<String>,
     channel: Option<String>,
@@ -427,6 +439,11 @@ impl DocumentIngestRuntime {
             source_message_event_id: envelope.source_message_event_id.clone(),
             session_key: Some(envelope.session_key.clone()),
             legacy_session_key: envelope.legacy_session_key.clone(),
+            turn_key: envelope
+                .source_message_event_id
+                .clone()
+                .unwrap_or_else(|| format!("turn:{}", Uuid::new_v4())),
+            degradation_recorded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             agent_id: envelope.agent_id.clone(),
             persona_id: envelope.persona_id.clone(),
             channel: envelope.channel.clone(),
@@ -458,6 +475,11 @@ impl DocumentIngestRuntime {
             source_message_event_id: scope.source_message_event_id.map(ToString::to_string),
             session_key: Some(scope.chat_id.to_string()),
             legacy_session_key: None,
+            turn_key: scope
+                .source_message_event_id
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("turn:{}", Uuid::new_v4())),
+            degradation_recorded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             agent_id: None,
             persona_id: None,
             // Persist the originating channel so anonymous principals can
@@ -472,6 +494,9 @@ impl DocumentIngestRuntime {
 
     #[must_use]
     pub(crate) fn with_source_message_event_id(mut self, source_message_event_id: Option<String>) -> Self {
+        if let Some(event_id) = source_message_event_id.as_ref() {
+            self.turn_key.clone_from(event_id);
+        }
         self.source_message_event_id = source_message_event_id;
         self
     }
@@ -1591,7 +1616,25 @@ fn compaction_boundary_without_orphan_tool_results(
         }
         boundary = boundary.saturating_sub(1);
     }
-    boundary
+    if boundary > start {
+        return boundary;
+    }
+    // Walking back reached `start`: the whole requested cold window sits inside
+    // one long tool round-trip chain. Giving up here returned "nothing to
+    // compact" on every rollover, so `switch` silently degraded to the lossy
+    // trim for the rest of the session. Walk forward to the first retained
+    // message that can stand at the head of the hot window instead — the cold
+    // window grows, but it still folds into one handoff.
+    let mut forward = compact_end;
+    while forward < source_history.len() {
+        if !source_history.get(forward).is_some_and(is_tool_roundtrip_companion) {
+            return forward;
+        }
+        forward = forward.saturating_add(1);
+    }
+    // Every message after `start` is a companion: there is no durable turn to
+    // retain and nothing safe to cut.
+    start
 }
 
 fn context_handoff_lineage(history: &[ChatMessage]) -> (u64, Option<String>) {
@@ -1842,12 +1885,29 @@ pub(crate) async fn persist_context_switch_degradation(
         "hard_limit_tokens": hard_limit,
         "fallback": "token_aware_trim",
     });
+    // One event per turn. The key is derived from the turn rather than from the
+    // event id it is attached to: a fresh `Uuid` in both places made every write
+    // a guaranteed insert and left the idempotency key unable to reject
+    // anything, including a retry of this very call from a second runtime built
+    // for the same turn.
+    if audit
+        .degradation_recorded
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        tracing::debug!(
+            trigger,
+            reason,
+            "context switch degradation already recorded for this turn"
+        );
+        return;
+    }
     let degraded_event_id = Uuid::new_v4().to_string();
+    let idempotency_key = format!("context-compaction-degraded:{}", audit.turn_key);
     if let Err(error) = audit
         .memory
         .append_message_event(crate::memory::MessageEventInput {
             event_id: Some(degraded_event_id.clone()),
-            idempotency_key: Some(format!("context-compaction-degraded:{degraded_event_id}")),
+            idempotency_key: Some(idempotency_key),
             workspace_id: audit.workspace_id.clone(),
             owner_id: audit.owner_id.clone(),
             source: "context_switch".into(),
@@ -2538,7 +2598,19 @@ async fn apply_os_paging(
     if evict_count == 0 {
         return Ok(false);
     }
-    let evict_end = start + evict_count;
+    // Page out the stranded tail of a tool round-trip together with the
+    // assistant message that requested it. Cutting between them leaves a
+    // `role="tool"` orphan at the head of the hot window, which every native
+    // provider rejects, and dropping it instead would lose output that was
+    // never written to the page store.
+    let mut evict_end = start + evict_count;
+    while history.get(evict_end).is_some_and(|message| message.role == "tool") {
+        evict_end = evict_end.saturating_add(1);
+    }
+    if evict_end >= history.len() {
+        tracing::debug!("os-paging: eviction would consume the whole hot window; deferring to legacy compaction");
+        return Ok(false);
+    }
     let Some(to_evict) = history.get(start..evict_end) else {
         return Ok(false);
     };
@@ -2617,6 +2689,11 @@ async fn apply_os_paging(
             evicted_message_count
         ))),
     );
+    // The breadcrumb carries no `tool_calls`, so anything left directly behind
+    // it that still claims to answer one is an orphan. The forward walk above
+    // normally leaves none; this is the invariant, asserted at the mutation
+    // point rather than assumed.
+    drop_orphan_tool_results_at(history, start.saturating_add(1));
 
     Ok(true)
 }
@@ -6573,6 +6650,12 @@ async fn run_tool_call_loop_outcome_unguarded(
     // rendered prompt sections and fingerprint instead of recomputing one JSON
     // serialization plus two SHA-256 digests per tool each time.
     let mut tool_snapshot_render_cache = crate::agent::turn_context::ToolSnapshotRenderCache::default();
+    // A sub-agent inherits the hidden surface of the turn that spawned it.
+    // Sub-agent loops deliberately run without tool tiering, so without this a
+    // conversation partner on an IM channel could reach the whole operations
+    // surface simply by asking for a spawn or a delegate. Read once: the spawn
+    // context is fixed for the lifetime of this turn.
+    let inherited_exclusions = crate::tools::sessions_spawn::ambient_channel_excluded_tools();
     let mut iteration = 0usize;
     loop {
         iteration = iteration.saturating_add(1);
@@ -6620,16 +6703,25 @@ async fn run_tool_call_loop_outcome_unguarded(
         let media_artifacts = hooks.media_artifacts();
         let mut prepared_messages =
             multimodal::prepare_messages_for_provider(history, multimodal_config, media_artifacts.as_ref()).await?;
+        // Corrective retries are appended as an ordinary trailing turn, not as
+        // request-local `system` context. A system message here is folded into
+        // the leading one by `coalesce_system_messages_at_front` below, which
+        // appends bytes to the system prefix and misses the provider-side
+        // prefix cache for the whole conversation — on the one turn that is
+        // already paying for a wasted provider call. Appending at the tail
+        // leaves every cached byte ahead of it untouched, and keeps the
+        // "exactly one system message, at index 0" shape that strict chat
+        // templates require.
         if inject_tool_summary_retry_instruction {
             prepared_messages
                 .messages
-                .push(ChatMessage::system(TOOL_SUMMARY_ONLY_RESPONSE_MESSAGE));
+                .push(ChatMessage::user(TOOL_SUMMARY_ONLY_RESPONSE_MESSAGE));
             inject_tool_summary_retry_instruction = false;
         }
         if inject_empty_response_retry_instruction {
             prepared_messages
                 .messages
-                .push(ChatMessage::system(EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE));
+                .push(ChatMessage::user(EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE));
             inject_empty_response_retry_instruction = false;
         }
         // Route the turn before refreshing dynamic tools. Refreshing the whole
@@ -6655,6 +6747,9 @@ async fn run_tool_call_loop_outcome_unguarded(
         } else {
             selected_tools
         };
+        if !inherited_exclusions.is_empty() {
+            selected_tools.retain(|tool| !inherited_exclusions.iter().any(|hidden| hidden == tool.name()));
+        }
         let context_lookup_required = compaction_config
             .is_some_and(|config| matches!(config.mode, crate::config::AgentCompactionMode::Switch))
             && history.iter().any(is_context_handoff_message);
@@ -9242,8 +9337,13 @@ mod tests {
         }
     }
 
+    /// Stands in for a chat template that accepts exactly one system message,
+    /// at index 0 (the deployed Qwen template is one). It also holds the
+    /// corrective retry to the prefix contract: the system message it sees on
+    /// the retry must be the byte-identical one it saw first.
     struct StrictSystemPositionRetryProvider {
         calls: AtomicUsize,
+        first_system: Mutex<Option<String>>,
     }
 
     #[async_trait]
@@ -9272,17 +9372,37 @@ mod tests {
             {
                 anyhow::bail!("system message must be at the beginning");
             }
+            let leading_system = request
+                .messages
+                .first()
+                .filter(|message| message.role == "system")
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call == 0 {
+                if let Ok(mut first) = self.first_system.lock() {
+                    *first = Some(leading_system);
+                }
                 return Ok(ChatResponse {
                     text: Some(String::new()),
                     tool_calls: Vec::new(),
                     reasoning_content: None,
                 });
             }
-            let leading_system = request.messages.first().filter(|message| message.role == "system");
-            if !leading_system.is_some_and(|message| message.content.contains(EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE)) {
-                anyhow::bail!("corrective retry instruction was not merged into the leading system message");
+            let first_system = self
+                .first_system
+                .lock()
+                .ok()
+                .and_then(|first| first.clone())
+                .unwrap_or_default();
+            if leading_system != first_system {
+                anyhow::bail!("the corrective retry moved the system prefix");
+            }
+            let tail_carries_instruction = request.messages.last().is_some_and(|message| {
+                message.role == "user" && message.content.contains(EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE)
+            });
+            if !tail_carries_instruction {
+                anyhow::bail!("corrective retry instruction did not reach the tail of the request");
             }
             Ok(ChatResponse {
                 text: Some("Recovered answer.".to_string()),
@@ -13743,6 +13863,480 @@ ls -la
         );
     }
 
+    /// A tool whose only job is to be present in the registry under a chosen
+    /// name, so a test can ask which names one turn published.
+    struct SurfaceProbeTool {
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl Tool for SurfaceProbeTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "surface probe"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: String::new(),
+                error: None,
+            })
+        }
+    }
+
+    /// Records the system prompt of the one request it answers, which carries
+    /// the authoritative `## Runtime Capabilities` inventory of this turn.
+    struct SurfaceCapturingProvider {
+        system: Arc<Mutex<String>>,
+    }
+
+    #[async_trait]
+    impl Provider for SurfaceCapturingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("surface capture always uses the chat path")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            if let Some(system) = request.messages.first().filter(|message| message.role == "system") {
+                if let Ok(mut captured) = self.system.lock() {
+                    system.content.clone_into(&mut captured);
+                }
+            }
+            Ok(ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    async fn published_tool_surface(spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>) -> String {
+        let captured = Arc::new(Mutex::new(String::new()));
+        let provider = SurfaceCapturingProvider {
+            system: Arc::clone(&captured),
+        };
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(SurfaceProbeTool { name: "gateway" }),
+            Box::new(SurfaceProbeTool { name: "shell" }),
+        ];
+        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("please run the task")];
+        let tmp = TempDir::new().unwrap();
+        let hooks = crate::hooks::HookManager::new(tmp.path().to_path_buf());
+        let multimodal = crate::config::MultimodalConfig::default();
+        let run = run_tool_call_loop_outcome(
+            &provider,
+            &mut history,
+            Arc::new(tools_registry),
+            &NoopObserver,
+            &hooks,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "sessions_spawn",
+            &multimodal,
+            2,
+            false,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            // Exactly what a spawned sub-agent passes: no tiering of its own.
+            None,
+            ToolLoopMemory::none(),
+            ChatMode::default(),
+            None,
+            false,
+            None,
+        );
+        match spawn_ctx {
+            Some(ctx) => crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
+                .scope(ctx, run)
+                .await
+                .expect("the sub-agent turn must complete"),
+            None => run.await.expect("the sub-agent turn must complete"),
+        };
+        captured.lock().expect("captured surface").clone()
+    }
+
+    /// A sub-agent spawned from an IM turn must not be a way around that
+    /// channel's tool boundary. The child loop runs with no tiering of its own,
+    /// so before this the operations surface came back in full the moment a
+    /// conversation partner said "spawn".
+    ///
+    /// MUTATION GUARD: drop the `ambient_channel_excluded_tools` filter in the
+    /// tool loop, or the `with_channel_excluded_tools` seed in the channel turn,
+    /// and the first assertion goes red.
+    #[tokio::test]
+    async fn a_spawned_sub_agent_inherits_the_parent_channels_tool_exclusions() {
+        let channel_surface = crate::config::ToolTieringConfig::default().for_channel_surface();
+        assert!(
+            channel_surface.always_exclude.iter().any(|name| name == "gateway"),
+            "fixture is useless unless the default channel surface hides this tool"
+        );
+        let parent_turn = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
+            "wacli-turn-run".to_string(),
+            "wacli:+15551230000:owner".to_string(),
+        )
+        .with_channel_excluded_tools(channel_surface.always_exclude.clone());
+
+        let inherited = published_tool_surface(Some(parent_turn)).await;
+        assert!(
+            !inherited.contains("`gateway`"),
+            "a wacli child session must not reach the operations surface: {inherited}"
+        );
+        assert!(
+            inherited.contains("`shell`"),
+            "the child must keep the ordinary surface: {inherited}"
+        );
+
+        // Fixture proof: with no parent boundary the same child publishes it.
+        let unbounded = published_tool_surface(None).await;
+        assert!(
+            unbounded.contains("`gateway`"),
+            "fixture is useless unless the unbounded child would publish it: {unbounded}"
+        );
+
+        // An operator who lists the name in `always_include` keeps it, and the
+        // child inherits that decision too.
+        let reopened = crate::config::ToolTieringConfig {
+            always_include: vec!["gateway".to_string()],
+            ..crate::config::ToolTieringConfig::default()
+        }
+        .for_channel_surface();
+        let opened_turn = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
+            "wacli-turn-run".to_string(),
+            "wacli:+15551230000:owner".to_string(),
+        )
+        .with_channel_excluded_tools(reopened.always_exclude.clone());
+        let opened = published_tool_surface(Some(opened_turn)).await;
+        assert!(
+            opened.contains("`gateway`"),
+            "always_include must still reopen the tool for the child: {opened}"
+        );
+    }
+
+    /// A degraded session must not open one write transaction per tool-loop
+    /// iteration. The pre-provider budget check runs on every iteration, and the
+    /// overflow retry adds four more call sites, so "write every time" meant a
+    /// synchronous SQLite write per iteration for the rest of the session.
+    ///
+    /// MUTATION GUARD: drop the `degradation_recorded` claim and the
+    /// four-iteration count goes red; restore the per-call `Uuid` idempotency
+    /// key and the second-runtime count goes red.
+    #[tokio::test]
+    async fn context_switch_degradation_writes_one_event_per_turn() {
+        let temp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+        let envelope = RuntimeEnvelope::agent("workspace-degrade-count", "run-degrade-count")
+            .with_source_message_event_id("inbound-msg-1");
+        let provider = ScriptedProvider::from_text_responses(vec!["MODEL_SUMMARY_MUST_NOT_RUN"]);
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Switch,
+            reserve_tokens: 1,
+            keep_recent_messages: 2,
+            memory_flush: false,
+            max_context_tokens: 400,
+            max_context_tokens_explicit: true,
+            os_paging: crate::config::OsPagingConfig::default(),
+        };
+
+        async fn degrade_once(
+            memory: &Arc<dyn Memory>,
+            envelope: &RuntimeEnvelope,
+            provider: &ScriptedProvider,
+            config: &crate::config::AgentCompactionConfig,
+            audit: &DocumentIngestRuntime,
+        ) {
+            // Nothing in this history is persisted, so provenance is never
+            // resolvable and every call degrades.
+            let mut history = tool_roundtrip_history_fixture(10);
+            let before = plan_context_budget(&history, config, PRE_TURN_FLUSH_THRESHOLD);
+            assert!(before.over_hard_limit, "the fixture must actually trigger a rollover");
+            let _ = memory;
+            let _ = envelope;
+            preflight_context_budget_before_provider_call(
+                &mut history,
+                provider,
+                "model",
+                config,
+                Some(audit),
+                "pre_provider_call",
+            )
+            .await
+            .expect("degradation must not fail the turn");
+        }
+
+        async fn degraded_event_count(memory: &Arc<dyn Memory>, envelope: &RuntimeEnvelope) -> usize {
+            memory
+                .list_message_events_recent(&envelope.memory_principal(), 256)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == CONTEXT_COMPACTION_DEGRADED_EVENT_TYPE)
+                .count()
+        }
+
+        // Four iterations of one turn, through the runtime the loop holds.
+        let audit = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
+        for _ in 0..4 {
+            degrade_once(&memory, &envelope, &provider, &config, &audit).await;
+        }
+        assert_eq!(
+            degraded_event_count(&memory, &envelope).await,
+            1,
+            "four iterations of one turn must record exactly one degradation"
+        );
+
+        // A second runtime built for the same turn (several entry paths build
+        // one) has its own in-process claim, so only the idempotency key can
+        // stop the duplicate.
+        let second = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
+        degrade_once(&memory, &envelope, &provider, &config, &second).await;
+        assert_eq!(
+            degraded_event_count(&memory, &envelope).await,
+            1,
+            "a second runtime for the same turn must be deduplicated by the idempotency key"
+        );
+
+        // Fixture proof: the suppression is scoped to the turn, not global.
+        let next_turn = RuntimeEnvelope::agent("workspace-degrade-count", "run-degrade-count")
+            .with_source_message_event_id("inbound-msg-2");
+        let next_audit = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &next_turn);
+        degrade_once(&memory, &next_turn, &provider, &config, &next_audit).await;
+        assert_eq!(
+            degraded_event_count(&memory, &envelope).await,
+            2,
+            "the next turn must still be able to report its own degradation"
+        );
+    }
+
+    /// A cold window that is nothing but one long tool round-trip chain.
+    ///
+    /// Walking the boundary backwards reaches `start`, which used to mean
+    /// "nothing to compact": `switch` then answered `Ok(None)` on every
+    /// rollover and the session silently ran on the lossy trim forever. The
+    /// boundary must move forward to the first message that can head the hot
+    /// window instead.
+    ///
+    /// MUTATION GUARD: delete the forward walk in
+    /// `compaction_boundary_without_orphan_tool_results` and both halves go red.
+    #[tokio::test]
+    async fn a_cold_window_of_only_tool_roundtrips_still_folds_into_one_handoff() {
+        let temp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+        let envelope = RuntimeEnvelope::agent("workspace-companion-window", "run-companion-window");
+        let audit = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
+        let fabric = MemoryFabric::new(Arc::clone(&memory), "workspace-companion-window");
+        let provider = ScriptedProvider::from_text_responses(vec!["MODEL_SUMMARY_MUST_NOT_RUN"]);
+
+        // One durable user turn, then 20 uninterrupted tool round-trips, then
+        // one durable answer: every message between them is a companion.
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(format!("question {}", "user-context ".repeat(20))),
+        ];
+        for round in 0..20 {
+            history.push(ChatMessage::assistant(build_native_assistant_history(
+                "",
+                &[ToolCall {
+                    id: format!("call-{round}"),
+                    name: "shell".to_string(),
+                    arguments: "{\"command\":\"ls\"}".to_string(),
+                }],
+                None,
+            )));
+            history.push(ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": format!("call-{round}"),
+                    "content": format!("result {round} {}", "tool-output ".repeat(20)),
+                })
+                .to_string(),
+            ));
+        }
+        history.push(ChatMessage::assistant(format!(
+            "final answer {}",
+            "assistant-context ".repeat(20)
+        )));
+        assert_eq!(history.len(), 43);
+        assert_eq!(
+            history
+                .iter()
+                .skip(2)
+                .take(40)
+                .filter(|message| is_tool_roundtrip_companion(message))
+                .count(),
+            40,
+            "the fixture must be one uninterrupted round-trip chain"
+        );
+
+        // The unit the whole outcome turns on.
+        assert_eq!(
+            compaction_boundary_without_orphan_tool_results(&history, 1, 41),
+            42,
+            "a boundary that cannot walk back must walk forward, not give up"
+        );
+
+        let persisted = persist_durable_transcript(&fabric, &envelope, &history).await;
+        assert_eq!(persisted.len(), 2, "only the two durable turns become events");
+
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Switch,
+            reserve_tokens: 1,
+            keep_recent_messages: 2,
+            memory_flush: true,
+            max_context_tokens: 50,
+            max_context_tokens_explicit: true,
+            os_paging: crate::config::OsPagingConfig::default(),
+        };
+        let before_len = history.len();
+        let compacted = apply_configurable_compaction(
+            &mut history,
+            &provider,
+            "model",
+            &config,
+            Some(&audit),
+            "test_companion_window",
+        )
+        .await
+        .expect("a companion-only cold window must not error");
+
+        assert!(compacted, "switch must still make progress on a companion-only window");
+        assert!(
+            history.len() < before_len / 4,
+            "got {} from {before_len}",
+            history.len()
+        );
+        assert_eq!(first_orphan_tool_index(&history), None);
+        let handoff = history
+            .iter()
+            .find(|message| message.content.contains("[context_handoff]"))
+            .expect("the window must fold into one handoff");
+        assert!(
+            handoff.content.contains("\"unpersisted_companion_count\":40"),
+            "the handoff must disclose the folded round-trips: {}",
+            handoff.content
+        );
+        let events = memory
+            .list_message_events_recent(&envelope.memory_principal(), 64)
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == CONTEXT_COMPACTION_DEGRADED_EVENT_TYPE)
+                .count(),
+            0,
+            "making progress must not be reported as a degradation"
+        );
+    }
+
+    /// `record_tool_events = true` is a supported operator setting, and it puts
+    /// durable `role="tool"` events next to the round-trip messages that
+    /// provenance folds into their assistant turn. The two must not disagree.
+    #[tokio::test]
+    async fn switch_provenance_holds_when_tool_events_are_recorded() {
+        let temp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+        let envelope = RuntimeEnvelope::agent("workspace-tool-events", "run-tool-events");
+        let audit = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
+        let recording = crate::memory::MemoryEventRecording {
+            enabled: true,
+            record_user_messages: true,
+            record_assistant_messages: true,
+            record_tool_events: true,
+        };
+        let fabric = MemoryFabric::new(Arc::clone(&memory), "workspace-tool-events").with_event_recording(recording);
+        let provider = ScriptedProvider::from_text_responses(vec!["MODEL_SUMMARY_MUST_NOT_RUN"]);
+        let mut history = tool_roundtrip_history_fixture(10);
+        let persisted_ids = persist_durable_transcript(&fabric, &envelope, &history).await;
+        assert_eq!(persisted_ids.len(), 20);
+
+        // What the operator setting adds on top: one durable event per tool
+        // result, interleaved with the durable turns.
+        let mut tool_events = 0usize;
+        for message in history.iter().filter(|message| message.role == "tool") {
+            fabric
+                .record_tool_event(envelope.message_scope(), message.content.clone(), None)
+                .await
+                .unwrap();
+            tool_events += 1;
+        }
+        assert_eq!(tool_events, 10, "the fixture must record real tool events");
+        assert_eq!(
+            memory
+                .list_message_events_recent(&envelope.memory_principal(), 256)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|event| event.role == "tool")
+                .count(),
+            10,
+            "fixture is useless unless the tool events are actually durable"
+        );
+
+        let cold_window = history.get(1..37).expect("cold window slice").to_vec();
+        let provenance = resolve_compaction_event_provenance(&*memory, envelope.memory_principal(), &cold_window)
+            .await
+            .unwrap()
+            .expect("recorded tool events must not make provenance unresolvable");
+        assert_eq!(provenance.source_event_ids.len(), 18);
+        assert_eq!(provenance.companion_message_count, 18);
+
+        let compacted = apply_configurable_compaction(
+            &mut history,
+            &provider,
+            "model",
+            &crate::config::AgentCompactionConfig {
+                mode: crate::config::AgentCompactionMode::Switch,
+                reserve_tokens: 1,
+                keep_recent_messages: 2,
+                memory_flush: true,
+                max_context_tokens: 50,
+                max_context_tokens_explicit: true,
+                os_paging: crate::config::OsPagingConfig::default(),
+            },
+            Some(&audit),
+            "test_tool_events",
+        )
+        .await
+        .expect("switch must still compact with tool events recorded");
+        assert!(compacted);
+        assert_eq!(
+            memory
+                .list_message_events_recent(&envelope.memory_principal(), 256)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == CONTEXT_COMPACTION_DEGRADED_EVENT_TYPE)
+                .count(),
+            0,
+            "recording tool events must not push switch into permanent degradation"
+        );
+    }
+
     #[test]
     fn token_aware_trim_never_strands_a_tool_result() {
         let fixture = tool_roundtrip_history_fixture(10);
@@ -15745,6 +16339,94 @@ Let me check the result."#;
         );
     }
 
+    /// OS-paging evicts a span from the middle of history and replaces it with
+    /// one breadcrumb. When that span ends between an assistant `tool_calls`
+    /// envelope and the result answering it, the result is left at the head of
+    /// the hot window with nothing to answer — the orphan shape every native
+    /// provider rejects. The round-trip must be paged out whole instead, so the
+    /// output also stays recallable.
+    ///
+    /// MUTATION GUARD: delete the forward walk over stranded `role="tool"`
+    /// messages in `apply_os_paging` and the orphan assertion goes red.
+    #[tokio::test]
+    async fn os_paging_never_strands_a_tool_result_at_the_hot_window_head() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().to_string_lossy().to_string();
+        let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let envelope = RuntimeEnvelope::agent(workspace, "run-paging-orphan");
+        let runtime = DocumentIngestRuntime::from_envelope(mem, &envelope);
+
+        let mut config = paging_test_config(true);
+        // Lands the requested eviction boundary exactly on the second tool
+        // result, i.e. inside a round-trip.
+        config.os_paging.keep_recent_messages = 2;
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("first question ".repeat(40)),
+            ChatMessage::assistant(build_native_assistant_history(
+                "",
+                &[ToolCall {
+                    id: "call-1".to_string(),
+                    name: "shell".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+                None,
+            )),
+            ChatMessage::tool(
+                serde_json::json!({"tool_call_id": "call-1", "content": "first result ".repeat(40)}).to_string(),
+            ),
+            ChatMessage::assistant("first answer ".repeat(40)),
+            ChatMessage::user("second question ".repeat(40)),
+            ChatMessage::assistant(build_native_assistant_history(
+                "",
+                &[ToolCall {
+                    id: "call-2".to_string(),
+                    name: "shell".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+                None,
+            )),
+            ChatMessage::tool(
+                serde_json::json!({"tool_call_id": "call-2", "content": "PANGOLIN-TOOL-OUTPUT ".repeat(40)})
+                    .to_string(),
+            ),
+            ChatMessage::user("latest question please summarize"),
+        ];
+        assert_eq!(history.len(), 9);
+        assert_eq!(
+            history.get(7).map(|message| message.role.as_str()),
+            Some("tool"),
+            "fixture is useless unless the requested boundary cuts inside a round-trip"
+        );
+
+        let evicted = apply_os_paging(&mut history, &config, Some(&runtime)).await.unwrap();
+
+        assert!(evicted, "paging should evict cold context above threshold");
+        assert_eq!(
+            first_orphan_tool_index(&history),
+            None,
+            "paging must not strand a tool result: {history:?}"
+        );
+        assert_eq!(
+            history.last().map(|message| message.content.as_str()),
+            Some("latest question please summarize"),
+            "the newest turn must stay in the hot window"
+        );
+        assert!(
+            history.iter().any(|m| m.content.starts_with(OS_PAGING_EVICT_MARKER)),
+            "a paging breadcrumb should replace the evicted span"
+        );
+
+        // The stranded round-trip was paged out, not dropped: it is recallable.
+        let recalled = recall_context_pages("PANGOLIN tool output", &config, Some(&runtime))
+            .await
+            .expect("the evicted round-trip must be recallable");
+        assert!(
+            recalled.content.contains("PANGOLIN-TOOL-OUTPUT"),
+            "the tool output must have reached the page store, not been discarded"
+        );
+    }
+
     #[tokio::test]
     async fn os_paging_ingest_failure_leaves_history_unchanged() {
         let tmp = TempDir::new().unwrap();
@@ -15841,6 +16523,8 @@ Let me check the result."#;
             source_message_event_id: None,
             session_key: Some("chat-1".to_string()),
             legacy_session_key: None,
+            turn_key: "turn:test-untrusted".to_string(),
+            degradation_recorded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             agent_id: None,
             persona_id: None,
             channel: Some("terminal".to_string()),
@@ -16421,9 +17105,10 @@ Let me check the result."#;
         }
 
         #[tokio::test]
-        async fn empty_response_retry_keeps_all_system_context_at_the_front() {
+        async fn empty_response_retry_keeps_one_leading_system_message_unchanged() {
             let provider = StrictSystemPositionRetryProvider {
                 calls: AtomicUsize::new(0),
+                first_system: Mutex::new(None),
             };
             let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
             let result = run_tool_call_loop_outcome(
