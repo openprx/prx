@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.128] - 15 September 2026
+
+### Security
+
+- Route `Agent::execute_tool_call` through the shared tool execution service.
+  The `Agent::run_single` shell called `Tool::execute_named` directly, so a
+  model-authored argument document reached a tool with no autonomy policy
+  decision, no approval gate, no published-schema check and no audit record —
+  the second execution path left over after 0.8.126 closed the gateway one. It
+  now builds the same `ToolExecutionService` every other entry point uses, with
+  a fail-closed approval strategy because this shell cannot prompt anyone, and
+  `AgentBuilder::security_policy` binds the policy it decides under. The runtime
+  scope block is authored by the service from the agent's own context instead of
+  being scrubbed in place, and the scope is deliberately not the local-operator
+  tuple, so the destructive-action guard still refuses.
+  `tests/architecture_boundaries.rs` fails if a direct call comes back.
+
+### Fixed
+
+- A key matched by `patternProperties` is no longer rejected by
+  `additionalProperties: false`. JSON Schema counts a pattern-matched key as
+  declared, so a dynamic MCP or WASM contract that closes its property set and
+  names the open part by pattern had every legal call refused. The pattern
+  subschemas are enforced for the keys they claim, and a pattern this build
+  cannot compile leaves the property set open rather than closed, because no key
+  can then be shown to be outside it.
+- `type: "integer"` accepts a whole number written as a float. JSON Schema
+  defines `integer` by mathematical value, so `1.0` is one and `1.5` is not;
+  several providers emit whole numbers in float form and every one of those
+  calls was refused.
+- `oneOf` no longer rejects a call because this subset cannot tell two branches
+  apart. Branches that differ only by a keyword the validator does not model
+  (`pattern`, `format`, `not`, `multipleOf`) compile to the same weaker rules
+  and both match, which used to fail the "exactly one" count. The rule is now
+  explicit: where every branch is expressible in the modelled subset — which
+  covers every contract PRX itself emits — "exactly one" is enforced as written;
+  where a branch is not, the test relaxes to "at least one", so an undecidable
+  `oneOf` can still reject a document no branch accepts but can never reject one
+  on multiplicity alone.
+- `if` / `then` / `else` written at a schema's own level is enforced, not only
+  inside an `allOf` member. Both spellings are the same contract.
+- Local `$ref` entries are resolved against the document's `$defs` and
+  `definitions` before compilation, so the subtree behind a reference is
+  enforced instead of silently unconstrained. Resolution carries a reference
+  stack that stops a cycle, and a reference that points outside the document —
+  or at a missing definition — compiles to no constraints rather than to a
+  rejection.
+- The compiled-schema cache keys on the whole contract instead of the tool name,
+  so two documents advertised under one name each keep a slot. Alternating
+  between them missed on every call and took the global write lock every time,
+  which is exactly what an MCP router swapping servers or a WASM alias reload
+  does.
+- A full compiled-schema cache evicts its least recently used entries instead of
+  clearing the table. Past the capacity, clearing meant every new name dropped
+  every cached contract, so a runtime with more live aliases than the capacity
+  recompiled every schema on every call — worse than having no cache at all.
+
+### Changed
+
+- The compiled-schema fingerprint is SHA-256 over the provider dialect, the
+  public tool name and the complete schema document, replacing a 64-bit
+  `DefaultHasher`. Dynamic MCP and WASM schemas are caller-controlled content,
+  and a collision would validate a new contract against the rules compiled for
+  an old one. Every variable-length field is length-prefixed.
+
 ## [0.8.127] - 14 September 2026
 
 ### Fixed
@@ -151,7 +216,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   call awaited I/O is corrected.
 - Bound the unindexed cosine scan in SQLite vector recall by recency instead of
   scoring every embedded memory on every turn, backed by a partial index on
-  embedded rows. The bound is far above any realistic per-turn working set.
+  embedded rows. The bound is a candidate cap: in a store holding more embedded
+  memories than the cap, the ones outside the window are not scored and
+  therefore cannot be recalled by vector search at all, however relevant they
+  are. The cap was fixed at `max(limit * 50, 2000)` here and became the
+  configurable `[memory] vector_candidate_cap` (default 2000) in 0.8.126.
 
 ## [0.8.123] - 14 September 2026
 
@@ -172,6 +241,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   callable. Contracts are compiled once per tool name and schema fingerprint, so
   per-call validation does not re-derive rules and a re-advertised alias with a
   changed contract is recompiled rather than checked against stale ones.
+
+  This is a behaviour change, not only an internal one: the constraints every
+  tool already published take effect in production for the first time here. A
+  tool that declares `additionalProperties: false` (30+ of them do) now rejects
+  a call carrying any field it does not declare, an `enum` rejects a value
+  outside it, a declared type rejects a differently typed value, and
+  `minLength` / `maxLength` / `minimum` / `maximum` / `minItems` / `maxItems`
+  are enforced. Three spellings that executors used to accept are now refused
+  before they run, because the published schema never allowed them:
+  `git_operations` with `action: "save"` (the stash enum is
+  `push` / `pop` / `list` / `drop`), `proxy_config` with a mixed-case `action`
+  such as `"GET"`, and `http_request` with a lowercase `method` such as `"get"`
+  or a non-string value in `headers`.
 - Stop the published schema from contradicting the executor for tools with a
   default action. `sessions_spawn`, `mcp_call`, `message_send` (both
   implementations), `subagents` and `managed_session` no longer declare the

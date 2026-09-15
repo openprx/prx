@@ -52,11 +52,13 @@
 //! ```
 //!
 use parking_lot::RwLock;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::hash::{DefaultHasher, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 /// One discriminator-specific set of required tool arguments.
@@ -299,7 +301,7 @@ impl CompiledTypeConstraint {
             "object" => value.is_object(),
             "array" => value.is_array(),
             "string" => value.is_string(),
-            "integer" => value.is_i64() || value.is_u64(),
+            "integer" => is_integral_number(value),
             "number" => value.is_number(),
             "boolean" => value.is_boolean(),
             "null" => value.is_null(),
@@ -310,6 +312,21 @@ impl CompiledTypeConstraint {
     }
 }
 
+/// Whether `value` is an integer under JSON Schema's numeric model.
+///
+/// JSON Schema defines `integer` by mathematical value, not by lexical form:
+/// `1.0` is an integer and `1.5` is not. Several providers hand back whole
+/// numbers in float form, so testing only the JSON representation rejected
+/// calls that are correct by the specification.
+fn is_integral_number(value: &Value) -> bool {
+    if value.is_i64() || value.is_u64() {
+        return true;
+    }
+    value
+        .as_f64()
+        .is_some_and(|number| number.is_finite() && number.fract().abs() < f64::EPSILON)
+}
+
 /// How a compiled object schema treats properties it does not declare.
 #[derive(Debug, Clone, Default)]
 enum CompiledAdditionalProperties {
@@ -317,6 +334,17 @@ enum CompiledAdditionalProperties {
     Unconstrained,
     Forbidden,
     Schema(Box<CompiledToolSchema>),
+}
+
+/// One compiled `patternProperties` entry.
+///
+/// A pattern the `regex` crate cannot compile is not modelled at all; the
+/// compiler records that separately so a closed property set fails open for the
+/// keys it can no longer classify.
+#[derive(Debug, Clone)]
+struct CompiledPatternProperty {
+    pattern: Regex,
+    schema: CompiledToolSchema,
 }
 
 /// One compiled `allOf` entry.
@@ -346,10 +374,25 @@ enum CompiledCondition {
 /// uses richer JSON Schema still validates against the parts PRX understands
 /// instead of rejecting the whole call. It is *fail-closed on known
 /// violations*: every keyword that is modelled is enforced.
+///
+/// Fail-open has one consequence that has to be spelled out, because it is the
+/// difference between a permissive result and a wrong one: `oneOf` means
+/// "exactly one branch", and a branch whose distinguishing keyword is not
+/// modelled (`pattern`, `format`, `not`, `multipleOf`, ...) compiles to a
+/// weaker schema that can accept documents the real branch would reject. If
+/// such a branch is present, counting matches cannot decide the "exactly one"
+/// question, so the multiplicity test is relaxed to "at least one" for that
+/// `oneOf`. Where every branch *is* expressible here — which is the case for
+/// every contract PRX itself emits — "exactly one" is enforced as written. A
+/// `oneOf` is never a source of rejection just because this subset could not
+/// tell two branches apart.
 #[derive(Debug, Clone, Default)]
 pub struct CompiledToolSchema {
     any_of: Option<Vec<Self>>,
     one_of: Option<Vec<Self>>,
+    /// Whether every `oneOf` branch is expressible in this subset, which is
+    /// what makes the "exactly one" count meaningful. See [`Self::validate`].
+    one_of_is_decidable: bool,
     type_constraint: Option<CompiledTypeConstraint>,
     const_value: Option<Value>,
     enum_values: Option<Vec<Value>>,
@@ -361,24 +404,102 @@ pub struct CompiledToolSchema {
     max_items: Option<u64>,
     required: Vec<String>,
     properties: BTreeMap<String, Self>,
+    pattern_properties: Vec<CompiledPatternProperty>,
+    /// Set when `patternProperties` carried a regular expression this build
+    /// cannot compile, so no key can be classified as "not matched by any
+    /// pattern" any more.
+    unclassifiable_patterns: bool,
     additional_properties: CompiledAdditionalProperties,
     conditions: Vec<CompiledCondition>,
     items: Option<Box<Self>>,
 }
 
+/// Local `$defs` / `definitions` entries of one schema document, borrowed for
+/// the duration of a compilation.
+type LocalDefinitions<'a> = HashMap<&'a str, &'a Value>;
+
+/// Collect the document-level `$defs` and `definitions` entries a local `$ref`
+/// can name. `$defs` is the 2019-09 spelling and `definitions` the draft-07
+/// one; tool schemas in the wild use both, sometimes in the same document.
+fn collect_local_definitions(schema: &Value) -> LocalDefinitions<'_> {
+    let mut definitions = HashMap::new();
+    let Some(object) = schema.as_object() else {
+        return definitions;
+    };
+    for container in ["definitions", "$defs"] {
+        if let Some(entries) = object.get(container).and_then(Value::as_object) {
+            for (name, entry) in entries {
+                definitions.insert(name.as_str(), entry);
+            }
+        }
+    }
+    definitions
+}
+
+/// Whether every keyword in `schema` is one [`CompiledToolSchema`] models.
+///
+/// Annotation keywords carry no constraint, so they never make a schema
+/// undecidable. `$ref` counts as unmodelled here on purpose: the reference may
+/// point outside the document, and the only consumer of this answer relaxes a
+/// check when it is `false`.
+fn schema_is_fully_modelled(schema: &Value) -> bool {
+    let Some(object) = schema.as_object() else {
+        return true;
+    };
+    object.iter().all(|(keyword, child)| match keyword.as_str() {
+        "properties" | "patternProperties" | "$defs" | "definitions" => child
+            .as_object()
+            .is_none_or(|entries| entries.values().all(schema_is_fully_modelled)),
+        "items" | "if" | "then" | "else" | "additionalProperties" => schema_is_fully_modelled(child),
+        "anyOf" | "oneOf" | "allOf" => child
+            .as_array()
+            .is_none_or(|branches| branches.iter().all(schema_is_fully_modelled)),
+        "type" | "const" | "enum" | "required" | "minLength" | "maxLength" | "minimum" | "maximum" | "minItems"
+        | "maxItems" => true,
+        // Annotations: they describe, they do not constrain.
+        "description" | "title" | "default" | "examples" | "deprecated" | "readOnly" | "writeOnly" | "$schema"
+        | "$id" | "$comment" => true,
+        _ => false,
+    })
+}
+
 impl CompiledToolSchema {
     /// Compile one schema document into its enforceable rules.
+    ///
+    /// Local `$ref` entries are resolved against the document's own `$defs` /
+    /// `definitions` before compilation, with a reference stack that stops a
+    /// cycle; a reference that points outside the document compiles to no
+    /// constraints rather than to a rejection.
     #[must_use]
     pub fn compile(schema: &Value) -> Self {
+        let definitions = collect_local_definitions(schema);
+        Self::compile_node(schema, &definitions, &mut Vec::new())
+    }
+
+    fn compile_node(schema: &Value, definitions: &LocalDefinitions<'_>, stack: &mut Vec<String>) -> Self {
         let mut compiled = Self::default();
         let Some(object) = schema.as_object() else {
             return compiled;
         };
+        if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+            return Self::compile_reference(reference, definitions, stack);
+        }
         if let Some(any_of) = object.get("anyOf").and_then(Value::as_array) {
-            compiled.any_of = Some(any_of.iter().map(Self::compile).collect());
+            compiled.any_of = Some(
+                any_of
+                    .iter()
+                    .map(|branch| Self::compile_node(branch, definitions, stack))
+                    .collect(),
+            );
         }
         if let Some(one_of) = object.get("oneOf").and_then(Value::as_array) {
-            compiled.one_of = Some(one_of.iter().map(Self::compile).collect());
+            compiled.one_of_is_decidable = one_of.iter().all(schema_is_fully_modelled);
+            compiled.one_of = Some(
+                one_of
+                    .iter()
+                    .map(|branch| Self::compile_node(branch, definitions, stack))
+                    .collect(),
+            );
         }
         if let Some(expected) = object.get("type") {
             let names = expected.as_str().map_or_else(
@@ -408,30 +529,89 @@ impl CompiledToolSchema {
         if let Some(properties) = object.get("properties").and_then(Value::as_object) {
             compiled.properties = properties
                 .iter()
-                .map(|(name, property)| (name.clone(), Self::compile(property)))
+                .map(|(name, property)| (name.clone(), Self::compile_node(property, definitions, stack)))
                 .collect();
+        }
+        if let Some(patterns) = object.get("patternProperties").and_then(Value::as_object) {
+            for (pattern, property) in patterns {
+                match Regex::new(pattern) {
+                    Ok(pattern) => compiled.pattern_properties.push(CompiledPatternProperty {
+                        pattern,
+                        schema: Self::compile_node(property, definitions, stack),
+                    }),
+                    Err(error) => {
+                        tracing::debug!("tool schema pattern property '{pattern}' is not a supported regex: {error}");
+                        compiled.unclassifiable_patterns = true;
+                    }
+                }
+            }
         }
         compiled.additional_properties = match object.get("additionalProperties") {
             Some(Value::Bool(false)) => CompiledAdditionalProperties::Forbidden,
-            Some(schema) if schema.is_object() => CompiledAdditionalProperties::Schema(Box::new(Self::compile(schema))),
+            Some(schema) if schema.is_object() => {
+                CompiledAdditionalProperties::Schema(Box::new(Self::compile_node(schema, definitions, stack)))
+            }
             _ => CompiledAdditionalProperties::Unconstrained,
         };
         if let Some(conditions) = object.get("allOf").and_then(Value::as_array) {
             compiled.conditions = conditions
                 .iter()
-                .map(|condition| {
-                    condition.get("if").map_or_else(
-                        || CompiledCondition::Always(Box::new(Self::compile(condition))),
-                        |if_schema| CompiledCondition::Branch {
-                            condition: Box::new(Self::compile(if_schema)),
-                            then_schema: condition.get("then").map(|schema| Box::new(Self::compile(schema))),
-                            else_schema: condition.get("else").map(|schema| Box::new(Self::compile(schema))),
-                        },
-                    )
-                })
+                .map(|condition| Self::compile_member(condition, definitions, stack))
                 .collect();
         }
-        compiled.items = object.get("items").map(|schema| Box::new(Self::compile(schema)));
+        // A schema may also carry `if` / `then` / `else` at its own level rather
+        // than inside an `allOf` member. Both spellings are the same contract,
+        // so both are enforced.
+        if object.contains_key("if") {
+            compiled
+                .conditions
+                .push(Self::compile_member(schema, definitions, stack));
+        }
+        compiled.items = object
+            .get("items")
+            .map(|schema| Box::new(Self::compile_node(schema, definitions, stack)));
+        compiled
+    }
+
+    /// Compile one `allOf` member, or one schema level carrying `if`.
+    fn compile_member(
+        condition: &Value,
+        definitions: &LocalDefinitions<'_>,
+        stack: &mut Vec<String>,
+    ) -> CompiledCondition {
+        let Some(if_schema) = condition.get("if") else {
+            return CompiledCondition::Always(Box::new(Self::compile_node(condition, definitions, stack)));
+        };
+        CompiledCondition::Branch {
+            condition: Box::new(Self::compile_node(if_schema, definitions, stack)),
+            then_schema: condition
+                .get("then")
+                .map(|schema| Box::new(Self::compile_node(schema, definitions, stack))),
+            else_schema: condition
+                .get("else")
+                .map(|schema| Box::new(Self::compile_node(schema, definitions, stack))),
+        }
+    }
+
+    /// Compile the target of a `$ref`.
+    ///
+    /// Anything that cannot be resolved inside this document — an external URI,
+    /// a missing definition, or a cycle — compiles to no constraints, because
+    /// refusing a call over a reference this subset cannot follow would reject
+    /// arguments that are in fact correct.
+    fn compile_reference(reference: &str, definitions: &LocalDefinitions<'_>, stack: &mut Vec<String>) -> Self {
+        let Some(name) = SchemaCleanr::parse_local_ref(reference) else {
+            return Self::default();
+        };
+        if stack.iter().any(|entry| entry == reference) {
+            return Self::default();
+        }
+        let Some(target) = definitions.get(name.as_str()) else {
+            return Self::default();
+        };
+        stack.push(reference.to_string());
+        let compiled = Self::compile_node(target, definitions, stack);
+        stack.pop();
         compiled
     }
 
@@ -449,6 +629,19 @@ impl CompiledToolSchema {
         issues.is_empty()
     }
 
+    /// Whether `name` is an *additional* property, i.e. one that neither
+    /// `properties` nor `patternProperties` accounts for.
+    ///
+    /// JSON Schema applies `additionalProperties` to exactly this remainder, so
+    /// a key covered by a pattern is not additional and a closed property set
+    /// must not reject it. When a pattern could not be compiled, no key can be
+    /// shown to be outside the pattern set and nothing is reported.
+    fn is_additional_property(&self, name: &str) -> bool {
+        !self.unclassifiable_patterns
+            && !self.properties.contains_key(name)
+            && !self.pattern_properties.iter().any(|entry| entry.pattern.is_match(name))
+    }
+
     fn validate(&self, value: &Value, path: &str, issues: &mut Vec<ArgumentValidationIssue>) {
         if let Some(any_of) = self.any_of.as_ref()
             && !any_of.iter().any(|candidate| candidate.matches(value))
@@ -458,13 +651,25 @@ impl CompiledToolSchema {
                 message: "does not contain any accepted required-field set".to_string(),
             });
         }
-        if let Some(one_of) = self.one_of.as_ref()
-            && one_of.iter().filter(|candidate| candidate.matches(value)).count() != 1
-        {
-            issues.push(ArgumentValidationIssue {
-                path: path.to_string(),
-                message: "must match exactly one accepted schema".to_string(),
-            });
+        if let Some(one_of) = self.one_of.as_ref() {
+            let matched = one_of.iter().filter(|candidate| candidate.matches(value)).count();
+            // See the type-level note: "exactly one" is only enforceable when
+            // every branch is expressible in this subset. Otherwise two branches
+            // may compile to the same weaker rules and match the same document,
+            // which says nothing about the contract the caller broke.
+            if self.one_of_is_decidable {
+                if matched != 1 {
+                    issues.push(ArgumentValidationIssue {
+                        path: path.to_string(),
+                        message: "must match exactly one accepted schema".to_string(),
+                    });
+                }
+            } else if matched == 0 {
+                issues.push(ArgumentValidationIssue {
+                    path: path.to_string(),
+                    message: "does not match any accepted schema".to_string(),
+                });
+            }
         }
 
         if let Some(constraint) = self.type_constraint.as_ref()
@@ -546,10 +751,15 @@ impl CompiledToolSchema {
                     property.validate(property_value, &format!("{path}.{name}"), issues);
                 }
             }
+            for entry in &self.pattern_properties {
+                for (name, property_value) in object.iter().filter(|(name, _)| entry.pattern.is_match(name)) {
+                    entry.schema.validate(property_value, &format!("{path}.{name}"), issues);
+                }
+            }
             match &self.additional_properties {
                 CompiledAdditionalProperties::Unconstrained => {}
                 CompiledAdditionalProperties::Forbidden => {
-                    for name in object.keys().filter(|name| !self.properties.contains_key(*name)) {
+                    for name in object.keys().filter(|name| self.is_additional_property(name)) {
                         issues.push(ArgumentValidationIssue {
                             path: format!("{path}.{name}"),
                             message: "is not an accepted property".to_string(),
@@ -557,8 +767,7 @@ impl CompiledToolSchema {
                     }
                 }
                 CompiledAdditionalProperties::Schema(additional) => {
-                    for (name, property_value) in object.iter().filter(|(name, _)| !self.properties.contains_key(*name))
-                    {
+                    for (name, property_value) in object.iter().filter(|(name, _)| self.is_additional_property(name)) {
                         additional.validate(property_value, &format!("{path}.{name}"), issues);
                     }
                 }
@@ -619,58 +828,150 @@ pub fn validate_tool_arguments(schema: &Value, arguments: &Value) -> Vec<Argumen
     CompiledToolSchema::compile(schema).validate_tool_arguments(arguments)
 }
 
-/// Process-wide compiled-schema cache, keyed by public tool name.
+/// Process-wide compiled-schema cache.
 ///
-/// The stored fingerprint is what makes the key safe for dynamic MCP, WASM and
-/// skill aliases: a router that re-advertises the same name with a different
-/// contract misses the cached entry and is recompiled instead of validated
-/// against a stale rule set.
-static COMPILED_TOOL_SCHEMAS: LazyLock<RwLock<HashMap<String, (u64, Arc<CompiledToolSchema>)>>> =
+/// The key is the SHA-256 of the whole contract — provider dialect, public tool
+/// name and the complete schema document — so it identifies a contract rather
+/// than a name. One tool name re-advertised with two different documents (an
+/// MCP router that swaps servers, a WASM alias hot-reload, an enum that follows
+/// configuration) therefore keeps one entry per document and alternating
+/// between them hits the cache both ways instead of recompiling on every call.
+static COMPILED_TOOL_SCHEMAS: LazyLock<RwLock<HashMap<[u8; 32], CompiledSchemaCacheEntry>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// Upper bound on cached contracts. Reached only by a runtime that cycles
-/// through thousands of distinct dynamic alias names; the cache is then dropped
-/// wholesale rather than growing without limit.
+/// Monotonic tick used to order cache entries by last use.
+static COMPILED_TOOL_SCHEMA_CLOCK: AtomicU64 = AtomicU64::new(0);
+
+/// Upper bound on cached contracts.
 const COMPILED_TOOL_SCHEMA_CACHE_CAPACITY: usize = 4096;
+
+/// Upper bound on how many least-recently-used entries one overflow drops.
+///
+/// Evicting a batch rather than a single entry keeps the scan amortised, and
+/// evicting at all — rather than clearing the table, which is what this did
+/// until 0.8.128 — keeps a runtime whose steady-state alias count sits above
+/// the capacity from recompiling every schema on every call.
+const COMPILED_TOOL_SCHEMA_CACHE_EVICTION: usize = 512;
+
+/// How many entries an overflow at `capacity` drops: an eighth of the table,
+/// never the whole of it and never nothing.
+const fn eviction_count(capacity: usize) -> usize {
+    let eighth = capacity / 8;
+    if eighth < 1 {
+        1
+    } else if eighth > COMPILED_TOOL_SCHEMA_CACHE_EVICTION {
+        COMPILED_TOOL_SCHEMA_CACHE_EVICTION
+    } else {
+        eighth
+    }
+}
+
+/// One cached compilation plus the tick at which it was last served.
+struct CompiledSchemaCacheEntry {
+    compiled: Arc<CompiledToolSchema>,
+    last_used: AtomicU64,
+}
+
+impl CompiledSchemaCacheEntry {
+    fn new(compiled: Arc<CompiledToolSchema>) -> Self {
+        Self {
+            compiled,
+            last_used: AtomicU64::new(next_cache_tick()),
+        }
+    }
+
+    fn touch(&self) {
+        self.last_used.store(next_cache_tick(), Ordering::Relaxed);
+    }
+
+    fn last_used(&self) -> u64 {
+        self.last_used.load(Ordering::Relaxed)
+    }
+}
+
+fn next_cache_tick() -> u64 {
+    COMPILED_TOOL_SCHEMA_CLOCK.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Drop the least recently used entries of a full cache.
+fn evict_least_recently_used(cache: &mut HashMap<[u8; 32], CompiledSchemaCacheEntry>, victims: usize) {
+    let victims = victims.min(cache.len());
+    if victims == 0 {
+        return;
+    }
+    let mut ticks: Vec<u64> = cache.values().map(CompiledSchemaCacheEntry::last_used).collect();
+    ticks.sort_unstable();
+    let Some(&threshold) = ticks.get(victims - 1) else {
+        return;
+    };
+    cache.retain(|_, entry| entry.last_used() > threshold);
+}
+
+/// Insert one compilation, evicting by recency when the table is full.
+fn store_compiled_schema(
+    cache: &mut HashMap<[u8; 32], CompiledSchemaCacheEntry>,
+    key: [u8; 32],
+    compiled: &Arc<CompiledToolSchema>,
+    capacity: usize,
+) {
+    if cache.len() >= capacity && !cache.contains_key(&key) {
+        evict_least_recently_used(cache, eviction_count(capacity));
+    }
+    cache.insert(key, CompiledSchemaCacheEntry::new(Arc::clone(compiled)));
+}
+
+/// Content fingerprint of one (dialect, tool name, schema) triple.
+///
+/// SHA-256 rather than a non-cryptographic hash because dynamic MCP and WASM
+/// schemas are caller-controlled content: a collision here would validate a new
+/// contract against the rules compiled for an old one.
+fn schema_cache_key(tool_name: &str, dialect: ToolSchemaDialect, schema: &Value) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update([dialect as u8]);
+    hasher.update((tool_name.len() as u64).to_le_bytes());
+    hasher.update(tool_name.as_bytes());
+    hash_schema(schema, &mut hasher);
+    hasher.finalize().into()
+}
 
 /// Structural fingerprint of a schema document.
 ///
 /// Walks the document without allocating a serialization of it, and is stable
 /// across processes for the same content because `serde_json` maps iterate in
-/// key order.
-fn hash_schema(value: &Value, hasher: &mut impl Hasher) {
+/// key order. Every variable-length field is length-prefixed so two different
+/// documents cannot produce the same byte stream.
+fn hash_schema(value: &Value, hasher: &mut Sha256) {
     match value {
-        Value::Null => hasher.write_u8(0),
-        Value::Bool(flag) => {
-            hasher.write_u8(1);
-            hasher.write_u8(u8::from(*flag));
-        }
+        Value::Null => hasher.update([0]),
+        Value::Bool(flag) => hasher.update([1, u8::from(*flag)]),
         Value::Number(number) => {
-            hasher.write_u8(2);
+            hasher.update([2]);
             if let Some(number) = number.as_i64() {
-                hasher.write_i64(number);
+                hasher.update(number.to_le_bytes());
             } else if let Some(number) = number.as_u64() {
-                hasher.write_u64(number);
+                hasher.update(number.to_le_bytes());
             } else {
-                hasher.write_u64(number.as_f64().unwrap_or_default().to_bits());
+                hasher.update(number.as_f64().unwrap_or_default().to_bits().to_le_bytes());
             }
         }
         Value::String(text) => {
-            hasher.write_u8(3);
-            hasher.write(text.as_bytes());
+            hasher.update([3]);
+            hasher.update((text.len() as u64).to_le_bytes());
+            hasher.update(text.as_bytes());
         }
         Value::Array(items) => {
-            hasher.write_u8(4);
-            hasher.write_usize(items.len());
+            hasher.update([4]);
+            hasher.update((items.len() as u64).to_le_bytes());
             for item in items {
                 hash_schema(item, hasher);
             }
         }
         Value::Object(entries) => {
-            hasher.write_u8(5);
-            hasher.write_usize(entries.len());
+            hasher.update([5]);
+            hasher.update((entries.len() as u64).to_le_bytes());
             for (key, entry) in entries {
-                hasher.write(key.as_bytes());
+                hasher.update((key.len() as u64).to_le_bytes());
+                hasher.update(key.as_bytes());
                 hash_schema(entry, hasher);
             }
         }
@@ -744,67 +1045,39 @@ impl ToolSchemaDialect {
     }
 }
 
-/// Compile `schema` once per (tool name, dialect, schema fingerprint) and reuse it.
+/// Compile `schema` once per (tool name, dialect, schema document) and reuse it.
 ///
 /// Every production tool call validates its arguments, so the compile step must
-/// not repeat per call. Fingerprinting is a non-allocating walk of the *published*
-/// schema with the dialect folded in; compiling — and, for a non-`Raw` dialect,
-/// cleaning — is not, which is what the cache saves. One process normally talks
-/// to one provider family, so the dialect component is stable in practice;
-/// alternating families for the same tool name misses the cache and recompiles,
-/// exactly as alternating schemas for one name already does.
+/// not repeat per call. Fingerprinting is a non-allocating walk of the
+/// *published* schema with the dialect and the tool name folded in; compiling —
+/// and, for a non-`Raw` dialect, cleaning — is not, which is what the cache
+/// saves. Two contracts advertised under one name occupy two entries, so
+/// neither evicts the other.
 #[must_use]
 pub fn compiled_tool_schema_for_dialect(
     tool_name: &str,
     dialect: ToolSchemaDialect,
     schema: &Value,
 ) -> Arc<CompiledToolSchema> {
-    let fingerprint = dialect_schema_fingerprint(dialect, schema);
+    let key = schema_cache_key(tool_name, dialect, schema);
     {
         let cache = COMPILED_TOOL_SCHEMAS.read();
-        if let Some((cached_fingerprint, compiled)) = cache.get(tool_name)
-            && *cached_fingerprint == fingerprint
-        {
-            return Arc::clone(compiled);
+        if let Some(entry) = cache.get(&key) {
+            entry.touch();
+            return Arc::clone(&entry.compiled);
         }
     }
     let compiled = Arc::new(CompiledToolSchema::compile(&dialect.enforceable_schema(schema)));
     let mut cache = COMPILED_TOOL_SCHEMAS.write();
-    if cache.len() >= COMPILED_TOOL_SCHEMA_CACHE_CAPACITY && !cache.contains_key(tool_name) {
-        cache.clear();
-    }
-    cache.insert(tool_name.to_string(), (fingerprint, Arc::clone(&compiled)));
+    store_compiled_schema(&mut cache, key, &compiled, COMPILED_TOOL_SCHEMA_CACHE_CAPACITY);
     compiled
-}
-
-#[must_use]
-fn dialect_schema_fingerprint(dialect: ToolSchemaDialect, schema: &Value) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    hasher.write_u8(dialect as u8);
-    hash_schema(schema, &mut hasher);
-    hasher.finish()
 }
 
 /// [`compiled_tool_schema_for_dialect`] for callers that hold the published
 /// document with no provider rewrite in play.
 #[must_use]
 pub fn compiled_tool_schema(tool_name: &str, schema: &Value) -> Arc<CompiledToolSchema> {
-    let fingerprint = dialect_schema_fingerprint(ToolSchemaDialect::Raw, schema);
-    {
-        let cache = COMPILED_TOOL_SCHEMAS.read();
-        if let Some((cached_fingerprint, compiled)) = cache.get(tool_name)
-            && *cached_fingerprint == fingerprint
-        {
-            return Arc::clone(compiled);
-        }
-    }
-    let compiled = Arc::new(CompiledToolSchema::compile(schema));
-    let mut cache = COMPILED_TOOL_SCHEMAS.write();
-    if cache.len() >= COMPILED_TOOL_SCHEMA_CACHE_CAPACITY && !cache.contains_key(tool_name) {
-        cache.clear();
-    }
-    cache.insert(tool_name.to_string(), (fingerprint, Arc::clone(&compiled)));
-    compiled
+    compiled_tool_schema_for_dialect(tool_name, ToolSchemaDialect::Raw, schema)
 }
 
 /// Render validation issues for a model, without an `Error:` prefix.
@@ -2143,6 +2416,292 @@ mod tests {
         assert!(
             !raw_again.validate_tool_arguments(&args).is_empty(),
             "the Gemini compilation leaked into the Raw path"
+        );
+    }
+
+    #[test]
+    fn pattern_property_keys_are_not_additional_properties() {
+        // 2c: a key matched by `patternProperties` is not "additional", so a
+        // closed property set must let it through — and must still close the
+        // set against a key no pattern matches.
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {"name": {"type": "string"}},
+            "patternProperties": {"^x-": {"type": "string"}}
+        });
+        assert!(
+            validate_tool_arguments(&schema, &json!({"name": "n", "x-trace": "abc"})).is_empty(),
+            "a pattern-matched key must be accepted"
+        );
+        let rejected = validate_tool_arguments(&schema, &json!({"name": "n", "y-trace": "abc"}));
+        assert!(
+            rejected.iter().any(|issue| issue.path == "$.y-trace"),
+            "a key no pattern matches is still additional: {rejected:?}"
+        );
+        // The pattern's own subschema is enforced for the keys it claims.
+        let typed = validate_tool_arguments(&schema, &json!({"name": "n", "x-trace": 7}));
+        assert!(
+            typed.iter().any(|issue| issue.path == "$.x-trace"),
+            "the pattern subschema must be enforced: {typed:?}"
+        );
+    }
+
+    #[test]
+    fn an_uncompilable_pattern_opens_the_property_set_instead_of_closing_it() {
+        // A pattern this build cannot compile leaves no way to tell which keys
+        // it claims, so refusing unknown keys would refuse legal ones.
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {},
+            // A lookahead: valid ECMA-262, outside the `regex` crate's grammar.
+            "patternProperties": {"^(?=x)": {"type": "string"}}
+        });
+        assert!(
+            validate_tool_arguments(&schema, &json!({"anything": 1})).is_empty(),
+            "an unclassifiable pattern set must fail open"
+        );
+    }
+
+    #[test]
+    fn integer_accepts_whole_numbers_written_as_floats() {
+        // 2d: JSON Schema defines `integer` by value, not by spelling.
+        let schema = json!({"type": "object", "properties": {"limit": {"type": "integer"}}});
+        assert!(validate_tool_arguments(&schema, &json!({"limit": 1})).is_empty());
+        assert!(
+            validate_tool_arguments(&schema, &json!({"limit": 1.0})).is_empty(),
+            "1.0 is an integer"
+        );
+        assert!(
+            validate_tool_arguments(&schema, &json!({"limit": -3.0})).is_empty(),
+            "-3.0 is an integer"
+        );
+        let rejected = validate_tool_arguments(&schema, &json!({"limit": 1.5}));
+        assert!(
+            rejected.iter().any(|issue| issue.path == "$.limit"),
+            "1.5 is not an integer: {rejected:?}"
+        );
+        let text = validate_tool_arguments(&schema, &json!({"limit": "1"}));
+        assert!(
+            text.iter().any(|issue| issue.path == "$.limit"),
+            "a string is not an integer: {text:?}"
+        );
+    }
+
+    #[test]
+    fn one_of_branches_separated_by_unmodelled_keywords_do_not_reject() {
+        // 2b: both branches compile to `{"type":"string"}` because `pattern` is
+        // not modelled, so the match count says nothing. Rejecting on count
+        // here would refuse a call that is correct under either branch.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "ref": {
+                    "oneOf": [
+                        {"type": "string", "pattern": "^[0-9]+$"},
+                        {"type": "string", "pattern": "^[a-z]+$"}
+                    ]
+                }
+            }
+        });
+        assert!(
+            validate_tool_arguments(&schema, &json!({"ref": "abc"})).is_empty(),
+            "an undecidable oneOf must not reject"
+        );
+        // Fail-open is not no-op: a value no branch can accept is still refused.
+        let rejected = validate_tool_arguments(&schema, &json!({"ref": 5}));
+        assert!(
+            rejected.iter().any(|issue| issue.path == "$.ref"),
+            "no branch accepts a number: {rejected:?}"
+        );
+    }
+
+    #[test]
+    fn one_of_branches_this_subset_models_still_mean_exactly_one() {
+        // The other half of the rule: when every branch is expressible here,
+        // "exactly one" is enforced as written.
+        let schema = json!({
+            "type": "object",
+            "oneOf": [{"required": ["expression"]}, {"required": ["schedule"]}],
+            "properties": {"expression": {"type": "string"}, "schedule": {"type": "string"}}
+        });
+        assert!(validate_tool_arguments(&schema, &json!({"expression": "1+1"})).is_empty());
+        let both = validate_tool_arguments(&schema, &json!({"expression": "1+1", "schedule": "daily"}));
+        assert!(
+            both.iter().any(|issue| issue.message.contains("exactly one")),
+            "two matching branches must still be refused: {both:?}"
+        );
+        let neither = validate_tool_arguments(&schema, &json!({}));
+        assert!(!neither.is_empty(), "no matching branch must be refused");
+    }
+
+    #[test]
+    fn root_level_if_then_else_is_enforced() {
+        // 2e: the same contract written at the schema root rather than inside
+        // an `allOf` member.
+        let schema = json!({
+            "type": "object",
+            "properties": {"mode": {"type": "string"}, "path": {"type": "string"}, "url": {"type": "string"}},
+            "if": {"properties": {"mode": {"const": "local"}}, "required": ["mode"]},
+            "then": {"required": ["path"]},
+            "else": {"required": ["url"]}
+        });
+        assert!(validate_tool_arguments(&schema, &json!({"mode": "local", "path": "/tmp"})).is_empty());
+        let missing_path = validate_tool_arguments(&schema, &json!({"mode": "local"}));
+        assert!(
+            missing_path.iter().any(|issue| issue.path == "$.path"),
+            "the `then` branch must bind: {missing_path:?}"
+        );
+        let missing_url = validate_tool_arguments(&schema, &json!({"mode": "remote"}));
+        assert!(
+            missing_url.iter().any(|issue| issue.path == "$.url"),
+            "the `else` branch must bind: {missing_url:?}"
+        );
+        assert!(validate_tool_arguments(&schema, &json!({"mode": "remote", "url": "https://x"})).is_empty());
+    }
+
+    #[test]
+    fn local_refs_are_resolved_before_compilation() {
+        // 2f: `#/$defs/*` and `#/definitions/*` are followed, so the subtree
+        // behind a reference is enforced rather than silently unconstrained.
+        let schema = json!({
+            "type": "object",
+            "required": ["target"],
+            "properties": {"target": {"$ref": "#/$defs/Target"}},
+            "$defs": {
+                "Target": {
+                    "type": "object",
+                    "required": ["host"],
+                    "properties": {"host": {"type": "string", "minLength": 1}, "port": {"type": "integer"}}
+                }
+            }
+        });
+        assert!(validate_tool_arguments(&schema, &json!({"target": {"host": "h", "port": 1}})).is_empty());
+        let missing = validate_tool_arguments(&schema, &json!({"target": {}}));
+        assert!(
+            missing.iter().any(|issue| issue.path == "$.target.host"),
+            "the referenced contract must bind: {missing:?}"
+        );
+        let wrong = validate_tool_arguments(&schema, &json!({"target": {"host": "h", "port": "80"}}));
+        assert!(
+            wrong.iter().any(|issue| issue.path == "$.target.port"),
+            "the referenced types must bind: {wrong:?}"
+        );
+
+        let draft07 = json!({
+            "type": "object",
+            "properties": {"target": {"$ref": "#/definitions/Target"}},
+            "definitions": {"Target": {"type": "string", "minLength": 2}}
+        });
+        assert!(validate_tool_arguments(&draft07, &json!({"target": "ok"})).is_empty());
+        assert!(!validate_tool_arguments(&draft07, &json!({"target": "x"})).is_empty());
+    }
+
+    #[test]
+    fn unresolvable_and_circular_refs_stay_open_instead_of_rejecting() {
+        // A reference this document cannot resolve is a keyword the validator
+        // does not model, not a violation.
+        let external = json!({
+            "type": "object",
+            "properties": {"target": {"$ref": "https://example.test/schema.json#/Target"}}
+        });
+        assert!(validate_tool_arguments(&external, &json!({"target": {"anything": true}})).is_empty());
+
+        let missing = json!({"type": "object", "properties": {"target": {"$ref": "#/$defs/Absent"}}});
+        assert!(validate_tool_arguments(&missing, &json!({"target": 1})).is_empty());
+
+        // A cycle must terminate, and must still enforce the part it walked.
+        let circular = json!({
+            "type": "object",
+            "properties": {"node": {"$ref": "#/$defs/Node"}},
+            "$defs": {
+                "Node": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": {"name": {"type": "string"}, "child": {"$ref": "#/$defs/Node"}}
+                }
+            }
+        });
+        assert!(validate_tool_arguments(&circular, &json!({"node": {"name": "a", "child": {"name": "b"}}})).is_empty());
+        let broken = validate_tool_arguments(&circular, &json!({"node": {"child": {}}}));
+        assert!(
+            broken.iter().any(|issue| issue.path == "$.node.name"),
+            "the first level of a recursive contract is still enforced: {broken:?}"
+        );
+    }
+
+    #[test]
+    fn one_tool_name_keeps_one_cache_entry_per_contract() {
+        // 4a: two contracts advertised under one name used to share a single
+        // slot, so alternating between them recompiled on every single call and
+        // took the global write lock each time.
+        let name = "mcp__alternating__probe";
+        let first = json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]});
+        let second = json!({"type": "object", "properties": {"b": {"type": "integer"}}, "required": ["b"]});
+
+        let first_compiled = compiled_tool_schema(name, &first);
+        let second_compiled = compiled_tool_schema(name, &second);
+        assert!(!Arc::ptr_eq(&first_compiled, &second_compiled));
+        for _ in 0..4 {
+            assert!(
+                Arc::ptr_eq(&first_compiled, &compiled_tool_schema(name, &first)),
+                "the first contract must stay cached while the second is in use"
+            );
+            assert!(
+                Arc::ptr_eq(&second_compiled, &compiled_tool_schema(name, &second)),
+                "the second contract must stay cached while the first is in use"
+            );
+        }
+        assert!(first_compiled.validate_tool_arguments(&json!({"a": "x"})).is_empty());
+        assert!(second_compiled.validate_tool_arguments(&json!({"b": 1})).is_empty());
+    }
+
+    #[test]
+    fn a_full_cache_evicts_by_recency_instead_of_clearing() {
+        // 4b: clearing the table meant a runtime whose live alias count sits
+        // above the capacity recompiled every schema on every call — worse than
+        // having no cache. Eviction keeps the recently used entries.
+        let mut cache = HashMap::new();
+        let compiled = Arc::new(CompiledToolSchema::compile(&json!({"type": "object"})));
+        let key = |byte: u8| [byte; 32];
+        for index in 0..4_u8 {
+            store_compiled_schema(&mut cache, key(index), &compiled, 4);
+        }
+        assert_eq!(cache.len(), 4);
+        // Touch two entries so they are the most recently used.
+        for index in [2_u8, 3] {
+            if let Some(entry) = cache.get(&key(index)) {
+                entry.touch();
+            }
+        }
+        store_compiled_schema(&mut cache, key(9), &compiled, 4);
+        assert!(cache.contains_key(&key(9)), "the new contract must be cached");
+        assert!(cache.contains_key(&key(2)), "a recently used contract must survive");
+        assert!(cache.contains_key(&key(3)), "a recently used contract must survive");
+        assert!(
+            cache.len() > 1,
+            "eviction must not empty the table: {} entries left",
+            cache.len()
+        );
+    }
+
+    #[test]
+    fn the_cache_key_is_a_content_hash_of_the_whole_contract() {
+        // 4c: the fingerprint is SHA-256 over dialect, name and document, so a
+        // caller-controlled schema cannot be fitted to another one's slot.
+        let schema = json!({"type": "object", "properties": {"a": {"type": "string"}}});
+        let other = json!({"type": "object", "properties": {"a": {"type": "integer"}}});
+        let key = schema_cache_key("probe", ToolSchemaDialect::Raw, &schema);
+        assert_eq!(key.len(), 32);
+        assert_eq!(key, schema_cache_key("probe", ToolSchemaDialect::Raw, &schema));
+        assert_ne!(key, schema_cache_key("probe", ToolSchemaDialect::Raw, &other));
+        assert_ne!(key, schema_cache_key("other", ToolSchemaDialect::Raw, &schema));
+        assert_ne!(key, schema_cache_key("probe", ToolSchemaDialect::Gemini, &schema));
+        // Length prefixing: neighbouring fields must not be able to trade bytes.
+        assert_ne!(
+            schema_cache_key("ab", ToolSchemaDialect::Raw, &json!({"c": 1})),
+            schema_cache_key("a", ToolSchemaDialect::Raw, &json!({"bc": 1}))
         );
     }
 }

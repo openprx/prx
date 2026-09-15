@@ -908,9 +908,9 @@ fn strip_cfg_test_items(source: &str) -> String {
 /// A new entry needs a reason on the line above it, and any entry under
 /// `src/gateway/` is a regression of the 0.8.126 fix by construction.
 const ALLOWED_DIRECT_TOOL_INVOCATIONS: &[&str] = &[
-    // Legacy `Agent::run_single` shell, reachable only from the crate's own
-    // tests today; kept out of the service until that shell is removed.
-    "src/agent/agent.rs::execute_tool_call",
+    // Fire-and-forget delegate spawn from the legacy `Agent::run_single` shell.
+    // `Agent::execute_tool_call` — the shell's actual tool path — was routed
+    // through the service in 0.8.128 and must not come back here.
     "src/agent/agent.rs::spawn_delegate_task",
     // Operator-typed terminal commands: `@file` mention expansion, `/kill`,
     // `/spawn`, `/steer` and `!command`. The human at the keyboard is the
@@ -980,6 +980,12 @@ fn direct_tool_invocations_outside_the_execution_service_are_allowlisted() {
             "{entry} calls a tool directly. The gateway MCP endpoint was routed through \
              ToolExecutionService in 0.8.126 precisely so an external caller cannot skip policy, \
              approval, schema validation and audit; re-adding a direct call there reopens that hole"
+        );
+        assert_ne!(
+            entry, "src/agent/agent.rs::execute_tool_call",
+            "Agent::execute_tool_call was the second execution path: it advertised a tool schema \
+             to the model and then enforced none of it, with no policy decision and no audit \
+             record. It was routed through ToolExecutionService in 0.8.128"
         );
     }
 

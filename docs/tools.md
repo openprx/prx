@@ -146,7 +146,10 @@ against the model's arguments before the policy decision is acted on, before any
 approval prompt, and before the executor runs. Validation covers nested required
 fields, scalar types, enums, constants, string/array lengths, numeric bounds,
 union types, unknown-field rejection where the schema closes its property set,
-and alternative required-field sets. A structurally invalid call is rejected
+alternative required-field sets, `patternProperties`, `if`/`then`/`else` at any
+schema level, and local `$ref` entries resolved against the document's own
+`$defs` / `definitions` (with cycle detection; a reference that points outside
+the document constrains nothing). A structurally invalid call is rejected
 with an `InvalidArguments` outcome that names every offending path, is recorded
 in the tool execution audit like any other terminal outcome, and never reaches
 the backend. Executor checks remain as defense in depth.
@@ -154,9 +157,25 @@ the backend. Executor checks remain as defense in depth.
 Validation is fail-open on JSON Schema keywords PRX does not model and
 fail-closed on the ones it does: a dynamic MCP or WASM contract that uses
 `pattern`, `format`, `propertyNames` or similar keeps working, and only the
-modelled constraints bind. Each contract is compiled once per tool name, schema
-fingerprint and provider dialect, so a re-advertised alias with a changed
-contract is recompiled rather than checked against stale rules.
+modelled constraints bind. `type: "integer"` follows the specification's
+numeric model, so a whole number a provider spelled as `1.0` is an integer.
+
+`oneOf` has one rule worth stating, because fail-open changes what a count
+means. Where every branch is expressible in the modelled subset — which covers
+every contract PRX itself publishes — "exactly one branch matches" is enforced
+as written. Where a branch turns on a keyword the validator does not model, two
+branches can compile to the same weaker rules and match the same document, so
+the multiplicity test relaxes to "at least one": an undecidable `oneOf` still
+rejects a document no branch accepts, but never rejects one for matching too
+many. A key matched by `patternProperties` counts as declared, so
+`additionalProperties: false` does not reject it.
+
+Each contract is compiled once per provider dialect, public tool name and
+complete schema document, identified by a SHA-256 of the three. Two documents
+advertised under one name each keep a cache entry, so an MCP router that swaps
+servers or a WASM alias reload hits the cache both ways instead of recompiling
+per call, and a full cache evicts its least recently used entries rather than
+clearing itself.
 
 The document enforced is the one the caller was actually shown. Tool schemas do
 not always reach a provider verbatim: Gemini's API rejects `additionalProperties`,
@@ -176,8 +195,13 @@ to the published document, and its request goes through the same policy
 decision, approval gate, schema check and audit record as a model-issued call.
 Approval there is fail-closed: a remote client cannot answer a prompt, so a tool
 the autonomy level wants confirmed is refused rather than auto-approved.
+The `Agent::run_single` shell runs through the same service as of 0.8.128;
+approval there is fail-closed for the same reason.
 `tests/architecture_boundaries.rs` pins the inventory of production call sites
-that invoke a tool directly, so a new bypass fails a test.
+that invoke a tool directly, so a new bypass fails a test, and
+`tests/tool_schema_contract.rs` sweeps the whole static tool inventory: every
+published contract must accept a document derived from itself and reject one
+that breaks it.
 See [Tool Schema and Child Capability Parity](tool-schema-and-child-capability-parity.md)
 for the architecture and acceptance matrix.
 
