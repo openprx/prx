@@ -3329,6 +3329,7 @@ impl SessionsSpawnTool {
             let process_parent_run_id = parent_run_id.clone();
             let process_session_scope_key = session_scope_key.clone();
             let process_spawn_depth = spawn_depth;
+            let process_channel_exclusions = inherited_channel_exclusions.clone();
             let process_compaction_config = resolved_compaction.config.clone();
             let process_event_recording = self.event_recording;
             let process_execution_ctx = SpawnExecutionContext {
@@ -3407,6 +3408,7 @@ impl SessionsSpawnTool {
                                 &process_config_generation,
                                 process_event_recording,
                                 &process_compaction_config,
+                                &process_channel_exclusions,
                                 monitor_process_control.as_ref(),
                                 process_steer_rx,
                                 history_arc,
@@ -3707,6 +3709,7 @@ impl SessionsSpawnTool {
                     } else {
                         Some(&cfg.allowed_tools)
                     },
+                    &inherited_channel_exclusions,
                 )
             });
             (prompt, tools)
@@ -4624,11 +4627,20 @@ impl Tool for AllowedToolProxy {
     }
 }
 
+/// Build the tool registry one sub-agent sees.
+///
+/// `channel_excluded` is the spawning channel surface's hidden set and is
+/// applied last, after the agent's own allowlist: the boundary between a
+/// conversation partner and the operations surface is not something an agent
+/// configuration — or a `mode: "process"` manifest — may re-open. Names an
+/// operator put back through `[tool_tiering] always_include` never reach this
+/// list, because it is derived from `for_channel_surface()`, which keeps them.
 pub(crate) fn resolve_tools_for_agent(
     source: Arc<Vec<Box<dyn Tool>>>,
     agent_name: &str,
     memory_scope: MemoryScope,
     allowed_tools: Option<&[String]>,
+    channel_excluded: &[String],
 ) -> Arc<Vec<Box<dyn Tool>>> {
     let allowlist = allowed_tools.map(|items| {
         items
@@ -4662,6 +4674,9 @@ pub(crate) fn resolve_tools_for_agent(
             .any(|tool| tool.supports_name(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME))
     {
         selected_names.push(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME);
+    }
+    if !channel_excluded.is_empty() {
+        selected_names.retain(|name| !channel_excluded.iter().any(|hidden| hidden == name));
     }
 
     let memory_prefix = if memory_scope == MemoryScope::Isolated {
@@ -5354,6 +5369,7 @@ fn build_session_worker_manifest(
     session_scope_key: &str,
     parent_run_id: Option<&str>,
     compaction_config: &AgentCompactionConfig,
+    channel_excluded_tools: &[String],
 ) -> anyhow::Result<(WorkerManifest, String, u64)> {
     let mut manifest = WorkerManifest {
         parent_capability: None,
@@ -5378,6 +5394,7 @@ fn build_session_worker_manifest(
         persona_id: None,
         memory_event_recording: event_recording,
         allowed_tools: allowed_tools.to_vec(),
+        channel_excluded_tools: channel_excluded_tools.to_vec(),
         system_prompt: agent_system_prompt.map(str::to_string),
         identity_dir,
         scope_sender: scope.map(|ctx| ctx.sender.clone()),
@@ -6020,6 +6037,7 @@ async fn run_sub_agent_process(
     config_generation: &str,
     event_recording: MemoryEventRecording,
     compaction_config: &AgentCompactionConfig,
+    channel_excluded_tools: &[String],
     process_control: &ProcessRunControl,
     steer_rx: tokio::sync::mpsc::Receiver<String>,
     history: Arc<RwLock<Vec<HistoryEntry>>>,
@@ -6096,6 +6114,7 @@ async fn run_sub_agent_process(
         session_scope_key,
         parent_run_id,
         compaction_config,
+        channel_excluded_tools,
     )?;
 
     if let Some(reason) = process_control.termination_reason() {
@@ -6414,7 +6433,7 @@ mod tests {
     async fn wildcard_tool_inheritance_preserves_dynamic_specs_and_execution() {
         let source: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(DynamicCapabilityTool)]);
         let allowed = vec!["*".to_string()];
-        let tools = resolve_tools_for_agent(source, "worker", MemoryScope::Shared, Some(&allowed));
+        let tools = resolve_tools_for_agent(source, "worker", MemoryScope::Shared, Some(&allowed), &[]);
 
         assert_eq!(tools.len(), 1);
         let proxy = tools.first().expect("wildcard inherits root tool");
@@ -6442,7 +6461,7 @@ mod tests {
         refresh_tools_for_explicit_allowlist(&source, &allowed)
             .await
             .expect("dynamic discovery");
-        let selected = resolve_tools_for_agent(source, "worker", MemoryScope::Shared, Some(&allowed));
+        let selected = resolve_tools_for_agent(source, "worker", MemoryScope::Shared, Some(&allowed), &[]);
 
         assert!(refreshed.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(selected.len(), 1);
@@ -6460,7 +6479,7 @@ mod tests {
         ]);
         let allowed = vec!["capability_call".to_string()];
 
-        let tools = resolve_tools_for_agent(source, "worker", MemoryScope::Shared, Some(&allowed));
+        let tools = resolve_tools_for_agent(source, "worker", MemoryScope::Shared, Some(&allowed), &[]);
         let names = tools.iter().map(|tool| tool.name()).collect::<Vec<_>>();
         assert_eq!(
             names,
@@ -7118,19 +7137,94 @@ mod tests {
             "sessions_spawn:test",
             None,
             &resolved.config,
+            &[],
         )
         .expect("manifest");
 
-        let manifest_config = manifest.compaction_config.expect("manifest compaction config");
+        let manifest_config = manifest.compaction_config.clone().expect("manifest compaction config");
         assert_eq!(manifest_config.max_context_tokens, 200_000);
         assert_eq!(manifest.model, "small-child");
         assert_eq!(
             manifest.system_prompt.as_deref(),
             Some("Use tools before reporting completion.")
         );
+        assert!(
+            manifest.channel_excluded_tools.is_empty(),
+            "an operator-rooted spawn hides nothing"
+        );
         assert_ne!(manifest_config.max_context_tokens, 1_000_000);
         assert_eq!(manifest.runtime_config_generation_id, Some(17));
         assert_eq!(manifest.runtime_config_source_revision.as_deref(), Some("revision-17"));
+    }
+
+    #[test]
+    fn sessions_spawn_process_manifest_carries_the_channel_exclusions_under_the_seal() {
+        // `mode: "process"` used to be a one-word way out of the channel
+        // boundary: the manifest had no field for it, so the worker started
+        // with the whole operations surface back. The list travels in the
+        // manifest now, and the manifest is what the capability seals.
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+        let resolved = tool.resolve_child_compaction("openrouter", "small-child");
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let lineage = SpawnLineage {
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
+        };
+        let hidden = crate::config::ToolTieringConfig::default()
+            .for_channel_surface()
+            .always_exclude;
+        assert!(
+            hidden.iter().any(|name| name == "gateway"),
+            "fixture validity: the default channel surface hides `gateway`"
+        );
+
+        let build = |excluded: &[String]| {
+            build_session_worker_manifest(
+                "run-child",
+                "task",
+                "openrouter",
+                "small-child",
+                None,
+                0.2,
+                temp.path().join("worker"),
+                temp.path().join("brain.db"),
+                temp.path().display().to_string(),
+                PROCESS_MEMORY_STRATEGY_SHARED,
+                "sqlite",
+                temp.path().join("memory").join("brain.db"),
+                temp.path().join("worker").join("brain.db"),
+                temp.path().join("config"),
+                &"0".repeat(64),
+                None,
+                None,
+                MemoryEventRecording::default(),
+                &[],
+                None,
+                None,
+                &lineage,
+                0,
+                "sessions_spawn:test",
+                None,
+                &resolved.config,
+                excluded,
+            )
+            .expect("manifest")
+        };
+
+        let (bounded, sealed, _) = build(&hidden);
+        assert_eq!(
+            bounded.channel_excluded_tools, hidden,
+            "the spawning surface's hidden set has to cross the process boundary"
+        );
+        let (open, open_seal, _) = build(&[]);
+        assert!(open.channel_excluded_tools.is_empty());
+        assert_ne!(
+            sealed, open_seal,
+            "the exclusions are covered by the capability seal, so they cannot be stripped in transit"
+        );
     }
 
     #[test]
@@ -9513,6 +9607,7 @@ mod tests {
             persona_id: None,
             memory_event_recording: MemoryEventRecording::default(),
             allowed_tools: vec!["shell".to_string()],
+            channel_excluded_tools: Vec::new(),
             system_prompt: None,
             identity_dir: None,
             scope_sender: None,

@@ -47,6 +47,19 @@ pub struct WorkerManifest {
     #[serde(default)]
     pub memory_event_recording: crate::memory::MemoryEventRecording,
     pub allowed_tools: Vec<String>,
+    /// Tool names the spawning channel surface hides, carried across the
+    /// process boundary.
+    ///
+    /// `allowed_tools` is the *agent's* contract and is usually empty, meaning
+    /// "inherit everything". The channel surface's `channel_exclude` list is a
+    /// different thing: it is the boundary between a conversation partner on an
+    /// IM channel and the operations surface, and until 0.8.131 it stopped at
+    /// the OS process boundary — a `mode: "process"` spawn, or a worker resumed
+    /// from this manifest, got `gateway`, `config_reload`, `proxy_config`,
+    /// `nodes` and `git_operations` back. The list is covered by the manifest
+    /// capability seal, so a worker cannot be started with it stripped.
+    #[serde(default)]
+    pub channel_excluded_tools: Vec<String>,
     pub system_prompt: Option<String>,
     pub identity_dir: Option<String>,
     pub scope_sender: Option<String>,
@@ -170,6 +183,7 @@ mod tests {
                 record_tool_events: true,
             },
             allowed_tools: vec!["shell".into(), "file_read".into()],
+            channel_excluded_tools: Vec::new(),
             system_prompt: None,
             identity_dir: Some("identity/worker".into()),
             scope_sender: Some("openprx_user".into()),

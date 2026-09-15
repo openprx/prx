@@ -2502,6 +2502,32 @@ impl crate::agent::loop_::ToolLoopEventSink for ReduxToolLoopEventSink {
 /// streaming, overflow recovery, tool execution, usage aggregation, history
 /// mutation and cancellation are all delegated to `run_tool_call_loop_outcome`.
 #[allow(clippy::too_many_arguments)]
+/// Publish the tail of the last throttle window before a terminal action
+/// retires the draft, since the reducer drops reasoning deltas once it has.
+///
+/// Both terminal paths use it: a turn that fails still produced the reasoning
+/// that led up to the failure, and dropping it there hid exactly the part a
+/// reader needs.
+async fn flush_trailing_reasoning(
+    action_tx: &mpsc::Sender<Action>,
+    draft_id: &str,
+    reasoning_progress: &Arc<ParkingMutex<ReasoningProgressBatcher>>,
+    stream_version: &Arc<AtomicU64>,
+) {
+    // The lock is released by the end of this statement, before the await
+    // below: a batcher lock must never be held across a send.
+    let trailing = reasoning_progress.lock().flush();
+    if let Some(batch) = trailing {
+        let _ = action_tx
+            .send(Action::StreamReasoningReceived {
+                draft_id: draft_id.to_string(),
+                delta: batch,
+                version: stream_version.fetch_add(1, Ordering::Relaxed).saturating_add(1),
+            })
+            .await;
+    }
+}
+
 async fn drive_start_turn_stream(
     provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
     provider: Arc<dyn Provider>,
@@ -2699,6 +2725,11 @@ async fn drive_start_turn_stream(
         }
         Err(error) => {
             let retryable = crate::agent::loop_::tool_loop_error_is_retryable(&error);
+            // A failed turn keeps whatever reasoning it produced before it
+            // broke, and that tail is often the only account of why it broke.
+            // `StreamFailed` retires the draft, so the flush has to come first
+            // here for the same reason it does on the success path.
+            flush_trailing_reasoning(&action_tx, &draft_id, &reasoning_progress, &stream_version).await;
             let _ = action_tx
                 .send(Action::StreamFailed {
                     draft_id,
@@ -2713,16 +2744,7 @@ async fn drive_start_turn_stream(
     let final_text = outcome.into_text();
     // Publish the tail of the last throttle window before the terminal action
     // retires the draft: after it the reducer drops reasoning deltas as stale.
-    let trailing_reasoning = reasoning_progress.lock().flush();
-    if let Some(batch) = trailing_reasoning {
-        let _ = action_tx
-            .send(Action::StreamReasoningReceived {
-                draft_id: draft_id.clone(),
-                delta: batch,
-                version: stream_version.fetch_add(1, Ordering::Relaxed).saturating_add(1),
-            })
-            .await;
-    }
+    flush_trailing_reasoning(&action_tx, &draft_id, &reasoning_progress, &stream_version).await;
     if trace.tokens_used.is_reported()
         && action_tx
             .send(Action::StreamUsageMetered {
@@ -4330,6 +4352,119 @@ mod tests {
         assert!(
             redux_injection_overbudget_diagnostic_text(&enriched, &original_already_over, &config).is_none(),
             "when original is already over budget, D5 diagnostic must not fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_still_publishes_the_reasoning_it_produced() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+
+        /// Emits reasoning inside one throttle window, then breaks. The batcher
+        /// is still holding that tail when the turn fails.
+        struct FailingAfterReasoningProvider;
+
+        #[async_trait]
+        impl Provider for FailingAfterReasoningProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok("unused".to_string())
+            }
+
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: Some("unused".into()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat_with_history(
+                &self,
+                _: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                stream::iter(vec![
+                    Ok(StreamChunk::reasoning_delta("weighing the")),
+                    Ok(StreamChunk::reasoning_delta(" last option")),
+                    Err(crate::providers::traits::StreamError::Provider(
+                        "upstream closed the connection".to_string(),
+                    )),
+                ])
+                .boxed()
+            }
+
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let history = vec![PMsg::system("sys"), PMsg::user("think then break")];
+        let (action_tx, mut action_rx) = mpsc::channel::<Action>(32);
+        let policy = full_tool_security_policy();
+        let tool_context = chat_tool_execution_context(policy.as_ref(), None, None, "draft-failing-reasoning");
+
+        drive_start_turn_stream(
+            None,
+            Arc::new(FailingAfterReasoningProvider),
+            history.clone(),
+            history,
+            "model".to_string(),
+            0.0,
+            None,
+            CancellationToken::new(),
+            "draft-failing-reasoning".to_string(),
+            action_tx,
+            None,
+            None,
+            tool_context,
+            MemoryFabric::new(Arc::new(crate::memory::NoneMemory::new()), "test"),
+            None,
+            crate::agent::loop_::ChatMode::Edit,
+            Arc::new(crate::observability::noop::NoopObserver),
+            Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),
+            crate::tools::intent::SessionToolSurface {
+                tiering: crate::config::ToolTieringConfig::default(),
+                unrouted: crate::tools::intent::UnroutedToolPolicy::KeepPinnedExposure,
+            },
+            None,
+        )
+        .await;
+
+        let mut reasoning = String::new();
+        let mut reasoning_before_failure = false;
+        let mut failed = false;
+        while let Ok(action) = action_rx.try_recv() {
+            match action {
+                Action::StreamReasoningReceived { delta, .. } => {
+                    reasoning.push_str(&delta);
+                    reasoning_before_failure = !failed;
+                }
+                Action::StreamFailed { .. } => failed = true,
+                _ => {}
+            }
+        }
+        assert!(failed, "fixture validity: the turn must actually fail");
+        assert!(
+            reasoning.contains("last option"),
+            "the tail of the last throttle window must survive a failed turn: {reasoning:?}"
+        );
+        assert!(
+            reasoning_before_failure,
+            "the flush has to precede StreamFailed, which retires the draft"
         );
     }
 

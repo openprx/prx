@@ -149,7 +149,9 @@ union types, unknown-field rejection where the schema closes its property set,
 alternative required-field sets, `patternProperties`, `if`/`then`/`else` at any
 schema level, and local `$ref` entries resolved against the document's own
 `$defs` / `definitions` (with cycle detection; a reference that points outside
-the document constrains nothing). A structurally invalid call is rejected
+the document constrains nothing, and the subtree *below* a cycle is
+unconstrained as well — only the level at which the cycle closes is enforced).
+A structurally invalid call is rejected
 with an `InvalidArguments` outcome that names every offending path, is recorded
 in the tool execution audit like any other terminal outcome, and never reaches
 the backend. Executor checks remain as defense in depth.
@@ -159,6 +161,22 @@ fail-closed on the ones it does: a dynamic MCP or WASM contract that uses
 `pattern`, `format`, `propertyNames` or similar keeps working, and only the
 modelled constraints bind. `type: "integer"` follows the specification's
 numeric model, so a whole number a provider spelled as `1.0` is an integer.
+`enum` and `const` use the same numeric model, so one document cannot accept
+`1.0` for `type: "integer"` and refuse it for `enum: [1]`.
+
+Because `integer` accepts a float spelling but executors read integers with
+`as_u64()` / `as_i64()`, the service rewrites integral floats into JSON integers
+after validation and before dispatch, against the published schema: nested
+objects, array items, `patternProperties`, an `additionalProperties` schema and
+the taken side of an `if` / `then` / `else` are all covered. A non-integral
+value is a violation and is rejected, never rewritten.
+
+Compilation is bounded. `$ref` resolution unwinds its stack, so a non-cyclic
+document that references the same definition from many places can expand
+exponentially, and MCP or WASM contracts are caller-supplied. Past the node and
+depth budgets the remaining subtrees compile to no constraints and a warning is
+logged; the bound counts work, not time, so a given document always costs the
+same.
 
 `oneOf` has one rule worth stating, because fail-open changes what a count
 means. Where every branch is expressible in the modelled subset — which covers
@@ -201,7 +219,13 @@ approval there is fail-closed for the same reason.
 that invoke a tool directly, so a new bypass fails a test, and
 `tests/tool_schema_contract.rs` sweeps the whole static tool inventory: every
 published contract must accept a document derived from itself and reject one
-that breaks it.
+that breaks it. The accepting half derives its example from the schema alone —
+never from the validator's own complaints, which would make the assertion the
+generator's exit condition — and validates it once, with no repair; a contract
+the derivation cannot satisfy is pinned by name with its reason. Paired
+accept/reject cases for `patternProperties`, undecidable `oneOf`, integral
+floats, a root-level `if` / `then` / `else` and local `$ref` cover the semantics
+no schema PRX itself publishes uses.
 See [Tool Schema and Child Capability Parity](tool-schema-and-child-capability-parity.md)
 for the architecture and acceptance matrix.
 

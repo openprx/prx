@@ -849,6 +849,12 @@ archives rather than one overwriting the other. Archives are never cleaned up
 and they contain the encrypted credentials that were in the tree at the time, so
 prune `config.d.pre-*` yourself after a key rotation.
 
+An archive holds `config.toml` and `config.d/`, not the defaults record. If you
+restore a tree from one, the record on disk still describes the version you
+restored *from*, so the next `--force` classifies against the wrong baseline:
+delete `.init-defaults.toml` after restoring and every value in the restored
+tree is treated as yours.
+
 If the preserved values cannot be validated against this build, `--force` still
 repairs the tree — that is what it is for — but it does so loudly rather than
 quietly: it writes bare templates, prints an uppercase warning naming the

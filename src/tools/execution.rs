@@ -1467,7 +1467,7 @@ impl ToolExecutionService {
     /// execute -> audit pipeline and return a typed terminal outcome.
     pub async fn execute(
         &self,
-        command: ToolExecutionCommand,
+        mut command: ToolExecutionCommand,
         context: ToolExecutionContext,
         cancellation: Option<CancellationToken>,
     ) -> ToolExecutionOutcome {
@@ -1546,7 +1546,8 @@ impl ToolExecutionService {
         // the gateway MCP server, which ran outside it until 0.8.126. The
         // contract enforced is the one the caller was shown: see
         // `ToolExecutionContext::schema_dialect`.
-        if let Err(error) = validate_command_arguments(&command.arguments, &descriptor, context.schema_dialect) {
+        let contract = enforce_command_contract(&mut command.arguments, &descriptor, context.schema_dialect);
+        if let Err(error) = contract {
             return self.finish(
                 &command,
                 &context,
@@ -1969,7 +1970,8 @@ pub fn strip_runtime_only_args(root: &mut serde_json::Map<String, serde_json::Va
     root.retain(|key, _| !is_runtime_only_arg(key));
 }
 
-/// Enforce a tool's schema against caller-supplied arguments.
+/// Enforce a tool's published contract on caller-supplied arguments: validate
+/// them, then make the document say what the contract means.
 ///
 /// The descriptor's `parameters` document is the single truth source: native,
 /// skill, MCP alias and WASM plugin tools all reach this with the same schema
@@ -1981,36 +1983,50 @@ pub fn strip_runtime_only_args(root: &mut serde_json::Map<String, serde_json::Va
 /// constraint the model never saw is never enforced against it. Runtime-only
 /// keys are removed first because the runtime authors them after validation and
 /// they are intentionally absent from public schemas.
-fn validate_command_arguments(
-    arguments: &serde_json::Value,
+///
+/// On success the arguments are normalized in place — see
+/// [`crate::tools::schema::CompiledToolSchema::normalize_integral_numbers`].
+/// That is why this takes `&mut`: enforcement is not only a verdict.
+fn enforce_command_contract(
+    arguments: &mut serde_json::Value,
     descriptor: &ToolDescriptor,
     dialect: ToolSchemaDialect,
 ) -> Result<(), String> {
-    let Some(root) = arguments.as_object() else {
-        return Err("tool arguments must be a JSON object".to_string());
-    };
-    let sanitized;
-    let candidate = if root.keys().any(|key| is_runtime_only_arg(key)) {
-        let mut root = root.clone();
-        strip_runtime_only_args(&mut root);
-        sanitized = serde_json::Value::Object(root);
-        &sanitized
-    } else {
-        arguments
-    };
     let compiled = crate::tools::schema::compiled_tool_schema_for_dialect(
         &descriptor.public_name,
         dialect,
         &descriptor.parameters,
     );
-    let issues = compiled.validate_tool_arguments(candidate);
-    if issues.is_empty() {
-        return Ok(());
+    let issues = {
+        let Some(root) = arguments.as_object() else {
+            return Err("tool arguments must be a JSON object".to_string());
+        };
+        let sanitized;
+        let candidate = if root.keys().any(|key| is_runtime_only_arg(key)) {
+            let mut root = root.clone();
+            strip_runtime_only_args(&mut root);
+            sanitized = serde_json::Value::Object(root);
+            &sanitized
+        } else {
+            &*arguments
+        };
+        compiled.validate_tool_arguments(candidate)
+    };
+    if !issues.is_empty() {
+        return Err(crate::tools::schema::describe_argument_validation_issues(
+            &descriptor.public_name,
+            &issues,
+        ));
     }
-    Err(crate::tools::schema::describe_argument_validation_issues(
-        &descriptor.public_name,
-        &issues,
-    ))
+    // The contract holds, so the document is now made to say what the contract
+    // says it means: `integer` is a mathematical value in JSON Schema, and a
+    // model that answers `200.0` for one is correct — but every executor reads
+    // integers with `as_u64()` / `as_i64()`, which see `Float(200.0)` as absent
+    // and fall back to a default. Coercing here, against the published schema,
+    // is the one place that knows which fields were declared `integer`; doing
+    // it in each executor would be ~20 copies of a rule none of them can state.
+    compiled.normalize_integral_numbers(arguments);
+    Ok(())
 }
 
 fn normalize_arguments(
@@ -3100,6 +3116,136 @@ mod tests {
         assert_eq!(outcome.status, ToolExecutionStatus::PreparationDenied);
         assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
         assert_eq!(&*fixture.stages.lock(), &["policy", "preparation", "audit"]);
+    }
+
+    /// A tool whose contract declares integers, so the coercion has something
+    /// to act on and the recorded arguments show what the executor really got.
+    struct IntegerContractTool {
+        calls: Arc<AtomicUsize>,
+        arguments: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    #[async_trait]
+    impl Tool for IntegerContractTool {
+        fn name(&self) -> &str {
+            "paged_read"
+        }
+
+        fn description(&self) -> &str {
+            "reads a page"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "from": {"type": "integer"},
+                    "window": {"type": "object", "properties": {"lines": {"type": "integer"}}},
+                    "marks": {"type": "array", "items": {"type": "integer"}}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            })
+        }
+
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.arguments.lock().push(args);
+            Ok(ToolResult {
+                success: true,
+                output: "page".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    fn integer_contract_service(fixture: &Fixture) -> ToolExecutionService {
+        ToolExecutionService::from_shared_boxed_registry(
+            Arc::new(vec![Box::new(IntegerContractTool {
+                calls: Arc::clone(&fixture.calls),
+                arguments: Arc::clone(&fixture.arguments),
+            }) as Box<dyn Tool>]),
+            Arc::new(FixedPolicy {
+                decision: ToolExecutionDecision::Allow,
+                stages: Arc::clone(&fixture.stages),
+            }),
+            Arc::new(FixedApproval {
+                decision: approved(),
+                stages: Arc::clone(&fixture.stages),
+            }),
+            Arc::new(RecordingPreparation {
+                stages: Arc::clone(&fixture.stages),
+                allowed: true,
+            }),
+            Arc::new(RecordingAudit {
+                records: Arc::clone(&fixture.records),
+                stages: Arc::clone(&fixture.stages),
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn whole_numbers_written_as_floats_reach_the_executor_as_integers() {
+        // The validator accepts `200.0` for an `integer` because JSON Schema
+        // says so. Executors read integers with `as_u64()`, which answers
+        // `None` for `Float(200.0)` and leaves them on their default — a wrong
+        // answer the model never learns about. This is the one place that knows
+        // which fields the contract declared `integer`.
+        let fixture = fixture();
+        let service = integer_contract_service(&fixture);
+        let outcome = service
+            .execute(
+                ToolExecutionCommand::new(
+                    "paged_read",
+                    serde_json::json!({
+                        "path": "notes.md",
+                        "from": 200.0,
+                        "window": {"lines": 12.0},
+                        "marks": [3.0, 4.0]
+                    }),
+                ),
+                context(),
+                None,
+            )
+            .await;
+
+        assert_eq!(outcome.status, ToolExecutionStatus::Succeeded);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        let recorded = fixture.arguments.lock().first().cloned().expect("executor arguments");
+        let integer_at = |pointer: &str| recorded.pointer(pointer).and_then(serde_json::Value::as_u64);
+        assert_eq!(
+            integer_at("/from"),
+            Some(200),
+            "the executor must read 200, not fall back to a default: {recorded}"
+        );
+        assert_eq!(integer_at("/window/lines"), Some(12), "{recorded}");
+        assert_eq!(integer_at("/marks/0"), Some(3), "{recorded}");
+        assert_eq!(integer_at("/marks/1"), Some(4), "{recorded}");
+        assert_eq!(
+            recorded.pointer("/path").and_then(serde_json::Value::as_str),
+            Some("notes.md")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fractional_value_for_an_integer_field_is_still_rejected_before_the_executor() {
+        let fixture = fixture();
+        let service = integer_contract_service(&fixture);
+        let outcome = service
+            .execute(
+                ToolExecutionCommand::new("paged_read", serde_json::json!({"path": "notes.md", "from": 1.5})),
+                context(),
+                None,
+            )
+            .await;
+
+        assert_eq!(outcome.status, ToolExecutionStatus::InvalidArguments);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            outcome.error.unwrap_or_default().contains("integer"),
+            "the model has to be told which field it got wrong"
+        );
     }
 
     #[tokio::test]

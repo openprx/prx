@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.131] - 15 September 2026
+
+### Security
+
+- The channel surface's hidden tool set crosses the process boundary. A
+  sub-agent started with `mode: "process"`, and a session worker resumed from a
+  manifest, ran with the full operations surface: the exclusion list lived only
+  in a task-local the OS child never saw, and the worker registers `gateway` and
+  `config_reload` itself. A conversation partner on an IM channel could
+  therefore reach `gateway`, `config_reload`, `proxy_config`, `nodes` and
+  `git_operations` by asking for a spawn in process mode — the same route
+  0.8.130 closed for task mode, with one argument changed. The list now travels
+  in `WorkerManifest`, which the parent capability seals, so it cannot be
+  stripped in transit; the worker applies it after the agent's own
+  `allowed_tools`, so naming a hidden tool there does not re-open it; and
+  everything the worker spawns in turn inherits the same boundary. Names an
+  operator re-enables through `[tool_tiering] always_include` are unaffected.
+- An excluded tool published under an alias is hidden too. The exclusion was
+  matched against each backend's root name, so an MCP router or WASM alias that
+  answers to an excluded public name stayed exposed.
+- Compiling a tool schema is bounded. `$ref` resolution pops its stack, so a
+  non-cyclic document that names the same definition from `k` places at each of
+  `n` levels expanded to `k^n` nodes; MCP and WASM contracts are caller-supplied
+  and are compiled on their first call, so such a document could burn a turn
+  inside the validator. Past the budget the remaining subtrees compile to no
+  constraints and a warning is logged. The bound is a work count, not a clock:
+  the same document always costs the same.
+- The compiled-schema fingerprint distinguishes the three JSON number
+  representations. Without a discriminator `minimum: -1` and
+  `minimum: 18446744073709551615` hashed to the same eight bytes, as did `1` and
+  the smallest subnormal `f64`, so two different caller-supplied contracts could
+  share a cache slot.
+
+### Fixed
+
+- A whole number written in float form reaches the executor as an integer.
+  0.8.128 made `type: "integer"` accept `200.0`, as JSON Schema requires, but
+  executors read integers with `as_u64()` / `as_i64()`, which answer `None` for
+  `Float(200.0)` and fall back to a default — so an accepted call silently ran
+  with the wrong value and the model got no signal, where before it got a
+  correctable rejection. The execution service now normalizes integral floats
+  against the published schema after validation and before dispatch, including
+  inside nested objects, arrays, `patternProperties`, `additionalProperties` and
+  the taken branch of an `if` / `then` / `else`. A non-integral value is still a
+  violation and is still rejected.
+- `enum` and `const` read whole numbers the way `type` does. `serde_json`
+  compares numbers by representation, so one document could accept `1.0` for
+  `type: "integer"` and reject it for `enum: [1]`. Distinct 64-bit integers are
+  still distinct.
+- A `context.compaction.degraded` event the backend refused is retried instead
+  of claimed. The turn marked itself as having recorded the event before
+  attempting the write, so a backend that was briefly unavailable lost the event
+  for the rest of the turn — silently, because the failure is only a debug line.
+  The claim now follows a write that landed; duplicates remain impossible
+  through the turn-derived idempotency key.
+- The chat thinking-progress batcher flushes its final window on a failed turn
+  as well as a completed one. `StreamFailed` retires the draft, so the reasoning
+  that led up to the failure was dropped — the part a reader most needs.
+
+### Changed
+
+- The published-contract sweep derives its example calls from the schema alone.
+  The generator repaired a seed against the validator's own complaints until the
+  validator stopped complaining, and the test then asserted that the validator
+  does not complain: the assertion was the loop's exit condition and could not
+  fail. Examples are now read off `required`, `type`, `enum`, `const`,
+  `minimum`, `minLength`, `minItems`, `pattern` and local `$ref`, with `if` /
+  `then` / `else` decided by a predicate written in the test, and validated
+  once with no repair; a contract that cannot be satisfied this way is pinned by
+  name with the reason. Paired accept/reject cases cover the five keywords
+  0.8.128 changed, none of which appear in any schema PRX itself publishes.
+
 ## [0.8.130] - 15 September 2026
 
 ### Fixed
@@ -46,12 +118,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- A sub-agent started by `sessions_spawn` or `delegate` inherits the tool
-  exclusions of the channel surface that spawned it. Sub-agent loops run without
-  tiering of their own, so a conversation partner on an IM channel could reach
-  the operations surface the channel hides simply by asking for a spawn. Names
-  an operator re-enables through `[tool_tiering] always_include` are unaffected,
-  and operator entry points (terminal chat, gateway, console) seed no exclusions.
+- A sub-agent that `sessions_spawn` or `delegate` runs inside the parent process
+  inherits the tool exclusions of the channel surface that spawned it. Sub-agent
+  loops run without tiering of their own, so a conversation partner on an IM
+  channel could reach the operations surface the channel hides simply by asking
+  for a spawn. Names an operator re-enables through `[tool_tiering]
+  always_include` are unaffected, and operator entry points (terminal chat,
+  gateway, console) seed no exclusions. `mode: "process"` spawns and resumed
+  session workers are a separate process and were **not** covered by this
+  change; 0.8.131 carries the list across that boundary.
 - The canonical tool order is a pure function of the exposed set even when two
   entries share a name. Duplicate names were collapsed by keeping whichever copy
   came first, so an MCP or WASM alias shadowing a built-in, or a middleware pass
@@ -119,6 +194,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   being scrubbed in place, and the scope is deliberately not the local-operator
   tuple, so the destructive-action guard still refuses.
   `tests/architecture_boundaries.rs` fails if a direct call comes back.
+  Two behaviour changes come with it. A failed tool call on this path now
+  emits `HookEvent::Error` where it used to emit `HookEvent::ToolCall` with
+  `success: false`, so a hook that counts failures by subscribing to `ToolCall`
+  stops seeing them. And `_zc_scope_trusted` — which asserts "the runtime, not
+  the caller, wrote this scope block" — is `true` on this path, where the old
+  code forced it to `false`; the marker that gates destructive `gateway`
+  actions is `_prx_scope_trusted`, and that one is still `false` here.
 
 ### Fixed
 

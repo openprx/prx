@@ -386,6 +386,10 @@ enum CompiledCondition {
 /// every contract PRX itself emits — "exactly one" is enforced as written. A
 /// `oneOf` is never a source of rejection just because this subset could not
 /// tell two branches apart.
+///
+/// Compilation is also *bounded*: see [`COMPILE_NODE_BUDGET`]. A document that
+/// exhausts the budget keeps the rules compiled so far and leaves the rest
+/// unconstrained.
 #[derive(Debug, Clone, Default)]
 pub struct CompiledToolSchema {
     any_of: Option<Vec<Self>>,
@@ -417,6 +421,48 @@ pub struct CompiledToolSchema {
 /// Local `$defs` / `definitions` entries of one schema document, borrowed for
 /// the duration of a compilation.
 type LocalDefinitions<'a> = HashMap<&'a str, &'a Value>;
+
+/// Upper bound on how many schema nodes one compilation may expand.
+///
+/// `$ref` resolution pushes its target onto a stack and pops it again, which
+/// stops a cycle but not a *non-cyclic* document that names the same definition
+/// from several places: `n` levels of `$defs` with `k` references each expand to
+/// `k^n` nodes. MCP and WASM contracts are caller-supplied content and are
+/// compiled on their first call, so a document shaped like that would burn a
+/// turn inside the validator. The budget counts work, not time: the same
+/// document always consumes the same amount of it, so compilation stays
+/// deterministic and reproducible.
+const COMPILE_NODE_BUDGET: usize = 4096;
+
+/// Upper bound on how deeply `$ref` resolution may nest within one compilation.
+const COMPILE_DEPTH_BUDGET: usize = 32;
+
+/// Work budget and reference stack of one compilation.
+struct CompileState {
+    stack: Vec<String>,
+    nodes_remaining: usize,
+    exhausted: bool,
+}
+
+impl CompileState {
+    const fn new() -> Self {
+        Self {
+            stack: Vec::new(),
+            nodes_remaining: COMPILE_NODE_BUDGET,
+            exhausted: false,
+        }
+    }
+
+    /// Claim one node of budget, or record exhaustion and refuse.
+    const fn claim_node(&mut self) -> bool {
+        if self.nodes_remaining == 0 {
+            self.exhausted = true;
+            return false;
+        }
+        self.nodes_remaining -= 1;
+        true
+    }
+}
 
 /// Collect the document-level `$defs` and `definitions` entries a local `$ref`
 /// can name. `$defs` is the 2019-09 spelling and `definitions` the draft-07
@@ -472,23 +518,47 @@ impl CompiledToolSchema {
     /// constraints rather than to a rejection.
     #[must_use]
     pub fn compile(schema: &Value) -> Self {
-        let definitions = collect_local_definitions(schema);
-        Self::compile_node(schema, &definitions, &mut Vec::new())
+        let (compiled, exhausted) = Self::compile_reporting_budget(schema);
+        if exhausted {
+            tracing::warn!(
+                node_budget = COMPILE_NODE_BUDGET,
+                depth_budget = COMPILE_DEPTH_BUDGET,
+                "tool schema exceeded the compilation budget; the parts beyond it are not enforced"
+            );
+        }
+        compiled
     }
 
-    fn compile_node(schema: &Value, definitions: &LocalDefinitions<'_>, stack: &mut Vec<String>) -> Self {
+    /// [`Self::compile`] plus whether the expansion budget ran out, which is the
+    /// only observable difference between a bounded and an unbounded compiler.
+    #[must_use]
+    pub fn compile_reporting_budget(schema: &Value) -> (Self, bool) {
+        let definitions = collect_local_definitions(schema);
+        let mut state = CompileState::new();
+        let compiled = Self::compile_node(schema, &definitions, &mut state);
+        (compiled, state.exhausted)
+    }
+
+    fn compile_node(schema: &Value, definitions: &LocalDefinitions<'_>, state: &mut CompileState) -> Self {
         let mut compiled = Self::default();
+        // Running out of budget compiles the rest of the document to no
+        // constraints, which is the same direction every other thing this
+        // subset cannot model takes: never a rejection of a call that may well
+        // be correct.
+        if !state.claim_node() {
+            return compiled;
+        }
         let Some(object) = schema.as_object() else {
             return compiled;
         };
         if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
-            return Self::compile_reference(reference, definitions, stack);
+            return Self::compile_reference(reference, definitions, state);
         }
         if let Some(any_of) = object.get("anyOf").and_then(Value::as_array) {
             compiled.any_of = Some(
                 any_of
                     .iter()
-                    .map(|branch| Self::compile_node(branch, definitions, stack))
+                    .map(|branch| Self::compile_node(branch, definitions, state))
                     .collect(),
             );
         }
@@ -497,7 +567,7 @@ impl CompiledToolSchema {
             compiled.one_of = Some(
                 one_of
                     .iter()
-                    .map(|branch| Self::compile_node(branch, definitions, stack))
+                    .map(|branch| Self::compile_node(branch, definitions, state))
                     .collect(),
             );
         }
@@ -529,7 +599,7 @@ impl CompiledToolSchema {
         if let Some(properties) = object.get("properties").and_then(Value::as_object) {
             compiled.properties = properties
                 .iter()
-                .map(|(name, property)| (name.clone(), Self::compile_node(property, definitions, stack)))
+                .map(|(name, property)| (name.clone(), Self::compile_node(property, definitions, state)))
                 .collect();
         }
         if let Some(patterns) = object.get("patternProperties").and_then(Value::as_object) {
@@ -537,7 +607,7 @@ impl CompiledToolSchema {
                 match Regex::new(pattern) {
                     Ok(pattern) => compiled.pattern_properties.push(CompiledPatternProperty {
                         pattern,
-                        schema: Self::compile_node(property, definitions, stack),
+                        schema: Self::compile_node(property, definitions, state),
                     }),
                     Err(error) => {
                         tracing::debug!("tool schema pattern property '{pattern}' is not a supported regex: {error}");
@@ -549,14 +619,14 @@ impl CompiledToolSchema {
         compiled.additional_properties = match object.get("additionalProperties") {
             Some(Value::Bool(false)) => CompiledAdditionalProperties::Forbidden,
             Some(schema) if schema.is_object() => {
-                CompiledAdditionalProperties::Schema(Box::new(Self::compile_node(schema, definitions, stack)))
+                CompiledAdditionalProperties::Schema(Box::new(Self::compile_node(schema, definitions, state)))
             }
             _ => CompiledAdditionalProperties::Unconstrained,
         };
         if let Some(conditions) = object.get("allOf").and_then(Value::as_array) {
             compiled.conditions = conditions
                 .iter()
-                .map(|condition| Self::compile_member(condition, definitions, stack))
+                .map(|condition| Self::compile_member(condition, definitions, state))
                 .collect();
         }
         // A schema may also carry `if` / `then` / `else` at its own level rather
@@ -565,11 +635,11 @@ impl CompiledToolSchema {
         if object.contains_key("if") {
             compiled
                 .conditions
-                .push(Self::compile_member(schema, definitions, stack));
+                .push(Self::compile_member(schema, definitions, state));
         }
         compiled.items = object
             .get("items")
-            .map(|schema| Box::new(Self::compile_node(schema, definitions, stack)));
+            .map(|schema| Box::new(Self::compile_node(schema, definitions, state)));
         compiled
     }
 
@@ -577,19 +647,19 @@ impl CompiledToolSchema {
     fn compile_member(
         condition: &Value,
         definitions: &LocalDefinitions<'_>,
-        stack: &mut Vec<String>,
+        state: &mut CompileState,
     ) -> CompiledCondition {
         let Some(if_schema) = condition.get("if") else {
-            return CompiledCondition::Always(Box::new(Self::compile_node(condition, definitions, stack)));
+            return CompiledCondition::Always(Box::new(Self::compile_node(condition, definitions, state)));
         };
         CompiledCondition::Branch {
-            condition: Box::new(Self::compile_node(if_schema, definitions, stack)),
+            condition: Box::new(Self::compile_node(if_schema, definitions, state)),
             then_schema: condition
                 .get("then")
-                .map(|schema| Box::new(Self::compile_node(schema, definitions, stack))),
+                .map(|schema| Box::new(Self::compile_node(schema, definitions, state))),
             else_schema: condition
                 .get("else")
-                .map(|schema| Box::new(Self::compile_node(schema, definitions, stack))),
+                .map(|schema| Box::new(Self::compile_node(schema, definitions, state))),
         }
     }
 
@@ -599,19 +669,23 @@ impl CompiledToolSchema {
     /// a missing definition, or a cycle — compiles to no constraints, because
     /// refusing a call over a reference this subset cannot follow would reject
     /// arguments that are in fact correct.
-    fn compile_reference(reference: &str, definitions: &LocalDefinitions<'_>, stack: &mut Vec<String>) -> Self {
+    fn compile_reference(reference: &str, definitions: &LocalDefinitions<'_>, state: &mut CompileState) -> Self {
         let Some(name) = SchemaCleanr::parse_local_ref(reference) else {
             return Self::default();
         };
-        if stack.iter().any(|entry| entry == reference) {
+        if state.stack.iter().any(|entry| entry == reference) {
+            return Self::default();
+        }
+        if state.stack.len() >= COMPILE_DEPTH_BUDGET {
+            state.exhausted = true;
             return Self::default();
         }
         let Some(target) = definitions.get(name.as_str()) else {
             return Self::default();
         };
-        stack.push(reference.to_string());
-        let compiled = Self::compile_node(target, definitions, stack);
-        stack.pop();
+        state.stack.push(reference.to_string());
+        let compiled = Self::compile_node(target, definitions, state);
+        state.stack.pop();
         compiled
     }
 
@@ -621,6 +695,97 @@ impl CompiledToolSchema {
         let mut issues = Vec::new();
         self.validate(arguments, "$", &mut issues);
         issues
+    }
+
+    /// Rewrite whole numbers written in float form into JSON integers wherever
+    /// this contract declares `integer`, and report whether anything changed.
+    ///
+    /// JSON Schema defines `integer` by mathematical value, so `200.0` is a
+    /// legal `integer` and the validator accepts it. Executors do not read
+    /// arguments through JSON Schema: they read them with `as_u64()` /
+    /// `as_i64()`, which answer `None` for `Float(200.0)` and leave the executor
+    /// falling back to its default. Accepting the call and then handing the
+    /// executor a value it cannot see is worse than rejecting it, because the
+    /// model gets a wrong answer instead of a correctable error. This closes
+    /// that gap once, on the schema, rather than in each of the ~20 executor
+    /// read sites — none of which know what the contract declared.
+    ///
+    /// Only integral floats are rewritten; `1.5` under `type: "integer"` is
+    /// still a violation and is still the validator's to reject.
+    pub fn normalize_integral_numbers(&self, value: &mut Value) -> bool {
+        let mut changed = if self.declares_integer()
+            && let Some(integral) = integral_spelling(value)
+        {
+            *value = integral;
+            true
+        } else {
+            false
+        };
+        // Branches and conditions are resolved against the document *before*
+        // descending, so the immutable borrow they need never overlaps the
+        // mutable one the descent takes.
+        let mut applicable: Vec<&Self> = Vec::new();
+        for member in self.any_of.iter().chain(self.one_of.iter()).flatten() {
+            if member.matches(value) {
+                applicable.push(member);
+            }
+        }
+        for condition in &self.conditions {
+            match condition {
+                CompiledCondition::Always(schema) => applicable.push(schema),
+                CompiledCondition::Branch {
+                    condition,
+                    then_schema,
+                    else_schema,
+                } => {
+                    let taken = if condition.matches(value) {
+                        then_schema.as_ref()
+                    } else {
+                        else_schema.as_ref()
+                    };
+                    if let Some(taken) = taken {
+                        applicable.push(taken);
+                    }
+                }
+            }
+        }
+        for schema in applicable {
+            changed |= schema.normalize_integral_numbers(value);
+        }
+        match value {
+            Value::Object(entries) => {
+                for (name, entry) in entries.iter_mut() {
+                    if let Some(property) = self.properties.get(name) {
+                        changed |= property.normalize_integral_numbers(entry);
+                    }
+                    for pattern in self.pattern_properties.iter().filter(|p| p.pattern.is_match(name)) {
+                        changed |= pattern.schema.normalize_integral_numbers(entry);
+                    }
+                    if let CompiledAdditionalProperties::Schema(additional) = &self.additional_properties
+                        && !self.properties.contains_key(name.as_str())
+                        && !self.pattern_properties.iter().any(|p| p.pattern.is_match(name))
+                    {
+                        changed |= additional.normalize_integral_numbers(entry);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                if let Some(item_schema) = self.items.as_ref() {
+                    for item in items.iter_mut() {
+                        changed |= item_schema.normalize_integral_numbers(item);
+                    }
+                }
+            }
+            _ => {}
+        }
+        changed
+    }
+
+    /// Whether this node declares `integer`, including inside a `type` array.
+    fn declares_integer(&self) -> bool {
+        self.type_constraint
+            .as_ref()
+            .is_some_and(|constraint| constraint.names.iter().any(|name| name == "integer"))
     }
 
     fn matches(&self, value: &Value) -> bool {
@@ -683,7 +848,7 @@ impl CompiledToolSchema {
         }
 
         if let Some(expected) = self.const_value.as_ref()
-            && value != expected
+            && !values_match(value, expected)
         {
             issues.push(ArgumentValidationIssue {
                 path: path.to_string(),
@@ -731,7 +896,7 @@ impl CompiledToolSchema {
         }
 
         if let Some(allowed) = self.enum_values.as_ref()
-            && !allowed.contains(value)
+            && !allowed.iter().any(|candidate| values_match(candidate, value))
         {
             issues.push(ArgumentValidationIssue {
                 path: path.to_string(),
@@ -817,6 +982,72 @@ impl CompiledToolSchema {
             }
         }
     }
+}
+
+/// Whether two documents denote the same JSON value.
+///
+/// Identical to `==` except for numbers, where JSON Schema compares by
+/// mathematical value and `serde_json` compares by representation: `1` and
+/// `1.0` are the same number and `PosInt(1) != Float(1.0)`. Without this, a
+/// contract that writes `type: "integer"` would accept `1.0` while
+/// `enum: [1]` in the same document rejected it. The float comparison is only
+/// reached when at least one side *is* a float, so two distinct 64-bit integers
+/// that round to one `f64` still compare as different.
+fn values_match(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => numbers_match(left, right),
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len() && left.iter().zip(right.iter()).all(|(l, r)| values_match(l, r))
+        }
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .all(|(key, value)| right.get(key).is_some_and(|other| values_match(value, other)))
+        }
+        _ => left == right,
+    }
+}
+
+fn numbers_match(left: &serde_json::Number, right: &serde_json::Number) -> bool {
+    if left == right {
+        return true;
+    }
+    let both_integral = (left.is_i64() || left.is_u64()) && (right.is_i64() || right.is_u64());
+    if both_integral {
+        // Two exact integer representations that are not equal are different
+        // numbers; widening them to `f64` could only lose that distinction.
+        return false;
+    }
+    matches!((left.as_f64(), right.as_f64()), (Some(left), Some(right)) if left == right)
+}
+
+/// The integer spelling of a whole number written in float form, if it has one.
+///
+/// Returns `None` for a value that is already an integer, for a non-integral
+/// number, and for one no 64-bit integer can hold.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn integral_spelling(value: &Value) -> Option<Value> {
+    if value.is_i64() || value.is_u64() {
+        return None;
+    }
+    let number = value.as_f64()?;
+    if !number.is_finite() || number.fract().abs() >= f64::EPSILON {
+        return None;
+    }
+    // Both casts are guarded by the range test on the line above them, so the
+    // truncation clippy warns about cannot happen and the value is exact.
+    if number >= 0.0 && number <= u64::MAX as f64 {
+        return Some(Value::Number((number as u64).into()));
+    }
+    if number >= i64::MIN as f64 && number <= i64::MAX as f64 {
+        return Some(Value::Number((number as i64).into()));
+    }
+    None
 }
 
 /// Validate the canonical JSON Schema subset used by PRX tool contracts.
@@ -945,12 +1176,18 @@ fn hash_schema(value: &Value, hasher: &mut Sha256) {
         Value::Null => hasher.update([0]),
         Value::Bool(flag) => hasher.update([1, u8::from(*flag)]),
         Value::Number(number) => {
-            hasher.update([2]);
+            // The three numeric representations carry their own discriminator:
+            // without one, `-1` as i64 and `u64::MAX` are the same eight bytes,
+            // as are `1` and the subnormal `5e-324`, and two different contracts
+            // would then share a cache slot.
             if let Some(number) = number.as_i64() {
+                hasher.update([2, 0]);
                 hasher.update(number.to_le_bytes());
             } else if let Some(number) = number.as_u64() {
+                hasher.update([2, 1]);
                 hasher.update(number.to_le_bytes());
             } else {
+                hasher.update([2, 2]);
                 hasher.update(number.as_f64().unwrap_or_default().to_bits().to_le_bytes());
             }
         }
@@ -2703,5 +2940,214 @@ mod tests {
             schema_cache_key("ab", ToolSchemaDialect::Raw, &json!({"c": 1})),
             schema_cache_key("a", ToolSchemaDialect::Raw, &json!({"bc": 1}))
         );
+    }
+
+    #[test]
+    fn the_cache_key_separates_the_three_numeric_representations() {
+        // Without a sub-tag, `-1` as i64 and `u64::MAX` are the same eight
+        // bytes, and so are `1` and the smallest subnormal f64 (bits == 1).
+        // Both pairs are legal JSON numbers a caller-supplied contract may use,
+        // and sharing a slot means validating one contract by another's rules.
+        let negative_one = json!({"minimum": -1});
+        let unsigned_max = json!({"minimum": u64::MAX});
+        assert_ne!(
+            schema_cache_key("probe", ToolSchemaDialect::Raw, &negative_one),
+            schema_cache_key("probe", ToolSchemaDialect::Raw, &unsigned_max),
+            "i64 -1 and u64::MAX share a byte pattern and must not share a key"
+        );
+        let one = json!({"minimum": 1});
+        let subnormal: Value = serde_json::from_str("{\"minimum\": 5e-324}").expect("subnormal literal");
+        assert_ne!(
+            schema_cache_key("probe", ToolSchemaDialect::Raw, &one),
+            schema_cache_key("probe", ToolSchemaDialect::Raw, &subnormal),
+            "integer 1 and the f64 whose bits are 1 must not share a key"
+        );
+    }
+
+    #[test]
+    fn whole_numbers_written_as_floats_are_rewritten_where_integer_is_declared() {
+        // The validator accepts `200.0` for an `integer`, and every executor
+        // reads integers with `as_u64()`, which cannot see it. Normalisation is
+        // what keeps those two facts from producing a silent default.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "from": {"type": "integer"},
+                "ratio": {"type": "number"},
+                "label": {"type": "string"},
+                "window": {
+                    "type": "object",
+                    "properties": {"lines": {"type": ["integer", "null"]}}
+                },
+                "marks": {"type": "array", "items": {"type": "integer"}}
+            }
+        });
+        let compiled = CompiledToolSchema::compile(&schema);
+        let mut document = json!({
+            "from": 200.0,
+            "ratio": 0.5,
+            "label": "x",
+            "window": {"lines": 12.0},
+            "marks": [1.0, 2.0]
+        });
+        assert!(compiled.normalize_integral_numbers(&mut document));
+        assert_eq!(document["from"].as_u64(), Some(200), "{document}");
+        assert_eq!(document["window"]["lines"].as_u64(), Some(12), "{document}");
+        assert_eq!(document["marks"][0].as_u64(), Some(1), "{document}");
+        assert_eq!(document["marks"][1].as_u64(), Some(2), "{document}");
+        assert!(
+            (document["ratio"].as_f64().unwrap_or_default() - 0.5).abs() < f64::EPSILON,
+            "a declared `number` keeps its float form: {document}"
+        );
+        assert_eq!(document["label"].as_str(), Some("x"));
+
+        // Idempotent, and silent when there is nothing to rewrite.
+        assert!(!compiled.normalize_integral_numbers(&mut document));
+
+        // A non-integral float is still a violation, and normalisation leaves it
+        // alone for the validator to reject.
+        let mut fractional = json!({"from": 1.5});
+        assert!(!compiled.normalize_integral_numbers(&mut fractional));
+        assert!(fractional["from"].as_u64().is_none());
+        assert!(
+            !validate_tool_arguments(&schema, &json!({"from": 1.5})).is_empty(),
+            "1.5 is not an integer"
+        );
+    }
+
+    #[test]
+    fn normalization_follows_conditional_and_pattern_declarations() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"action": {"type": "string"}},
+            "patternProperties": {"^count_": {"type": "integer"}},
+            "additionalProperties": {"type": "integer"},
+            "allOf": [{
+                "if": {"properties": {"action": {"const": "page"}}, "required": ["action"]},
+                "then": {"properties": {"offset": {"type": "integer"}}},
+                "else": {"properties": {"offset": {"type": "string"}}}
+            }]
+        });
+        let compiled = CompiledToolSchema::compile(&schema);
+        let mut taken = json!({"action": "page", "offset": 40.0, "count_hits": 3.0, "spare": 7.0});
+        assert!(compiled.normalize_integral_numbers(&mut taken));
+        assert_eq!(taken["offset"].as_u64(), Some(40), "the `then` branch declares it");
+        assert_eq!(taken["count_hits"].as_u64(), Some(3), "a pattern-matched key");
+        assert_eq!(taken["spare"].as_u64(), Some(7), "an additionalProperties schema");
+
+        let mut untaken = json!({"action": "list", "offset": "40"});
+        assert!(
+            !compiled.normalize_integral_numbers(&mut untaken),
+            "the `else` branch declares a string, so nothing is rewritten"
+        );
+        assert_eq!(untaken["offset"].as_str(), Some("40"));
+    }
+
+    #[test]
+    fn enums_and_constants_read_whole_numbers_the_way_types_do() {
+        // `type: "integer"` accepted 1.0 while `enum: [1]` in the same document
+        // rejected it, because `serde_json` compares `PosInt(1)` and
+        // `Float(1.0)` as different values. One document, two numeric rules.
+        let schema = json!({
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "enum": [1, 5]}, "mode": {"const": 2}}
+        });
+        assert!(
+            validate_tool_arguments(&schema, &json!({"limit": 5.0, "mode": 2.0})).is_empty(),
+            "whole numbers in float form satisfy enum and const"
+        );
+        let rejected = validate_tool_arguments(&schema, &json!({"limit": 4.0}));
+        assert!(
+            rejected.iter().any(|issue| issue.path == "$.limit"),
+            "a value outside the enum is still rejected: {rejected:?}"
+        );
+        let wrong_const = validate_tool_arguments(&schema, &json!({"mode": 3.0}));
+        assert!(
+            wrong_const.iter().any(|issue| issue.path == "$.mode"),
+            "a value other than the constant is still rejected: {wrong_const:?}"
+        );
+    }
+
+    #[test]
+    fn a_reference_expansion_bomb_stops_at_the_budget_instead_of_running_away() {
+        // A *non-cyclic* document: each level names the next one four times, so
+        // the reference stack never reports a cycle and the expansion is 4^n.
+        // MCP and WASM contracts are caller-supplied, so this is reachable.
+        fn ladder(levels: usize, width: usize) -> Value {
+            let mut definitions = serde_json::Map::new();
+            for level in 0..levels {
+                let properties = (0..width)
+                    .map(|branch| {
+                        let target = if level + 1 == levels {
+                            json!({"type": "string", "minLength": 1})
+                        } else {
+                            json!({"$ref": format!("#/$defs/level{}", level + 1)})
+                        };
+                        (format!("b{branch}"), target)
+                    })
+                    .collect::<serde_json::Map<_, _>>();
+                definitions.insert(
+                    format!("level{level}"),
+                    json!({"type": "object", "properties": properties}),
+                );
+            }
+            json!({
+                "type": "object",
+                "properties": {"root": {"$ref": "#/$defs/level0"}, "name": {"type": "string", "minLength": 3}},
+                "required": ["name"],
+                "$defs": definitions
+            })
+        }
+
+        let (bounded, exhausted) = CompiledToolSchema::compile_reporting_budget(&ladder(8, 4));
+        assert!(
+            exhausted,
+            "4^8 expansions must run out of budget; without one this document costs 65k node compiles"
+        );
+        // Fail-open: what was compiled is still enforced, and the part beyond
+        // the budget constrains nothing rather than rejecting everything.
+        assert!(
+            bounded.validate_tool_arguments(&json!({"name": "abc"})).is_empty(),
+            "a legal call must survive an over-budget contract"
+        );
+        assert!(
+            !bounded.validate_tool_arguments(&json!({"name": "ab"})).is_empty(),
+            "the rules compiled before the budget ran out are still enforced"
+        );
+
+        // The paired half: an ordinary document with repeated references stays
+        // well inside the budget and is fully enforced.
+        let (modest, spent) = CompiledToolSchema::compile_reporting_budget(&ladder(3, 2));
+        assert!(!spent, "a small document must not trip the budget");
+        assert!(
+            !modest
+                .validate_tool_arguments(&json!({"name": "abc", "root": {"b0": {"b1": {"b0": ""}}}}))
+                .is_empty(),
+            "a nested reference target is enforced when it fits in the budget"
+        );
+    }
+
+    #[test]
+    fn reference_depth_is_bounded_even_when_every_level_is_distinct() {
+        let mut definitions = serde_json::Map::new();
+        let depth = COMPILE_DEPTH_BUDGET + 8;
+        for level in 0..depth {
+            let target = if level + 1 == depth {
+                json!({"type": "string", "minLength": 4})
+            } else {
+                json!({"$ref": format!("#/$defs/level{}", level + 1)})
+            };
+            definitions.insert(
+                format!("level{level}"),
+                json!({"type": "object", "properties": {"next": target}}),
+            );
+        }
+        let schema = json!({
+            "type": "object",
+            "properties": {"chain": {"$ref": "#/$defs/level0"}},
+            "$defs": definitions
+        });
+        let (_, exhausted) = CompiledToolSchema::compile_reporting_budget(&schema);
+        assert!(exhausted, "a reference chain deeper than the budget must report it");
     }
 }

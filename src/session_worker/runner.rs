@@ -210,6 +210,7 @@ async fn next_steer(steer_rx: &mut Option<tokio::sync::mpsc::Receiver<String>>) 
 async fn select_tools_for_worker(
     source: Vec<Box<dyn Tool>>,
     allowed_tools: &[String],
+    channel_excluded_tools: &[String],
 ) -> Result<Arc<Vec<Box<dyn Tool>>>> {
     let normalized = allowed_tools
         .iter()
@@ -227,6 +228,7 @@ async fn select_tools_for_worker(
         "session-worker",
         crate::tools::sessions_spawn::MemoryScope::Shared,
         (!normalized.is_empty()).then_some(allowed_tools),
+        channel_excluded_tools,
     ))
 }
 
@@ -924,7 +926,8 @@ async fn run_validated_manifest(
 
     verify_worker_orchestration_tool_names(full_tools.iter().map(|tool| tool.name()))?;
 
-    let tools_registry = select_tools_for_worker(full_tools, &manifest.allowed_tools).await?;
+    let tools_registry =
+        select_tools_for_worker(full_tools, &manifest.allowed_tools, &manifest.channel_excluded_tools).await?;
     let _ = spawn_tools_handle.set(Arc::clone(&tools_registry));
     let native_tools = provider
         .capabilities_for(
@@ -1488,9 +1491,10 @@ where
                     // A resumed spawn-run process (not a turn root): children
                     // compute spawn_depth + 1, preserving the manifest depth chain.
                     is_turn_root: false,
-                    // A resumed worker re-reads its surface from the manifest;
-                    // the parent turn's channel exclusions are not part of it.
-                    channel_excluded_tools: Vec::new(),
+                    // The spawning surface's exclusions travel in the sealed
+                    // manifest, so everything this worker spawns in turn — task
+                    // or process — stays inside the same boundary.
+                    channel_excluded_tools: manifest.channel_excluded_tools.clone(),
                 },
                 fut,
             )
@@ -1590,6 +1594,7 @@ mod tests {
             persona_id: None,
             memory_event_recording: crate::memory::MemoryEventRecording::default(),
             allowed_tools: vec!["file_read".to_string()],
+            channel_excluded_tools: Vec::new(),
             system_prompt: None,
             identity_dir: Some("identity/worker".to_string()),
             scope_sender: None,
@@ -1659,10 +1664,139 @@ mod tests {
     async fn worker_wildcard_preserves_its_source_registry() {
         let source = crate::tools::default_tools(Arc::new(crate::security::SecurityPolicy::default()));
         let expected = source.len();
-        let selected = select_tools_for_worker(source, &["*".to_string()])
+        let selected = select_tools_for_worker(source, &["*".to_string()], &[])
             .await
             .expect("wildcard selection");
         assert_eq!(selected.len(), expected);
+    }
+
+    /// One plain tool under a fixed public name, to build a registry whose
+    /// membership is exactly what a test wants to reason about.
+    struct NamedWorkerTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl Tool for NamedWorkerTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "worker surface fixture"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: self.0.to_string(),
+                error: None,
+            })
+        }
+    }
+
+    fn worker_surface_fixture() -> Vec<Box<dyn Tool>> {
+        [
+            "gateway",
+            "proxy_config",
+            "config_reload",
+            "nodes",
+            "git_operations",
+            "shell",
+        ]
+        .into_iter()
+        .map(|name| Box::new(NamedWorkerTool(name)) as Box<dyn Tool>)
+        .collect()
+    }
+
+    async fn worker_tool_names(allowed: &[String], excluded: &[String]) -> Vec<String> {
+        select_tools_for_worker(worker_surface_fixture(), allowed, excluded)
+            .await
+            .expect("worker tool selection")
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_process_worker_cannot_regain_the_operations_surface_its_channel_hides() {
+        // Fixture validity first: the exclusions come from the real default
+        // channel surface, not from a list written for this test, so the test
+        // fails if `channel_exclude` ever stops hiding the operations tools.
+        let surface = crate::config::ToolTieringConfig::default().for_channel_surface();
+        let hidden = surface.always_exclude.clone();
+        for name in ["gateway", "proxy_config", "config_reload", "nodes", "git_operations"] {
+            assert!(
+                hidden.iter().any(|entry| entry == name),
+                "the default channel surface must hide '{name}' for this fixture to mean anything"
+            );
+        }
+
+        let filtered = worker_tool_names(&[], &hidden).await;
+        for name in ["gateway", "proxy_config", "config_reload", "nodes", "git_operations"] {
+            assert!(
+                !filtered.iter().any(|entry| entry == name),
+                "a worker started from an IM turn must not publish '{name}': {filtered:?}"
+            );
+        }
+        assert!(
+            filtered.iter().any(|entry| entry == "shell"),
+            "the rest of the surface is untouched: {filtered:?}"
+        );
+
+        // The paired half: without an inherited list the same worker publishes
+        // the whole registry, so the assertion above is about the list and not
+        // about the fixture being empty.
+        let unfiltered = worker_tool_names(&[], &[]).await;
+        assert!(
+            unfiltered.iter().any(|entry| entry == "gateway"),
+            "an operator-rooted worker keeps the operations surface: {unfiltered:?}"
+        );
+
+        // An explicit `allowed_tools` is the agent's own contract and cannot
+        // re-open the channel boundary.
+        let named = worker_tool_names(&["gateway".to_string()], &hidden).await;
+        assert!(
+            named.is_empty(),
+            "naming a hidden tool in allowed_tools must not publish it: {named:?}"
+        );
+
+        // An operator who re-enables one keeps it: `for_channel_surface` never
+        // folds an `always_include` name into the hidden set.
+        let mut reopened = crate::config::ToolTieringConfig::default();
+        reopened.always_include.push("gateway".to_string());
+        let reopened = reopened.for_channel_surface().always_exclude;
+        let names = worker_tool_names(&[], &reopened).await;
+        assert!(
+            names.iter().any(|entry| entry == "gateway"),
+            "always_include must still reach a process worker: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_worker_hands_its_inherited_exclusions_to_everything_it_spawns() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let mut manifest = base_manifest(workspace.path(), "capability");
+        manifest.session_scope_key = "sessions_spawn:parent".to_string();
+        manifest.channel_excluded_tools = vec!["gateway".to_string()];
+        let inherited = with_manifest_spawn_context(&manifest, async {
+            crate::tools::sessions_spawn::ambient_channel_excluded_tools()
+        })
+        .await;
+        assert_eq!(
+            inherited,
+            vec!["gateway".to_string()],
+            "a grandchild spawned inside the worker must see the same boundary"
+        );
+
+        manifest.channel_excluded_tools.clear();
+        let operator = with_manifest_spawn_context(&manifest, async {
+            crate::tools::sessions_spawn::ambient_channel_excluded_tools()
+        })
+        .await;
+        assert!(operator.is_empty(), "an operator-rooted worker seeds no exclusions");
     }
 
     struct WorkerDynamicAliases;
@@ -1726,6 +1860,7 @@ mod tests {
         let selected = select_tools_for_worker(
             vec![Box::new(WorkerDynamicAliases)],
             &["dynamic__one".to_string(), "dynamic__two".to_string()],
+            &[],
         )
         .await
         .expect("dynamic aliases must resolve independently");
@@ -1758,7 +1893,7 @@ mod tests {
     #[tokio::test]
     async fn worker_wildcard_must_be_exclusive() {
         let source = crate::tools::default_tools(Arc::new(crate::security::SecurityPolicy::default()));
-        let error = match select_tools_for_worker(source, &["*".to_string(), "shell".to_string()]).await {
+        let error = match select_tools_for_worker(source, &["*".to_string(), "shell".to_string()], &[]).await {
             Ok(_) => panic!("mixed wildcard must be rejected"),
             Err(error) => error,
         };
@@ -1772,7 +1907,7 @@ mod tests {
             crate::memory::NoneMemory::new(),
         ))));
 
-        let selected = select_tools_for_worker(source, &["shell".to_string()])
+        let selected = select_tools_for_worker(source, &["shell".to_string()], &[])
             .await
             .expect("restricted selection");
         let names = selected.iter().map(|tool| tool.name()).collect::<Vec<_>>();
@@ -2324,6 +2459,7 @@ mod tests {
             persona_id: None,
             memory_event_recording: crate::memory::MemoryEventRecording::default(),
             allowed_tools: Vec::new(),
+            channel_excluded_tools: Vec::new(),
             system_prompt: None,
             identity_dir: None,
             scope_sender: Some("alice".to_string()),
@@ -2395,6 +2531,7 @@ mod tests {
             persona_id: Some("persona-a".to_string()),
             memory_event_recording: crate::memory::MemoryEventRecording::default(),
             allowed_tools: Vec::new(),
+            channel_excluded_tools: Vec::new(),
             system_prompt: None,
             identity_dir: None,
             scope_sender: Some("alice".to_string()),
@@ -2525,6 +2662,7 @@ mod tests {
             persona_id: None,
             memory_event_recording: crate::memory::MemoryEventRecording::default(),
             allowed_tools: Vec::new(),
+            channel_excluded_tools: Vec::new(),
             system_prompt: None,
             identity_dir: None,
             scope_sender: Some("alice".to_string()),
@@ -2601,6 +2739,7 @@ mod tests {
             persona_id: Some("persona-a".to_string()),
             memory_event_recording: crate::memory::MemoryEventRecording::default(),
             allowed_tools: Vec::new(),
+            channel_excluded_tools: Vec::new(),
             system_prompt: None,
             identity_dir: None,
             scope_sender: None,
@@ -2670,6 +2809,7 @@ mod tests {
             persona_id: Some("persona-a".to_string()),
             memory_event_recording: crate::memory::MemoryEventRecording::default(),
             allowed_tools: Vec::new(),
+            channel_excluded_tools: Vec::new(),
             system_prompt: None,
             identity_dir: None,
             scope_sender: Some("alice".to_string()),

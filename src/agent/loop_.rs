@@ -1890,10 +1890,7 @@ pub(crate) async fn persist_context_switch_degradation(
     // a guaranteed insert and left the idempotency key unable to reject
     // anything, including a retry of this very call from a second runtime built
     // for the same turn.
-    if audit
-        .degradation_recorded
-        .swap(true, std::sync::atomic::Ordering::SeqCst)
-    {
+    if audit.degradation_recorded.load(std::sync::atomic::Ordering::SeqCst) {
         tracing::debug!(
             trigger,
             reason,
@@ -1939,7 +1936,17 @@ pub(crate) async fn persist_context_switch_degradation(
         })
         .await
     {
+        // Deliberately *not* claimed: the turn is marked as recorded only once
+        // a write has actually landed, so a backend that was briefly
+        // unavailable costs a retry on the next iteration instead of losing the
+        // event for the rest of the turn. Duplicate writes are still impossible
+        // — the backend is unique on `(workspace_id, idempotency_key)` and the
+        // key is derived from the turn.
         tracing::debug!(error = %error, "failed to append context switch degradation event");
+    } else {
+        audit
+            .degradation_recorded
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -6748,7 +6755,15 @@ async fn run_tool_call_loop_outcome_unguarded(
             selected_tools
         };
         if !inherited_exclusions.is_empty() {
-            selected_tools.retain(|tool| !inherited_exclusions.iter().any(|hidden| hidden == tool.name()));
+            // Matched through `supports_name`, not the root name: `channel_exclude`
+            // names a *published* tool, and a backend that publishes several
+            // (an MCP router, a WASM alias) answers to a name its root spelling
+            // never equals. Comparing root names left those aliases exposed.
+            selected_tools.retain(|tool| {
+                !inherited_exclusions
+                    .iter()
+                    .any(|hidden| tool.name() == hidden || tool.supports_name(hidden))
+            });
         }
         let context_lookup_required = compaction_config
             .is_some_and(|config| matches!(config.mode, crate::config::AgentCompactionMode::Switch))
@@ -9442,6 +9457,85 @@ mod tests {
 
     struct FailingIngestMemory {
         inner: Arc<dyn Memory>,
+    }
+
+    /// A `Memory` decorator whose `append_message_event` refuses while
+    /// `refusing` is set. Used to prove that a turn does not *claim* a
+    /// degradation event it never managed to write.
+    struct RefusingEventMemory {
+        inner: Arc<dyn Memory>,
+        refusing: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Memory for RefusingEventMemory {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        fn supports_document_ingest(&self) -> bool {
+            self.inner.supports_document_ingest()
+        }
+        async fn ingest_document(&self, input: DocumentIngestInput) -> anyhow::Result<DocumentRecord> {
+            self.inner.ingest_document(input).await
+        }
+        async fn store(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.inner.store(key, content, category, session_id).await
+        }
+        async fn recall(
+            &self,
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.inner.recall(query, limit, session_id).await
+        }
+        async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            self.inner.get(key).await
+        }
+        async fn list(
+            &self,
+            category: Option<&MemoryCategory>,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.inner.list(category, session_id).await
+        }
+        async fn forget(&self, key: &str) -> anyhow::Result<bool> {
+            self.inner.forget(key).await
+        }
+        async fn count(&self) -> anyhow::Result<usize> {
+            self.inner.count().await
+        }
+        async fn health_check(&self) -> bool {
+            self.inner.health_check().await
+        }
+        async fn append_message_event(&self, input: MessageEventInput) -> anyhow::Result<MessageEvent> {
+            if self.refusing.load(Ordering::SeqCst) {
+                anyhow::bail!("forced message-event backend failure")
+            }
+            self.inner.append_message_event(input).await
+        }
+        async fn list_message_events_recent(
+            &self,
+            principal: &MemoryPrincipal,
+            limit: usize,
+        ) -> anyhow::Result<Vec<MessageEvent>> {
+            self.inner.list_message_events_recent(principal, limit).await
+        }
+        async fn find_message_event_by_idempotency_key(
+            &self,
+            workspace_id: &str,
+            idempotency_key: &str,
+        ) -> anyhow::Result<Option<MessageEvent>> {
+            self.inner
+                .find_message_event_by_idempotency_key(workspace_id, idempotency_key)
+                .await
+        }
     }
 
     #[async_trait]
@@ -13892,6 +13986,47 @@ ls -la
         }
     }
 
+    /// A backend that publishes a name other than its own, the way an MCP
+    /// router or a WASM alias does. `channel_exclude` names the *published*
+    /// tool, so an exclusion matched against the root name alone never reaches
+    /// this one.
+    struct SurfaceAliasProbeTool;
+
+    #[async_trait]
+    impl Tool for SurfaceAliasProbeTool {
+        fn name(&self) -> &str {
+            "ops_router"
+        }
+
+        fn description(&self) -> &str {
+            "surface alias probe"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        fn specs(&self) -> Vec<crate::tools::ToolSpec> {
+            vec![crate::tools::ToolSpec {
+                name: "nodes".to_string(),
+                description: "surface alias probe".to_string(),
+                parameters: self.parameters_schema(),
+            }]
+        }
+
+        fn supports_name(&self, name: &str) -> bool {
+            name == "ops_router" || name == "nodes"
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: String::new(),
+                error: None,
+            })
+        }
+    }
+
     /// Records the system prompt of the one request it answers, which carries
     /// the authoritative `## Runtime Capabilities` inventory of this turn.
     struct SurfaceCapturingProvider {
@@ -13937,6 +14072,7 @@ ls -la
         let tools_registry: Vec<Box<dyn Tool>> = vec![
             Box::new(SurfaceProbeTool { name: "gateway" }),
             Box::new(SurfaceProbeTool { name: "shell" }),
+            Box::new(SurfaceAliasProbeTool),
         ];
         let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("please run the task")];
         let tmp = TempDir::new().unwrap();
@@ -14011,12 +14147,20 @@ ls -la
             inherited.contains("`shell`"),
             "the child must keep the ordinary surface: {inherited}"
         );
+        assert!(
+            !inherited.contains("`nodes`"),
+            "an excluded name published under an alias must be hidden too: {inherited}"
+        );
 
         // Fixture proof: with no parent boundary the same child publishes it.
         let unbounded = published_tool_surface(None).await;
         assert!(
             unbounded.contains("`gateway`"),
             "fixture is useless unless the unbounded child would publish it: {unbounded}"
+        );
+        assert!(
+            unbounded.contains("`nodes`"),
+            "fixture is useless unless the alias is published without a boundary: {unbounded}"
         );
 
         // An operator who lists the name in `always_include` keeps it, and the
@@ -14130,6 +14274,61 @@ ls -la
             degraded_event_count(&memory, &envelope).await,
             2,
             "the next turn must still be able to report its own degradation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_degradation_the_backend_refused_is_retried_instead_of_claimed() {
+        // The turn used to claim the write before attempting it, so a backend
+        // that was briefly unavailable cost the event for the rest of the turn
+        // — silently, because the failure is only a debug line. The claim now
+        // follows a landed write; the idempotency key still makes the retry a
+        // no-op once one has landed.
+        let temp = TempDir::new().unwrap();
+        let inner: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+        let refusing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let memory: Arc<dyn Memory> = Arc::new(RefusingEventMemory {
+            inner: Arc::clone(&inner),
+            refusing: Arc::clone(&refusing),
+        });
+        let envelope = RuntimeEnvelope::agent("workspace-degrade-retry", "run-degrade-retry")
+            .with_source_message_event_id("inbound-retry-1");
+        let audit = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
+
+        async fn degraded_events(memory: &Arc<dyn Memory>, envelope: &RuntimeEnvelope) -> usize {
+            memory
+                .list_message_events_recent(&envelope.memory_principal(), 256)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == CONTEXT_COMPACTION_DEGRADED_EVENT_TYPE)
+                .count()
+        }
+
+        persist_context_switch_degradation(Some(&audit), "pre_provider_call", "no_provenance", 10, 9, 8).await;
+        assert_eq!(
+            degraded_events(&inner, &envelope).await,
+            0,
+            "fixture validity: the refusing backend must really have written nothing"
+        );
+
+        // The backend comes back; the same turn must still be able to report.
+        refusing.store(false, Ordering::SeqCst);
+        persist_context_switch_degradation(Some(&audit), "pre_provider_call", "no_provenance", 10, 9, 8).await;
+        assert_eq!(
+            degraded_events(&inner, &envelope).await,
+            1,
+            "a turn whose first write was refused must still record the degradation"
+        );
+
+        // And it is claimed exactly once from then on.
+        for _ in 0..3 {
+            persist_context_switch_degradation(Some(&audit), "pre_provider_call", "no_provenance", 10, 9, 8).await;
+        }
+        assert_eq!(
+            degraded_events(&inner, &envelope).await,
+            1,
+            "a landed write still claims the turn"
         );
     }
 

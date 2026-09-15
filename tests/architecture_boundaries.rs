@@ -824,7 +824,7 @@ fn tool_arguments_are_schema_validated_on_the_production_execution_path() {
         .find("#[cfg(test)]\nmod tests {")
         .map_or(execution.as_str(), |offset| &execution[..offset]);
 
-    let validator = function_body(production, "validate_command_arguments");
+    let validator = function_body(production, "enforce_command_contract");
     assert!(
         validator.contains("validate_tool_arguments("),
         "the production argument gate no longer calls the canonical schema validator; \
@@ -835,10 +835,15 @@ fn tool_arguments_are_schema_validated_on_the_production_execution_path() {
         "the production argument gate must validate against the descriptor's published schema, \
          not a second hand-written rule set"
     );
+    assert!(
+        validator.contains("normalize_integral_numbers("),
+        "the production argument gate no longer normalizes integral floats; a whole number a \
+         provider spelled as a float would pass the gate and then read as a default in the executor"
+    );
 
     let execute = function_body(production, "execute");
     assert!(
-        execute.contains("validate_command_arguments("),
+        execute.contains("enforce_command_contract("),
         "ToolExecutionService::execute no longer validates arguments; every entry point funnels \
          through it, so removing the call disables schema enforcement everywhere"
     );
