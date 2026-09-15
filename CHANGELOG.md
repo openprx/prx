@@ -37,7 +37,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   freshly written `daemon_state.json`; the notice never blocks the run.
 - `docs/configuration.md` documents the configuration-directory precedence.
 
-
 ## [0.8.126] - 14 September 2026
 
 ### Security
