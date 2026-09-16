@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.135] - 16 September 2026
+
+### Fixed
+
+- The scheduled `Sec Audit` Miri job runs an explicit allowlist of pure-computation
+  modules instead of the whole library. `cargo miri test --lib` could never pass:
+  `ring` resolves its CPU feature flags through the foreign function
+  `OPENSSL_cpuid_setup` before any primitive runs, Miri refuses foreign calls, and
+  the refusal aborts the entire test binary at the first test that touches crypto —
+  which is why the run reported only `test exited abnormally` with no error text.
+  `ring` sits on the witness-keyring, session-worker HMAC, GLM signing and rustls
+  provider paths, so ignoring the one reported test would only move the abort. The
+  library's ~6700 unit tests, many of them async or filesystem-bound, do not fit
+  Miri's isolation model or the job's 45-minute budget either. The job now runs
+  `agent::stream_buffer`, `providers::utf8_stream` and `memory::chunker` under
+  `-Zmiri-strict-provenance` — 51 tests, clean — with the admission rule and the
+  remaining `unsafe`-coverage gap recorded in the workflow. No undefined behaviour
+  was found and no production code changed.
+
 ## [0.8.134] - 16 September 2026
 
 ### Fixed

@@ -25,6 +25,7 @@ on:
       - '.github/workflows/sec-audit.yml'
   schedule:
     - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 concurrency:
   group: security-${{ github.event.pull_request.number || github.ref }}
@@ -70,7 +71,7 @@ jobs:
 
   miri:
     name: Miri UB Smoke
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -80,8 +81,45 @@ jobs:
           toolchain: nightly
           components: miri
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      # `cargo miri test --lib` over the whole library cannot pass, and never
+      # could. `ring` resolves its CPU feature flags through the foreign
+      # function `OPENSSL_cpuid_setup` before it runs any primitive, and Miri
+      # refuses foreign calls ("unsupported operation: can't call foreign
+      # function `ring_core_0_17_14__OPENSSL_cpuid_setup` on OS `linux`"),
+      # which aborts the whole test binary at the first test that touches
+      # crypto. That is not one stray test: `ring` sits on the witness-keyring
+      # path (`acl::approval_grant`, `gateway::compat`), the session-worker
+      # HMAC (`session_worker::runner`, `tools::sessions_spawn`), the GLM
+      # signer (`providers::glm`) and the rustls provider (`channels::irc`,
+      # `nodes::server`). The library also carries ~6.7k unit tests, a large
+      # share of them async, filesystem- or network-bound, which neither fit
+      # Miri's isolation model nor a 45-minute budget.
+      #
+      # The job therefore runs an explicit allowlist of pure-computation
+      # modules: no FFI, no clock, no filesystem, no tokio. A module may only
+      # be added here if it holds to that.
+      #
+      # Keep the list small for a second reason: Miri's cost here is dominated
+      # by interpreter start-up over this test binary (~10 minutes before the
+      # first test runs), not by the tests themselves, so the 45-minute budget
+      # buys only a handful of modules. `tools::schema` was evaluated and left
+      # out -- its reference-expansion-budget tests did not finish inside a
+      # 15-minute local run.
+      #
+      # Known gap: this smoke covers no `unsafe` block. Every `unsafe` site in
+      # the library is out of Miri's reach today -- `daemon` (libc socket
+      # sendto) and `tools::gateway` (libc kill) are FFI; `config::schema` and
+      # `session_worker::runner` only wrap `env::set_var`/`remove_var`, and
+      # their covering tests are filesystem-bound or reach `ring::hmac`. The
+      # allowlist is a Stacked-Borrows and strict-provenance smoke over safe
+      # code, not `unsafe` coverage. Revisit if the crypto backend gains a
+      # pure-Rust path or the env-var helpers gain isolation-free tests.
       - name: Run cargo miri smoke
-        run: MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test --lib
+        run: |
+          MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test --lib -- \
+            agent::stream_buffer:: \
+            providers::utf8_stream:: \
+            memory::chunker::
 
   coverage:
     name: Coverage
