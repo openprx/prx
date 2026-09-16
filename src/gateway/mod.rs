@@ -65,6 +65,58 @@ use tokio_util::sync::CancellationToken;
 use tower_http::limit::RequestBodyLimitLayer;
 use uuid::Uuid;
 
+/// The gateway's own announce channel for `sessions_spawn`.
+///
+/// `sessions_spawn` needs one `Arc<dyn Channel>` as the fallback destination for
+/// a run's completion announcement (and for a kill receipt). Until now the
+/// gateway only had one when Signal happened to be configured, so on a host with
+/// no Signal account the tool was never registered at all and a webhook turn
+/// could not spawn anything.
+///
+/// The gateway is a request/response surface: it owns no conversation to push an
+/// unsolicited message into, and inventing one would mean a new outbound
+/// transport. So this channel deliberately accepts the announcement and drops the
+/// outbound leg, recording it in the log instead. Nothing is lost: every run is
+/// already recorded in the shared memory fabric by the tool itself, so the result
+/// is collected the way a gateway caller collects it anyway — `sessions_spawn`'s
+/// own `join`, `sessions_list` / `sessions_history`, or `GET /api/runtime/tasks`.
+///
+/// `listen` refuses: this is an outbound sink, never an inbound listener (the
+/// 2026-08-26 stage-c constraint — no new listeners, no new transports).
+#[derive(Debug, Clone, Copy)]
+struct GatewayAnnounceChannel;
+
+#[async_trait::async_trait]
+impl Channel for GatewayAnnounceChannel {
+    fn name(&self) -> &str {
+        "gateway"
+    }
+
+    async fn send(&self, message: &SendMessage) -> Result<()> {
+        tracing::info!(
+            recipient = %message.recipient,
+            body_len = message.content.len(),
+            "gateway sessions_spawn announcement has no outbound channel; \
+             the run result stays retrievable via join / sessions_list"
+        );
+        Ok(())
+    }
+
+    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>) -> Result<()> {
+        anyhow::bail!("gateway announce channel does not accept inbound messages")
+    }
+}
+
+/// Pick the channel `sessions_spawn` announces on for a gateway process.
+///
+/// Signal keeps priority whenever it is configured, so a deployment that has one
+/// behaves exactly as before. Without it the gateway falls back to its own
+/// [`GatewayAnnounceChannel`] rather than skipping the tool: registration of
+/// `sessions_spawn` must not depend on an unrelated IM channel being present.
+fn gateway_spawn_announce_channel(signal: Option<Arc<dyn Channel>>) -> Arc<dyn Channel> {
+    signal.unwrap_or_else(|| Arc::new(GatewayAnnounceChannel))
+}
+
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
 /// Larger request body limit for `/api` routes to support media uploads
@@ -1112,11 +1164,16 @@ fn build_gateway_turn_runtime(
         ));
     }
 
-    let spawn_tools_handle = signal.as_ref().map(|signal_channel| {
+    // `sessions_spawn` is registered on every gateway, with or without Signal.
+    // The channel argument is only the fallback announce destination, so a
+    // missing IM channel is no reason to withhold the tool from a webhook turn.
+    let spawn_tools_handle = {
+        let announce_channel =
+            gateway_spawn_announce_channel(signal.as_ref().map(|channel| Arc::clone(channel) as Arc<dyn Channel>));
         let channels_by_name = Arc::clone(&channels_registry);
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter").to_string();
         let spawn_tool = tools::SessionsSpawnTool::new(
-            Arc::clone(signal_channel) as Arc<dyn Channel>,
+            announce_channel,
             Arc::clone(&provider),
             provider_name,
             model.clone(),
@@ -1142,16 +1199,14 @@ fn build_gateway_turn_runtime(
         let handle = spawn_tool.tools_handle();
         tools_list.push(Box::new(spawn_tool));
         handle
-    });
+    };
 
     tools_list.push(Box::new(tools::ConfigReloadTool::with_security(
         shared_config,
-        security.clone(),
+        security,
     )));
     let tools_registry = Arc::new(tools_list);
-    if let Some(handle) = spawn_tools_handle {
-        let _ = handle.set(Arc::clone(&tools_registry));
-    }
+    let _ = spawn_tools_handle.set(Arc::clone(&tools_registry));
 
     let temperature = config.default_temperature;
     Ok(TurnRuntimeGeneration {
@@ -1389,10 +1444,15 @@ pub async fn run_gateway(
         tools_list.push(Box::new(msg_send_tool));
     }
 
-    // Register sessions_spawn tool backed by Signal (if configured) so the LLM can
-    // fire off async sub-agent tasks that announce their results when complete.
-    // Keep the OnceLock handle so we can inject the full tools_registry post-wrap.
-    let spawn_tools_handle = if let Some(ref sc) = signal_channel {
+    // Register sessions_spawn so the LLM can fire off async sub-agent tasks that
+    // announce their results when complete. Keep the OnceLock handle so we can
+    // inject the full tools_registry post-wrap.
+    // Registered unconditionally: the channel below is only the announce
+    // fallback, and a gateway without Signal must still expose `sessions_spawn`
+    // to its webhook turns.
+    let spawn_tools_handle = {
+        let announce_channel =
+            gateway_spawn_announce_channel(signal_channel.as_ref().map(|sc| Arc::clone(sc) as Arc<dyn Channel>));
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter").to_string();
         // Per-turn announce/kill routing registry: every configured gateway channel
         // keyed by name. A webhook turn stamps its originating channel into the
@@ -1401,7 +1461,7 @@ pub async fn run_gateway(
         // is never mis-routed to the wrong channel under concurrent webhooks.
         let spawn_channels_by_name = Arc::clone(&channels_registry);
         let spawn_tool = tools::SessionsSpawnTool::new(
-            sc.clone() as Arc<dyn Channel>,
+            announce_channel,
             Arc::clone(&provider),
             provider_name,
             model.clone(),
@@ -1426,9 +1486,7 @@ pub async fn run_gateway(
         .with_event_recording(config.memory.event_recording_config());
         let handle = spawn_tool.tools_handle();
         tools_list.push(Box::new(spawn_tool));
-        Some(handle)
-    } else {
-        None
+        handle
     };
 
     // The ConfigReloadTool and `/api/config/reload` route both submit candidates to
@@ -1445,9 +1503,7 @@ pub async fn run_gateway(
     let tools_registry = Arc::new(tools_list);
 
     // Inject the tools registry into sessions_spawn so sub-agents can use tools.
-    if let Some(handle) = spawn_tools_handle {
-        handle.set(Arc::clone(&tools_registry)).ok();
-    }
+    spawn_tools_handle.set(Arc::clone(&tools_registry)).ok();
 
     // WhatsApp app secret for webhook signature verification (from config)
     let whatsapp_app_secret: Option<Arc<str>> = config
@@ -1922,6 +1978,35 @@ async fn persist_pairing_tokens(config: &crate::config::SharedConfig, pairing: &
     Ok(())
 }
 
+/// Build the turn-root spawn context for one gateway/webhook turn.
+///
+/// Two things travel down from here into every sub-agent this turn starts:
+///
+/// * `run_id` — the turn's own id becomes the child's `parent_run_id`, so a
+///   webhook-launched run is attached to the turn that asked for it instead of
+///   floating as a root.
+/// * `channel_excluded_tools` — the names the turn's own surface hides. The
+///   gateway is not an IM channel and has no `channel_exclude` list: it publishes
+///   `tool_tiering` as configured, not `for_channel_surface()`. So the boundary a
+///   child inherits here is exactly `always_exclude`: the child's surface is the
+///   gateway's own surface minus the names the operator hid from the gateway, and
+///   `spawn` is not a way to get one of them back. `always_include` is untouched,
+///   exactly as on the channel path.
+fn gateway_turn_spawn_context(
+    run_id: String,
+    fabric_ctx: &GatewayFabricContext,
+    tiering: &crate::config::ToolTieringConfig,
+) -> crate::tools::sessions_spawn::SpawnExecutionContext {
+    crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
+        run_id,
+        format!(
+            "{}:{}:{}",
+            fabric_ctx.channel, fabric_ctx.session_key, fabric_ctx.sender
+        ),
+    )
+    .with_channel_excluded_tools(tiering.always_exclude.clone())
+}
+
 async fn run_gateway_chat_with_multimodal(
     state: &AppState,
     provider_label: &str,
@@ -2132,52 +2217,73 @@ async fn run_gateway_chat_with_multimodal(
     // reads as that handle's channel and a rule written for the surface the
     // message actually came from can never match. Reply routing is untouched;
     // only rule matching changes.
-    let loop_result = crate::tools::message_send::with_outbound_origin_channel(
-        fabric_ctx.channel.as_str(),
-        run_tool_call_loop_traced(
-            turn_runtime.provider.as_ref(),
-            &mut history,
-            Arc::clone(&turn_runtime.tools_registry),
-            &noop_observer,
-            state.hooks.as_ref(),
-            provider_label,
-            &turn_runtime.model,
-            turn_runtime.temperature,
-            true, // silent
-            None, // no approval manager
-            "webhook",
-            &multimodal_config,
-            config_snapshot.agent.read_only_tool_concurrency_window,
-            config_snapshot.agent.priority_scheduling_enabled,
-            config_snapshot.agent.low_priority_tools.clone(),
-            None,
-            None,                     // no cancellation token
-            None,                     // no streaming delta sender
-            Some(&gateway_scope_ctx), // P1-a: gateway turns now route through decide()
-            None,                     // no tool call notifications
-            Some(&config_snapshot.tool_tiering),
-            crate::agent::loop_::ToolLoopMemory::new(
-                &state.mem,
-                &config_snapshot.workspace_dir,
-                Some(DocumentIngestRuntime::from_envelope(
-                    state.mem.clone(),
-                    &runtime_envelope,
-                )),
-            )
-            .with_event_fabric(
-                MemoryFabric::new(state.mem.clone(), runtime_envelope.workspace_id.clone())
-                    .with_event_recording(config_snapshot.memory.event_recording_config()),
-            )
-            .with_request_event_scope({
-                let mut scope = base_scope.clone();
-                scope.causation_event_id = gateway_user_event.as_ref().map(|event| event.event_id.clone());
-                scope
-            })
-            .with_routing_input(message.to_string()),
-            crate::agent::loop_::ChatMode::default(),
-        ),
-    )
-    .await;
+    //
+    // G2: the same turn also seeds the spawn execution context. A sub-agent the
+    // webhook turn starts inherits (a) this turn's run_id as its parent, and (b)
+    // the gateway surface's own hidden tool names. The gateway is not an IM
+    // channel, so it has no `channel_exclude` list of its own: it publishes
+    // `config_snapshot.tool_tiering` rather than `for_channel_surface()`. The
+    // boundary a child must therefore inherit is exactly `always_exclude` — the
+    // gateway's own tool set minus what the operator hid from it — so a spawn can
+    // never be a way to get back a tool the gateway itself may not call.
+    let turn_spawn_ctx = gateway_turn_spawn_context(
+        runtime_envelope
+            .run_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        fabric_ctx,
+        &config_snapshot.tool_tiering,
+    );
+    let loop_result = crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
+        .scope(
+            turn_spawn_ctx,
+            crate::tools::message_send::with_outbound_origin_channel(
+                fabric_ctx.channel.as_str(),
+                run_tool_call_loop_traced(
+                    turn_runtime.provider.as_ref(),
+                    &mut history,
+                    Arc::clone(&turn_runtime.tools_registry),
+                    &noop_observer,
+                    state.hooks.as_ref(),
+                    provider_label,
+                    &turn_runtime.model,
+                    turn_runtime.temperature,
+                    true, // silent
+                    None, // no approval manager
+                    "webhook",
+                    &multimodal_config,
+                    config_snapshot.agent.read_only_tool_concurrency_window,
+                    config_snapshot.agent.priority_scheduling_enabled,
+                    config_snapshot.agent.low_priority_tools.clone(),
+                    None,
+                    None,                     // no cancellation token
+                    None,                     // no streaming delta sender
+                    Some(&gateway_scope_ctx), // P1-a: gateway turns now route through decide()
+                    None,                     // no tool call notifications
+                    Some(&config_snapshot.tool_tiering),
+                    crate::agent::loop_::ToolLoopMemory::new(
+                        &state.mem,
+                        &config_snapshot.workspace_dir,
+                        Some(DocumentIngestRuntime::from_envelope(
+                            state.mem.clone(),
+                            &runtime_envelope,
+                        )),
+                    )
+                    .with_event_fabric(
+                        MemoryFabric::new(state.mem.clone(), runtime_envelope.workspace_id.clone())
+                            .with_event_recording(config_snapshot.memory.event_recording_config()),
+                    )
+                    .with_request_event_scope({
+                        let mut scope = base_scope.clone();
+                        scope.causation_event_id = gateway_user_event.as_ref().map(|event| event.event_id.clone());
+                        scope
+                    })
+                    .with_routing_input(message.to_string()),
+                    crate::agent::loop_::ChatMode::default(),
+                ),
+            ),
+        )
+        .await;
     let (response, trace) = match loop_result {
         Ok(result) => result,
         Err(error) => {
@@ -3173,6 +3279,174 @@ mod tests {
         // A delivery that carries no message has nothing to name, and must not
         // grow a placeholder that looks like an address.
         assert_eq!(channel_webhook_job_label("telegram", None), "gateway:telegram");
+    }
+
+    /// A gateway with no Signal account still publishes `sessions_spawn`.
+    ///
+    /// The tool's channel argument is only the fallback announce destination, but
+    /// registration used to hang off `signal.as_ref().map(..)`: on a host without
+    /// Signal, a webhook turn simply had no way to start a sub-agent. The whole
+    /// registry is built here by the production builder, not by a copy of it.
+    ///
+    /// MUTATION GUARD: put the registration back behind `if let Some(signal)`
+    /// and the first assertion goes red.
+    #[test]
+    fn a_gateway_without_signal_still_publishes_sessions_spawn() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace_dir: workspace.path().to_path_buf(),
+            // The builder constructs a real provider chain, which refuses to come
+            // up with no credential at all. Nothing here ever calls out.
+            api_key: Some("test-key".to_string()),
+            ..Config::default()
+        };
+        let manager = crate::config::new_shared(config);
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).unwrap());
+        let hooks = Arc::new(HookManager::new(workspace.path().to_path_buf()));
+
+        let without_signal = build_gateway_turn_runtime(
+            manager.pin(),
+            manager.clone(),
+            Arc::clone(&memory),
+            None,
+            None,
+            None,
+            None,
+            Arc::clone(&hooks),
+            #[cfg(feature = "wasm-plugins")]
+            None,
+        )
+        .expect("test: the gateway turn runtime must build without any channel");
+        let names: Vec<&str> = without_signal.tools_registry.iter().map(|tool| tool.name()).collect();
+        assert!(
+            names.contains(&"sessions_spawn"),
+            "a gateway without Signal must still publish sessions_spawn: {names:?}"
+        );
+
+        // With Signal configured the tool is published exactly as before, so this
+        // is a widening and not a swap.
+        let signal = Arc::new(crate::channels::SignalChannel::new(
+            "http://127.0.0.1:1".to_string(),
+            "+10000000000".to_string(),
+            None,
+            Vec::new(),
+            false,
+            false,
+            crate::config::MediaConfig::default(),
+        ));
+        let with_signal = build_gateway_turn_runtime(
+            manager.pin(),
+            manager.clone(),
+            memory,
+            Some(signal),
+            None,
+            None,
+            None,
+            hooks,
+            #[cfg(feature = "wasm-plugins")]
+            None,
+        )
+        .expect("test: the gateway turn runtime must build with Signal");
+        let signal_names: Vec<&str> = with_signal.tools_registry.iter().map(|tool| tool.name()).collect();
+        assert!(
+            signal_names.contains(&"sessions_spawn"),
+            "the Signal-configured gateway must keep sessions_spawn: {signal_names:?}"
+        );
+    }
+
+    /// Signal keeps priority as the announce destination; without it the gateway
+    /// announces on its own sink rather than withholding the tool.
+    ///
+    /// MUTATION GUARD: make `gateway_spawn_announce_channel` ignore its argument
+    /// and the Signal assertion goes red; make it return `signal` unchanged and
+    /// the fallback assertion goes red.
+    #[tokio::test]
+    async fn the_spawn_announce_channel_prefers_signal_and_falls_back_to_the_gateway() {
+        let signal = Arc::new(crate::channels::SignalChannel::new(
+            "http://127.0.0.1:1".to_string(),
+            "+10000000000".to_string(),
+            None,
+            Vec::new(),
+            false,
+            false,
+            crate::config::MediaConfig::default(),
+        )) as Arc<dyn Channel>;
+        let chosen = gateway_spawn_announce_channel(Some(Arc::clone(&signal)));
+        assert!(
+            Arc::ptr_eq(&chosen, &signal),
+            "a configured Signal channel must stay the announce destination"
+        );
+
+        let fallback = gateway_spawn_announce_channel(None);
+        assert_eq!(
+            fallback.name(),
+            "gateway",
+            "without Signal the announcement falls back to the gateway's own sink"
+        );
+        // The sink accepts and drops; it must never fail a run, and it must never
+        // become an inbound listener.
+        fallback
+            .send(&SendMessage::new("sub-agent result", "webhook-client"))
+            .await
+            .expect("the gateway sink must accept an announcement");
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        assert!(
+            fallback.listen(tx).await.is_err(),
+            "the gateway sink must refuse to become an inbound listener"
+        );
+    }
+
+    /// A sub-agent spawned from a webhook turn inherits the gateway's own
+    /// boundary. The gateway is not an IM channel, so it has no `channel_exclude`
+    /// list; the names it must hand down are exactly `always_exclude`, i.e. the
+    /// child surface is the gateway's surface minus what the operator hid.
+    ///
+    /// The filter that consumes this list is pinned separately by
+    /// `agent::loop_::a_spawned_sub_agent_inherits_the_parent_channels_tool_exclusions`;
+    /// what is pinned here is that the gateway turn actually seeds it.
+    ///
+    /// MUTATION GUARD: drop `.with_channel_excluded_tools(..)` from
+    /// `gateway_turn_spawn_context` and the first assertion goes red.
+    #[tokio::test]
+    async fn a_webhook_turn_hands_the_gateways_own_boundary_to_what_it_spawns() {
+        let fabric_ctx = GatewayFabricContext::generic_webhook(Some("webhook-client"), None);
+        let tiering = crate::config::ToolTieringConfig {
+            always_exclude: vec!["gateway".to_string(), "config_reload".to_string()],
+            ..crate::config::ToolTieringConfig::default()
+        };
+        let ctx = gateway_turn_spawn_context("turn-run-1".to_string(), &fabric_ctx, &tiering);
+        let inherited = crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
+            .scope(ctx, async {
+                crate::tools::sessions_spawn::ambient_channel_excluded_tools()
+            })
+            .await;
+        assert_eq!(
+            inherited,
+            vec!["gateway".to_string(), "config_reload".to_string()],
+            "a webhook-spawned sub-agent must run behind the gateway's own boundary"
+        );
+
+        // Fixture proof: with nothing hidden from the gateway the child inherits
+        // nothing, so the assertion above is about the seed and not about the
+        // task-local always being non-empty.
+        let open_ctx = gateway_turn_spawn_context(
+            "turn-run-2".to_string(),
+            &fabric_ctx,
+            &crate::config::ToolTieringConfig::default(),
+        );
+        assert!(
+            crate::config::ToolTieringConfig::default().always_exclude.is_empty(),
+            "fixture is useless unless the default gateway surface hides nothing"
+        );
+        let open = crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
+            .scope(open_ctx, async {
+                crate::tools::sessions_spawn::ambient_channel_excluded_tools()
+            })
+            .await;
+        assert!(
+            open.is_empty(),
+            "an unrestricted gateway hands down no boundary: {open:?}"
+        );
     }
 
     struct TestConfigParticipant;

@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.134] - 16 September 2026
+
+### Fixed
+
+- Gateway: `sessions_spawn` is now registered on every gateway, not only when a
+  Signal channel is configured. The channel passed to the tool is only the
+  fallback destination for a run's completion announcement, so a deployment
+  without Signal silently lost the ability to start sub-agents from a webhook
+  turn. Signal remains the announce destination wherever it is configured;
+  without it the gateway falls back to its own sink, which records the
+  announcement in the log — the result itself stays available through the tool's
+  `join` action, `sessions_list` / `sessions_history`, and
+  `GET /api/runtime/tasks`. No new outbound transport and no new listener.
+
+### Changed
+
+- Gateway: a webhook turn now seeds a turn-root spawn execution context. A
+  sub-agent started from that turn inherits the turn's run id as its parent
+  (previously it had none) and the gateway's own hidden tool names. The gateway
+  is not an IM channel and has no `channel_exclude` list, so the inherited
+  boundary is exactly `tool_tiering.always_exclude`: a spawned sub-agent's tool
+  surface is the gateway's own surface minus what the operator hid from it, and
+  `always_include` is unaffected.
+
 ## [0.8.133] - 16 September 2026
 
 ### Changed
