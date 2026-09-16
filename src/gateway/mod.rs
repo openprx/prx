@@ -2007,6 +2007,32 @@ fn gateway_turn_spawn_context(
     .with_channel_excluded_tools(tiering.always_exclude.clone())
 }
 
+/// Run `inner` as the webhook turn itself: seeded with this turn's spawn
+/// boundary, so anything it spawns inherits the gateway's own surface.
+///
+/// This is the production seam. `gateway_turn_spawn_context` only builds the
+/// context; nothing enforced that the value actually reached the tool loop, so
+/// emptying the list at the call site (or shadowing the binding) left every
+/// test green while `sessions_spawn` handed a child the tools the operator hid
+/// from the gateway. Binding construction and scoping together here gives that
+/// wiring one place to be tested, and
+/// `tests/architecture_boundaries.rs::the_gateway_webhook_turn_seeds_its_spawn_boundary`
+/// pins that `run_gateway_chat_with_multimodal` still goes through it.
+async fn within_gateway_turn_spawn_context<F>(
+    run_id: String,
+    fabric_ctx: &GatewayFabricContext,
+    tiering: &crate::config::ToolTieringConfig,
+    inner: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    let turn_spawn_ctx = gateway_turn_spawn_context(run_id, fabric_ctx, tiering);
+    crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
+        .scope(turn_spawn_ctx, inner)
+        .await
+}
+
 async fn run_gateway_chat_with_multimodal(
     state: &AppState,
     provider_label: &str,
@@ -2226,64 +2252,60 @@ async fn run_gateway_chat_with_multimodal(
     // boundary a child must therefore inherit is exactly `always_exclude` — the
     // gateway's own tool set minus what the operator hid from it — so a spawn can
     // never be a way to get back a tool the gateway itself may not call.
-    let turn_spawn_ctx = gateway_turn_spawn_context(
+    let loop_result = within_gateway_turn_spawn_context(
         runtime_envelope
             .run_id
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string()),
         fabric_ctx,
         &config_snapshot.tool_tiering,
-    );
-    let loop_result = crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
-        .scope(
-            turn_spawn_ctx,
-            crate::tools::message_send::with_outbound_origin_channel(
-                fabric_ctx.channel.as_str(),
-                run_tool_call_loop_traced(
-                    turn_runtime.provider.as_ref(),
-                    &mut history,
-                    Arc::clone(&turn_runtime.tools_registry),
-                    &noop_observer,
-                    state.hooks.as_ref(),
-                    provider_label,
-                    &turn_runtime.model,
-                    turn_runtime.temperature,
-                    true, // silent
-                    None, // no approval manager
-                    "webhook",
-                    &multimodal_config,
-                    config_snapshot.agent.read_only_tool_concurrency_window,
-                    config_snapshot.agent.priority_scheduling_enabled,
-                    config_snapshot.agent.low_priority_tools.clone(),
-                    None,
-                    None,                     // no cancellation token
-                    None,                     // no streaming delta sender
-                    Some(&gateway_scope_ctx), // P1-a: gateway turns now route through decide()
-                    None,                     // no tool call notifications
-                    Some(&config_snapshot.tool_tiering),
-                    crate::agent::loop_::ToolLoopMemory::new(
-                        &state.mem,
-                        &config_snapshot.workspace_dir,
-                        Some(DocumentIngestRuntime::from_envelope(
-                            state.mem.clone(),
-                            &runtime_envelope,
-                        )),
-                    )
-                    .with_event_fabric(
-                        MemoryFabric::new(state.mem.clone(), runtime_envelope.workspace_id.clone())
-                            .with_event_recording(config_snapshot.memory.event_recording_config()),
-                    )
-                    .with_request_event_scope({
-                        let mut scope = base_scope.clone();
-                        scope.causation_event_id = gateway_user_event.as_ref().map(|event| event.event_id.clone());
-                        scope
-                    })
-                    .with_routing_input(message.to_string()),
-                    crate::agent::loop_::ChatMode::default(),
-                ),
+        crate::tools::message_send::with_outbound_origin_channel(
+            fabric_ctx.channel.as_str(),
+            run_tool_call_loop_traced(
+                turn_runtime.provider.as_ref(),
+                &mut history,
+                Arc::clone(&turn_runtime.tools_registry),
+                &noop_observer,
+                state.hooks.as_ref(),
+                provider_label,
+                &turn_runtime.model,
+                turn_runtime.temperature,
+                true, // silent
+                None, // no approval manager
+                "webhook",
+                &multimodal_config,
+                config_snapshot.agent.read_only_tool_concurrency_window,
+                config_snapshot.agent.priority_scheduling_enabled,
+                config_snapshot.agent.low_priority_tools.clone(),
+                None,
+                None,                     // no cancellation token
+                None,                     // no streaming delta sender
+                Some(&gateway_scope_ctx), // P1-a: gateway turns now route through decide()
+                None,                     // no tool call notifications
+                Some(&config_snapshot.tool_tiering),
+                crate::agent::loop_::ToolLoopMemory::new(
+                    &state.mem,
+                    &config_snapshot.workspace_dir,
+                    Some(DocumentIngestRuntime::from_envelope(
+                        state.mem.clone(),
+                        &runtime_envelope,
+                    )),
+                )
+                .with_event_fabric(
+                    MemoryFabric::new(state.mem.clone(), runtime_envelope.workspace_id.clone())
+                        .with_event_recording(config_snapshot.memory.event_recording_config()),
+                )
+                .with_request_event_scope({
+                    let mut scope = base_scope.clone();
+                    scope.causation_event_id = gateway_user_event.as_ref().map(|event| event.event_id.clone());
+                    scope
+                })
+                .with_routing_input(message.to_string()),
+                crate::agent::loop_::ChatMode::default(),
             ),
-        )
-        .await;
+        ),
+    )
+    .await;
     let (response, trace) = match loop_result {
         Ok(result) => result,
         Err(error) => {
@@ -3443,6 +3465,79 @@ mod tests {
                 crate::tools::sessions_spawn::ambient_channel_excluded_tools()
             })
             .await;
+        assert!(
+            open.is_empty(),
+            "an unrestricted gateway hands down no boundary: {open:?}"
+        );
+    }
+
+    /// The webhook turn's tool loop really runs inside the seeded context.
+    ///
+    /// `a_webhook_turn_hands_the_gateways_own_boundary_to_what_it_spawns` pins
+    /// the builder; this pins the seam the builder is useless without. The
+    /// future handed to `within_gateway_turn_spawn_context` stands in for the
+    /// tool loop `run_gateway_chat_with_multimodal` passes, and it reads exactly
+    /// what `sessions_spawn` reads when a webhook turn calls it.
+    ///
+    /// MUTATION GUARD: emptying the list at the seeding site
+    /// (`.with_channel_excluded_tools(Vec::new())` on the value the wrapper
+    /// scopes) or shadowing `turn_spawn_ctx` with a bare
+    /// `SpawnExecutionContext::seed_turn_context(..)` turns both assertion
+    /// groups below red. That `run_gateway_chat_with_multimodal` still routes
+    /// through this wrapper is pinned by
+    /// `tests/architecture_boundaries.rs::the_gateway_webhook_turn_seeds_its_spawn_boundary`.
+    #[tokio::test]
+    async fn the_webhook_turns_tool_loop_runs_inside_the_seeded_spawn_context() {
+        let fabric_ctx = GatewayFabricContext::generic_webhook(Some("webhook-client"), None);
+        let tiering = crate::config::ToolTieringConfig {
+            always_exclude: vec!["gateway".to_string(), "config_reload".to_string()],
+            ..crate::config::ToolTieringConfig::default()
+        };
+
+        let (excluded, parent_run_id, is_turn_root) =
+            within_gateway_turn_spawn_context("turn-run-42".to_string(), &fabric_ctx, &tiering, async {
+                (
+                    crate::tools::sessions_spawn::ambient_channel_excluded_tools(),
+                    crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
+                        .try_with(|ctx| ctx.run_id.clone())
+                        .ok(),
+                    crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
+                        .try_with(|ctx| ctx.is_turn_root)
+                        .ok(),
+                )
+            })
+            .await;
+
+        assert_eq!(
+            excluded,
+            vec!["gateway".to_string(), "config_reload".to_string()],
+            "the tool loop the webhook turn runs must already stand behind the gateway's boundary,              or one sessions_spawn call hands a child the tools the operator hid"
+        );
+        assert_eq!(
+            parent_run_id.as_deref(),
+            Some("turn-run-42"),
+            "a task spawned from the webhook turn must attach to that turn's run_id"
+        );
+        assert_eq!(
+            is_turn_root,
+            Some(true),
+            "the webhook turn is a turn root: its first child reports spawn depth 0"
+        );
+
+        // Fixture proof: the assertions above are about the seeding, not about
+        // the task-local being populated by something else. Nothing hidden from
+        // the gateway means nothing inherited, under the same call.
+        let open = within_gateway_turn_spawn_context(
+            "turn-run-43".to_string(),
+            &fabric_ctx,
+            &crate::config::ToolTieringConfig::default(),
+            async { crate::tools::sessions_spawn::ambient_channel_excluded_tools() },
+        )
+        .await;
+        assert!(
+            crate::config::ToolTieringConfig::default().always_exclude.is_empty(),
+            "fixture is useless unless the default gateway surface hides nothing"
+        );
         assert!(
             open.is_empty(),
             "an unrestricted gateway hands down no boundary: {open:?}"

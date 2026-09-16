@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.136] - 16 September 2026
+
+### Fixed
+- The gateway webhook turn's spawn boundary is now enforced at the production seam.
+  Seeding the turn's spawn execution context and scoping the tool loop inside it moved
+  into a single `within_gateway_turn_spawn_context` function, covered by a test that
+  reads the context exactly as `sessions_spawn` does, plus an architecture guard that
+  the webhook turn still routes through it and scopes no context of its own. Previously
+  only the context builder was covered, so emptying the inherited exclusion list at the
+  call site would have let a sub-agent spawned from a webhook turn reach tools the
+  operator hid from the gateway, with the whole suite green.
+
+### Changed
+- The `sec-audit` workflow's Miri comment now quotes the measured start-up cost
+  (about 3 minutes over this test binary) instead of an unsourced ten-minute figure.
+
 ## [0.8.135] - 16 September 2026
 
 ### Fixed

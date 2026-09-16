@@ -858,6 +858,52 @@ fn tool_arguments_are_schema_validated_on_the_production_execution_path() {
     );
 }
 
+/// A webhook turn must run its tool loop inside its own spawn boundary.
+///
+/// `gateway::tests::the_webhook_turns_tool_loop_runs_inside_the_seeded_spawn_context`
+/// pins what `within_gateway_turn_spawn_context` does; this pins that the
+/// shipped webhook turn still goes through it. Without this guard the seeding
+/// can be deleted from `run_gateway_chat_with_multimodal` -- or replaced by a
+/// hand-rolled `SPAWN_EXECUTION_CONTEXT.scope` over a bare context -- and every
+/// test stays green while `sessions_spawn` becomes a way back to the tools the
+/// operator hid from the gateway.
+#[test]
+fn the_gateway_webhook_turn_seeds_its_spawn_boundary() {
+    let root = repository_root();
+    let gateway = fs::read_to_string(root.join("src/gateway/mod.rs")).expect("read src/gateway/mod.rs");
+    let production = gateway
+        .find("#[cfg(test)]\nmod tests {")
+        .map_or(gateway.as_str(), |offset| &gateway[..offset]);
+
+    let turn = function_body(production, "run_gateway_chat_with_multimodal");
+    assert!(
+        turn.contains("within_gateway_turn_spawn_context("),
+        "the webhook turn no longer seeds its spawn boundary; a sub-agent it starts would run with no          inherited exclusions and could call the tools the operator hid from the gateway"
+    );
+    assert!(
+        !turn.contains("SPAWN_EXECUTION_CONTEXT"),
+        "the webhook turn scopes a spawn context of its own instead of the seeded one; the seeding          must stay in within_gateway_turn_spawn_context, where it is under test"
+    );
+
+    let seeder = {
+        let start = production
+            .find("async fn within_gateway_turn_spawn_context")
+            .expect("missing production function within_gateway_turn_spawn_context");
+        let end = production[start..]
+            .find("\n}\n")
+            .expect("unterminated production function within_gateway_turn_spawn_context");
+        &production[start..start + end]
+    };
+    assert!(
+        seeder.contains("gateway_turn_spawn_context(") && seeder.contains("SPAWN_EXECUTION_CONTEXT"),
+        "the gateway spawn seam must still build the turn context and scope the tool loop inside it"
+    );
+    assert!(
+        !seeder.contains("with_channel_excluded_tools(Vec::new())"),
+        "the gateway spawn seam empties the inherited exclusion list; that is the escape hatch this          boundary exists to close"
+    );
+}
+
 /// Strip every `#[cfg(test)]` item from `source`, brace-balanced.
 ///
 /// Line-based and deliberately conservative: it matches the shape this crate

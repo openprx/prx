@@ -100,8 +100,9 @@ jobs:
       # be added here if it holds to that.
       #
       # Keep the list small for a second reason: Miri's cost here is dominated
-      # by interpreter start-up over this test binary (~10 minutes before the
-      # first test runs), not by the tests themselves, so the 45-minute budget
+      # by interpreter start-up over this test binary (measured locally: 300s
+      # wall clock total, 118s of it tests, so about 3 minutes before the first
+      # test runs), not by the tests themselves, so the 45-minute budget
       # buys only a handful of modules. `tools::schema` was evaluated and left
       # out -- its reference-expansion-budget tests did not finish inside a
       # 15-minute local run.
