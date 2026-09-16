@@ -380,7 +380,11 @@ impl Tool for XinTool {
     }
 
     fn description(&self) -> &str {
-        "Xin autonomous task heartbeat engine: tasks and durable goal/step workflows, with execution and history."
+        "Xin autonomous task heartbeat engine: tasks and durable goal/step workflows, with execution \
+         and history. Tasks: 'add', 'list', 'get', 'update', 'remove', 'pause', 'resume', 'cancel', \
+         'run', 'runs', 'events', 'status'. Goals: 'goal_add', 'goal_list', 'goal_get', 'goal_pause', \
+         'goal_resume', 'goal_cancel', 'goal_remove'. Steps: 'step_add', 'step_list', 'step_get', \
+         'step_retry'."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -396,7 +400,13 @@ impl Tool for XinTool {
                                 "goal_list", "goal_get", "goal_add", "goal_pause", "goal_resume", "goal_cancel", "goal_remove",
                                 "step_list", "step_get", "step_add", "step_retry"
                             ],
-                            "description": "Action to perform."
+                            "description": "Task actions: create with 'add'; inspect with \
+                                            'list'/'get'/'runs'/'events'/'status'; change with 'update'; \
+                                            control with 'pause'/'resume'/'cancel'/'run'; delete with 'remove'. \
+                                            Goal-workflow actions: 'goal_add', 'goal_list', 'goal_get', \
+                                            'goal_pause', 'goal_resume', 'goal_cancel', 'goal_remove'. \
+                                            Step actions within a goal: 'step_add', 'step_list', 'step_get', \
+                                            'step_retry'."
                         },
                         "task_id": {
                             "type": "string",
@@ -1392,7 +1402,11 @@ mod tests {
         let config = Config::default();
         let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
         let tool = XinTool::new(new_shared(config), security);
-        crate::tools::schema::action_contract::assert_action_schema_contract("xin", &tool.parameters_schema());
+        crate::tools::schema::action_contract::assert_action_tool_contract(
+            "xin",
+            tool.description(),
+            &tool.parameters_schema(),
+        );
     }
 
     #[test]

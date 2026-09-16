@@ -35,18 +35,26 @@ every model-running entrypoint:
 | `prx chat` (TUI or plain) | yes | yes | yes | yes |
 | `prx agent` (interactive or one-shot) | yes | yes | yes | yes |
 | embedded `process_message` | yes | yes | yes | yes |
-| standalone IM channel supervisor | use only¹ | call only¹ | no¹ | call only¹ |
+| standalone IM channel supervisor | use only¹ | call only¹ | run only¹ | call only¹ |
 | gateway/webhook turns | yes | yes | yes | yes |
 | delegated/session-worker turns | yes | yes | yes | yes |
 
-¹ The registry a channel supervisor builds is the same one; `channel_exclude`
-then hides the management and status tools from the turn, because a channel turn
-is driven by a conversation partner rather than by the operator. `skills_manage`,
-`mcp_status`, `hooks_status`, `hooks_manage`, `wasm_plugins_status`,
-`wasm_plugins_manage` and `wasm_plugin_reload` are excluded; invoking a skill, an
-MCP tool or a WASM plugin tool is not. See
-[Per-turn capability routing](#per-turn-capability-routing) for the full list and
-how to override it.
+¹ The registry a channel supervisor builds is the same one, and every capability
+still *runs*: skills are usable, MCP and WASM plugin tools are callable, and
+hooks fire on the turn exactly as they do in terminal chat. What
+`channel_exclude` removes is the operations surface — the tools that manage or
+inspect those subsystems — because a channel turn is driven by a conversation
+partner rather than by the operator. The default excluded set is
+`DEFAULT_CHANNEL_EXCLUDED_TOOLS` (`src/config/schema.rs`):
+
+`wasm_plugins_manage`, `wasm_plugin_reload`, `wasm_plugins_status`,
+`hooks_manage`, `hooks_status`, `proxy_config`, `config_reload`, `gateway`,
+`mcp_status`, `nodes`, `git_operations`, `skills_manage`, `memory_reindex`,
+`document_sync`, `document_ingest`.
+
+Nothing else is hidden by the channel surface. See
+[Per-turn capability routing](#per-turn-capability-routing) for how to override
+it.
 
 ## Per-turn capability routing
 
@@ -92,6 +100,27 @@ pin a session at the whole catalog for the rest of its life.
 
 `/new` and `/clear` reset the union. Channel, gateway, console and worker turns
 are unaffected — each of those turns is its own session.
+
+**If a tool you expect is missing from a turn**, check these two mechanisms in
+order, because they answer different questions:
+
+1. *Intent routing* decides what this turn publishes. In `prx chat` the catalog
+   is cut down to the capabilities the conversation has actually named so far,
+   so a tool that has never been mentioned in the session is simply not in the
+   request. Naming its capability once is enough — the session's union keeps it
+   from then on. A tool that must be present on *every* turn regardless of
+   wording belongs in `[tool_tiering] always_include`, which is applied by name
+   and is not subject to the keyword table:
+
+   ```toml
+   [tool_tiering]
+   always_include = ["memory_recall", "document_search"]
+   ```
+
+2. *Channel exclusion* decides what an IM turn may publish at all, and it wins
+   over routing. If the tool is one of the `channel_exclude` names above, no
+   amount of phrasing brings it back on a channel — put it in `always_include`,
+   or clear `channel_exclude`, as shown below.
 
 The skill catalog in the system prompt follows the same principle: a catalog of
 at most `[skill_rag] top_k` skills (32 by default) is published whole, which

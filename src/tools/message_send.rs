@@ -202,6 +202,20 @@ fn requested_channel(args: &serde_json::Value) -> Option<&str> {
 /// each implementation publishes only the operations it can execute.
 pub(crate) const MESSAGE_SEND_TOOL_NAME: &str = "message_send";
 
+/// Tool-list summary for the channel-owned `message_send`. Kept beside the
+/// schema, and out of the trait method, so the contract test can hold it to the
+/// same standard without standing up a channel.
+const CHANNEL_MESSAGE_SEND_DESCRIPTION: &str = "Send a message on the active messaging channel (Signal, Telegram, …). Text, file/image/voice \
+     attachments, emoji reactions and quote replies. Use action='send' to send and action='react' \
+     to react; 'edit' rewrites and 'delete'/'unsend' withdraws an earlier message by `message_id`; \
+     'thread' replies inside a thread; set 'channel' to deliver text on another configured channel.";
+
+/// Tool-list summary for the daemon-brokered `message_send`.
+const DAEMON_MESSAGE_SEND_DESCRIPTION: &str = "Send a message through one of the PRX daemon's messaging channels (Signal, Telegram, wacli, etc.). \
+     This chat session holds no channel of its own, so the send is performed by the daemon: \
+     'channel' is required, only action='send' is available, and the daemon's outbound scope \
+     rules decide whether the recipient may be reached.";
+
 /// Parameter schema for a channel-owned `message_send` implementation.
 fn channel_message_send_parameters_schema() -> serde_json::Value {
     let mut schema = crate::tools::schema::with_default_action_requirements(
@@ -603,9 +617,7 @@ impl Tool for MessageSendTool {
     }
 
     fn description(&self) -> &str {
-        "Send a message on the active messaging channel (Signal, Telegram, …). Text, file/image/voice \
-         attachments, emoji reactions and quote replies. Use action='send' to send and action='react' \
-         to react; set 'channel' to deliver text on another configured channel."
+        CHANNEL_MESSAGE_SEND_DESCRIPTION
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1092,10 +1104,7 @@ impl Tool for DaemonMessageSendTool {
     }
 
     fn description(&self) -> &str {
-        "Send a message through one of the PRX daemon's messaging channels (Signal, Telegram, wacli, etc.). \
-         This chat session holds no channel of its own, so the send is performed by the daemon: \
-         'channel' is required, only action='send' is available, and the daemon's outbound scope \
-         rules decide whether the recipient may be reached."
+        DAEMON_MESSAGE_SEND_DESCRIPTION
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1286,12 +1295,14 @@ mod tests {
     /// has to name that action.
     #[test]
     fn schemas_name_every_action_in_the_parameters_they_require() {
-        crate::tools::schema::action_contract::assert_action_schema_contract(
+        crate::tools::schema::action_contract::assert_action_tool_contract(
             "message_send",
+            CHANNEL_MESSAGE_SEND_DESCRIPTION,
             &channel_message_send_parameters_schema(),
         );
-        crate::tools::schema::action_contract::assert_action_schema_contract(
+        crate::tools::schema::action_contract::assert_action_tool_contract(
             "message_send (daemon)",
+            DAEMON_MESSAGE_SEND_DESCRIPTION,
             &daemon_message_send_parameters_schema(),
         );
     }

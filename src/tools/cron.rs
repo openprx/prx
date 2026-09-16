@@ -312,10 +312,10 @@ impl Tool for CronTool {
 
     fn description(&self) -> &str {
         "Unified cron/scheduler management — the single entry point for ALL scheduled-task \
-         operations. Actions: add/schedule (recurring job: `expression`+`command`, or a \
-         `schedule` object with `payload`/`job_type`); once (one-shot shell job via `delay` \
-         or `run_at`); list; get; remove/cancel; update/patch; run; runs/history; events; \
-         pause; resume; status."
+         operations. Actions: 'add'/'schedule' (recurring job: `expression`+`command`, or a \
+         `schedule` object with `payload`/`job_type`); 'once' (one-shot shell job via `delay` \
+         or `run_at`); 'list'; 'get'; 'remove'/'cancel'; 'update'/'patch'; 'run'; \
+         'runs'/'history'; 'events'; 'pause'; 'resume'; 'status'."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -340,7 +340,10 @@ impl Tool for CronTool {
                                     "pause", "resume",
                                     "status"
                                 ],
-                                "description": "Action to perform."
+                                "description": "Create a job with 'add'/'schedule' (recurring) or 'once' \
+                                                (one-shot); inspect with 'list'/'get'/'runs'/'history'/'events'/'status'; \
+                                                change one with 'update'/'patch'; trigger it now with 'run'; \
+                                                halt or resume it with 'pause'/'resume'; delete it with 'remove'/'cancel'."
                             },
                             "job_id": {
                                 "type": "string",
@@ -1137,7 +1140,11 @@ mod tests {
         let config = new_shared(Config::default());
         let snapshot = config.load_full();
         let tool = CronTool::new(Arc::clone(&config), test_security(&snapshot));
-        crate::tools::schema::action_contract::assert_action_schema_contract("cron", &tool.parameters_schema());
+        crate::tools::schema::action_contract::assert_action_tool_contract(
+            "cron",
+            tool.description(),
+            &tool.parameters_schema(),
+        );
     }
 
     #[test]

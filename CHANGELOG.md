@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.133] - 16 September 2026
+
+### Changed
+
+- Hold every action-dispatched tool to the *whole* schema contract, not just the
+  half of it that fits in a conditional-required clause. `assert_action_schema_contract`
+  now also requires the `action` enum's own description to name every action it
+  enumerates, and a new `assert_action_tool_contract` requires the tool-list
+  description to name them too — the two pieces of text a model reads before it
+  can choose a tool and then an action. Both checks used to exist only inside
+  `sessions_spawn`'s private test module, which is why the convention had
+  silently stopped holding elsewhere: `cron`, `xin` and `wasm_plugins_manage` all
+  shipped `"Action to perform."` as the entire action description, `xin`'s
+  tool-list summary named none of its 23 actions, and `message_send` advertised
+  two of its six. All five schemas are brought into compliance. The 0.8.116 note
+  that the schema-contract tests "continue to hold" was true only of
+  `sessions_spawn`; it holds across all five from this version.
+
+### Fixed
+
+- Stop `docs/tools.md` contradicting itself about what an IM channel turn may
+  do. The entrypoint table said hooks were unavailable on a channel supervisor
+  and its footnote listed seven excluded tools, while the routing section below
+  listed fifteen — hooks in fact fire normally and only the management and
+  status tools are hidden. Both places are now derived from
+  `DEFAULT_CHANNEL_EXCLUDED_TOOLS`, and a new section explains the two distinct
+  reasons a tool can be absent from a turn: intent routing, which
+  `[tool_tiering] always_include` overrides by name, and channel exclusion,
+  which outranks routing entirely.
+
 ## [0.8.132] - 16 September 2026
 
 ### Fixed

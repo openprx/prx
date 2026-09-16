@@ -1043,6 +1043,13 @@ fn validate_plugin_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Tool-list summary for `wasm_plugins_manage`, kept beside the schema so the
+/// contract test can hold both to the same standard without a live runtime.
+pub(crate) const PLUGIN_MANAGE_DESCRIPTION: &str = "Inspect, manage and invoke workspace WASM plugins (tool, middleware, hook, cron, provider, storage). \
+     Actions: 'status', 'get', 'refresh', 'install', 'update', 'enable', 'disable', 'remove', \
+     'middleware_test', 'cron_run', 'provider_chat', 'storage_health', 'storage_store', \
+     'storage_recall', 'storage_forget', 'storage_count'.";
+
 /// Parameter schema for `wasm_plugins_manage`.
 ///
 /// Kept as a free function so the schema contract can be asserted without
@@ -1054,7 +1061,10 @@ pub(crate) fn plugin_manage_parameters_schema() -> serde_json::Value {
             "action": {
                 "type": "string",
                 "enum": ["status", "get", "refresh", "install", "update", "enable", "disable", "remove", "middleware_test", "cron_run", "provider_chat", "storage_health", "storage_store", "storage_recall", "storage_forget", "storage_count"],
-                "description": "Action to perform."
+                "description": "Inspect with 'status'/'get'; reload the workspace with 'refresh'; manage a plugin \
+                                with 'install'/'update'/'enable'/'disable'/'remove'; exercise an exported adapter with \
+                                'middleware_test' (middleware stage), 'cron_run' (cron handler), 'provider_chat' (provider) \
+                                or the storage actions 'storage_health'/'storage_store'/'storage_recall'/'storage_forget'/'storage_count'."
             },
             "name": {"type": "string", "minLength": 1, "description": "Plugin name or exported adapter name; required by 'get'/'enable'/'disable'/'remove'/'cron_run'/'provider_chat' and by every storage action ('storage_health'/'storage_store'/'storage_recall'/'storage_forget'/'storage_count')."},
             "source": {"type": "string", "description": "'install'/'update': plugin source directory in the workspace."},
@@ -1117,7 +1127,7 @@ impl Tool for PluginManageTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect, manage and invoke workspace WASM plugins (tool, middleware, hook, cron, provider, storage)."
+        PLUGIN_MANAGE_DESCRIPTION
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1452,8 +1462,9 @@ mod tests {
     /// without has to name that action, and no parameter may ship undescribed.
     #[test]
     fn manage_schema_names_every_action_in_the_parameters_it_requires() {
-        crate::tools::schema::action_contract::assert_action_schema_contract(
+        crate::tools::schema::action_contract::assert_action_tool_contract(
             "wasm_plugins_manage",
+            PLUGIN_MANAGE_DESCRIPTION,
             &plugin_manage_parameters_schema(),
         );
     }

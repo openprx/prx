@@ -1966,13 +1966,13 @@ pub(crate) mod action_contract {
         pairs
     }
 
-    /// Assert the contract for one action-dispatched tool.
-    pub(crate) fn assert_action_schema_contract(tool: &str, schema: &Value) {
-        let properties = schema
+    /// Read the action enum off a schema, panicking with the tool's name when
+    /// the schema is not action-dispatched at all.
+    fn enumerated_actions<'a>(tool: &str, schema: &'a Value) -> Vec<&'a str> {
+        let actions: Vec<&str> = schema
             .get("properties")
             .and_then(Value::as_object)
-            .unwrap_or_else(|| panic!("{tool}: schema must declare properties"));
-        let actions: Vec<&str> = properties
+            .unwrap_or_else(|| panic!("{tool}: schema must declare properties"))
             .get("action")
             .and_then(|action| action.get("enum"))
             .and_then(Value::as_array)
@@ -1981,6 +1981,16 @@ pub(crate) mod action_contract {
             .filter_map(Value::as_str)
             .collect();
         assert!(!actions.is_empty(), "{tool}: the action enum must not be empty");
+        actions
+    }
+
+    /// Assert the contract for one action-dispatched tool.
+    pub(crate) fn assert_action_schema_contract(tool: &str, schema: &Value) {
+        let properties = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("{tool}: schema must declare properties"));
+        let actions = enumerated_actions(tool, schema);
 
         for (name, property) in properties {
             let description = property.get("description").and_then(Value::as_str).unwrap_or("");
@@ -2007,6 +2017,43 @@ pub(crate) mod action_contract {
                 "{tool}: action '{action}' cannot be called without '{parameter}', but that parameter's \
                  description never names the action, so a model calling '{action}' cannot tell which \
                  parameter to pass: {description}"
+            );
+        }
+
+        // Choosing the action comes before choosing its parameters, and the
+        // `action` property's own description is the only text in the schema
+        // that the model reads while making that choice. An enum entry absent
+        // from it is a capability the model has to guess at from the bare
+        // identifier.
+        let action_description = properties
+            .get("action")
+            .and_then(|action| action.get("description"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("{tool}: the action parameter must carry a description"));
+        for action in &actions {
+            assert!(
+                mentions_action(action_description, action),
+                "{tool}: action '{action}' is callable but the action enum's description never names it, \
+                 so the model has only the bare identifier to infer the capability from: {action_description}"
+            );
+        }
+    }
+
+    /// Assert the full contract for one action-dispatched tool: everything
+    /// [`assert_action_schema_contract`] checks inside the schema, plus the
+    /// tool-list description, which is the one piece of text every entry point
+    /// renders while the model is still choosing *which tool* to call.
+    ///
+    /// The schema is never consulted for a capability the description gave no
+    /// reason to look for, so an action missing from the summary is effectively
+    /// unreachable however well the schema documents it.
+    pub(crate) fn assert_action_tool_contract(tool: &str, description: &str, schema: &Value) {
+        assert_action_schema_contract(tool, schema);
+        for action in enumerated_actions(tool, schema) {
+            assert!(
+                mentions_action(description, action),
+                "{tool}: action '{action}' is callable but the tool-list description never names it, so a \
+                 model choosing a tool has no reason to open this schema for it: {description}"
             );
         }
     }
