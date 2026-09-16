@@ -181,6 +181,10 @@ pub struct InitReport {
     /// Keys the folder could not place in the regenerated tree. Each one is a
     /// value the operator wrote that this run did not carry over.
     unpreserved: Vec<String>,
+    /// Keys this build can no longer represent because the template now writes
+    /// a scalar where the previous tree held a table (or the reverse). Same
+    /// class of loss as `unpreserved`, different cause.
+    dropped: Vec<String>,
 }
 
 impl InitReport {
@@ -222,22 +226,42 @@ impl InitReport {
         &self.unpreserved
     }
 
+    /// Keys this run reset because the regenerated templates can no longer
+    /// represent their shape, in the order they are reported.
+    #[must_use]
+    pub fn dropped_keys(&self) -> &[String] {
+        &self.dropped
+    }
+
     /// A reset is a data-loss event, so it ends the command non-zero even
     /// though the tree on disk is valid and usable. Individual keys that could
     /// not be folded are the same kind of loss on a smaller scale and end the
     /// command the same way: silence is what made this class of bug survive.
+    /// Keys this build can no longer represent are lost just as completely, so
+    /// they end the command non-zero too, listed under their own heading.
     pub fn into_result(self) -> Result<()> {
         if let Some(reason) = self.reset {
             return Err(anyhow::anyhow!(reason));
         }
-        if self.unpreserved.is_empty() {
+        if self.unpreserved.is_empty() && self.dropped.is_empty() {
             return Ok(());
         }
-        Err(anyhow::anyhow!(
-            "{} setting(s) could not be folded into the regenerated configuration: {}",
-            self.unpreserved.len(),
-            self.unpreserved.join(", ")
-        ))
+        let mut parts = Vec::new();
+        if !self.unpreserved.is_empty() {
+            parts.push(format!(
+                "{} setting(s) could not be folded into the regenerated configuration: {}",
+                self.unpreserved.len(),
+                self.unpreserved.join(", ")
+            ));
+        }
+        if !self.dropped.is_empty() {
+            parts.push(format!(
+                "{} setting(s) this build can no longer represent were reset: {}",
+                self.dropped.len(),
+                self.dropped.join(", ")
+            ));
+        }
+        Err(anyhow::anyhow!(parts.join("; ")))
     }
 
     fn record_preservation(&mut self, outcome: &PreservationOutcome, archive: Option<&Path>) {
@@ -270,10 +294,11 @@ impl InitReport {
             ));
         }
         if !outcome.dropped.is_empty() {
+            self.dropped = outcome.dropped.iter().cloned().collect();
             self.warnings.push(format!(
                 "WARNING: reset {} setting(s) this build can no longer represent: {}",
-                outcome.dropped.len(),
-                outcome.dropped.iter().cloned().collect::<Vec<_>>().join(", ")
+                self.dropped.len(),
+                self.dropped.join(", ")
             ));
         }
         if !outcome.unfoldable.is_empty() {
@@ -451,6 +476,15 @@ fn archive_previous_config(target_dir: &Path, config_path: &Path) -> Result<Opti
 
     let mut sources = vec![config_path.to_path_buf()];
     sources.extend(super::files::list_config_fragment_paths(config_path)?);
+    // The defaults sidecar is what tells the *next* `--force` which values on
+    // disk are stale shipped defaults rather than operator choices. Restoring
+    // `config.toml` from an archive that does not carry it leaves the two out
+    // of step, so it is archived alongside the files it describes. Trees
+    // written by an older build have no sidecar; that is not an error.
+    let managed_defaults = target_dir.join(MANAGED_DEFAULTS_FILE);
+    if managed_defaults.is_file() {
+        sources.push(managed_defaults);
+    }
     for source in sources {
         let Some(name) = source.file_name() else {
             continue;
@@ -2415,6 +2449,61 @@ mod tests {
         assert!(format!("{error:#}").contains("route"), "{error:#}");
     }
 
+    /// A key whose shape this build can no longer hold is the same data loss as
+    /// one the rewriter could not place, so it ends the command the same way
+    /// and is listed under its own heading rather than folded into the other.
+    #[test]
+    fn a_setting_this_build_cannot_represent_is_listed_and_exits_non_zero() {
+        // The template now writes `agent.mode` as a scalar, so the previous
+        // tree's table at that path has nowhere to go.
+        let template = "[agent]\nmode = \"auto\"\n";
+        let previous = toml::from_str::<toml::Value>("[agent.mode]\nlegacy = true\n").expect("test: parse previous");
+        let mut outcome = PreservationOutcome::default();
+
+        let _merged = apply_previous_settings(template, &previous, &previous, None, &mut outcome)
+            .expect("test: fold the previous configuration");
+        assert_eq!(
+            outcome.dropped.iter().cloned().collect::<Vec<_>>(),
+            vec!["agent.mode.legacy".to_string()],
+            "a key this build cannot represent must be recorded"
+        );
+        assert!(
+            outcome.unfoldable.is_empty(),
+            "the two loss classes must stay distinct: {:?}",
+            outcome.unfoldable
+        );
+
+        let mut report = InitReport::default();
+        report.record_preservation(&outcome, None);
+        assert_eq!(report.dropped_keys(), ["agent.mode.legacy".to_string()]);
+        let error = report
+            .into_result()
+            .expect_err("test: a setting this build cannot represent must exit non-zero");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("can no longer represent") && rendered.contains("agent.mode.legacy"),
+            "the error must list the dropped keys under their own heading: {rendered}"
+        );
+    }
+
+    /// The mirror of the test above: a fold that loses nothing still exits zero.
+    #[test]
+    fn a_fold_that_drops_nothing_exits_zero() {
+        let template = "[agent]\nmode = \"auto\"\n";
+        let previous = toml::from_str::<toml::Value>("[agent]\nmode = \"manual\"\n").expect("test: parse previous");
+        let mut outcome = PreservationOutcome::default();
+
+        let merged = apply_previous_settings(template, &previous, &previous, None, &mut outcome)
+            .expect("test: fold the previous configuration");
+        assert!(merged.contains("mode = \"manual\""), "{merged}");
+        assert!(outcome.dropped.is_empty(), "dropped: {:?}", outcome.dropped);
+
+        let mut report = InitReport::default();
+        report.record_preservation(&outcome, None);
+        assert!(report.dropped_keys().is_empty());
+        report.into_result().expect("test: a lossless fold must exit zero");
+    }
+
     // ── Archive directories ──────────────────────────────────────
 
     #[test]
@@ -2478,6 +2567,81 @@ mod tests {
             archived_models.iter().any(|body| body.contains("second-model")),
             "the second run's archive must exist: {archived_models:?}"
         );
+    }
+
+    /// The defaults sidecar is the baseline the *next* `--force` classifies
+    /// against, so an archive that omits it cannot restore a working tree.
+    #[tokio::test]
+    async fn the_archive_carries_the_defaults_sidecar() {
+        let tmp = tempfile::tempdir().expect("test: create tempdir");
+        let dir = tmp.path();
+        Spec::Full.generate(dir, false).await.expect("test: generate full");
+        assert!(
+            dir.join(MANAGED_DEFAULTS_FILE).is_file(),
+            "the first run must write the defaults record"
+        );
+
+        Spec::Full
+            .generate_reported(dir, true)
+            .await
+            .expect("test: force regenerate");
+
+        let archives = archive_dirs(dir);
+        assert_eq!(archives.len(), 1, "one --force run makes one archive: {archives:?}");
+        let archive = archives.first().expect("test: the archive must exist");
+        assert!(
+            archive.join(MANAGED_DEFAULTS_FILE).is_file(),
+            "the archive must carry the defaults record next to the files it describes"
+        );
+        assert!(
+            archive.join("config.toml").is_file() && archive.join("memory.toml").is_file(),
+            "the archive must still carry config.toml and the fragments"
+        );
+    }
+
+    /// A tree written by a build older than the sidecar has none to archive,
+    /// which is an ordinary case and not a failure.
+    #[tokio::test]
+    async fn archiving_a_tree_without_a_sidecar_succeeds() {
+        let tmp = tempfile::tempdir().expect("test: create tempdir");
+        let dir = tmp.path();
+        Spec::Full.generate(dir, false).await.expect("test: generate full");
+        fs::remove_file(dir.join(MANAGED_DEFAULTS_FILE)).expect("test: remove the defaults record");
+
+        Spec::Full
+            .generate_reported(dir, true)
+            .await
+            .expect("test: an older tree must still regenerate");
+
+        let archives = archive_dirs(dir);
+        assert_eq!(archives.len(), 1, "one --force run makes one archive: {archives:?}");
+        let archive = archives.first().expect("test: the archive must exist");
+        assert!(
+            !archive.join(MANAGED_DEFAULTS_FILE).exists(),
+            "there was no sidecar to archive"
+        );
+        assert!(
+            archive.join("config.toml").is_file(),
+            "the archive must still be written"
+        );
+    }
+
+    /// Every `config.d.pre-*` directory directly under `dir`, sorted.
+    fn archive_dirs(dir: &Path) -> Vec<PathBuf> {
+        let mut archives = fs::read_dir(dir)
+            .expect("test: read target dir")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("config.d.pre-"))
+            })
+            .collect::<Vec<_>>();
+        archives.sort();
+        archives
     }
 
     // ── Default refresh semantics ────────────────────────────────

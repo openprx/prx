@@ -86,6 +86,38 @@ const TOOL_SUMMARY_ONLY_RESPONSE_MESSAGE: &str = "The previous assistant respons
      Either invoke the required tools now or provide a complete final answer. \
      Do not output a '[Used tools: ...]' summary.";
 
+/// Marks the runtime's own words inside a user turn.
+///
+/// A corrective retry instruction is not something the operator said, so it is
+/// labelled. Without the label the model reads it as the user's latest request
+/// and can answer it ("understood, I will not return an empty reply") or quote
+/// it back, and anything downstream that shows the user their own prompt cannot
+/// tell the two apart. The prefix is the split point: everything before the
+/// first occurrence is the operator's text, everything from it on is this
+/// runtime's.
+pub(crate) const CORRECTIVE_ASIDE_PREFIX: &str = "[system note]";
+
+/// Append a corrective instruction to the request as a labelled aside.
+///
+/// It is folded into the trailing user turn when there is one rather than
+/// pushed as a second user message: `[system, user, user]` is a shape no
+/// provider in this crate coalesces (`src/providers/anthropic.rs`,
+/// `src/providers/gemini.rs` forward same-role runs verbatim), and strict chat
+/// templates reject alternation breaks outright. When the tail is not a user
+/// turn — a tool result, for instance — the aside becomes its own user message,
+/// which cannot create an adjacent pair either.
+fn append_corrective_aside(messages: &mut Vec<ChatMessage>, instruction: &str) {
+    match messages.last_mut() {
+        Some(last) if last.role == "user" => {
+            last.content.push_str("\n\n");
+            last.content.push_str(CORRECTIVE_ASIDE_PREFIX);
+            last.content.push(' ');
+            last.content.push_str(instruction);
+        }
+        _ => messages.push(ChatMessage::user(format!("{CORRECTIVE_ASIDE_PREFIX} {instruction}"))),
+    }
+}
+
 pub(crate) fn is_empty_assistant_response(text: &str, has_tool_calls: bool) -> bool {
     text.trim().is_empty() && !has_tool_calls
 }
@@ -490,6 +522,23 @@ impl DocumentIngestRuntime {
             config_source_revision: scope.config_source_revision.map(ToString::to_string),
             visibility: MemoryVisibility::Session,
         }
+    }
+
+    /// Re-key this runtime as a nested turn of the one that built its scope.
+    ///
+    /// A `delegate` or `sessions_spawn` sub-loop inherits the parent's
+    /// `source_message_event_id` through [`ScopeContext`], so parent and child
+    /// would otherwise carry the identical `turn_key`. Every per-turn
+    /// idempotency key is derived from it, so the parent's degradation event
+    /// and the child's collapse into one row and the child's degradation
+    /// disappears from the audit trail. The suffix separates them while leaving
+    /// the parent's id readable in the key. It is applied once, where the child
+    /// runtime is built, so the key is still constant for the whole child loop
+    /// and a child that degrades twice in its turn still records one event.
+    #[must_use]
+    pub(crate) fn into_nested_turn(mut self) -> Self {
+        self.turn_key = format!("{}:sub:{}", self.turn_key, Uuid::new_v4());
+        self
     }
 
     #[must_use]
@@ -6710,25 +6759,20 @@ async fn run_tool_call_loop_outcome_unguarded(
         let media_artifacts = hooks.media_artifacts();
         let mut prepared_messages =
             multimodal::prepare_messages_for_provider(history, multimodal_config, media_artifacts.as_ref()).await?;
-        // Corrective retries are appended as an ordinary trailing turn, not as
-        // request-local `system` context. A system message here is folded into
-        // the leading one by `coalesce_system_messages_at_front` below, which
-        // appends bytes to the system prefix and misses the provider-side
-        // prefix cache for the whole conversation — on the one turn that is
-        // already paying for a wasted provider call. Appending at the tail
-        // leaves every cached byte ahead of it untouched, and keeps the
-        // "exactly one system message, at index 0" shape that strict chat
-        // templates require.
+        // Corrective retries are appended at the tail, not as request-local
+        // `system` context. A system message here is folded into the leading
+        // one by `coalesce_system_messages_at_front` below, which appends bytes
+        // to the system prefix and misses the provider-side prefix cache for
+        // the whole conversation — on the one turn that is already paying for a
+        // wasted provider call. Appending at the tail leaves every cached byte
+        // ahead of it untouched, and keeps the "exactly one system message, at
+        // index 0" shape that strict chat templates require.
         if inject_tool_summary_retry_instruction {
-            prepared_messages
-                .messages
-                .push(ChatMessage::user(TOOL_SUMMARY_ONLY_RESPONSE_MESSAGE));
+            append_corrective_aside(&mut prepared_messages.messages, TOOL_SUMMARY_ONLY_RESPONSE_MESSAGE);
             inject_tool_summary_retry_instruction = false;
         }
         if inject_empty_response_retry_instruction {
-            prepared_messages
-                .messages
-                .push(ChatMessage::user(EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE));
+            append_corrective_aside(&mut prepared_messages.messages, EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE);
             inject_empty_response_retry_instruction = false;
         }
         // Route the turn before refreshing dynamic tools. Refreshing the whole
@@ -9425,6 +9469,137 @@ mod tests {
                 reasoning_content: None,
             })
         }
+    }
+
+    /// Answers the first call with an empty response so the loop takes its
+    /// corrective-retry path, then echoes the tail user turn back verbatim:
+    /// exactly what a model does when it reads the corrective instruction as
+    /// the operator's latest request.
+    struct EchoTailRetryProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for EchoTailRetryProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in the echo fixture");
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(ChatResponse {
+                    text: Some(String::new()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                });
+            }
+            let echoed = request
+                .messages
+                .last()
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            Ok(ChatResponse {
+                text: Some(echoed),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    /// The corrective instruction is the runtime talking, not the operator, so
+    /// it must be attributable wherever it surfaces. A model is free to quote
+    /// the turn it was handed back at the user, and nothing downstream strips
+    /// it; what the runtime owes is that every copy it puts into the request is
+    /// labelled, so an echo can be recognised and cut at the marker instead of
+    /// being read as the operator's own words.
+    ///
+    /// MUTATION GUARD: drop `CORRECTIVE_ASIDE_PREFIX` from
+    /// `append_corrective_aside` and the split below finds no marker.
+    #[tokio::test]
+    async fn a_corrective_aside_stays_attributable_when_the_model_echoes_it() {
+        let provider = EchoTailRetryProvider {
+            calls: AtomicUsize::new(0),
+        };
+        let tmp = TempDir::new().expect("test: tempdir");
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("summarise the release notes"),
+        ];
+        let (outcome, _trace) = run_tool_call_loop_outcome(
+            &provider,
+            &mut history,
+            Arc::new(Vec::new()),
+            &NoopObserver,
+            &HookManager::new(tmp.path().to_path_buf()),
+            "echo-provider",
+            "echo-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            2,
+            false,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ToolLoopMemory::none(),
+            ChatMode::default(),
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("test: the corrective retry must complete the turn");
+
+        let ToolLoopOutcome::Text(answer) = outcome else {
+            panic!("test: the echo fixture returns text");
+        };
+        // Fixture proof: the model really did echo the instruction back.
+        assert!(
+            answer.contains(EMPTY_ASSISTANT_RESPONSE_RETRY_MESSAGE),
+            "the fixture must echo the corrective instruction: {answer}"
+        );
+        // Every copy of the instruction the runtime put into the request carries
+        // the marker, so the echo splits cleanly into operator text and aside.
+        let (operator_text, aside) = answer
+            .split_once(CORRECTIVE_ASIDE_PREFIX)
+            .expect("the corrective instruction must be labelled wherever it is emitted");
+        assert_eq!(
+            operator_text.trim(),
+            "summarise the release notes",
+            "everything before the marker must be exactly what the operator wrote: {answer}"
+        );
+        assert!(
+            aside.trim().starts_with("The previous assistant response was empty."),
+            "the marker must sit immediately before the runtime's instruction: {aside}"
+        );
+        // And the aside was only ever a request-local edit: the operator's own
+        // turn in the conversation is untouched, so the next turn cannot carry
+        // the instruction forward.
+        assert_eq!(
+            history
+                .iter()
+                .find(|message| message.role == "user")
+                .map(|message| message.content.as_str()),
+            Some("summarise the release notes"),
+            "the corrective aside must not be written back into the operator's turn: {history:?}"
+        );
     }
 
     /// FIX-P2-02: a provider that advertises native tool calling and returns
@@ -14274,6 +14449,93 @@ ls -la
             degraded_event_count(&memory, &envelope).await,
             2,
             "the next turn must still be able to report its own degradation"
+        );
+    }
+
+    /// A delegate or spawned sub-loop inherits the parent's
+    /// `source_message_event_id`, so before the nested suffix it inherited the
+    /// parent's `turn_key` too and the per-turn idempotency key swallowed the
+    /// child's degradation event: a turn in which both parent and child
+    /// degraded recorded one row and the child's context loss was invisible.
+    ///
+    /// MUTATION GUARD: drop `into_nested_turn()` from the child below and the
+    /// two-event assertion goes red.
+    #[tokio::test]
+    async fn a_nested_sub_loop_records_its_own_degradation() {
+        let temp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+        let policy = crate::security::SecurityPolicy {
+            workspace_dir: temp.path().to_path_buf(),
+            ..crate::security::SecurityPolicy::default()
+        };
+        // The one scope a parent turn hands to its delegate / spawn children.
+        let scope = ScopeContext {
+            policy: &policy,
+            sender: "user@example.com",
+            channel: "telegram",
+            chat_type: "private",
+            chat_id: "chat-nested-degrade",
+            owner_id: None,
+            topic_id: None,
+            task_id: None,
+            source_message_event_id: Some("inbound-msg-nested"),
+            config_generation_id: None,
+            config_source_revision: None,
+        };
+
+        let parent = DocumentIngestRuntime::from_scope(Arc::clone(&memory), &scope);
+        let child = DocumentIngestRuntime::from_scope(Arc::clone(&memory), &scope).into_nested_turn();
+        // Fixture proof: the child really is on the parent's turn lineage, which
+        // is what made the two keys collide.
+        assert_eq!(
+            parent.source_message_event_id, child.source_message_event_id,
+            "the child must inherit the parent's message lineage"
+        );
+        assert_ne!(parent.turn_key, child.turn_key, "the child needs its own turn key");
+        assert!(
+            child.turn_key.starts_with(&parent.turn_key),
+            "the parent's turn must stay readable in the child's key: {}",
+            child.turn_key
+        );
+
+        let principal = parent.memory_principal();
+        async fn degraded_events(memory: &Arc<dyn Memory>, principal: &MemoryPrincipal) -> usize {
+            memory
+                .list_message_events_recent(principal, 256)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == CONTEXT_COMPACTION_DEGRADED_EVENT_TYPE)
+                .count()
+        }
+
+        persist_context_switch_degradation(Some(&parent), "pre_provider_call", "no_provenance", 10, 9, 8).await;
+        persist_context_switch_degradation(Some(&child), "pre_provider_call", "no_provenance", 10, 9, 8).await;
+        assert_eq!(
+            degraded_events(&memory, &principal).await,
+            2,
+            "parent and child each degraded once, so each must have its own event"
+        );
+
+        // Within one runtime the key is still constant: a child that degrades
+        // again in the same turn adds nothing.
+        for _ in 0..3 {
+            persist_context_switch_degradation(Some(&child), "pre_provider_call", "no_provenance", 10, 9, 8).await;
+        }
+        assert_eq!(
+            degraded_events(&memory, &principal).await,
+            2,
+            "repeated degradation inside one runtime must stay one event"
+        );
+
+        // And a second runtime built for the *parent* turn is still deduplicated
+        // by the idempotency key, so the suffix did not weaken the parent path.
+        let parent_again = DocumentIngestRuntime::from_scope(Arc::clone(&memory), &scope);
+        persist_context_switch_degradation(Some(&parent_again), "pre_provider_call", "no_provenance", 10, 9, 8).await;
+        assert_eq!(
+            degraded_events(&memory, &principal).await,
+            2,
+            "a second runtime for the same parent turn must not add an event"
         );
     }
 

@@ -1050,7 +1050,9 @@ async fn run_validated_manifest(
                         crate::agent::loop_::ToolLoopMemory::new(
                             &memory,
                             workspace_dir_ref,
-                            scope_ctx_ref.map(|ctx| DocumentIngestRuntime::from_scope(Arc::clone(&memory), ctx)),
+                            scope_ctx_ref.map(|ctx| {
+                                DocumentIngestRuntime::from_scope(Arc::clone(&memory), ctx).into_nested_turn()
+                            }),
                         )
                         .with_event_fabric(request_event_fabric)
                         .with_routing_input(routing_input_ref),

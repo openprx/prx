@@ -1084,7 +1084,7 @@ impl DelegateTool {
                         &self.security.workspace_dir,
                         scope_ctx
                             .as_ref()
-                            .map(|ctx| DocumentIngestRuntime::from_scope(memory.clone(), ctx)),
+                            .map(|ctx| DocumentIngestRuntime::from_scope(memory.clone(), ctx).into_nested_turn()),
                     )
                     .with_event_fabric(
                         MemoryFabric::new(

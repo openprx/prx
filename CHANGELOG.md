@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.132] - 16 September 2026
+
+### Fixed
+
+- A corrective retry no longer hands the model a second consecutive user turn,
+  and labels its own words. The instruction was pushed as its own `user`
+  message, producing `[system, user, user]`: no provider in this crate merges a
+  same-role run, and a strict chat template rejects the alternation break
+  outright. It is now appended to the trailing user turn as a paragraph marked
+  `[system note]`, so the request shape is unchanged and anything reading the
+  turn back — including a model that quotes it at the user — can tell the
+  runtime's instruction from the operator's words. The system prefix is still
+  byte-identical across the retry.
+- A delegate or spawned sub-loop records its own
+  `context.compaction.degraded` event. The child inherits the parent's
+  `source_message_event_id`, so both carried the same `turn_key`, and the
+  per-turn idempotency key collapsed the two events into one: a turn in which
+  parent and child both degraded reported only the parent. The child runtime
+  now derives a nested turn key, and the session worker does the same for each
+  segment it runs. Repeated degradation inside one runtime is still one event.
+- `prx init --force` exits non-zero when a setting is reset because this build
+  can no longer represent it. A key whose parent the templates now write as a
+  scalar is data loss exactly like one the rewriter could not place, but it
+  only printed a warning, so a script read the run as clean. It is now listed
+  under its own heading in both the warning and the error.
+
+### Changed
+
+- The `--force` archive carries the `.init-defaults.toml` defaults record
+  alongside `config.toml` and the fragments. The record is the baseline the
+  next `--force` classifies against, so an archive without it could not restore
+  a tree that behaves the way it did before. A tree written by an older build
+  has no record and is archived without one.
+- The tool-snapshot render cache decides a hit by comparing the snapshot. The
+  `Arc::ptr_eq` short-circuit in front of that comparison could never return
+  true — each iteration compiles a freshly canonicalized `Vec` — so it was
+  removed rather than left reading as a working optimization.
+
 ## [0.8.131] - 15 September 2026
 
 ### Security

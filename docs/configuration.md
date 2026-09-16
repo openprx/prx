@@ -841,7 +841,14 @@ Quoted keys and quoted table headers are ordinary configuration —
 `[cost.prices."gpt-4.1"]`, `[reliability.model_fallbacks]` with `"gpt-4.1" = [...]`
 — and are folded and re-emitted with their quoting intact. Anything `--force`
 still cannot place is named on stderr and makes the command exit non-zero; it is
-never dropped quietly.
+never dropped quietly. The same applies to a key this build can no longer
+represent — one whose parent the templates now write as a scalar — which is
+listed under its own heading and exits non-zero as well:
+
+```
+WARNING: could not fold 1 setting(s) into the regenerated templates, ...
+WARNING: reset 1 setting(s) this build can no longer represent: routing.mode.legacy
+```
 
 Each `--force` run gets its own archive. The stamp carries milliseconds and a
 taken name gets a `-2`, `-3` suffix, so two runs in the same second produce two
@@ -849,10 +856,14 @@ archives rather than one overwriting the other. Archives are never cleaned up
 and they contain the encrypted credentials that were in the tree at the time, so
 prune `config.d.pre-*` yourself after a key rotation.
 
-An archive holds `config.toml` and `config.d/`, not the defaults record. If you
-restore a tree from one, the record on disk still describes the version you
-restored *from*, so the next `--force` classifies against the wrong baseline:
-delete `.init-defaults.toml` after restoring and every value in the restored
+An archive holds every file `--force` is about to rewrite: `config.toml`, each
+managed `config.d/*.toml` fragment, any unmanaged `config.d/*.toml` fragment of
+your own, and the `.init-defaults.toml` defaults record. A tree written by a
+build older than 0.8.132 has no defaults record and is archived without one,
+which is not an error. Restore all of them together and the next `--force`
+classifies against the baseline the restored tree was written with; restore
+`config.toml` alone and the record left on disk describes a different version,
+so delete `.init-defaults.toml` in that case and every value in the restored
 tree is treated as yours.
 
 If the preserved values cannot be validated against this build, `--force` still

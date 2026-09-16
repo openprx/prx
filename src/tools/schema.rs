@@ -2868,6 +2868,59 @@ mod tests {
         );
     }
 
+    /// The other half of the recursion contract, stated on its own because
+    /// `docs/tools.md` now promises it: the subtree below the level at which a
+    /// cycle closes carries no constraints at all. A recursive contract is
+    /// enforced one level deep, and callers relying on it to validate a whole
+    /// tree are relying on something PRX does not do.
+    #[test]
+    fn a_recursive_contract_is_only_enforced_at_the_level_the_cycle_closes() {
+        let circular = json!({
+            "type": "object",
+            "properties": {"node": {"$ref": "#/$defs/Node"}},
+            "$defs": {
+                "Node": {
+                    "type": "object",
+                    "required": ["name"],
+                    "additionalProperties": false,
+                    "properties": {"name": {"type": "string"}, "child": {"$ref": "#/$defs/Node"}}
+                }
+            }
+        });
+
+        // Level 1 binds: the same three violations are all reported there.
+        let level_one = validate_tool_arguments(&circular, &json!({"node": {"name": 7, "stray": true}}));
+        assert!(
+            level_one.iter().any(|issue| issue.path == "$.node.name"),
+            "level 1 must bind the declared type: {level_one:?}"
+        );
+        assert!(
+            level_one.iter().any(|issue| issue.path == "$.node.stray"),
+            "level 1 must close the property set: {level_one:?}"
+        );
+        assert!(
+            validate_tool_arguments(&circular, &json!({"node": {}}))
+                .iter()
+                .any(|issue| issue.path == "$.node.name"),
+            "level 1 must bind the required key"
+        );
+
+        // Level 2 is where the cycle closes, so none of the three bind.
+        let level_two = validate_tool_arguments(
+            &circular,
+            &json!({"node": {"name": "a", "child": {"name": 7, "stray": true}}}),
+        );
+        assert!(
+            level_two.is_empty(),
+            "below the cycle nothing is enforced - not the type, not additionalProperties: {level_two:?}"
+        );
+        let level_two_required = validate_tool_arguments(&circular, &json!({"node": {"name": "a", "child": {}}}));
+        assert!(
+            level_two_required.is_empty(),
+            "below the cycle a missing required key is accepted: {level_two_required:?}"
+        );
+    }
+
     #[test]
     fn one_tool_name_keeps_one_cache_entry_per_contract() {
         // 4a: two contracts advertised under one name used to share a single

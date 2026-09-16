@@ -86,10 +86,17 @@ impl ToolSnapshotRenderCache {
 
     /// `tool_specs` is shared rather than borrowed so a miss can keep the exact
     /// snapshot it rendered without copying tens of kilobytes of JSON schema.
+    ///
+    /// The hit is decided by comparing the snapshot field by field. An
+    /// `Arc::ptr_eq` short-circuit used to sit in front of it and never once
+    /// returned true in production: [`CompiledToolContext::compile`] wraps a
+    /// freshly canonicalized `Vec` on every iteration, so the two pointers are
+    /// never the same allocation. It is gone rather than left to read as a
+    /// working optimization.
     fn resolve(&mut self, native_tools: bool, tool_specs: &Arc<Vec<ToolSpec>>) -> Arc<RenderedToolSnapshot> {
         if let Some(entry) = self.entry.as_ref()
             && entry.native_tools == native_tools
-            && (Arc::ptr_eq(&entry.tool_specs, tool_specs) || tool_specs_match(&entry.tool_specs, tool_specs))
+            && tool_specs_match(&entry.tool_specs, tool_specs)
         {
             self.hits = self.hits.saturating_add(1);
             return Arc::clone(&entry.rendered);

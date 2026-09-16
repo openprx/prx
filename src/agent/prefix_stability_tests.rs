@@ -372,6 +372,8 @@ struct RetryPrefixProvider {
     system_digests: parking_lot::Mutex<Vec<String>>,
     tail_roles: parking_lot::Mutex<Vec<String>>,
     saw_late_system: parking_lot::Mutex<bool>,
+    saw_adjacent_user: parking_lot::Mutex<bool>,
+    role_shapes: parking_lot::Mutex<Vec<Vec<String>>>,
 }
 
 impl RetryPrefixProvider {
@@ -381,6 +383,8 @@ impl RetryPrefixProvider {
             system_digests: parking_lot::Mutex::new(Vec::new()),
             tail_roles: parking_lot::Mutex::new(Vec::new()),
             saw_late_system: parking_lot::Mutex::new(false),
+            saw_adjacent_user: parking_lot::Mutex::new(false),
+            role_shapes: parking_lot::Mutex::new(Vec::new()),
         }
     }
 }
@@ -406,6 +410,15 @@ impl Provider for RetryPrefixProvider {
         {
             *self.saw_late_system.lock() = true;
         }
+        let roles = request
+            .messages
+            .iter()
+            .map(|message| message.role.clone())
+            .collect::<Vec<_>>();
+        if roles.windows(2).any(|pair| pair == ["user", "user"]) {
+            *self.saw_adjacent_user.lock() = true;
+        }
+        self.role_shapes.lock().push(roles);
         let system = request
             .messages
             .first()
@@ -510,5 +523,34 @@ async fn a_corrective_retry_round_does_not_move_the_system_prefix() {
             .iter()
             .all(|message| !message.content.contains("The previous assistant response was empty.")),
         "the corrective instruction must stay request-local"
+    );
+
+    // The retry must not change the *shape* of the request either. Pushing the
+    // instruction as its own turn produced `[system, user, user]`, which no
+    // provider in this crate coalesces and strict chat templates reject.
+    let shapes = provider.role_shapes.lock().clone();
+    assert!(
+        !*provider.saw_adjacent_user.lock(),
+        "a corrective retry must not produce two adjacent user turns: {shapes:?}"
+    );
+    assert_eq!(
+        shapes[0], shapes[1],
+        "the retry round must send the same role sequence as the first round: {shapes:?}"
+    );
+
+    // The instruction is the runtime's words, not the operator's, so it is
+    // labelled and therefore separable from the turn it rides on.
+    let (operator_text, aside) = tails[1]
+        .trim_start_matches("user:")
+        .split_once(crate::agent::loop_::CORRECTIVE_ASIDE_PREFIX)
+        .expect("the corrective aside must carry its marker");
+    assert_eq!(
+        operator_text.trim(),
+        "what changed in rustls lately",
+        "everything before the marker must be exactly what the operator wrote"
+    );
+    assert!(
+        aside.contains("The previous assistant response was empty."),
+        "everything after the marker must be the runtime's instruction: {aside}"
     );
 }

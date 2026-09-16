@@ -5199,7 +5199,7 @@ async fn run_sub_agent_task(
                             &workspace_dir_owned,
                             scope_ctx
                                 .as_ref()
-                                .map(|ctx| DocumentIngestRuntime::from_scope(memory.clone(), ctx)),
+                                .map(|ctx| DocumentIngestRuntime::from_scope(memory.clone(), ctx).into_nested_turn()),
                         )
                         .with_event_fabric(
                             MemoryFabric::new(memory.clone(), workspace_dir_owned.to_string_lossy().to_string())
