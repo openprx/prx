@@ -170,6 +170,7 @@ pub fn diagnose(config: &Config) -> DoctorReport {
     check_workspace(config, &mut items);
     check_legacy_fitness_telemetry(config, &mut items);
     check_daemon_state(config, &mut items);
+    check_daemon_process_path(config, &mut items);
     check_environment(&mut items);
 
     DoctorReport::new("OpenPRX Doctor", items)
@@ -304,6 +305,7 @@ pub async fn diagnose_runtime(config: &Config) -> DoctorReport {
     check_deployed_binary(&mut items);
     check_runtime_config(config, &mut items);
     check_daemon_state(config, &mut items);
+    check_daemon_process_path(config, &mut items);
     check_gateway_runtime(config, &mut items);
     check_channel_runtime(config, &mut items);
     check_console_runtime(config, &mut items);
@@ -1762,6 +1764,148 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
     }
 }
 
+// ── Daemon process PATH ──────────────────────────────────────────
+//
+// A hand-written unit without `Environment="PATH=…"` leaves the daemon with
+// systemd's default PATH, which does not contain `~/.cargo/bin`. The model
+// then gets `sh: prx: not found` from the shell tool while `prx doctor`, run
+// from an interactive shell, sees a perfectly healthy PATH. The daemon's own
+// environment is the only place that truth is visible, so read it from
+// `/proc/<pid>/environ` instead of trusting the doctor process.
+
+const DAEMON_PATH_CATEGORY: &str = "daemon";
+
+/// Non-failing outcome: the daemon PATH could not be inspected at all.
+/// Reported as `Ok`/`Unknown` so an uninspectable daemon never turns
+/// `prx doctor` red.
+fn daemon_path_skipped(msg: impl Into<String>) -> DiagItem {
+    DiagItem::with_state(Severity::Ok, DiagnosticState::Unknown, DAEMON_PATH_CATEGORY, msg)
+}
+
+fn canonical_or_owned(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Directories the daemon PATH must contain for a shell tool to resolve `prx`:
+/// the directory this doctor binary runs from, plus `~/.cargo/bin` when it
+/// exists (the default `cargo install` target).
+fn required_daemon_path_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(current) = std::env::current_exe() {
+        if let Some(parent) = current.parent() {
+            dirs.push(canonical_or_owned(parent));
+        }
+    }
+    if let Some(home) = directories::UserDirs::new().map(|user| user.home_dir().to_path_buf()) {
+        let cargo_bin = home.join(".cargo").join("bin");
+        if cargo_bin.is_dir() {
+            dirs.push(canonical_or_owned(&cargo_bin));
+        }
+    }
+    let mut unique: Vec<PathBuf> = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        if !unique.contains(&dir) {
+            unique.push(dir);
+        }
+    }
+    unique
+}
+
+/// Extract `PATH` from a NUL-separated `/proc/<pid>/environ` payload.
+fn daemon_path_from_environ(bytes: &[u8]) -> Option<String> {
+    bytes
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .find_map(|entry| entry.strip_prefix("PATH=").map(str::to_owned))
+}
+
+fn path_contains_dir(path: &str, dir: &Path) -> bool {
+    std::env::split_paths(path)
+        .filter(|entry| !entry.as_os_str().is_empty())
+        .any(|entry| same_executable_path(&entry, dir))
+}
+
+/// Pure judgement over a daemon PATH value, so the decision is testable
+/// without a live daemon.
+fn evaluate_daemon_path(path: &str, required_dirs: &[PathBuf]) -> DiagItem {
+    let missing: Vec<String> = required_dirs
+        .iter()
+        .filter(|dir| !path_contains_dir(path, dir))
+        .map(|dir| dir.display().to_string())
+        .collect();
+
+    if missing.is_empty() {
+        return DiagItem::ok(
+            DAEMON_PATH_CATEGORY,
+            format!("daemon process PATH resolves the deployed prx binary: {path}"),
+        );
+    }
+
+    let missing_list = missing.join(", ");
+    let suggested = if path.is_empty() {
+        missing.join(":")
+    } else {
+        format!("{}:{path}", missing.join(":"))
+    };
+    DiagItem::warn(
+        DAEMON_PATH_CATEGORY,
+        format!(
+            "daemon PATH does not include {missing_list}; shell tool cannot find prx — \
+             add Environment=\"PATH={suggested}\" to the unit or re-run `prx service install` \
+             (daemon PATH: {path})"
+        ),
+    )
+}
+
+fn evaluate_daemon_environ(bytes: &[u8], required_dirs: &[PathBuf]) -> DiagItem {
+    daemon_path_from_environ(bytes).map_or_else(
+        || {
+            DiagItem::warn(
+                DAEMON_PATH_CATEGORY,
+                "daemon process environment carries no PATH entry; shell tool cannot find prx — \
+                 add Environment=\"PATH=…\" to the unit or re-run `prx service install`",
+            )
+        },
+        |path| evaluate_daemon_path(&path, required_dirs),
+    )
+}
+
+fn daemon_pid_from_state(config: &Config) -> Option<u32> {
+    let raw = std::fs::read_to_string(crate::daemon::state_file_path(config)).ok()?;
+    let snapshot: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    snapshot
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+}
+
+#[cfg(target_os = "linux")]
+fn read_daemon_environ(pid: u32) -> std::io::Result<Vec<u8>> {
+    std::fs::read(format!("/proc/{pid}/environ"))
+}
+
+fn check_daemon_process_path(config: &Config, items: &mut Vec<DiagItem>) {
+    let Some(pid) = daemon_pid_from_state(config) else {
+        items.push(daemon_path_skipped(
+            "daemon state exposes no pid; skipped daemon PATH inspection",
+        ));
+        return;
+    };
+
+    #[cfg(target_os = "linux")]
+    match read_daemon_environ(pid) {
+        Ok(bytes) => items.push(evaluate_daemon_environ(&bytes, &required_daemon_path_dirs())),
+        Err(error) => items.push(daemon_path_skipped(format!(
+            "cannot read /proc/{pid}/environ ({error}); skipped daemon PATH inspection"
+        ))),
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    items.push(daemon_path_skipped(format!(
+        "daemon PATH inspection is only supported on Linux; skipped for daemon pid {pid}"
+    )));
+}
+
 // ── Environment checks ───────────────────────────────────────────
 
 fn check_environment(items: &mut Vec<DiagItem>) {
@@ -2729,6 +2873,166 @@ mod tests {
                 .iter()
                 .any(|i| i.category == "embedding" && i.severity == Severity::Warn),
             "expected warn for unreachable embedding endpoint"
+        );
+    }
+
+    // ---- daemon process PATH (v0.8.139) ---------------------------------
+
+    fn environ_blob(entries: &[&str]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for entry in entries {
+            bytes.extend_from_slice(entry.as_bytes());
+            bytes.push(0);
+        }
+        bytes
+    }
+
+    fn path_value(dirs: &[&Path]) -> String {
+        std::env::join_paths(dirs).unwrap().to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn daemon_path_from_environ_picks_the_path_entry() {
+        let blob = environ_blob(&["HOME=/home/ck", "PATH=/usr/bin:/bin", "LANG=C"]);
+        assert_eq!(daemon_path_from_environ(&blob).as_deref(), Some("/usr/bin:/bin"));
+    }
+
+    #[test]
+    fn daemon_path_from_environ_ignores_path_lookalike_keys() {
+        let blob = environ_blob(&["LD_LIBRARY_PATH=/opt/lib", "MANPATH=/usr/share/man"]);
+        assert!(daemon_path_from_environ(&blob).is_none());
+    }
+
+    #[test]
+    fn daemon_path_ok_when_required_directory_is_present() {
+        let temp = TempDir::new().unwrap();
+        let bin = temp.path().join("cargo-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let other = temp.path().join("usr-bin");
+        std::fs::create_dir_all(&other).unwrap();
+
+        let path = path_value(&[other.as_path(), bin.as_path()]);
+        let blob = environ_blob(&["HOME=/home/ck", &format!("PATH={path}")]);
+        let item = evaluate_daemon_environ(&blob, std::slice::from_ref(&bin));
+
+        assert_eq!(item.severity, Severity::Ok, "message: {}", item.message);
+        assert_eq!(item.category, "daemon");
+        assert!(
+            item.message.contains(&path),
+            "ok message must print the daemon PATH, got: {}",
+            item.message
+        );
+    }
+
+    #[test]
+    fn daemon_path_warns_when_required_directory_is_missing() {
+        let temp = TempDir::new().unwrap();
+        let bin = temp.path().join("cargo-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let other = temp.path().join("usr-bin");
+        std::fs::create_dir_all(&other).unwrap();
+
+        let path = path_value(&[other.as_path()]);
+        let blob = environ_blob(&[&format!("PATH={path}")]);
+        let item = evaluate_daemon_environ(&blob, std::slice::from_ref(&bin));
+
+        assert_eq!(item.severity, Severity::Warn, "message: {}", item.message);
+        assert!(
+            item.message.contains(&bin.display().to_string()),
+            "warn message must name the missing directory, got: {}",
+            item.message
+        );
+        assert!(
+            item.message.contains("Environment=\"PATH="),
+            "warn message must carry the systemd fix, got: {}",
+            item.message
+        );
+        assert!(
+            item.message.contains("prx service install"),
+            "warn message must carry the re-install fix, got: {}",
+            item.message
+        );
+    }
+
+    #[test]
+    fn daemon_path_warns_when_environ_has_no_path_key() {
+        let blob = environ_blob(&["HOME=/home/ck", "LANG=C"]);
+        let item = evaluate_daemon_environ(&blob, &[PathBuf::from("/home/ck/.cargo/bin")]);
+
+        assert_eq!(item.severity, Severity::Warn, "message: {}", item.message);
+        assert!(
+            item.message.contains("no PATH entry"),
+            "warn message must explain the missing PATH key, got: {}",
+            item.message
+        );
+        assert!(
+            item.message.contains("Environment="),
+            "warn message must carry the systemd fix, got: {}",
+            item.message
+        );
+    }
+
+    #[test]
+    fn daemon_path_check_skips_when_state_has_no_pid() {
+        let temp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.config_path = temp.path().join("config.toml");
+        std::fs::write(
+            temp.path().join("daemon_state.json"),
+            br#"{"updated_at":"2026-09-17T00:00:00Z","components":{}}"#,
+        )
+        .unwrap();
+
+        let mut items = Vec::new();
+        check_daemon_process_path(&config, &mut items);
+
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.severity, Severity::Ok, "skip must not be an error or warning");
+        assert_eq!(item.state, DiagnosticState::Unknown);
+        assert!(
+            item.message.contains("no pid"),
+            "skip message must explain why, got: {}",
+            item.message
+        );
+    }
+
+    #[test]
+    fn daemon_path_check_skips_when_state_file_is_absent() {
+        let temp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.config_path = temp.path().join("config.toml");
+
+        let mut items = Vec::new();
+        check_daemon_process_path(&config, &mut items);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].severity, Severity::Ok);
+        assert_eq!(items[0].state, DiagnosticState::Unknown);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn daemon_path_check_skips_for_a_pid_that_does_not_exist() {
+        let temp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.config_path = temp.path().join("config.toml");
+        // PID above the kernel maximum can never be live.
+        std::fs::write(
+            temp.path().join("daemon_state.json"),
+            br#"{"pid":4294967000,"updated_at":"2026-09-17T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let mut items = Vec::new();
+        check_daemon_process_path(&config, &mut items);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].severity, Severity::Ok, "message: {}", items[0].message);
+        assert!(
+            items[0].message.contains("environ"),
+            "skip message must name the unreadable source, got: {}",
+            items[0].message
         );
     }
 }

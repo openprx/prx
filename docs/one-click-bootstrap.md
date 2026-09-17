@@ -131,6 +131,42 @@ turns just as they are in the interactive CLI. Re-run `prx service install`
 after changing the toolchain location so the service definition captures the
 new path.
 
+### Hand-written units lose the toolchain PATH
+
+A unit written by hand (or copied from an older release) usually has no
+`Environment="PATH=…"` line. systemd then starts the daemon with its own
+default `PATH` — typically
+`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin` — which does not
+contain `~/.cargo/bin` or `~/.local/bin`. The symptom shows up only inside the
+daemon: the model runs `prx --version` through the shell tool and gets
+`sh: prx: not found`, while the same command typed in a terminal works, because
+the interactive shell has a different `PATH`.
+
+`prx doctor` reports this directly. It reads the live daemon's own environment
+(`/proc/<pid>/environ` on Linux, using the pid from `~/.openprx/daemon_state.json`)
+and compares it against the directory the running `prx` binary lives in plus
+`~/.cargo/bin`:
+
+```text
+[daemon]
+  ✅ [HEALTHY] daemon process PATH resolves the deployed prx binary: /home/me/.cargo/bin:/usr/bin:/bin
+```
+
+A missing directory becomes a warning that carries the fix:
+
+```text
+[daemon]
+  ⚠️  [UNKNOWN] daemon PATH does not include /home/me/.cargo/bin; shell tool cannot
+      find prx — add Environment="PATH=/home/me/.cargo/bin:/usr/bin:/bin" to the unit
+      or re-run `prx service install` (daemon PATH: /usr/bin:/bin)
+```
+
+Fix it either by re-running `prx service install` (which regenerates the unit
+with the absolute `PATH`) or by adding the `Environment="PATH=…"` line to the
+existing unit, then `systemctl --user daemon-reload` and `prx service restart`.
+The check never fails the run: on non-Linux hosts, when the state file carries
+no pid, or when `/proc` cannot be read, it reports a skip instead.
+
 Apply a new binary or configuration with:
 
 ```bash

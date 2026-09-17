@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.139] - 17 September 2026
+
+### Added
+
+- `prx doctor` now inspects the live daemon's own `PATH` instead of only the doctor
+  process's. It takes the pid from the daemon state file, reads `/proc/<pid>/environ`
+  on Linux, and checks that the daemon's `PATH` contains the directory the running
+  `prx` binary lives in plus `~/.cargo/bin` when that directory exists. A missing
+  directory is reported as a warning naming the directory and the fix — add
+  `Environment="PATH=…"` to the unit or re-run `prx service install` — which is the
+  case for hand-written units that were never given the installer's absolute `PATH`
+  and therefore make the shell tool answer `sh: prx: not found` inside the daemon.
+  When the `PATH` is complete the check prints the daemon `PATH` it saw. The check
+  never turns the run red on its own: a state file without a pid, an unreadable or
+  dead `/proc` entry, and non-Linux hosts are all reported as an explicit skip. Both
+  `prx doctor` and `prx doctor runtime` run it.
+
 ## [0.8.138] - 17 September 2026
 
 ### Changed
