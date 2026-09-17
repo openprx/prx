@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.141] - 17 September 2026
+
+### Fixed
+
+- The session worker's manifest is now bound to its tool filter in one place.
+  `run_validated_manifest` read `manifest.allowed_tools` and
+  `manifest.channel_excluded_tools` out at the call site and handed them to
+  `select_tools_for_worker`, and no test reached that wiring: the covering test
+  called the filter with a list it computed itself, so replacing the exclusion
+  argument with `&[]` left the suite green even though the worker lost a layer of
+  the channel boundary. The call site now goes through
+  `select_tools_for_manifest(source, &manifest)`, which cannot be handed a list
+  that did not come from the sealed manifest, and
+  `a_worker_manifest_binds_its_channel_exclusions_to_the_tool_filter` drives that
+  binding, with the architecture guard
+  `a_session_worker_selects_its_tools_through_its_manifest` holding the call site
+  to it -- a unit test on the binding helper alone does not close this, because
+  the call site can stop using the helper. No behaviour change: the worker's own
+  tool loop already re-filtered against the inherited list, so this closes a test
+  gap in a redundant defence rather than an escalation path.
+
+### Changed
+
+- The gateway's two launch paths register one tool surface from one body. The
+  gateway the daemon runs (rebuilt on every hot reload) and a standalone
+  `prx gateway` each carried a symmetric copy of the same block — the channel
+  routing registry, `message_send` behind Signal, `sessions_spawn`
+  unconditionally, `config_reload` — and only the daemon copy had tests, so a
+  change to one could silently give the two launch modes different tools. Both
+  now call `register_gateway_turn_tools`, and
+  `both_gateway_launch_paths_publish_the_same_tool_surface` asserts the two paths
+  publish the same tool names. The published surface is unchanged: 37 tools
+  without Signal, 38 with it.
+- Two architecture guards in `tests/architecture_boundaries.rs` keep both of the
+  above single. `a_session_worker_selects_its_tools_through_its_manifest` pins
+  that `run_validated_manifest` selects through `select_tools_for_manifest` and
+  that no other production site in the module calls the tool filter directly;
+  `both_gateway_launch_paths_register_their_tools_from_one_body` pins that
+  `build_gateway_turn_runtime` and `run_gateway` both go through
+  `register_gateway_turn_tools` and that `sessions_spawn` is constructed at
+  exactly one production site in the gateway. Both scan the source text, so
+  re-inlining either seam fails a test instead of shipping.
+- `docs/channels.md` documents what a gateway without Signal does with a
+  sub-agent result. `sessions_spawn` is registered on every gateway, but with no
+  IM channel the completion announcement is recorded in a `tracing` line rather
+  than pushed anywhere, so the result has to be pulled back with
+  `spawn_batch` + `join`, `sessions_list` / `sessions_history`, or
+  `GET /api/runtime/tasks`.
+
+
 ## [0.8.140] - 17 September 2026
 
 ### Changed

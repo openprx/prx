@@ -904,6 +904,92 @@ fn the_gateway_webhook_turn_seeds_its_spawn_boundary() {
     );
 }
 
+/// A session worker must select its tool surface from its own manifest.
+///
+/// `run_validated_manifest` used to read `manifest.allowed_tools` and
+/// `manifest.channel_excluded_tools` out at the call site and hand them to
+/// `select_tools_for_worker`, and nothing pinned that: the covering unit test
+/// calls the filter with a list it computes itself, so replacing the exclusion
+/// argument with `&[]` left the whole suite green while a worker resumed from
+/// that manifest lost a layer of the channel boundary (independent audit
+/// 2026-09-16 §1.4). A unit test on the binding helper does not close this --
+/// the call site can simply stop using the helper.
+///
+/// `select_tools_for_manifest` is the one binding now, and this guard keeps it
+/// the only one: the production entry point must go through it, and no other
+/// production site in the module may reach the filter directly.
+#[test]
+fn a_session_worker_selects_its_tools_through_its_manifest() {
+    let root = repository_root();
+    let source =
+        fs::read_to_string(root.join("src/session_worker/runner.rs")).expect("read src/session_worker/runner.rs");
+    let production = strip_cfg_test_items(&source);
+
+    let entry = function_body(&production, "run_validated_manifest");
+    assert!(
+        entry.contains("select_tools_for_manifest(full_tools, &manifest)"),
+        "run_validated_manifest no longer selects the worker's tools from its manifest; a list that never \
+         came from the sealed manifest can reach the filter and the channel boundary stops crossing the \
+         process edge"
+    );
+
+    let direct_calls = production
+        .matches("select_tools_for_worker(")
+        .count()
+        .saturating_sub(production.matches("fn select_tools_for_worker(").count());
+    assert_eq!(
+        direct_calls, 1,
+        "select_tools_for_worker must be called from exactly one production site; any other caller picks \
+         its own two lists and bypasses the manifest binding select_tools_for_manifest exists to be"
+    );
+
+    let binding = function_body(&production, "select_tools_for_manifest");
+    assert!(
+        binding.contains("select_tools_for_worker(source, &manifest.allowed_tools, &manifest.channel_excluded_tools)"),
+        "the one call to select_tools_for_worker must pass both of the manifest's own lists; emptying \
+         either of them is the escape hatch this binding exists to close"
+    );
+}
+
+/// Both gateway launch paths must register their turn tools from one body.
+///
+/// The gateway the daemon runs (rebuilt on every hot reload) and a standalone
+/// `prx gateway` each carried a symmetric copy of the same registration block,
+/// and only the daemon copy had tests, so a change to one silently gave the two
+/// launch modes different tool surfaces (independent audit 2026-09-16 §2.3).
+/// `gateway::tests::both_gateway_launch_paths_publish_the_same_tool_surface`
+/// compares what the shared registrar produces; this pins that both entry points
+/// still go through it rather than growing a second registration of their own.
+#[test]
+fn both_gateway_launch_paths_register_their_tools_from_one_body() {
+    let root = repository_root();
+    let source = fs::read_to_string(root.join("src/gateway/mod.rs")).expect("read src/gateway/mod.rs");
+    let production = strip_cfg_test_items(&source);
+
+    for entry in ["build_gateway_turn_runtime", "run_gateway"] {
+        let body = function_body(&production, entry);
+        assert!(
+            body.contains("register_gateway_turn_tools("),
+            "{entry} no longer registers its turn tools through register_gateway_turn_tools; the two \
+             gateway launch paths can drift into different tool surfaces again, and only one of them \
+             is reachable from a test"
+        );
+    }
+
+    assert_eq!(
+        production.matches("SessionsSpawnTool::new(").count(),
+        1,
+        "sessions_spawn must be constructed at exactly one production site in the gateway; a second one \
+         is a second tool surface that no test compares against the first"
+    );
+    let registrar = function_body(&production, "register_gateway_turn_tools");
+    assert!(
+        registrar.contains("SessionsSpawnTool::new("),
+        "the one sessions_spawn registration must live in register_gateway_turn_tools, which is what \
+         both launch paths share and what the gateway tests drive"
+    );
+}
+
 /// Strip every `#[cfg(test)]` item from `source`, brace-balanced.
 ///
 /// Line-based and deliberately conservative: it matches the shape this crate

@@ -1079,6 +1079,118 @@ impl AppState {
     }
 }
 
+/// Build the gateway's per-turn channel routing registry and register the
+/// channel-aware tools that complete its tool surface.
+///
+/// The gateway has two launch paths — [`build_gateway_turn_runtime`] (under the
+/// daemon, and again on every hot reload) and [`run_gateway`] (`prx gateway`,
+/// no daemon) — and each used to carry its own symmetric copy of this block.
+/// Only the daemon copy had tests, so a change to one path silently gave the two
+/// launch modes different tool surfaces. There is one body now, and
+/// `both_gateway_launch_paths_publish_the_same_tool_surface` asserts the two
+/// callers end up with the same tool names.
+///
+/// `message_send` is registered only when Signal is configured; `sessions_spawn`
+/// and `config_reload` are registered on every gateway. Returns the routing
+/// registry (the caller publishes it for `POST /api/channels/{name}/send`) and
+/// the `sessions_spawn` tools handle, which the caller must fill with the final
+/// registry once it is sealed.
+#[allow(clippy::too_many_arguments)]
+fn register_gateway_turn_tools(
+    tools_list: &mut Vec<Box<dyn Tool>>,
+    config: &Config,
+    shared_config: &crate::config::SharedConfig,
+    security: &Arc<crate::security::SecurityPolicy>,
+    provider: &Arc<dyn Provider>,
+    model: &str,
+    memory: &Arc<dyn Memory>,
+    provider_runtime_options: &providers::ProviderRuntimeOptions,
+    signal: Option<&Arc<SignalChannel>>,
+    whatsapp: Option<&Arc<WhatsAppChannel>>,
+    linq: Option<&Arc<LinqChannel>>,
+    nextcloud_talk: Option<&Arc<NextcloudTalkChannel>>,
+) -> (
+    Arc<HashMap<String, Arc<dyn Channel>>>,
+    Arc<std::sync::OnceLock<Arc<Vec<Box<dyn Tool>>>>>,
+) {
+    // One routing registry, keyed by `Channel::name`, shared by `message_send`
+    // (destination of an explicit `channel` argument) and `sessions_spawn`
+    // (announce/kill routing) so both address exactly the same channel set.
+    let mut registry: HashMap<String, Arc<dyn Channel>> = HashMap::new();
+    if let Some(channel) = signal {
+        registry.insert(channel.name().to_string(), Arc::clone(channel) as Arc<dyn Channel>);
+    }
+    if let Some(channel) = whatsapp {
+        registry.insert(channel.name().to_string(), Arc::clone(channel) as Arc<dyn Channel>);
+    }
+    if let Some(channel) = linq {
+        registry.insert(channel.name().to_string(), Arc::clone(channel) as Arc<dyn Channel>);
+    }
+    if let Some(channel) = nextcloud_talk {
+        registry.insert(channel.name().to_string(), Arc::clone(channel) as Arc<dyn Channel>);
+    }
+    let channels_registry = Arc::new(registry);
+
+    // `message_send` is backed by Signal when the channel is configured. Other
+    // channels are addressed through the routing registry above.
+    if let Some(signal_channel) = signal {
+        tools_list.push(Box::new(
+            tools::MessageSendTool::new_signal(Arc::clone(signal_channel), Arc::clone(security))
+                .with_channels(Arc::clone(&channels_registry)),
+        ));
+    }
+
+    // `sessions_spawn` is registered on every gateway, with or without Signal.
+    // The channel argument is only the fallback announce destination, so a
+    // missing IM channel is no reason to withhold the tool from a webhook turn.
+    //
+    // The per-turn announce/kill routing registry is the one built above: a
+    // webhook turn stamps its originating channel into the tool's per-turn
+    // scope, and the tool resolves the channel object from here at announce /
+    // kill time, so a result is never mis-routed under concurrent webhooks.
+    let spawn_tools_handle = {
+        let announce_channel =
+            gateway_spawn_announce_channel(signal.map(|channel| Arc::clone(channel) as Arc<dyn Channel>));
+        let provider_name = config.default_provider.as_deref().unwrap_or("openrouter").to_string();
+        let spawn_tool = tools::SessionsSpawnTool::new(
+            announce_channel,
+            Arc::clone(provider),
+            provider_name,
+            model.to_string(),
+            config.default_temperature,
+            Arc::clone(security),
+            config.workspace_dir.clone(),
+            config.multimodal.clone(),
+            config.agent.compaction.clone(),
+            config.agents.clone(),
+            config.api_key.clone(),
+            provider_runtime_options.clone(),
+            config.sessions_spawn.clone(),
+        )
+        .with_compaction_resolver(crate::router::CompactionResolver::new(
+            config.agent.compaction.clone(),
+            config.router.clone(),
+            config.model_routes.clone(),
+        ))
+        .with_reliability(config.reliability.clone())
+        .with_channels(Arc::clone(&channels_registry))
+        .with_shared_memory(Arc::clone(memory))
+        .with_event_recording(config.memory.event_recording_config());
+        let handle = spawn_tool.tools_handle();
+        tools_list.push(Box::new(spawn_tool));
+        handle
+    };
+
+    // The ConfigReloadTool and `/api/config/reload` route both submit candidates
+    // to the same manager; no gateway path can publish configuration directly.
+    tools_list.push(Box::new(tools::ConfigReloadTool::with_security(
+        shared_config.clone(),
+        Arc::clone(security),
+    )));
+
+    (channels_registry, spawn_tools_handle)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_gateway_turn_runtime(
     generation: Arc<crate::config::ConfigGeneration>,
@@ -1139,72 +1251,20 @@ fn build_gateway_turn_runtime(
     let mut tools_list = tools_result.tools;
     let mcp_tool = tools_result.mcp_tool;
 
-    // One routing registry, keyed by `Channel::name`, shared by `message_send`
-    // (destination of an explicit `channel` argument) and `sessions_spawn`
-    // (announce/kill routing) so both address exactly the same channel set.
-    let mut registry: HashMap<String, Arc<dyn Channel>> = HashMap::new();
-    if let Some(channel) = &signal {
-        registry.insert(channel.name().to_string(), Arc::clone(channel) as Arc<dyn Channel>);
-    }
-    if let Some(channel) = &whatsapp {
-        registry.insert(channel.name().to_string(), Arc::clone(channel) as Arc<dyn Channel>);
-    }
-    if let Some(channel) = &linq {
-        registry.insert(channel.name().to_string(), Arc::clone(channel) as Arc<dyn Channel>);
-    }
-    if let Some(channel) = &nextcloud_talk {
-        registry.insert(channel.name().to_string(), Arc::clone(channel) as Arc<dyn Channel>);
-    }
-    let channels_registry = Arc::new(registry);
-
-    if let Some(signal_channel) = &signal {
-        tools_list.push(Box::new(
-            tools::MessageSendTool::new_signal(Arc::clone(signal_channel), security.clone())
-                .with_channels(Arc::clone(&channels_registry)),
-        ));
-    }
-
-    // `sessions_spawn` is registered on every gateway, with or without Signal.
-    // The channel argument is only the fallback announce destination, so a
-    // missing IM channel is no reason to withhold the tool from a webhook turn.
-    let spawn_tools_handle = {
-        let announce_channel =
-            gateway_spawn_announce_channel(signal.as_ref().map(|channel| Arc::clone(channel) as Arc<dyn Channel>));
-        let channels_by_name = Arc::clone(&channels_registry);
-        let provider_name = config.default_provider.as_deref().unwrap_or("openrouter").to_string();
-        let spawn_tool = tools::SessionsSpawnTool::new(
-            announce_channel,
-            Arc::clone(&provider),
-            provider_name,
-            model.clone(),
-            config.default_temperature,
-            security.clone(),
-            config.workspace_dir.clone(),
-            config.multimodal.clone(),
-            config.agent.compaction.clone(),
-            config.agents.clone(),
-            config.api_key.clone(),
-            provider_runtime_options,
-            config.sessions_spawn.clone(),
-        )
-        .with_compaction_resolver(crate::router::CompactionResolver::new(
-            config.agent.compaction.clone(),
-            config.router.clone(),
-            config.model_routes.clone(),
-        ))
-        .with_reliability(config.reliability.clone())
-        .with_channels(channels_by_name)
-        .with_shared_memory(Arc::clone(&memory))
-        .with_event_recording(config.memory.event_recording_config());
-        let handle = spawn_tool.tools_handle();
-        tools_list.push(Box::new(spawn_tool));
-        handle
-    };
-
-    tools_list.push(Box::new(tools::ConfigReloadTool::with_security(
-        shared_config,
-        security,
-    )));
+    let (_channels_registry, spawn_tools_handle) = register_gateway_turn_tools(
+        &mut tools_list,
+        config,
+        &shared_config,
+        &security,
+        &provider,
+        &model,
+        &memory,
+        &provider_runtime_options,
+        signal.as_ref(),
+        whatsapp.as_ref(),
+        linq.as_ref(),
+        nextcloud_talk.as_ref(),
+    );
     let tools_registry = Arc::new(tools_list);
     let _ = spawn_tools_handle.set(Arc::clone(&tools_registry));
 
@@ -1412,89 +1472,25 @@ pub async fn run_gateway(
             ))
         });
 
-    // One routing registry, keyed by `Channel::name`, shared by `message_send`
-    // (destination of an explicit `channel` argument) and `sessions_spawn`
-    // (announce/kill routing) so both address exactly the same channel set.
-    let mut registry: HashMap<String, Arc<dyn Channel>> = HashMap::new();
-    if let Some(ref sc) = signal_channel {
-        registry.insert(sc.name().to_string(), sc.clone() as Arc<dyn Channel>);
-    }
-    if let Some(ref wa) = whatsapp_channel {
-        registry.insert(wa.name().to_string(), wa.clone() as Arc<dyn Channel>);
-    }
-    if let Some(ref lq) = linq_channel {
-        registry.insert(lq.name().to_string(), lq.clone() as Arc<dyn Channel>);
-    }
-    if let Some(ref nc) = nextcloud_talk_channel {
-        registry.insert(nc.name().to_string(), nc.clone() as Arc<dyn Channel>);
-    }
-    let channels_registry = Arc::new(registry);
-    // Publish it process-wide for as long as this gateway runs, so
-    // `POST /api/channels/{name}/send` can address the channels the gateway
-    // itself constructed. The channels supervisor publishes its own (larger)
-    // registry alongside this one; the two are merged at lookup time.
+    let (channels_registry, spawn_tools_handle) = register_gateway_turn_tools(
+        &mut tools_list,
+        &config,
+        &shared_config_for_reload,
+        &security,
+        &provider,
+        &model,
+        &mem,
+        &provider_runtime_options,
+        signal_channel.as_ref(),
+        whatsapp_channel.as_ref(),
+        linq_channel.as_ref(),
+        nextcloud_talk_channel.as_ref(),
+    );
+    // Publish the routing registry process-wide for as long as this gateway
+    // runs, so `POST /api/channels/{name}/send` can address the channels the
+    // gateway itself constructed. The channels supervisor publishes its own
+    // (larger) registry alongside this one; the two are merged at lookup time.
     let _outbound_publication = crate::channels::outbound_registry::publish(Arc::clone(&channels_registry));
-
-    // Register message_send tool backed by Signal when the channel is configured.
-    // For other channels (WhatsApp, Linq, etc.) we register a generic sender without
-    // reaction support so the tool is still available for text/file messages.
-    if let Some(ref sc) = signal_channel {
-        let msg_send_tool = tools::MessageSendTool::new_signal(sc.clone(), security.clone())
-            .with_channels(Arc::clone(&channels_registry));
-        tools_list.push(Box::new(msg_send_tool));
-    }
-
-    // Register sessions_spawn so the LLM can fire off async sub-agent tasks that
-    // announce their results when complete. Keep the OnceLock handle so we can
-    // inject the full tools_registry post-wrap.
-    // Registered unconditionally: the channel below is only the announce
-    // fallback, and a gateway without Signal must still expose `sessions_spawn`
-    // to its webhook turns.
-    let spawn_tools_handle = {
-        let announce_channel =
-            gateway_spawn_announce_channel(signal_channel.as_ref().map(|sc| Arc::clone(sc) as Arc<dyn Channel>));
-        let provider_name = config.default_provider.as_deref().unwrap_or("openrouter").to_string();
-        // Per-turn announce/kill routing registry: every configured gateway channel
-        // keyed by name. A webhook turn stamps its originating channel into the
-        // tool's per-turn scope; sessions_spawn binds that name to each run and
-        // resolves the channel object from here at announce/kill time, so a result
-        // is never mis-routed to the wrong channel under concurrent webhooks.
-        let spawn_channels_by_name = Arc::clone(&channels_registry);
-        let spawn_tool = tools::SessionsSpawnTool::new(
-            announce_channel,
-            Arc::clone(&provider),
-            provider_name,
-            model.clone(),
-            temperature,
-            security.clone(),
-            config.workspace_dir.clone(),
-            config.multimodal.clone(),
-            config.agent.compaction.clone(),
-            config.agents.clone(),
-            config.api_key.clone(),
-            provider_runtime_options.clone(),
-            config.sessions_spawn.clone(),
-        )
-        .with_compaction_resolver(crate::router::CompactionResolver::new(
-            config.agent.compaction.clone(),
-            config.router.clone(),
-            config.model_routes.clone(),
-        ))
-        .with_reliability(config.reliability.clone())
-        .with_channels(spawn_channels_by_name)
-        .with_shared_memory(Arc::clone(&mem))
-        .with_event_recording(config.memory.event_recording_config());
-        let handle = spawn_tool.tools_handle();
-        tools_list.push(Box::new(spawn_tool));
-        handle
-    };
-
-    // The ConfigReloadTool and `/api/config/reload` route both submit candidates to
-    // this same manager; no gateway path can publish configuration directly.
-    tools_list.push(Box::new(tools::ConfigReloadTool::with_security(
-        Arc::clone(&shared_config_for_reload),
-        security.clone(),
-    )));
     #[cfg(feature = "wasm-plugins")]
     if let Some(runtime) = &wasm_plugin_runtime {
         tracing::debug!(generation = runtime.generation_id(), "WASM plugin runtime ready");
@@ -3310,8 +3306,13 @@ mod tests {
     /// Signal, a webhook turn simply had no way to start a sub-agent. The whole
     /// registry is built here by the production builder, not by a copy of it.
     ///
-    /// MUTATION GUARD: put the registration back behind `if let Some(signal)`
-    /// and the first assertion goes red.
+    /// Registration now lives in `register_gateway_turn_tools`, shared with the
+    /// `prx gateway` path, so this test covers both launch modes' registration
+    /// body (see `both_gateway_launch_paths_publish_the_same_tool_surface` for
+    /// the two-path equality).
+    ///
+    /// MUTATION GUARD: put the registration in `register_gateway_turn_tools`
+    /// back behind `if let Some(signal)` and the first assertion goes red.
     #[test]
     fn a_gateway_without_signal_still_publishes_sessions_spawn() {
         let workspace = tempfile::tempdir().unwrap();
@@ -3373,6 +3374,136 @@ mod tests {
         assert!(
             signal_names.contains(&"sessions_spawn"),
             "the Signal-configured gateway must keep sessions_spawn: {signal_names:?}"
+        );
+    }
+
+    /// Both gateway launch paths publish the same tool surface.
+    ///
+    /// `build_gateway_turn_runtime` (daemon, and again on every hot reload) and
+    /// `run_gateway` (`prx gateway`, no daemon) used to carry two symmetric
+    /// copies of the channel-aware registration block, and only the first was
+    /// covered: a change to one silently gave the two launch modes different
+    /// tool surfaces (independent audit 2026-09-16 §2.3). Both call
+    /// `register_gateway_turn_tools` now. This test drives the daemon path end
+    /// to end and the `prx gateway` path through the shared registrar over the
+    /// same configuration, then pins the two tool-name sets to each other.
+    ///
+    /// MUTATION GUARD: drop the `sessions_spawn` push from
+    /// `register_gateway_turn_tools` and both `sessions_spawn` assertions fail;
+    /// make the registrar's registration conditional on Signal and they fail too.
+    #[test]
+    fn both_gateway_launch_paths_publish_the_same_tool_surface() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace_dir: workspace.path().to_path_buf(),
+            // The provider chain refuses to come up with no credential at all.
+            // Nothing here ever calls out.
+            api_key: Some("test-key".to_string()),
+            ..Config::default()
+        };
+        let manager = crate::config::new_shared(config.clone());
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).unwrap());
+        let hooks = Arc::new(HookManager::new(workspace.path().to_path_buf()));
+
+        // Path 1 — the daemon / hot-reload builder, end to end.
+        let daemon = build_gateway_turn_runtime(
+            manager.pin(),
+            manager.clone(),
+            Arc::clone(&memory),
+            None,
+            None,
+            None,
+            None,
+            Arc::clone(&hooks),
+            #[cfg(feature = "wasm-plugins")]
+            None,
+        )
+        .expect("test: the daemon gateway turn runtime must build");
+        let mut daemon_names: Vec<String> = daemon
+            .tools_registry
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        daemon_names.sort_unstable();
+
+        // Path 2 — `prx gateway`: the same base registry, then the shared
+        // registrar with the arguments that entry point supplies.
+        let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
+        let provider: Arc<dyn Provider> = Arc::from(
+            providers::create_resilient_provider_with_options(
+                config.default_provider.as_deref().unwrap_or("openrouter"),
+                config.api_key.as_deref(),
+                config.api_url.as_deref(),
+                &config.reliability,
+                &provider_runtime_options,
+            )
+            .expect("test: the provider chain must build"),
+        );
+        let model = config
+            .default_model
+            .clone()
+            .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
+        let security = crate::runtime::bootstrap::build_security_policy(&config);
+        let runtime_adapter: Arc<dyn runtime::RuntimeAdapter> =
+            Arc::from(runtime::create_runtime(&config.runtime).expect("test: the runtime adapter must build"));
+        let extensions = hooks.control_tool_arcs(Arc::clone(&security));
+        let mut direct_tools = tools::all_tools_with_runtime_ext_and_extensions(
+            Arc::new(config.clone()),
+            manager.clone(),
+            &security,
+            runtime_adapter,
+            Arc::clone(&memory),
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.workspace_dir,
+            &config.agents,
+            config.api_key.as_deref(),
+            &config,
+            extensions,
+        )
+        .tools;
+        let (_channels_registry, spawn_tools_handle) = register_gateway_turn_tools(
+            &mut direct_tools,
+            &config,
+            &manager,
+            &security,
+            &provider,
+            &model,
+            &memory,
+            &provider_runtime_options,
+            None,
+            None,
+            None,
+            None,
+        );
+        let mut direct_names: Vec<String> = direct_tools.iter().map(|tool| tool.name().to_string()).collect();
+        direct_names.sort_unstable();
+
+        assert_eq!(
+            daemon_names, direct_names,
+            "the daemon gateway and `prx gateway` must publish the same tools"
+        );
+        // Named explicitly, so the equality above cannot be satisfied by two
+        // equally broken surfaces.
+        for names in [&daemon_names, &direct_names] {
+            assert!(
+                names.iter().any(|name| name == "sessions_spawn"),
+                "every gateway launch path must publish sessions_spawn: {names:?}"
+            );
+            assert!(
+                names.iter().any(|name| name == "config_reload"),
+                "every gateway launch path must publish config_reload: {names:?}"
+            );
+            assert!(
+                !names.iter().any(|name| name == "message_send"),
+                "message_send stays behind Signal on both paths: {names:?}"
+            );
+        }
+        assert!(
+            spawn_tools_handle.get().is_none(),
+            "the spawn tools handle is filled by the caller once the registry is sealed"
         );
     }
 

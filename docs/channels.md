@@ -130,6 +130,34 @@ puts runtime reconfiguration out of reach of a misread sentence. Naming one in
 `always_include` restores it; `channel_exclude = []` drops the default entirely.
 See [Tools](tools.md#per-turn-capability-routing).
 
+## Sub-Agents On A Gateway Without Signal
+
+`sessions_spawn` is registered on **every** gateway, whether or not a Signal
+account is configured, so a webhook turn can always hand work to a sub-agent.
+Both launch paths — the gateway the daemon runs (including after a hot reload)
+and a standalone `prx gateway` — register the same tool surface.
+
+What a missing IM channel changes is where the *result* goes. The tool's
+`channel` argument is only the fallback announce destination. With Signal
+configured, a finished run announces there. Without it, the gateway announces on
+its own sink, which accepts the announcement and records it with a `tracing`
+line instead of pushing it anywhere: the gateway is a request/response surface
+and owns no conversation to send an unsolicited message into. `message_send` is
+registered only when Signal is configured, for the same reason.
+
+**On a Signal-less gateway a sub-agent result must therefore be pulled, not
+awaited.** Nothing is lost — the tool records every run in the shared memory
+fabric — but the caller has to go and read it:
+
+- `sessions_spawn` `action="spawn_batch"` then `action="join"` with the returned
+  `batch_id` waits for every member and returns all results inside the same
+  turn;
+- `sessions_spawn` `action="list"` / the `sessions_list` tool shows the runs and
+  their state, and `action="history"` / `sessions_history` returns one run's
+  transcript by `run_id`;
+- `GET /api/runtime/tasks` on the gateway is the operator-plane view of live
+  runs (`prx tasks list` / `prx tasks kill` on the host reach the same registry).
+
 ## Listener Liveness Reporting
 
 Channel health is derived from what a listener has actually been observed doing,

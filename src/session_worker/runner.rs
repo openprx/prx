@@ -232,6 +232,22 @@ async fn select_tools_for_worker(
     ))
 }
 
+/// Bind a worker manifest to the tool filter.
+///
+/// This is the only place the manifest's two tool lists reach
+/// [`select_tools_for_worker`]. It takes the whole [`WorkerManifest`] rather
+/// than two `&[String]` arguments read out at the call site so that the wiring
+/// itself is reachable from a test: a caller cannot hand the filter a list that
+/// did not come from the sealed manifest, and
+/// `a_worker_manifest_binds_its_channel_exclusions_to_the_tool_filter` exercises
+/// this binding instead of the filter alone.
+async fn select_tools_for_manifest(
+    source: Vec<Box<dyn Tool>>,
+    manifest: &WorkerManifest,
+) -> Result<Arc<Vec<Box<dyn Tool>>>> {
+    select_tools_for_worker(source, &manifest.allowed_tools, &manifest.channel_excluded_tools).await
+}
+
 fn verify_worker_orchestration_tool_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<()> {
     let registered = names.into_iter().collect::<std::collections::HashSet<_>>();
     let missing = WORKER_ORCHESTRATION_TOOL_NAMES
@@ -926,8 +942,7 @@ async fn run_validated_manifest(
 
     verify_worker_orchestration_tool_names(full_tools.iter().map(|tool| tool.name()))?;
 
-    let tools_registry =
-        select_tools_for_worker(full_tools, &manifest.allowed_tools, &manifest.channel_excluded_tools).await?;
+    let tools_registry = select_tools_for_manifest(full_tools, &manifest).await?;
     let _ = spawn_tools_handle.set(Arc::clone(&tools_registry));
     let native_tools = provider
         .capabilities_for(
@@ -1774,6 +1789,78 @@ mod tests {
         assert!(
             names.iter().any(|entry| entry == "gateway"),
             "always_include must still reach a process worker: {names:?}"
+        );
+    }
+
+    async fn manifest_tool_names(manifest: &WorkerManifest) -> Vec<String> {
+        select_tools_for_manifest(worker_surface_fixture(), manifest)
+            .await
+            .expect("worker tool selection")
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect()
+    }
+
+    /// The manifest's channel exclusions must reach the worker's tool filter.
+    ///
+    /// `a_process_worker_cannot_regain_the_operations_surface_its_channel_hides`
+    /// hands `select_tools_for_worker` a list the test computed itself, so it
+    /// pins the filter and not the production wiring: with
+    /// `run_validated_manifest` passing `&[]` in place of
+    /// `&manifest.channel_excluded_tools` that test stayed green (independent
+    /// audit 2026-09-16 §1.4). This one goes through
+    /// `select_tools_for_manifest`, the single binding `run_validated_manifest`
+    /// uses, so the wiring itself is what is asserted.
+    ///
+    /// MUTATION GUARD: replace `&manifest.channel_excluded_tools` in
+    /// `select_tools_for_manifest` with `&[]` and the first assertion fails.
+    #[tokio::test]
+    async fn a_worker_manifest_binds_its_channel_exclusions_to_the_tool_filter() {
+        // Fixture validity first: the hidden set is the real default channel
+        // surface, so the test dies if `channel_exclude` stops hiding these.
+        let hidden = crate::config::ToolTieringConfig::default()
+            .for_channel_surface()
+            .always_exclude;
+        for name in ["gateway", "proxy_config", "config_reload", "nodes", "git_operations"] {
+            assert!(
+                hidden.iter().any(|entry| entry == name),
+                "the default channel surface must hide '{name}' for this fixture to mean anything"
+            );
+        }
+
+        let mut manifest = base_manifest(Path::new("/tmp/worker-manifest-exclusions"), "capability");
+        manifest.allowed_tools = Vec::new();
+        manifest.channel_excluded_tools = hidden;
+
+        let filtered = manifest_tool_names(&manifest).await;
+        for name in ["gateway", "proxy_config", "config_reload", "nodes", "git_operations"] {
+            assert!(
+                !filtered.iter().any(|entry| entry == name),
+                "a worker resumed from this manifest must not publish '{name}': {filtered:?}"
+            );
+        }
+        assert!(
+            filtered.iter().any(|entry| entry == "shell"),
+            "the rest of the surface is untouched: {filtered:?}"
+        );
+
+        // The paired half: the same manifest with an empty exclusion list
+        // publishes the operations surface, so the assertion above is about the
+        // manifest field and not about the fixture being empty.
+        manifest.channel_excluded_tools = Vec::new();
+        let unfiltered = manifest_tool_names(&manifest).await;
+        assert!(
+            unfiltered.iter().any(|entry| entry == "gateway"),
+            "an operator-rooted manifest keeps the operations surface: {unfiltered:?}"
+        );
+
+        // The manifest's own `allowed_tools` reaches the same binding.
+        manifest.allowed_tools = vec!["shell".to_string()];
+        let allowed = manifest_tool_names(&manifest).await;
+        assert_eq!(
+            allowed,
+            vec!["shell".to_string()],
+            "allowed_tools must come from the manifest too: {allowed:?}"
         );
     }
 
