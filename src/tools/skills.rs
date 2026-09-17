@@ -305,7 +305,7 @@ impl Tool for SkillsManageTool {
     }
 
     fn description(&self) -> &str {
-        "Create, install, update, enable, disable, validate, synchronize, or remove PRX skills. Mutating actions are approval-gated."
+        "Manage PRX skills: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, and 'remove' deletes one. Mutating actions are approval-gated."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -315,12 +315,13 @@ impl Tool for SkillsManageTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["create", "install", "update", "enable", "disable", "validate", "sync", "remove"]
+                        "enum": ["create", "install", "update", "enable", "disable", "validate", "sync", "remove"],
+                        "description": "Skill action: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, 'remove' deletes one"
                     },
-                    "name": {"type": "string", "description": "Workspace skill name"},
-                    "source": {"type": "string", "description": "Git URL or explicit local directory for install"},
-                    "description": {"type": "string", "description": "Short description for a created skill"},
-                    "instructions": {"type": "string", "description": "SKILL.md instructions for a created skill"}
+                    "name": {"type": "string", "description": "Workspace skill name; required for 'create', 'update', 'enable', 'disable', 'validate' and 'remove'"},
+                    "source": {"type": "string", "description": "Git URL or explicit local directory; required for 'install'"},
+                    "description": {"type": "string", "description": "Short description of the skill; required for 'create'"},
+                    "instructions": {"type": "string", "description": "SKILL.md instructions; required for 'create'"}
                 },
                 "required": ["action"],
                 "additionalProperties": false
@@ -804,6 +805,25 @@ mod tests {
         config.skills.open_skills_dir = Some(workspace.join("missing-open-skills").to_string_lossy().to_string());
         config.skills.openclaw_skills_dir = Some(workspace.join("missing-openclaw").to_string_lossy().to_string());
         config
+    }
+
+    /// The shared action contract every action-dispatched tool is held to:
+    /// the tool-list description and the `action` parameter's own description
+    /// must each name every enumerated action, and no parameter may ship
+    /// undescribed.
+    #[test]
+    fn skills_manage_action_tool_contract() {
+        let workspace = TempDir::new().unwrap();
+        let tool = SkillsManageTool::new(
+            workspace.path().to_path_buf(),
+            test_config(workspace.path()),
+            Arc::new(SecurityPolicy::default()),
+        );
+        crate::tools::schema::action_contract::assert_action_tool_contract(
+            tool.name(),
+            tool.description(),
+            &tool.parameters_schema(),
+        );
     }
 
     #[test]

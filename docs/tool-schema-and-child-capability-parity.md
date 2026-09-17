@@ -252,6 +252,44 @@ Capability inheritance and intent-based prompt-size optimization are separate:
   effects.
 - Assert schema/action parity for all migrated tools.
 
+`tools::schema::action_contract::assert_action_tool_contract` is the executable
+form of that parity assertion. It reads the action enum off the published
+schema and fails unless the tool-list description, the `action` parameter's own
+description, and the description of every parameter an action cannot be called
+without each name that action. Nothing about it is hand-maintained: the pairs
+come from the schema's own conditional-required clauses, so adding an action or
+rewriting a description without naming it turns the test red.
+
+As of 0.8.140 all sixteen action-dispatched surfaces are wired to it, each from
+a test in its own module whose name ends in `action_tool_contract` (the five
+wired in 0.8.133 keep their original test names):
+
+| Tool | Module |
+| --- | --- |
+| `xin` | `src/tools/xin.rs` |
+| `cron` | `src/tools/cron.rs` |
+| `message_send` (channel and daemon schemas) | `src/tools/message_send.rs` |
+| `sessions_spawn` | `src/tools/sessions_spawn.rs` |
+| `wasm_plugins_manage` | `src/plugins/runtime.rs` |
+| `mcp_call` | `src/tools/mcp.rs` |
+| `git_operations` (the `stash` sub-action enum) | `src/tools/git_operations.rs` |
+| `gateway` | `src/tools/gateway.rs` |
+| `skills_manage` | `src/tools/skills.rs` |
+| `composio` | `src/tools/composio.rs` |
+| `nodes` | `src/tools/nodes.rs` |
+| `subagents` | `src/tools/subagents.rs` |
+| `proxy_config` | `src/tools/proxy_config.rs` |
+| `chat_schedule` | `src/chat/scheduled_input.rs` |
+| `managed_session` | `src/chat/managed_session.rs` |
+| `hooks_manage` | `src/hooks/mod.rs` |
+
+`git_operations` dispatches on `operation` and carries a second `action` enum
+for the `stash` sub-command; the contract test covers that inner enum, and the
+tool description names both sets.
+
+A new action-dispatched tool is expected to add its own `action_tool_contract`
+test in the same change that introduces the executor branches.
+
 ### 8.2 Parent/child parity tests
 
 - Compare parent, task child, and process child public names and schema hashes.

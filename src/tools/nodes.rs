@@ -212,7 +212,7 @@ impl Tool for NodesTool {
     }
 
     fn description(&self) -> &str {
-        "Remote node management over HTTP/2 JSON-RPC. Actions: list, status, exec, read, write, cancel."
+        "Remote node management over HTTP/2 JSON-RPC: 'list' enumerates the configured nodes, 'status' probes one, 'exec' runs a shell command on one, 'read' and 'write' transfer a file, and 'cancel' aborts a running task."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -224,15 +224,15 @@ impl Tool for NodesTool {
                     "action": {
                         "type": "string",
                         "enum": ["list", "status", "exec", "read", "write", "cancel"],
-                        "description": "Action to perform."
+                        "description": "Action to perform: 'list' enumerates the configured nodes, 'status' probes one, 'exec' runs a shell command, 'read' fetches a file, 'write' stores a file, 'cancel' aborts a running task."
                     },
                     "node": {
                         "type": "string",
-                        "description": "Node ID for status/exec/read/write/cancel"
+                        "description": "Node ID; required for 'status', 'exec', 'read', 'write' and 'cancel'"
                     },
                     "command": {
                         "type": "string",
-                        "description": "Shell command for exec"
+                        "description": "Shell command; required for 'exec'"
                     },
                     "timeout_ms": {
                         "type": "integer",
@@ -241,33 +241,33 @@ impl Tool for NodesTool {
                     },
                     "cwd": {
                         "type": "string",
-                        "description": "Working directory for exec"
+                        "description": "Working directory for 'exec'"
                     },
                     "path": {
                         "type": "string",
-                        "description": "File path for read/write"
+                        "description": "File path; required for 'read' and 'write'"
                     },
                     "offset": {
                         "type": "integer",
                         "minimum": 0,
-                        "description": "Read offset"
+                        "description": "Byte offset for 'read'"
                     },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Read byte limit"
+                        "description": "Byte limit for 'read'"
                     },
                     "content": {
                         "type": "string",
-                        "description": "Write content"
+                        "description": "File content; required for 'write'"
                     },
                     "create_dirs": {
                         "type": "boolean",
-                        "description": "Create parent directories when writing"
+                        "description": "Create parent directories for 'write'"
                     },
                     "task_id": {
                         "type": "string",
-                        "description": "Task ID to cancel"
+                        "description": "Task ID; required for 'cancel'"
                     }
                 },
                 "required": ["action"]
@@ -542,6 +542,20 @@ mod tests {
     }
 
     // ── Metadata ────────────────────────────────────────────────
+
+    /// The shared action contract every action-dispatched tool is held to:
+    /// the tool-list description and the `action` parameter's own description
+    /// must each name every enumerated action, and no parameter may ship
+    /// undescribed.
+    #[test]
+    fn nodes_action_tool_contract() {
+        let tool = make_tool();
+        crate::tools::schema::action_contract::assert_action_tool_contract(
+            tool.name(),
+            tool.description(),
+            &tool.parameters_schema(),
+        );
+    }
 
     #[test]
     fn tool_name() {

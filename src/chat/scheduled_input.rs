@@ -210,7 +210,7 @@ impl Tool for ScheduledInputTool {
     }
 
     fn description(&self) -> &str {
-        "Schedule a future message back into the current PRX chat main session. Use this for dispatcher self-wake observation loops after the current turn completes."
+        "Schedule a future message back into the current PRX chat main session: 'schedule' creates a wake-up, 'list' shows pending, delivered and cancelled wake-ups, and 'cancel' aborts a pending one. Use this for dispatcher self-wake observation loops after the current turn completes."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -222,28 +222,28 @@ impl Tool for ScheduledInputTool {
                     "action": {
                         "type": "string",
                         "enum": ["schedule", "list", "cancel"],
-                        "description": "schedule creates a future main-session wake-up; list shows pending/delivered/cancelled wake-ups; cancel aborts a pending wake-up."
+                        "description": "'schedule' creates a future main-session wake-up; 'list' shows pending, delivered and cancelled wake-ups; 'cancel' aborts a pending wake-up."
                     },
                     "message": {
                         "type": "string",
-                        "description": "Message to inject into the main chat session when the wake-up fires."
+                        "description": "Message to inject into the main chat session when the wake-up fires; required for 'schedule'."
                     },
                     "delay_seconds": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": MAX_DELAY_SECONDS,
                         "default": DEFAULT_DELAY_SECONDS,
-                        "description": "Delay before injecting the message. Defaults to 60 seconds."
+                        "description": "Delay before injecting the message for 'schedule'. Defaults to 60 seconds."
                     },
                     "priority": {
                         "type": "boolean",
                         "default": false,
-                        "description": "When true, injects the wake-up as a priority /now message."
+                        "description": "When true, 'schedule' injects the wake-up as a priority /now message."
                     },
                     "id": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Wake-up id for cancel."
+                        "description": "Wake-up id; required for 'cancel' and reported by 'list'."
                     }
                 }
                 ,
@@ -349,6 +349,20 @@ mod tests {
     use super::*;
     use crate::tools::schema::validate_tool_arguments;
     use crate::tools::traits::Tool;
+
+    /// The shared action contract every action-dispatched tool is held to:
+    /// the tool-list description and the `action` parameter's own description
+    /// must each name every enumerated action, and no parameter may ship
+    /// undescribed.
+    #[test]
+    fn chat_schedule_action_tool_contract() {
+        let tool = ScheduledInputTool::new(ScheduledInputHandle::default());
+        crate::tools::schema::action_contract::assert_action_tool_contract(
+            tool.name(),
+            tool.description(),
+            &tool.parameters_schema(),
+        );
+    }
 
     #[test]
     fn schema_declares_action_specific_requirements() {

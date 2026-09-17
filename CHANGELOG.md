@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.140] - 17 September 2026
+
+### Changed
+
+- Every action-dispatched tool is now held to the shared action contract
+  (`tools::schema::action_contract::assert_action_tool_contract`), not just the
+  five wired in 0.8.133. `mcp_call`, `git_operations`, `gateway`,
+  `skills_manage`, `composio`, `nodes`, `subagents`, `proxy_config`,
+  `chat_schedule`, `managed_session` and `hooks_manage` each gained a test in
+  their own module, bringing the enforced set to sixteen surfaces. The contract
+  requires that the tool-list description, the `action` parameter's own
+  description, and the description of every parameter an action cannot be called
+  without each name that action, so a capability can no longer be published as a
+  bare enum identifier the model has to guess at.
+- Rewrote the tool and parameter descriptions those eleven tools publish so each
+  names its actions explicitly: `mcp_call` now spells out `'call'`, `'list'`,
+  `'status'` and `'refresh'`; `git_operations` names its ten operations and the
+  four `'stash'` sub-actions; `gateway`, `nodes`, `subagents`, `skills_manage`,
+  `proxy_config`, `chat_schedule`, `managed_session` and `hooks_manage` name
+  every enumerated action and say which action each required parameter belongs
+  to; `composio` names `'connect'` and `'execute'` on the parameters those two
+  actions require. No executor behaviour, action enum or required-field set
+  changed.
+- Added the missing `action` parameter description to the `skills_manage`,
+  `proxy_config` and `hooks_manage` schemas and the missing `event` description
+  to `hooks_manage`. These were published with no description at all, leaving
+  the model the bare property name; the enums, defaults and conditional
+  requirements are unchanged, so existing calls validate exactly as before.
+
 ## [0.8.139] - 17 September 2026
 
 ### Added

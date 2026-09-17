@@ -316,7 +316,7 @@ impl Tool for ProxyConfigTool {
     }
 
     fn description(&self) -> &str {
-        "Manage ZeroClaw proxy settings (scope: environment | prx | services), including runtime and process env application"
+        "Manage ZeroClaw proxy settings (scope: environment | prx | services): 'get' reads the effective settings, 'set' writes them, 'list_services' lists the routable service selectors, 'apply_env' applies the proxy to the process environment, and 'clear_env' removes it"
     }
 
     fn parameters_schema(&self) -> Value {
@@ -327,7 +327,8 @@ impl Tool for ProxyConfigTool {
                 "action": {
                     "type": "string",
                     "enum": ["get", "set", "list_services", "apply_env", "clear_env"],
-                    "default": "get"
+                    "default": "get",
+                    "description": "Action to perform: 'get' reads the effective proxy settings, 'set' writes them, 'list_services' lists the routable service selectors, 'apply_env' applies the proxy to the process environment, 'clear_env' removes it. Defaults to 'get'."
                 },
                 "scope": {
                     "type": "string",
@@ -354,7 +355,7 @@ impl Tool for ProxyConfigTool {
                     ]
                 },
                 "services": {
-                    "description": "Comma-separated string or array of service selectors used when scope=services",
+                    "description": "Comma-separated string or array of service selectors; required when 'set' targets scope=services",
                     "oneOf": [
                         {"type": "string", "minLength": 1},
                         {"type": "array", "items": {"type": "string"}, "minItems": 1}
@@ -471,6 +472,20 @@ mod tests {
         };
         config.save().await.unwrap();
         crate::config::new_shared(config)
+    }
+
+    /// The shared action contract every action-dispatched tool is held to:
+    /// the tool-list description and the `action` parameter's own description
+    /// must each name every enumerated action, and no parameter may ship
+    /// undescribed.
+    #[test]
+    fn proxy_config_action_tool_contract() {
+        let tool = ProxyConfigTool::new(crate::config::new_shared(Config::default()), test_security());
+        crate::tools::schema::action_contract::assert_action_tool_contract(
+            tool.name(),
+            tool.description(),
+            &tool.parameters_schema(),
+        );
     }
 
     #[tokio::test]

@@ -975,8 +975,8 @@ impl Tool for McpTool {
     }
 
     fn description(&self) -> &str {
-        "Call tools exposed by configured MCP servers. \
-         Also lists discovery status/errors and supports explicit refresh. \
+        "Call tools exposed by configured MCP servers: 'call' invokes a remote tool, \
+         'list' and 'status' report discovery results and errors, and 'refresh' forces rediscovery. \
          Supports hot config reload from workspace/mcp.json and dynamic aliases."
     }
 
@@ -998,7 +998,7 @@ impl Tool for McpTool {
 
         let mut server_schema = json!({
             "type": "string",
-            "description": "Configured MCP server name"
+            "description": "Configured MCP server name; required for 'call'"
         });
         if !server_names.is_empty() {
             if let Some(object) = server_schema.as_object_mut() {
@@ -1008,7 +1008,7 @@ impl Tool for McpTool {
 
         let mut tool_schema = json!({
             "type": "string",
-            "description": "Remote MCP tool name to invoke"
+            "description": "Remote MCP tool name to invoke; required for 'call'"
         });
         if !tool_names.is_empty() {
             if let Some(object) = tool_schema.as_object_mut() {
@@ -1024,13 +1024,13 @@ impl Tool for McpTool {
                         "type": "string",
                         "enum": ["call", "list", "status", "refresh"],
                         "default": "call",
-                        "description": "call invokes a remote tool; list/status inspect discovery; refresh forces rediscovery"
+                        "description": "'call' invokes a remote tool; 'list' and 'status' inspect discovery state and errors; 'refresh' forces rediscovery"
                     },
                     "server": server_schema,
                     "tool": tool_schema,
                     "arguments": {
                         "type": "object",
-                        "description": "Arguments object forwarded to MCP call_tool",
+                        "description": "Arguments object forwarded to MCP call_tool for 'call'",
                         "default": {}
                     }
                 },
@@ -1544,6 +1544,24 @@ mod tests {
     }
 
     // ── McpTool metadata ────────────────────────────────────────
+
+    /// The shared action contract every action-dispatched tool is held to:
+    /// the tool-list description and the `action` parameter's own description
+    /// must each name every enumerated action, and no parameter may ship
+    /// undescribed.
+    #[test]
+    fn mcp_call_action_tool_contract() {
+        let tool = McpTool::new(
+            Arc::new(SecurityPolicy::default()),
+            McpConfig::default(),
+            std::env::temp_dir(),
+        );
+        crate::tools::schema::action_contract::assert_action_tool_contract(
+            tool.name(),
+            tool.description(),
+            &tool.parameters_schema(),
+        );
+    }
 
     #[test]
     fn mcp_tool_name() {

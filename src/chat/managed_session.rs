@@ -218,7 +218,7 @@ impl Tool for ManagedSessionTool {
     }
 
     fn description(&self) -> &str {
-        "Create and manage PRX background sessions visible in the chat TUI. Use this for long-running shell observers instead of one-shot shell."
+        "Create and manage PRX background sessions visible in the chat TUI: 'shell' starts a managed background shell, 'list' shows the sessions, 'logs' reads recent output, and 'kill' terminates a session. Use this for long-running shell observers instead of one-shot shell."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -230,21 +230,21 @@ impl Tool for ManagedSessionTool {
                     "action": {
                         "type": "string",
                         "enum": ["shell", "list", "logs", "kill"],
-                        "description": "shell starts a managed background shell; list shows sessions; logs reads recent output; kill terminates a shell session."
+                        "description": "'shell' starts a managed background shell; 'list' shows the sessions; 'logs' reads recent output; 'kill' terminates a shell session."
                     },
                     "command": {
                         "type": "string",
-                        "description": "Shell command to run for action=shell."
+                        "description": "Shell command to run; required for 'shell'."
                     },
                     "session_id": {
                         "type": "string",
-                        "description": "Managed shell session id for logs or kill."
+                        "description": "Managed shell session id; required for 'logs' and 'kill'."
                     },
                     "max_lines": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 500,
-                        "description": "Maximum recent log lines to return for logs."
+                        "description": "Maximum recent log lines to return for 'logs'."
                     }
                 },
                 "required": ["action"]
@@ -372,6 +372,21 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         })
+    }
+
+    /// The shared action contract every action-dispatched tool is held to:
+    /// the tool-list description and the `action` parameter's own description
+    /// must each name every enumerated action, and no parameter may ship
+    /// undescribed.
+    #[test]
+    fn managed_session_action_tool_contract() {
+        let (sink, _rx) = SessionEventSink::channel();
+        let tool = ManagedSessionTool::new(std::env::temp_dir(), Arc::new(Mutex::new(Vec::new())), sink);
+        crate::tools::schema::action_contract::assert_action_tool_contract(
+            tool.name(),
+            tool.description(),
+            &tool.parameters_schema(),
+        );
     }
 
     #[tokio::test]

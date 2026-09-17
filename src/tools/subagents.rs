@@ -355,7 +355,7 @@ impl Tool for SubagentsTool {
     }
 
     fn description(&self) -> &str {
-        "Manage sub-agents spawned by sessions_spawn. Actions: list, kill, steer."
+        "Manage sub-agents spawned by sessions_spawn: 'list' shows active and recent runs, 'kill' terminates a run, and 'steer' sends a message into a running one."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -368,28 +368,28 @@ impl Tool for SubagentsTool {
                         "type": "string",
                         "enum": ["list", "kill", "steer"],
                         "default": "list",
-                        "description": "Action to perform."
+                        "description": "Action to perform: 'list' shows active and recent runs, 'kill' terminates a run, 'steer' sends a message into a running one."
                     },
                     "run_id": {
                         "type": "string",
-                        "description": "Target run ID for kill/steer."
+                        "description": "Target run ID; required for 'kill' and 'steer'."
                     },
                     "message": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "Message to send for steer action."
+                        "description": "Message to send into the run; required for 'steer'."
                     },
                     "status": {
                         "type": "string",
                         "enum": ["all", "running", "completed", "failed"],
                         "default": "all",
-                        "description": "Optional status filter for list action."
+                        "description": "Optional status filter for 'list'."
                     },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 100,
-                        "description": "Maximum number of results for list action (default 20)."
+                        "description": "Maximum number of results for 'list' (default 20)."
                     }
                 },
                 "required": []
@@ -471,6 +471,20 @@ mod tests {
     use crate::memory::{MemoryPrincipal, SqliteMemory};
     use crate::tools::sessions_spawn::{ProcessRunControl, SessionsSpawnTool};
     use chrono::Utc;
+
+    /// The shared action contract every action-dispatched tool is held to:
+    /// the tool-list description and the `action` parameter's own description
+    /// must each name every enumerated action, and no parameter may ship
+    /// undescribed.
+    #[test]
+    fn subagents_action_tool_contract() {
+        let tool = SubagentsTool::new(Arc::new(RwLock::new(Vec::new())));
+        crate::tools::schema::action_contract::assert_action_tool_contract(
+            tool.name(),
+            tool.description(),
+            &tool.parameters_schema(),
+        );
+    }
 
     fn make_run(id: &str, status: SubAgentStatus) -> SubAgentRun {
         SubAgentRun {

@@ -580,11 +580,11 @@ impl Tool for ComposioTool {
                         },
                         "action_name": {
                             "type": "string",
-                            "description": "Action/tool identifier to execute (legacy aliases supported)"
+                            "description": "Action/tool identifier for 'execute' (legacy aliases supported)"
                         },
                         "tool_slug": {
                             "type": "string",
-                            "description": "Preferred v3 tool slug to execute (alias of action_name)"
+                            "description": "Preferred v3 tool slug for 'execute' (alias of action_name)"
                         },
                         "params": {
                             "type": "object",
@@ -596,7 +596,7 @@ impl Tool for ComposioTool {
                         },
                         "auth_config_id": {
                             "type": "string",
-                            "description": "Optional Composio v3 auth config id for connect flow"
+                            "description": "Optional Composio v3 auth config id for the 'connect' flow"
                         },
                         "connected_account_id": {
                             "type": "string",
@@ -1153,6 +1153,20 @@ mod tests {
     }
 
     // ── Constructor ───────────────────────────────────────────
+
+    /// The shared action contract every action-dispatched tool is held to:
+    /// the tool-list description and the `action` parameter's own description
+    /// must each name every enumerated action, and no parameter may ship
+    /// undescribed.
+    #[test]
+    fn composio_action_tool_contract() {
+        let tool = ComposioTool::new("test-key", None, test_security());
+        crate::tools::schema::action_contract::assert_action_tool_contract(
+            tool.name(),
+            tool.description(),
+            &tool.parameters_schema(),
+        );
+    }
 
     #[test]
     fn composio_tool_has_correct_name() {

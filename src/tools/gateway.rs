@@ -181,7 +181,7 @@ impl Tool for GatewayTool {
                     "action": {
                         "type": "string",
                         "enum": ["config.get", "config.patch", "status", "version", "components", "restart"],
-                        "description": "Action to perform."
+                        "description": "Action to perform: 'config.get' reads the current config, 'config.patch' merges a JSON merge patch into it, 'status' reports uptime/model/channels, 'version' reports the build version, 'components' lists active channels/providers/memory/tools, 'restart' sends SIGHUP for a graceful restart."
                     },
                     "patch": {
                         "type": "object",
@@ -468,6 +468,21 @@ mod tests {
             ..Config::default()
         });
         GatewayTool::new(config, "anthropic", "claude-sonnet-4-6", vec!["signal".to_string()]).with_tools_count(12)
+    }
+
+    /// The shared action contract every action-dispatched tool is held to:
+    /// the tool-list description and the `action` parameter's own description
+    /// must each name every enumerated action, and no parameter may ship
+    /// undescribed.
+    #[test]
+    fn gateway_action_tool_contract() {
+        let tmp = TempDir::new().unwrap();
+        let tool = make_tool(&tmp);
+        crate::tools::schema::action_contract::assert_action_tool_contract(
+            tool.name(),
+            tool.description(),
+            &tool.parameters_schema(),
+        );
     }
 
     #[test]

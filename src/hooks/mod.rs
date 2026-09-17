@@ -610,7 +610,7 @@ impl crate::tools::Tool for HooksManageTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect, validate, atomically replace, remove, refresh, or test workspace lifecycle hooks. Mutating and test actions are approval-gated."
+        "Manage workspace lifecycle hooks: 'status' reports the active configuration, 'refresh' reloads it from disk, 'validate' checks a candidate hooks.json, 'replace' installs one atomically, 'remove' deletes it, and 'test' fires a synthetic event. Mutating and test actions are approval-gated."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -618,10 +618,18 @@ impl crate::tools::Tool for HooksManageTool {
             json!({
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["status", "refresh", "validate", "replace", "remove", "test"]},
-                    "content": {"type": "string", "description": "Complete hooks.json for validate or replace"},
-                    "event": {"type": "string", "enum": HookEvent::ALL.map(HookEvent::as_str)},
-                    "payload": {"type": "object", "description": "Synthetic payload for test"}
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "refresh", "validate", "replace", "remove", "test"],
+                        "description": "Action to perform: 'status' reports the active hooks configuration, 'refresh' reloads it from disk, 'validate' checks a candidate hooks.json, 'replace' installs one atomically, 'remove' deletes it, 'test' fires a synthetic event"
+                    },
+                    "content": {"type": "string", "description": "Complete hooks.json; required for 'validate' and 'replace'"},
+                    "event": {
+                        "type": "string",
+                        "enum": HookEvent::ALL.map(HookEvent::as_str),
+                        "description": "Lifecycle event to fire; required for 'test'"
+                    },
+                    "payload": {"type": "object", "description": "Synthetic payload for 'test'"}
                 },
                 "required": ["action"],
                 "additionalProperties": false
@@ -811,6 +819,22 @@ pub fn payload_error(component: &str, message: &str) -> serde_json::Value {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The shared action contract every action-dispatched tool is held to:
+    /// the tool-list description and the `action` parameter's own description
+    /// must each name every enumerated action, and no parameter may ship
+    /// undescribed.
+    #[test]
+    fn hooks_manage_action_tool_contract() {
+        let temp = TempDir::new().unwrap();
+        let manager = std::sync::Arc::new(HookManager::new(temp.path().to_path_buf()));
+        let tool = manager.manage_tool(std::sync::Arc::new(crate::security::SecurityPolicy::default()));
+        crate::tools::schema::action_contract::assert_action_tool_contract(
+            tool.name(),
+            tool.description(),
+            &tool.parameters_schema(),
+        );
+    }
 
     #[test]
     fn normalize_event_name_handles_case_and_dash() {

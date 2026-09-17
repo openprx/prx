@@ -512,7 +512,7 @@ impl Tool for GitOperationsTool {
     }
 
     fn description(&self) -> &str {
-        "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash, push, reset_hard). Provides parsed JSON output and integrates with security policy for autonomy controls."
+        "Perform structured Git operations: 'status', 'diff', 'log', 'branch', 'commit', 'add', 'checkout', 'stash', 'push' and 'reset_hard'. The 'stash' operation takes an action of 'push' (save), 'pop' (restore), 'list' (show entries) or 'drop' (delete one). Provides parsed JSON output and integrates with security policy for autonomy controls."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -560,7 +560,7 @@ impl Tool for GitOperationsTool {
                     "action": {
                         "type": "string",
                         "enum": ["push", "pop", "list", "drop"],
-                        "description": "Stash action (for 'stash' operation)"
+                        "description": "Sub-action of the 'stash' operation: 'push' saves the working tree, 'pop' restores the latest entry, 'list' shows the entries, 'drop' deletes one by index"
                     },
                     "index": {
                         "type": "integer",
@@ -715,6 +715,21 @@ mod tests {
             .output()
             .await
             .unwrap();
+    }
+
+    /// The shared action contract every action-dispatched tool is held to:
+    /// the tool-list description and the `action` parameter's own description
+    /// must each name every enumerated action, and no parameter may ship
+    /// undescribed.
+    #[test]
+    fn git_operations_action_tool_contract() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+        crate::tools::schema::action_contract::assert_action_tool_contract(
+            tool.name(),
+            tool.description(),
+            &tool.parameters_schema(),
+        );
     }
 
     #[test]
