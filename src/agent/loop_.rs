@@ -2641,6 +2641,19 @@ const OS_PAGING_EVICT_MARKER: &str = "[Context paged out at";
 /// Marker prefix used for recalled page content injected back into history.
 const OS_PAGING_RECALL_MARKER: &str = "[Recalled context from earlier in this session]";
 
+/// Historical framing written immediately under `OS_PAGING_RECALL_MARKER`.
+///
+/// A recalled page is a verbatim transcript of turns that already happened, so
+/// without an explicit disclaimer a model reads the version numbers, commit
+/// hashes, and command output inside it as observations of the current turn and
+/// repeats them as freshly measured facts. The marker alone does not say that;
+/// this notice does, and it must state the staleness, the re-measure duty, and
+/// the ban on replaying page content as this turn's work.
+const OS_PAGING_RECALL_HISTORY_NOTICE: &str = "HISTORY NOTICE: the excerpts below are a verbatim transcript of EARLIER turns in this session, replayed for reference only. Every number, version, commit hash, status, path, and command output in them describes the state at the time it was recorded, not the state now. Do not present anything from them as something you did, ran, or verified in this turn; when a current value matters, call the appropriate tool again and report that fresh result instead.";
+
+/// Prefix of the per-excerpt source line that precedes every recalled page.
+const OS_PAGING_RECALL_PAGE_PREFIX: &str = "[page";
+
 /// `source_kind` used when persisting evicted context pages into the document
 /// store. Distinguishes paged context from tool-output documents.
 const OS_PAGING_SOURCE_KIND: &str = "context_page";
@@ -2807,6 +2820,22 @@ async fn apply_os_paging(
     Ok(true)
 }
 
+/// Source line stamped in front of every recalled page excerpt so the model can
+/// judge how old the excerpt is instead of reading it as a current observation.
+///
+/// The timestamp is the page chunk's creation time, i.e. the moment the
+/// eviction wrote the page to the document store. Search results carry no
+/// document metadata, so when a backend cannot supply a creation time the
+/// field is dropped and the bare `[page]` line is still emitted.
+fn page_source_line(evicted_at: &str) -> String {
+    let evicted_at = evicted_at.trim();
+    if evicted_at.is_empty() {
+        format!("{OS_PAGING_RECALL_PAGE_PREFIX}]")
+    } else {
+        format!("{OS_PAGING_RECALL_PAGE_PREFIX} evicted_at={evicted_at}]")
+    }
+}
+
 /// Semantic recall of evicted context pages (FIX-P3-05, stage 2).
 ///
 /// Searches the durable document store for paged context relevant to `query`
@@ -2852,7 +2881,7 @@ async fn recall_context_pages(
             return None;
         }
     };
-    let mut recalled = String::from(OS_PAGING_RECALL_MARKER);
+    let mut recalled = format!("{OS_PAGING_RECALL_MARKER}\n{OS_PAGING_RECALL_HISTORY_NOTICE}");
     let mut injected = 0usize;
     for result in results {
         if injected >= limit {
@@ -2866,7 +2895,8 @@ async fn recall_context_pages(
         // belong to those turns, not to the one being assembled now.
         let quoted = crate::multimodal::neutralize_media_markers(result.chunk.content.trim());
         let snippet = truncate_with_ellipsis(&quoted, COMPACTION_MAX_SUMMARY_CHARS);
-        let _ = write!(recalled, "\n\n---\n{snippet}");
+        let source_line = page_source_line(&result.chunk.created_at);
+        let _ = write!(recalled, "\n\n---\n{source_line}\n{snippet}");
         injected += 1;
     }
     if injected == 0 {
@@ -16887,6 +16917,109 @@ Let me check the result."#;
             "recalled page must preserve full content verbatim, got: {}",
             &recalled.content[..recalled.content.len().min(200)]
         );
+    }
+
+    /// A recalled page is a verbatim transcript of turns that already ran. The
+    /// injected message must say so in words the model cannot miss, and must
+    /// stamp every excerpt with its own source line, otherwise stale version
+    /// numbers and command output inside the page get replayed to the user as
+    /// this turn's freshly measured results (observed after a daemon restart:
+    /// a recalled page's old version numbers were reported as "just measured").
+    ///
+    /// MUTATION GUARD: empty `OS_PAGING_RECALL_HISTORY_NOTICE`, or drop the
+    /// `page_source_line` write in `recall_context_pages`, and this goes red.
+    #[tokio::test]
+    async fn os_paging_recall_frames_pages_as_history_with_source_lines() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().to_string_lossy().to_string();
+        let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let envelope = RuntimeEnvelope::agent(workspace, "run-paging-history-notice");
+        let runtime = DocumentIngestRuntime::from_envelope(mem, &envelope);
+
+        let config = paging_test_config(true);
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("ZEBRA-PANGOLIN release check: version 0.8.108 at HEAD fb3b30f4. ".repeat(40)),
+            ChatMessage::assistant("Recorded the ZEBRA-PANGOLIN release numbers. ".repeat(40)),
+            ChatMessage::user("latest question please summarize"),
+        ];
+        assert!(apply_os_paging(&mut history, &config, Some(&runtime)).await.unwrap());
+
+        let recalled = recall_context_pages("ZEBRA-PANGOLIN release check", &config, Some(&runtime))
+            .await
+            .expect("evicted page should be recalled");
+
+        // The legacy marker stays the first thing in the message: callers
+        // (`latest_user_query`, injection filters) identify recalls by prefix.
+        assert!(
+            recalled.content.starts_with(OS_PAGING_RECALL_MARKER),
+            "the recall marker must remain the message prefix: {}",
+            &recalled.content[..recalled.content.len().min(160)]
+        );
+
+        // Literal phrases, not the constant: asserting against the constant
+        // would still pass if the notice were emptied out.
+        for phrase in [
+            "verbatim transcript of EARLIER turns in this session",
+            "describes the state at the time it was recorded, not the state now",
+            "Do not present anything from them as something you did, ran, or verified in this turn",
+            "call the appropriate tool again and report that fresh result instead",
+        ] {
+            assert!(
+                recalled.content.contains(phrase),
+                "recall message must carry the history declaration phrase {phrase:?}, got: {}",
+                recalled.content
+            );
+        }
+
+        // The declaration has to sit ahead of the excerpts, not after them.
+        let notice_at = recalled
+            .content
+            .find("HISTORY NOTICE")
+            .expect("history declaration must be present");
+        let first_page_at = recalled
+            .content
+            .find(OS_PAGING_RECALL_PAGE_PREFIX)
+            .expect("every excerpt must carry a [page ...] source line");
+        assert!(
+            notice_at < first_page_at,
+            "the history declaration must precede the first excerpt: {}",
+            recalled.content
+        );
+
+        // Each excerpt is introduced by its own source line carrying the
+        // eviction time, and the transcript still follows it verbatim.
+        assert!(
+            recalled.content.contains("\n[page evicted_at="),
+            "excerpts must be stamped with their eviction time: {}",
+            recalled.content
+        );
+        let page_line = recalled
+            .content
+            .lines()
+            .find(|line| line.starts_with(OS_PAGING_RECALL_PAGE_PREFIX))
+            .expect("a [page ...] line must exist");
+        assert!(
+            page_line.ends_with(']') && page_line.len() > "[page evicted_at=]".len(),
+            "the source line must carry a non-empty timestamp, got: {page_line}"
+        );
+        assert!(
+            recalled.content.contains("ZEBRA-PANGOLIN release check"),
+            "framing must not cost the verbatim page content: {}",
+            recalled.content
+        );
+    }
+
+    /// Search results carry chunk rows only, so a backend that cannot supply a
+    /// creation time must still get a source line — just without the field.
+    #[test]
+    fn page_source_line_drops_a_missing_timestamp_but_keeps_the_marker() {
+        assert_eq!(
+            page_source_line("2026-09-17T04:05:06Z"),
+            "[page evicted_at=2026-09-17T04:05:06Z]"
+        );
+        assert_eq!(page_source_line("   "), "[page]");
+        assert_eq!(page_source_line(""), "[page]");
     }
 
     /// OS-paging evicts a span from the middle of history and replaces it with

@@ -87,6 +87,15 @@ deleted. A later rollover can reference the prior handoff event exactly, so
 repeated switches form an auditable generation chain within the same durable
 session.
 
+When a legacy mode does recall an evicted OS-paging page, the injected message
+is framed as history, not as an observation: the `[Recalled context from earlier
+in this session]` marker line is followed by a notice stating that the excerpts
+are a verbatim transcript of earlier turns, that every value in them describes
+the state at the time it was recorded, that nothing in them may be presented as
+work done in the current turn, and that a current value must be re-measured with
+a fresh tool call. Each excerpt is introduced by a `[page evicted_at=<timestamp>]`
+source line so the age of the excerpt is visible.
+
 Switch mode bypasses the legacy OS-paging layer. Its recovery tool is a hard
 runtime dependency: PRX restores the canonical lookup spec after intent/model
 selection and request middleware, and restricted worker, spawn, and delegate

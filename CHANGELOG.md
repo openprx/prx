@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.138] - 17 September 2026
+
+### Changed
+
+- Recalled OS-paging context pages are now framed as history instead of arriving as bare
+  quoted text. The injected recall message keeps `[Recalled context from earlier in this
+  session]` as its first line and adds a history notice directly underneath: the excerpts
+  are a verbatim transcript of earlier turns, every number, version, commit hash, status,
+  path, and command output in them describes the state at the time it was recorded, they
+  must not be presented as something done, run, or verified in the current turn, and a
+  current value has to be re-measured with a fresh tool call. Each excerpt is also
+  introduced by its own `[page evicted_at=<timestamp>]` source line (taken from the page
+  chunk's creation time, reduced to `[page]` when the backend supplies none) so the model
+  can see how old the excerpt is. Recall thresholds, page counts, injection role, and
+  injection position are unchanged.
+
 ## [0.8.137] - 17 September 2026
 
 ### Fixed
