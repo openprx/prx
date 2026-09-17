@@ -24,6 +24,7 @@ use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
 use sha2::Digest;
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 use std::io::Write as _;
@@ -132,6 +133,58 @@ pub(crate) fn is_tool_summary_only_response(text: &str) -> bool {
     };
 
     !tool_names.trim().is_empty() && !tool_names.contains(['\n', '\r'])
+}
+
+/// True when `text` carries at least one fabricated `[Used tools: ...]` line.
+///
+/// The runtime has never produced that marker: it only ever appeared in model
+/// output. Once ~150 of those assistant turns were persisted, the model started
+/// imitating the shape in long contexts and claiming tool runs it never made.
+/// A marker is recognized per *line* (surrounding whitespace allowed), which is
+/// exactly the shape `is_tool_summary_only_response` accepts for a whole
+/// response, so producer and detector cannot drift apart.
+pub(crate) fn contains_fabricated_tool_marker(text: &str) -> bool {
+    text.lines().any(is_tool_summary_only_response)
+}
+
+/// Remove every fabricated `[Used tools: ...]` line from `text`.
+///
+/// Borrowed (zero allocation) when there is nothing to strip, which is the
+/// overwhelmingly common case — this runs on every delivered response and on
+/// every replayed history turn. Only whole lines are dropped; a marker embedded
+/// inside a sentence and any other bracketed text are left alone, so the strip
+/// cannot mangle legitimate prose. When a line is dropped the surrounding blank
+/// space is trimmed so the delivered text does not start or end with the hole
+/// the marker left behind.
+pub(crate) fn strip_fabricated_tool_markers(text: &str) -> Cow<'_, str> {
+    if !contains_fabricated_tool_marker(text) {
+        return Cow::Borrowed(text);
+    }
+
+    let mut stripped = String::with_capacity(text.len());
+    for line in text.lines().filter(|line| !is_tool_summary_only_response(line)) {
+        if !stripped.is_empty() {
+            stripped.push('\n');
+        }
+        stripped.push_str(line);
+    }
+    let leading = stripped.len() - stripped.trim_start().len();
+    stripped.drain(..leading);
+    stripped.truncate(stripped.trim_end().len());
+    Cow::Owned(stripped)
+}
+
+/// Strip fabricated tool markers from assistant turns of a replayed history.
+///
+/// Only the copy handed to the model is touched; the persisted rows keep the
+/// bytes the model actually produced. User turns are never rewritten — an
+/// operator quoting the marker back is real conversation content.
+pub(crate) fn strip_fabricated_tool_markers_from_assistant_turns(turns: &mut [ChatMessage]) {
+    for turn in turns.iter_mut().filter(|turn| turn.role == "assistant") {
+        if let Cow::Owned(stripped) = strip_fabricated_tool_markers(&turn.content) {
+            turn.content = stripped;
+        }
+    }
 }
 
 /// Canonicalize request-local system instructions for providers whose chat
@@ -6698,6 +6751,10 @@ async fn run_tool_call_loop_outcome_unguarded(
     let mut unrecoverable_failures: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     let mut tool_summary_retry_attempted = false;
     let mut inject_tool_summary_retry_instruction = false;
+    // Whether this turn ever really dispatched a tool batch. A response that
+    // claims tool use (`[Used tools: ...]`) while this is still false is a
+    // fabrication, and the only case worth spending a corrective retry on.
+    let mut executed_any_tool_call = false;
     let mut empty_response_retry_attempted = false;
     let mut inject_empty_response_retry_instruction = false;
 
@@ -7406,6 +7463,35 @@ async fn run_tool_call_loop_outcome_unguarded(
                 inject_empty_response_retry_instruction = true;
                 continue;
             }
+            // Fabricated tool-use marker guard. A `[Used tools: ...]` line the
+            // model wrote while this turn never dispatched a tool is a claim
+            // about work that did not happen; spend the one corrective retry on
+            // it (the same budget the summary-only path uses, so a response that
+            // is nothing but a marker still costs at most one retry).
+            let fabricated_marker =
+                contains_fabricated_tool_marker(&response_text) || contains_fabricated_tool_marker(&display_text);
+            if fabricated_marker && !executed_any_tool_call && !tool_summary_retry_attempted {
+                tracing::warn!(
+                    provider = provider_name,
+                    model,
+                    "model claimed tool use without executing any tool; retrying once with a corrective instruction"
+                );
+                tool_summary_retry_attempted = true;
+                inject_tool_summary_retry_instruction = true;
+                continue;
+            }
+            if fabricated_marker {
+                // Retry spent (or tools really ran): keep whatever the model
+                // actually answered and drop only the marker lines, so the
+                // fabrication never reaches the user, the history, or the next
+                // turn's prompt where it would be imitated again.
+                if let Cow::Owned(cleaned) = strip_fabricated_tool_markers(&display_text) {
+                    display_text = cleaned;
+                }
+                if display_text.trim().is_empty() {
+                    anyhow::bail!("model returned a tool-summary-only response after one corrective retry");
+                }
+            }
             // If a streaming sender is provided, relay the text in small chunks
             // so the channel can progressively update the draft message.
             if let Some(ref tx) = on_delta {
@@ -7533,6 +7619,9 @@ async fn run_tool_call_loop_outcome_unguarded(
         // to, so a replay repeated every one of them.
         history.push(ChatMessage::assistant(assistant_history_content));
         let executed = ExecutedToolRecords::new(history, &recorder, &tool_calls, &native_tool_calls);
+        // From here on this turn has a real tool batch on the wire, so a later
+        // `[Used tools: ...]` line is no longer provably fabricated.
+        executed_any_tool_call = true;
 
         let individual_results = execute_tools_with_service(
             &tool_calls,
@@ -17657,6 +17746,208 @@ Let me check the result."#;
                     .all(|message| !is_tool_summary_only_response(&message.content)),
                 "summary-only artifacts must not enter history: {history:?}"
             );
+        }
+
+        #[test]
+        fn fabricated_tool_marker_is_recognized_per_line() {
+            assert!(contains_fabricated_tool_marker("[Used tools: shell]"));
+            assert!(contains_fabricated_tool_marker("Done.\n[Used tools: shell, gateway]"));
+            assert!(contains_fabricated_tool_marker("[Used tools: shell]\nDone."));
+            assert!(contains_fabricated_tool_marker(
+                "Done.\n  [Used tools: shell]  \nAnything else?"
+            ));
+            // An empty list is not the fabricated shape.
+            assert!(!contains_fabricated_tool_marker("Done.\n[Used tools:]"));
+            // Neither is the same words without the brackets.
+            assert!(!contains_fabricated_tool_marker("Used tools: shell"));
+            // Nor a marker glued into a sentence: only whole lines count.
+            assert!(!contains_fabricated_tool_marker(
+                "I ran [Used tools: shell] on your box."
+            ));
+        }
+
+        #[test]
+        fn strip_fabricated_tool_markers_removes_only_marker_lines() {
+            assert_eq!(
+                strip_fabricated_tool_markers("[Used tools: shell]\nDone.").as_ref(),
+                "Done."
+            );
+            assert_eq!(
+                strip_fabricated_tool_markers("Done.\n[Used tools: shell]").as_ref(),
+                "Done."
+            );
+            assert_eq!(
+                strip_fabricated_tool_markers("Head.\n  [Used tools: shell, gateway]  \nTail.").as_ref(),
+                "Head.\nTail."
+            );
+            assert_eq!(
+                strip_fabricated_tool_markers("A\n[Used tools: shell]\nB\n[Used tools: gateway]\nC").as_ref(),
+                "A\nB\nC"
+            );
+            // Whole response is the marker: stripping leaves nothing, which the
+            // caller turns into the existing summary-only failure.
+            assert!(strip_fabricated_tool_markers("[Used tools: shell]").as_ref().is_empty());
+        }
+
+        #[test]
+        fn strip_fabricated_tool_markers_borrows_when_there_is_nothing_to_strip() {
+            for untouched in [
+                "Plain answer.",
+                "[Used tools:]",
+                "Used tools: shell",
+                "I ran [Used tools: shell] on your box.",
+                "See [1] and [note: unrelated] plus [Used tools] alone.",
+                "[Used tools: shell\nstill going]",
+            ] {
+                let result = strip_fabricated_tool_markers(untouched);
+                assert!(
+                    matches!(result, Cow::Borrowed(_)),
+                    "a text without a marker line must not allocate: {untouched:?}"
+                );
+                assert_eq!(result.as_ref(), untouched);
+            }
+        }
+
+        #[tokio::test]
+        async fn fabricated_tool_marker_without_tool_execution_retries_once() {
+            let provider = ScriptedProvider::from_text_responses(vec![
+                "The disk check is clean.\n[Used tools: shell]",
+                "The disk check is clean.",
+            ]);
+            let remaining = Arc::clone(&provider.responses);
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("check the disk")];
+            let tmp = TempDir::new().unwrap();
+            let (outcome, _trace) = run_tool_call_loop_outcome(
+                &provider,
+                &mut history,
+                Arc::new(Vec::new()),
+                &NoopObserver,
+                &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                None,
+                "terminal",
+                &crate::config::MultimodalConfig::default(),
+                2,
+                false,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ToolLoopMemory::none(),
+                ChatMode::default(),
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("the corrective retry should produce a deliverable answer");
+
+            assert_eq!(
+                remaining.lock().expect("responses lock should be valid").len(),
+                0,
+                "a fabricated marker with no tool execution must cost exactly one corrective retry \
+                 (both scripted responses consumed = two provider calls)"
+            );
+            assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "The disk check is clean."));
+            assert!(
+                history
+                    .iter()
+                    .all(|message| !contains_fabricated_tool_marker(&message.content)),
+                "no fabricated marker may reach history: {history:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn repeated_fabricated_tool_marker_is_stripped_and_still_delivered() {
+            let (result, history) = run_without_tools(vec![
+                "Everything is green.\n[Used tools: shell, gateway]",
+                "Everything is green.\n[Used tools: shell]",
+            ])
+            .await;
+            let (outcome, _trace) = result.expect("a marker beside real text must not fail the turn");
+
+            assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "Everything is green."));
+            assert_eq!(history.len(), 3);
+            assert_eq!(
+                history.last().map(|message| message.content.as_str()),
+                Some("Everything is green."),
+                "the second fabrication must be stripped, not bailed on: {history:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn marker_after_a_real_tool_batch_is_stripped_without_a_retry() {
+            let execution_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let provider = NativeScriptedProvider::new(vec![
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "noop_tool".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("The check ran.\n[Used tools: noop_tool]".to_string()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                },
+            ]);
+            let remaining = Arc::clone(&provider.responses);
+            let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingTool {
+                name: "noop_tool".to_string(),
+                execution_order: Arc::clone(&execution_order),
+            })];
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("run the check")];
+            let tmp = TempDir::new().unwrap();
+            let (outcome, _trace) = run_tool_call_loop_outcome(
+                &provider,
+                &mut history,
+                Arc::new(tools_registry),
+                &NoopObserver,
+                &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                None,
+                "cli",
+                &crate::config::MultimodalConfig::default(),
+                2,
+                false,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ToolLoopMemory::none(),
+                ChatMode::default(),
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("a turn that really used a tool must complete");
+
+            assert!(
+                history.iter().any(|message| message.role == "tool"),
+                "the turn must really have dispatched a tool batch: {history:?}"
+            );
+            assert_eq!(
+                remaining.lock().expect("responses lock should be valid").len(),
+                0,
+                "a marker backed by a real tool run must not spend a corrective retry"
+            );
+            assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "The check ran."));
         }
 
         async fn run_with_response(response: &str, expose: bool) -> (ToolLoopOutcome, Vec<ChatMessage>) {

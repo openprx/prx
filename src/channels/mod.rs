@@ -69,7 +69,10 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
-use crate::agent::loop_::{DocumentIngestRuntime, ScopeContext, build_context_with_shared_events_and_scope};
+use crate::agent::loop_::{
+    DocumentIngestRuntime, ScopeContext, build_context_with_shared_events_and_scope,
+    strip_fabricated_tool_markers_from_assistant_turns,
+};
 /// Canonical maximum characters per injected workspace file.
 pub use crate::agent::prompt::{BOOTSTRAP_MAX_CHARS, build_identity_prompt};
 use crate::config::Config;
@@ -961,6 +964,14 @@ fn build_channel_system_prompt(
     }
 }
 
+/// Reshape cached turns into the strict user/assistant alternation the
+/// providers expect, and drop fabricated `[Used tools: ...]` lines from the
+/// assistant turns on the way out.
+///
+/// The strip happens on this replay copy only: the persisted
+/// `conversation_turns` rows keep exactly what the model produced. It is what
+/// stops ~150 historical fabrications from teaching the model, turn after turn,
+/// that announcing tool use without calling a tool is the house style.
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let mut normalized = Vec::with_capacity(turns.len());
     let mut expecting_user = true;
@@ -991,6 +1002,7 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
         }
     }
 
+    strip_fabricated_tool_markers_from_assistant_turns(&mut normalized);
     normalized
 }
 
@@ -1203,6 +1215,13 @@ fn merged_history(
         let drop = merged.len() - MAX_CHANNEL_HISTORY;
         merged.drain(0..drop);
     }
+
+    // Fabricated `[Used tools: ...]` lines are stripped here too, not only in
+    // `normalize_cached_channel_turns`: this function is the read path for every
+    // caller that consumes the union directly (transcript lookups, compaction
+    // accounting), several of which never run the normalizer. The cached map and
+    // the sqlite rows behind it are untouched — `merged` is a fresh clone.
+    strip_fabricated_tool_markers_from_assistant_turns(&mut merged);
     merged
 }
 
@@ -6776,6 +6795,70 @@ mod tests {
             merged_b.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
             vec!["legacy-prehistory", "b-turn"],
             "other recipient retains legacy pre-history and own canonical turn"
+        );
+    }
+
+    #[test]
+    fn normalize_cached_channel_turns_strips_fabricated_tool_markers_from_assistant_turns() {
+        // The replay copy the model sees must not carry `[Used tools: ...]`
+        // lines it invented in an earlier turn — that is what taught it to keep
+        // claiming tool runs it never made.
+        let turns = vec![
+            ChatMessage::user("what is the disk usage?"),
+            ChatMessage::assistant("Root is at 41%.\n[Used tools: shell, session_status]"),
+            ChatMessage::user("and the logs? you wrote [Used tools: shell] last time"),
+            ChatMessage::assistant("[Used tools: shell]\nNothing in the logs."),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+
+        assert_eq!(normalized.len(), 4);
+        assert_eq!(normalized[1].content, "Root is at 41%.");
+        assert_eq!(normalized[3].content, "Nothing in the logs.");
+        assert_eq!(
+            normalized[2].content, "and the logs? you wrote [Used tools: shell] last time",
+            "a user turn is real conversation content and must never be rewritten"
+        );
+    }
+
+    #[test]
+    fn merged_history_strips_fabricated_tool_markers_without_touching_the_cache() {
+        // Not every caller runs the normalizer over this union, so the strip has
+        // to hold here on its own. The cached map must come out unchanged: the
+        // replay copy is sanitized, the stored turn is not.
+        let key = ConversationKey {
+            canonical: "channel:whatsapp:u1:chat-1".to_string(),
+            legacy: "whatsapp_u1".to_string(),
+        };
+        let mut map: HashMap<String, Vec<ChatMessage>> = HashMap::new();
+        map.insert(
+            key.legacy.clone(),
+            vec![
+                ChatMessage::user("old-question"),
+                ChatMessage::assistant("old-answer\n[Used tools: gateway]"),
+            ],
+        );
+        map.insert(
+            key.canonical.clone(),
+            vec![
+                ChatMessage::user("new-question"),
+                ChatMessage::assistant("[Used tools: shell]\nnew-answer"),
+            ],
+        );
+
+        let merged = merged_history(&map, &key);
+        let rendered: Vec<&str> = merged.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            rendered,
+            vec!["old-question", "old-answer", "new-question", "new-answer"],
+            "assistant turns replayed to the model must carry no fabricated tool markers"
+        );
+        assert_eq!(
+            map.get(&key.canonical)
+                .and_then(|turns| turns.last())
+                .map(|turn| turn.content.as_str()),
+            Some("[Used tools: shell]\nnew-answer"),
+            "the cached turn (and the sqlite row behind it) must keep the original bytes"
         );
     }
 

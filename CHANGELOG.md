@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.137] - 17 September 2026
+
+### Fixed
+
+- Fabricated `[Used tools: ...]` lines can no longer be claimed, delivered, or replayed.
+  A final response that carries such a line while the turn never dispatched a tool now
+  spends the existing corrective retry; if the next response still carries one, only the
+  marker lines are removed and the real answer is still delivered (a response that is
+  nothing but a marker keeps failing closed as before). The surviving text is stripped
+  before it reaches the stream, the history, or the recorded assistant message, and
+  cached channel turns are stripped again on the way back to the model in both
+  `normalize_cached_channel_turns` and `merged_history`. Previously the runtime only
+  rejected a response that was *entirely* a marker, so a marker appended to a real answer
+  was persisted, replayed, and imitated: a WhatsApp session announced tool runs for a week
+  without ever emitting a single tool call. Persisted rows are untouched — only the copy
+  handed to the model and the user is cleaned.
+
 ## [0.8.136] - 16 September 2026
 
 ### Fixed
