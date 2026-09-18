@@ -1023,17 +1023,81 @@ fn strip_cfg_test_items(source: &str) -> String {
     kept.join("\n")
 }
 
+/// Every method that runs a `Tool`.
+///
+/// `Tool` declares exactly these four: `execute` and `execute_named` plus their
+/// cancellation twins (`src/tools/traits.rs`). The guard below recognises all of
+/// them, in every call form Rust offers, because the string the scanner misses
+/// is the bypass that ships.
+const TOOL_EXECUTION_METHODS: &[&str] = &[
+    "execute",
+    "execute_named",
+    "execute_named_with_cancellation",
+    "execute_with_cancellation",
+];
+
+/// Receiver identifiers whose `.execute(...)` belongs to some *other* trait, and
+/// the type each one actually names.
+///
+/// Rust's `execute` is a popular method name: `rusqlite`, `tokio-postgres`, the
+/// shell process adapter, the chat effect executor, the xin builtin registry and
+/// `ToolExecutionService` itself all have one. A scanner with no type
+/// information has to separate them by hand, so this list is the hand: it is the
+/// *only* way a `.execute(` call escapes the inventory, every entry names the
+/// type it stands for, and `non_tool_execute_receivers_are_all_still_in_use`
+/// fails the moment one of them stops matching a real call site, so the list
+/// cannot quietly rot into a wildcard.
+///
+/// Everything else is treated as a `Tool` call, including a receiver the scanner
+/// cannot reduce to an identifier. The guard fails closed on purpose: a false
+/// entry in the inventory costs one review, a false *absence* costs an
+/// unauthorised tool execution.
+const NON_TOOL_EXECUTE_RECEIVERS: &[(&str, &str)] = &[
+    (
+        "client",
+        "tokio-postgres `Client::execute(statement, params)` and the reqwest client",
+    ),
+    (
+        "client_mut",
+        "pooled tokio-postgres client accessor in the webhook ingestion store",
+    ),
+    ("conn", "rusqlite / tokio-postgres connection handle"),
+    (
+        "executor",
+        "chat `EffectExecutor::execute(effect)` — UI effects, not tools",
+    ),
+    (
+        "process",
+        "`ShellProcessAdapter::execute(ShellProcessRequest)` — the shared child-process seam",
+    ),
+    (
+        "registry",
+        "xin `BuiltinRegistry::execute(payload, config)` — internal task builtins",
+    ),
+    (
+        "service",
+        "`ToolExecutionService::execute(command)` — the approved path itself, not a bypass",
+    ),
+    ("shell", "`ShellProcessAdapter` held by the skills tool"),
+    (
+        "tool_execution",
+        "the `ToolExecutionService` field on `Agent` — the approved path itself",
+    ),
+    ("transaction", "rusqlite / tokio-postgres transaction handle"),
+    ("tx", "rusqlite / tokio-postgres transaction handle"),
+];
+
 /// Production call sites that invoke a `Tool` directly instead of going through
 /// `ToolExecutionService`, each with the reason it is allowed to.
 ///
 /// `ToolExecutionService::execute` is the only place that applies the autonomy
 /// policy, the approval gate, the published-schema check and the audit record.
-/// A direct `Tool::execute_named` call skips all four. The gateway MCP endpoint
-/// did exactly that until 0.8.126 and handed an unauthenticated-by-the-runtime,
-/// fully attacker-controlled body straight to a tool; this inventory exists so
-/// the next one fails a test instead of shipping.
+/// A direct `Tool` call skips all four. The gateway MCP endpoint did exactly
+/// that until 0.8.126 and handed an unauthenticated-by-the-runtime, fully
+/// attacker-controlled body straight to a tool; this inventory exists so the
+/// next one fails a test instead of shipping.
 ///
-/// Two shapes are legitimate and listed here:
+/// Three shapes are legitimate:
 ///  * **decorators** — a `Tool` implementation forwarding to the tool it wraps.
 ///    The service already ran its gates on the outer call; the inner hop is one
 ///    tool's own implementation detail.
@@ -1041,94 +1105,754 @@ fn strip_cfg_test_items(source: &str) -> String {
 ///    in the terminal UI, where the human at the keyboard *is* the authority and
 ///    there is no model-authored argument document to validate. Converging these
 ///    onto the service is tracked separately; adding a new one is not.
+///  * **gateway operator-plane endpoints that carry their own gate chain** —
+///    listed separately in [`GATEWAY_DIRECT_TOOL_INVOCATION_GATES`], which names
+///    the alternative gate for each one.
 ///
-/// A new entry needs a reason on the line above it, and any entry under
-/// `src/gateway/` is a regression of the 0.8.126 fix by construction.
-const ALLOWED_DIRECT_TOOL_INVOCATIONS: &[&str] = &[
-    // Fire-and-forget delegate spawn from the legacy `Agent::run_single` shell.
-    // `Agent::execute_tool_call` — the shell's actual tool path — was routed
-    // through the service in 0.8.128 and must not come back here.
-    "src/agent/agent.rs::spawn_delegate_task",
-    // Operator-typed terminal commands: `@file` mention expansion, `/kill`,
-    // `/spawn`, `/steer` and `!command`. The human at the keyboard is the
-    // authority and the argument document is built by this code, not by a model.
-    "src/chat/mod.rs::enrich_file_mentions_for_prompt",
-    "src/chat/mod.rs::kill_local_session",
-    "src/chat/mod.rs::run",
-    // Decorator: the WASM plugin runtime dispatches a plugin alias onto the
-    // plugin tool it already resolved.
-    "src/plugins/runtime.rs::dispatch_alias",
-    "src/plugins/runtime.rs::execute_named",
-    // Decorator: delegate/capability aliases forward to the inner tool.
-    "src/tools/delegate.rs::execute",
-    "src/tools/delegate.rs::execute_named",
-    "src/tools/delegate.rs::execute_named_with_cancellation",
-    "src/tools/delegate.rs::execute_with_cancellation",
-    // The service's own legacy per-call adapter.
-    "src/tools/execution.rs::invoke",
-    // Decorator: the `mcp_call` root alias forwards to its own named entry.
-    "src/tools/mcp.rs::execute",
-    // Decorator: the tiering wrapper forwards to the wrapped tool.
-    "src/tools/mod.rs::execute_named",
-    "src/tools/mod.rs::execute_named_with_cancellation",
-    // Decorator: session-scoped aliases rewrite arguments then forward.
-    "src/tools/sessions_spawn.rs::execute",
-    "src/tools/sessions_spawn.rs::execute_named",
-    "src/tools/sessions_spawn.rs::execute_named_with_cancellation",
-    "src/tools/sessions_spawn.rs::execute_with_cancellation",
-    // Decorator: skill aliases forward to the skill runner.
-    "src/tools/skills.rs::execute",
-    "src/tools/skills.rs::execute_named",
-    // Decorator: the `Tool` cancellation twin routes to the named entry.
-    "src/tools/traits.rs::execute_named_with_cancellation",
+/// A new entry needs a reason next to it, and any new entry under `src/gateway/`
+/// that is not in `GATEWAY_DIRECT_TOOL_INVOCATION_GATES` is a regression of the
+/// 0.8.126 fix by construction.
+const ALLOWED_DIRECT_TOOL_INVOCATIONS: &[(&str, &str)] = &[
+    (
+        "src/agent/agent.rs::spawn_delegate_task",
+        "fire-and-forget delegate spawn from the legacy `Agent::run_single` shell; \
+         `Agent::execute_tool_call` — the shell's actual tool path — was routed through the \
+         service in 0.8.128 and must not come back here",
+    ),
+    (
+        "src/chat/mod.rs::enrich_file_mentions_for_prompt",
+        "operator-typed `@file` mention expansion; the argument document is built by this code, \
+         not by a model",
+    ),
+    (
+        "src/chat/mod.rs::kill_local_session",
+        "operator-typed `/kill`; the human at the keyboard is the authority",
+    ),
+    (
+        "src/chat/mod.rs::run",
+        "operator-typed `/spawn`, `/steer` and `!command`; the human at the keyboard is the \
+         authority",
+    ),
+    (
+        "src/gateway/api/channels.rs::post_channel_send",
+        "operator-plane send with its own gate chain — see GATEWAY_DIRECT_TOOL_INVOCATION_GATES",
+    ),
+    (
+        "src/gateway/api/config.rs::post_config_reload",
+        "operator-plane config reload with its own gate chain — see \
+         GATEWAY_DIRECT_TOOL_INVOCATION_GATES",
+    ),
+    (
+        "src/plugins/runtime.rs::dispatch_alias",
+        "decorator: the WASM plugin runtime dispatches a plugin alias onto the plugin tool it \
+         already resolved",
+    ),
+    (
+        "src/plugins/runtime.rs::execute_named",
+        "decorator: the WASM plugin tool forwards its named entry to the resolved plugin tool",
+    ),
+    (
+        "src/tools/delegate.rs::execute",
+        "decorator: the delegate/capability alias forwards to the inner tool",
+    ),
+    (
+        "src/tools/delegate.rs::execute_named",
+        "decorator: the delegate/capability alias forwards to the inner tool",
+    ),
+    (
+        "src/tools/delegate.rs::execute_named_with_cancellation",
+        "decorator: the delegate/capability alias forwards to the inner tool",
+    ),
+    (
+        "src/tools/delegate.rs::execute_with_cancellation",
+        "decorator: the delegate/capability alias forwards to the inner tool",
+    ),
+    (
+        "src/tools/execution.rs::invoke",
+        "the service's own legacy per-call adapter — this is `ToolExecutionService` reaching its \
+         backend after every gate has run",
+    ),
+    (
+        "src/tools/mcp.rs::execute",
+        "decorator: the `mcp_call` root alias forwards to its own named entry",
+    ),
+    (
+        "src/tools/mod.rs::execute",
+        "decorator: the tiering wrapper forwards to the wrapped tool",
+    ),
+    (
+        "src/tools/mod.rs::execute_named",
+        "decorator: the tiering wrapper forwards to the wrapped tool",
+    ),
+    (
+        "src/tools/mod.rs::execute_named_with_cancellation",
+        "decorator: the tiering wrapper forwards to the wrapped tool",
+    ),
+    (
+        "src/tools/mod.rs::execute_with_cancellation",
+        "decorator: the tiering wrapper forwards to the wrapped tool",
+    ),
+    (
+        "src/tools/sessions_spawn.rs::execute",
+        "decorator: session-scoped aliases rewrite arguments then forward",
+    ),
+    (
+        "src/tools/sessions_spawn.rs::execute_named",
+        "decorator: session-scoped aliases rewrite arguments then forward",
+    ),
+    (
+        "src/tools/sessions_spawn.rs::execute_named_with_cancellation",
+        "decorator: session-scoped aliases rewrite arguments then forward",
+    ),
+    (
+        "src/tools/sessions_spawn.rs::execute_with_cancellation",
+        "decorator: session-scoped aliases rewrite arguments then forward",
+    ),
+    (
+        "src/tools/skills.rs::execute",
+        "decorator: skill aliases forward to the skill runner",
+    ),
+    (
+        "src/tools/skills.rs::execute_named",
+        "decorator: skill aliases forward to the skill runner",
+    ),
+    (
+        "src/tools/skills.rs::execute_resolved",
+        "decorator: an `http` skill is run by handing the request this code built to the \
+         `HttpRequestTool` the skill tool owns; the service already gated the outer `skill_execute`",
+    ),
+    (
+        "src/tools/traits.rs::execute_named",
+        "the `Tool` trait's own default bodies: `execute_named` falls back to `execute`",
+    ),
+    (
+        "src/tools/traits.rs::execute_named_with_cancellation",
+        "the `Tool` trait's own default bodies: the cancellation twin routes to the named entry",
+    ),
+    (
+        "src/tools/traits.rs::execute_with_cancellation",
+        "the `Tool` trait's own default body: the cancellation twin races `execute`",
+    ),
 ];
+
+/// The gateway is internet-adjacent, so every direct tool execution it performs
+/// is listed here with the gate chain that stands in for `ToolExecutionService`.
+///
+/// These are *not* unprotected. Each one builds the tool's arguments itself from
+/// typed request fields, so nothing the caller sends becomes a scope claim or a
+/// prior-approval claim, and each one runs an authorization gate before the tool
+/// does any work. What they do not get is the service's audit record and its
+/// published-schema check, which is why they are pinned here and reviewed rather
+/// than allowed by shape.
+const GATEWAY_DIRECT_TOOL_INVOCATION_GATES: &[(&str, &str)] = &[
+    (
+        "src/gateway/api/channels.rs::post_channel_send",
+        "gate chain: `authorize_resource_mutation(state, \"channel_send\", Medium)` on entry, then \
+         `MessageSendTool::execute` itself resolves the channel, authorizes the destination \
+         against the outbound scope rules as a cross-channel decision, and refuses cross-channel \
+         media. The turn channel is pinned to the operator plane and the argument document is \
+         built here from bounded typed fields, so the identity behind the send is always the \
+         unknown operator plane",
+    ),
+    (
+        "src/gateway/api/config.rs::post_config_reload",
+        "gate chain: the authenticated `/api/config` router, then `ConfigReloadTool::execute` runs \
+         `SideEffectGate::authorize_resource_operation(\"config_reload:reload\", Low)` against a \
+         `SecurityPolicy` rebuilt from the sole active config generation, so a reload that \
+         tightened autonomy constrains the next one. The argument document is the empty object \
+         built here, so no caller-supplied approval grant reaches the gate",
+    ),
+];
+
+const fn is_ident_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
+}
+
+/// Replace every comment, string literal and character literal with spaces.
+///
+/// Line structure and character offsets are preserved, so the result can still
+/// be split into lines and searched for `fn` without a comment or a doc example
+/// that merely *mentions* `.execute(` being mistaken for a call site.
+fn blank_comments_and_literals(source: &str) -> String {
+    let characters: Vec<char> = source.chars().collect();
+    let mut output = characters.clone();
+    let length = characters.len();
+    let blank = |output: &mut [char], from: usize, to: usize| {
+        let end = to.min(length);
+        if from >= end {
+            return;
+        }
+        for slot in &mut output[from..end] {
+            if *slot != '\n' {
+                *slot = ' ';
+            }
+        }
+    };
+    let mut index = 0usize;
+    while index < length {
+        let character = characters[index];
+        if character == '/' && index + 1 < length && characters[index + 1] == '/' {
+            let mut end = index;
+            while end < length && characters[end] != '\n' {
+                end += 1;
+            }
+            blank(&mut output, index, end);
+            index = end;
+            continue;
+        }
+        if character == '/' && index + 1 < length && characters[index + 1] == '*' {
+            let mut depth = 0usize;
+            let mut end = index;
+            while end < length {
+                if characters[end] == '/' && end + 1 < length && characters[end + 1] == '*' {
+                    depth += 1;
+                    end += 2;
+                    continue;
+                }
+                if characters[end] == '*' && end + 1 < length && characters[end + 1] == '/' {
+                    depth = depth.saturating_sub(1);
+                    end += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                end += 1;
+            }
+            blank(&mut output, index, end);
+            index = end;
+            continue;
+        }
+        if character == 'r' || character == 'b' {
+            // Raw and byte strings: `r"..."`, `r#"..."#`, `br#"..."#`.
+            let mut cursor = index;
+            while cursor < length && (characters[cursor] == 'r' || characters[cursor] == 'b') {
+                cursor += 1;
+            }
+            let mut hashes = 0usize;
+            while cursor + hashes < length && characters[cursor + hashes] == '#' {
+                hashes += 1;
+            }
+            let quote = cursor + hashes;
+            let raw = cursor > index
+                && quote < length
+                && characters[quote] == '"'
+                && (hashes > 0 || characters[index] == 'r');
+            let leading_ident = index > 0 && is_ident_char(characters[index - 1]);
+            if raw && !leading_ident {
+                let mut end = quote + 1;
+                loop {
+                    if end >= length {
+                        break;
+                    }
+                    if characters[end] == '"' {
+                        let mut closing = 0usize;
+                        while closing < hashes && end + 1 + closing < length && characters[end + 1 + closing] == '#' {
+                            closing += 1;
+                        }
+                        if closing == hashes {
+                            end += 1 + hashes;
+                            break;
+                        }
+                    }
+                    end += 1;
+                }
+                blank(&mut output, index, end);
+                index = end;
+                continue;
+            }
+        }
+        if character == '"' {
+            let mut end = index + 1;
+            while end < length {
+                if characters[end] == '\\' {
+                    end += 2;
+                    continue;
+                }
+                if characters[end] == '"' {
+                    end += 1;
+                    break;
+                }
+                end += 1;
+            }
+            blank(&mut output, index, end);
+            index = end;
+            continue;
+        }
+        if character == '\'' {
+            // A character literal, not a lifetime: `'a'` or `'\n'`.
+            let escaped = index + 1 < length && characters[index + 1] == '\\';
+            let mut end = index + 1;
+            if escaped {
+                end += 1;
+                while end < length && characters[end] != '\'' && characters[end] != '\n' && end - index < 12 {
+                    end += 1;
+                }
+            } else {
+                end = index + 2;
+            }
+            if end < length && characters[end] == '\'' {
+                blank(&mut output, index, end + 1);
+                index = end + 1;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    output.into_iter().collect()
+}
+
+/// The receiver identifier of a method call whose `.` sits at `dot`.
+///
+/// Walks back over `?`, balanced call/index brackets and whitespace, which is
+/// what makes a multi-line chain (`self\n    .inner\n    .execute(args)`) and a
+/// trailing accessor (`checkout.client_mut()?.execute(...)`) reduce to the same
+/// identifier a single-line call would. A receiver the walk cannot reduce is
+/// reported as `<expression>`, which is not in `NON_TOOL_EXECUTE_RECEIVERS` and
+/// therefore counts as a tool execution.
+fn receiver_identifier(characters: &[char], dot: usize) -> String {
+    let mut index = dot;
+    loop {
+        while index > 0 && characters[index - 1].is_whitespace() {
+            index -= 1;
+        }
+        if index == 0 {
+            return "<expression>".to_string();
+        }
+        let previous = characters[index - 1];
+        if previous == '?' {
+            index -= 1;
+            continue;
+        }
+        if previous == ')' || previous == ']' {
+            let (open, close) = if previous == ')' { ('(', ')') } else { ('[', ']') };
+            let mut depth = 0usize;
+            let mut scan = index - 1;
+            loop {
+                if characters[scan] == close {
+                    depth += 1;
+                } else if characters[scan] == open {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                if scan == 0 {
+                    return "<expression>".to_string();
+                }
+                scan -= 1;
+            }
+            index = scan;
+            continue;
+        }
+        if is_ident_char(previous) {
+            let mut start = index - 1;
+            while start > 0 && is_ident_char(characters[start - 1]) {
+                start -= 1;
+            }
+            return characters[start..index].iter().collect();
+        }
+        return "<expression>".to_string();
+    }
+}
+
+/// The type or trait a UFCS call names: `Tool::execute`, `MessageSendTool::execute`
+/// and `<Self as Tool>::execute` all reduce to one segment.
+fn qualified_path_segment(characters: &[char], colons: usize) -> String {
+    let mut index = colons;
+    while index > 0 && characters[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    if index == 0 {
+        return "<path>".to_string();
+    }
+    let previous = characters[index - 1];
+    if previous == '>' {
+        let mut depth = 0usize;
+        let mut scan = index - 1;
+        loop {
+            if characters[scan] == '>' {
+                depth += 1;
+            } else if characters[scan] == '<' {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            if scan == 0 {
+                return "<path>".to_string();
+            }
+            scan -= 1;
+        }
+        let inner: String = characters[scan + 1..index - 1].iter().collect();
+        let qualified = inner.rsplit(" as ").next().unwrap_or(&inner).trim().to_string();
+        return qualified.rsplit("::").next().unwrap_or(&qualified).trim().to_string();
+    }
+    if is_ident_char(previous) {
+        let mut start = index - 1;
+        while start > 0 && is_ident_char(characters[start - 1]) {
+            start -= 1;
+        }
+        return characters[start..index].iter().collect();
+    }
+    "<path>".to_string()
+}
+
+/// One direct `Tool` execution the scanner found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolExecutionSite {
+    /// `<file>::<enclosing function>`, the inventory key.
+    entry: String,
+    /// The call form, for the failure message: `tool.execute(...)`, UFCS, and so on.
+    form: String,
+    line: usize,
+}
+
+/// Everything one file's production source says about tool execution.
+#[derive(Debug, Default)]
+struct ToolExecutionScan {
+    sites: Vec<ToolExecutionSite>,
+    /// Receivers that matched `NON_TOOL_EXECUTE_RECEIVERS` and were skipped.
+    excluded_receivers: BTreeSet<String>,
+}
+
+/// Find every direct `Tool` execution in one file's production source.
+///
+/// Token-level rather than regex-level: comments and literals are blanked first,
+/// identifiers are matched whole (so `execute_named` never matches inside
+/// `execute_named_with_cancellation`), and the receiver is recovered by walking
+/// the expression backwards. That covers the method form, the two cancellation
+/// twins, UFCS (`Tool::execute(&tool, args)` and `<T as Tool>::execute(...)`) and
+/// call chains broken across lines.
+fn scan_tool_executions(relative: &str, source: &str) -> ToolExecutionScan {
+    let production = strip_cfg_test_items(&blank_comments_and_literals(source));
+    let characters: Vec<char> = production.chars().collect();
+    let lines: Vec<&str> = production.lines().collect();
+    let newlines: Vec<usize> = characters
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, character)| (*character == '\n').then_some(offset))
+        .collect();
+    let mut scan = ToolExecutionScan::default();
+
+    let mut index = 0usize;
+    while index < characters.len() {
+        if !is_ident_char(characters[index]) || (index > 0 && is_ident_char(characters[index - 1])) {
+            index += 1;
+            continue;
+        }
+        let mut end = index;
+        while end < characters.len() && is_ident_char(characters[end]) {
+            end += 1;
+        }
+        let name: String = characters[index..end].iter().collect();
+        if !TOOL_EXECUTION_METHODS.contains(&name.as_str()) {
+            index = end;
+            continue;
+        }
+
+        // A call, not a definition or a path mention: the next significant
+        // character has to open the argument list.
+        let mut after = end;
+        while after < characters.len() && characters[after].is_whitespace() {
+            after += 1;
+        }
+        if after >= characters.len() || characters[after] != '(' {
+            index = end;
+            continue;
+        }
+
+        let mut before = index;
+        while before > 0 && characters[before - 1].is_whitespace() {
+            before -= 1;
+        }
+        let (receiver, form) = if before > 0 && characters[before - 1] == '.' {
+            let receiver = receiver_identifier(&characters, before - 1);
+            let form = format!("{receiver}.{name}(...)");
+            (receiver, form)
+        } else if before > 1 && characters[before - 1] == ':' && characters[before - 2] == ':' {
+            let segment = qualified_path_segment(&characters, before - 2);
+            let form = format!("{segment}::{name}(...)");
+            // A UFCS call has no receiver to exclude: every `Path::execute(...)`
+            // in this tree is a tool execution, and a new non-tool one is a
+            // review event rather than something the scanner may guess about.
+            (String::new(), form)
+        } else {
+            index = end;
+            continue;
+        };
+
+        if !receiver.is_empty()
+            && NON_TOOL_EXECUTE_RECEIVERS
+                .iter()
+                .any(|(candidate, _)| *candidate == receiver)
+        {
+            scan.excluded_receivers.insert(receiver);
+            index = end;
+            continue;
+        }
+
+        let line = newlines.partition_point(|offset| *offset < index);
+        scan.sites.push(ToolExecutionSite {
+            entry: format!("{relative}::{}", enclosing_function(&lines, line)),
+            form,
+            line: line + 1,
+        });
+        index = end;
+    }
+    scan
+}
+
+fn scan_repository_tool_executions() -> ToolExecutionScan {
+    let mut combined = ToolExecutionScan::default();
+    for path in rust_source_files() {
+        let relative = relative_path(&path);
+        let source = fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {relative}: {error}"));
+        let scan = scan_tool_executions(&relative, &source);
+        combined.sites.extend(scan.sites);
+        combined.excluded_receivers.extend(scan.excluded_receivers);
+    }
+    combined
+}
 
 /// The autonomy policy, the approval gate, the published-schema check and the
 /// audit record all live in `ToolExecutionService::execute`. Anything that calls
-/// a `Tool` directly gets none of them, so the set of direct callers is pinned.
+/// a `Tool` directly gets none of them, so the set of direct callers is pinned —
+/// in every call form, not only the two method names the 0.8.127 guard knew.
 #[test]
 fn direct_tool_invocations_outside_the_execution_service_are_allowlisted() {
-    let mut found = Vec::new();
-    for path in rust_source_files() {
-        let source = fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-        let production = strip_cfg_test_items(&source);
-        let lines: Vec<&str> = production.lines().collect();
-        for (index, line) in lines.iter().enumerate() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("//") || trimmed.starts_with("///") {
-                continue;
-            }
-            if !line.contains(".execute_named(") && !line.contains(".execute_named_with_cancellation(") {
-                continue;
-            }
-            found.push(format!(
-                "{}::{}",
-                relative_path(&path),
-                enclosing_function(&lines, index)
-            ));
-        }
-    }
-    found.sort();
-    found.dedup();
+    let scan = scan_repository_tool_executions();
 
-    for entry in &found {
-        assert!(
-            !entry.starts_with("src/gateway/"),
-            "{entry} calls a tool directly. The gateway MCP endpoint was routed through \
-             ToolExecutionService in 0.8.126 precisely so an external caller cannot skip policy, \
-             approval, schema validation and audit; re-adding a direct call there reopens that hole"
-        );
+    let gateway_gates: BTreeSet<&str> = GATEWAY_DIRECT_TOOL_INVOCATION_GATES
+        .iter()
+        .map(|(entry, _)| *entry)
+        .collect();
+    for site in &scan.sites {
+        if site.entry.starts_with("src/gateway/") {
+            assert!(
+                gateway_gates.contains(site.entry.as_str()),
+                "{} line {} calls a tool directly as `{}`. The gateway MCP endpoint was routed \
+                 through ToolExecutionService in 0.8.126 precisely so an external caller cannot \
+                 skip policy, approval, schema validation and audit; a new direct gateway call \
+                 reopens that hole unless GATEWAY_DIRECT_TOOL_INVOCATION_GATES documents the gate \
+                 chain that replaces it",
+                site.entry,
+                site.line,
+                site.form
+            );
+        }
         assert_ne!(
-            entry, "src/agent/agent.rs::execute_tool_call",
+            site.entry, "src/agent/agent.rs::execute_tool_call",
             "Agent::execute_tool_call was the second execution path: it advertised a tool schema \
              to the model and then enforced none of it, with no policy decision and no audit \
              record. It was routed through ToolExecutionService in 0.8.128"
         );
     }
 
+    let mut found: Vec<String> = scan.sites.into_iter().map(|site| site.entry).collect();
+    found.sort();
+    found.dedup();
+
+    let expected: Vec<&str> = ALLOWED_DIRECT_TOOL_INVOCATIONS
+        .iter()
+        .map(|(entry, _)| *entry)
+        .collect();
     assert_inventory(
-        "direct Tool::execute_named call sites outside ToolExecutionService",
+        "direct Tool execution call sites outside ToolExecutionService",
         found,
-        ALLOWED_DIRECT_TOOL_INVOCATIONS,
+        &expected,
     );
+}
+
+/// Every gateway entry documents a gate chain, and every documented gate chain
+/// still describes a call site that exists.
+#[test]
+fn every_gateway_tool_execution_documents_its_alternative_gate() {
+    let scan = scan_repository_tool_executions();
+    let gateway_sites: BTreeSet<String> = scan
+        .sites
+        .iter()
+        .filter(|site| site.entry.starts_with("src/gateway/"))
+        .map(|site| site.entry.clone())
+        .collect();
+
+    for (entry, reason) in GATEWAY_DIRECT_TOOL_INVOCATION_GATES {
+        assert!(
+            gateway_sites.contains(*entry),
+            "{entry} is documented as a gated direct tool execution but no such call site exists \
+             any more; remove the entry instead of leaving a standing exemption"
+        );
+        assert!(
+            reason.contains("gate chain:"),
+            "{entry} must name the gate chain that replaces ToolExecutionService"
+        );
+    }
+
+    let documented: BTreeSet<&str> = GATEWAY_DIRECT_TOOL_INVOCATION_GATES
+        .iter()
+        .map(|(entry, _)| *entry)
+        .collect();
+    let mut undocumented: Vec<&String> = gateway_sites
+        .iter()
+        .filter(|entry| !documented.contains(entry.as_str()))
+        .collect();
+    undocumented.sort();
+    assert!(
+        undocumented.is_empty(),
+        "gateway tool executions without a documented gate chain: {undocumented:?}"
+    );
+}
+
+/// Every allowlisted entry carries a reason, and no entry is listed twice.
+#[test]
+fn direct_tool_invocation_allowlist_entries_carry_a_reason() {
+    let mut seen = BTreeSet::new();
+    for (entry, reason) in ALLOWED_DIRECT_TOOL_INVOCATIONS {
+        assert!(
+            seen.insert(*entry),
+            "{entry} is listed twice in ALLOWED_DIRECT_TOOL_INVOCATIONS"
+        );
+        assert!(
+            reason.len() > 20,
+            "{entry} needs a real reason, not {reason:?}: the allowlist is the architecture record"
+        );
+    }
+}
+
+/// The non-tool receiver list is the only escape hatch in the scanner, so it is
+/// held to the same standard as the allowlist: every entry must still match a
+/// real call site, or it is a wildcard waiting for a tool variable to be named
+/// after it.
+#[test]
+fn non_tool_execute_receivers_are_all_still_in_use() {
+    let scan = scan_repository_tool_executions();
+    let mut stale: Vec<&str> = NON_TOOL_EXECUTE_RECEIVERS
+        .iter()
+        .map(|(receiver, _)| *receiver)
+        .filter(|receiver| !scan.excluded_receivers.contains(*receiver))
+        .collect();
+    stale.sort_unstable();
+    assert!(
+        stale.is_empty(),
+        "these receivers no longer name any `.execute(` call site and must be deleted from \
+         NON_TOOL_EXECUTE_RECEIVERS: {stale:?}"
+    );
+    for (receiver, reason) in NON_TOOL_EXECUTE_RECEIVERS {
+        assert!(
+            reason.len() > 20,
+            "{receiver} needs a reason naming the type whose `execute` this is, not {reason:?}"
+        );
+    }
+}
+
+/// The forms the scanner claims to cover, proven one at a time against a
+/// synthetic gateway file. Each snippet is the mutation a future bypass would
+/// look like; if any of them stops being reported, the guard has a blind spot
+/// and the real-file mutation runs in the receipt would pass for the wrong
+/// reason.
+#[test]
+fn the_scanner_reports_every_supported_tool_execution_form() {
+    let forms: &[(&str, &str)] = &[
+        ("method", "let result = tool.execute(args).await;"),
+        (
+            "cancellation twin",
+            "let result = tool.execute_with_cancellation(args, None).await;",
+        ),
+        ("named", "let result = tool.execute_named(name, args).await;"),
+        (
+            "named cancellation twin",
+            "let result = tool.execute_named_with_cancellation(name, args, None).await;",
+        ),
+        (
+            "UFCS type path",
+            "let result = MessageSendTool::execute(&tool, args).await;",
+        ),
+        ("UFCS trait path", "let result = Tool::execute(&tool, args).await;"),
+        (
+            "UFCS qualified path",
+            "let result = <MessageSendTool as Tool>::execute(&tool, args).await;",
+        ),
+        (
+            "multi-line chain",
+            "let result = state\n        .tool\n        .execute(args)\n        .await;",
+        ),
+        (
+            "multi-line UFCS",
+            "let result = <MessageSendTool as Tool>::execute(\n        &tool,\n        args,\n    )\n    .await;",
+        ),
+        (
+            "whitespace before the argument list",
+            "let result = tool.execute (args).await;",
+        ),
+    ];
+
+    for (label, snippet) in forms {
+        let source = format!("pub async fn post_channel_send() {{\n    {snippet}\n}}\n");
+        let scan = scan_tool_executions("src/gateway/api/channels.rs", &source);
+        assert_eq!(
+            scan.sites.len(),
+            1,
+            "the {label} form was not inventoried: {snippet:?} produced {:?}",
+            scan.sites
+        );
+        assert_eq!(
+            scan.sites[0].entry, "src/gateway/api/channels.rs::post_channel_send",
+            "the {label} form was attributed to the wrong function"
+        );
+    }
+}
+
+/// The scanner must not invent call sites out of prose, and must not stop
+/// scanning a file because a literal mentioned a brace or a quote.
+#[test]
+fn the_scanner_ignores_comments_literals_and_test_modules() {
+    let source = r##"
+/// Doc comment: this endpoint used to call tool.execute(args) directly.
+pub async fn post_channel_send() {
+    // tool.execute(args)
+    let sql = "tool.execute(args)";
+    let raw = r#"tool.execute_named("send", args)"#;
+    let brace = '{';
+    let _ = (sql, raw, brace);
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn direct_call_is_fine_in_a_test() {
+        let _ = tool.execute(args).await;
+    }
+}
+"##;
+    let scan = scan_tool_executions("src/gateway/api/channels.rs", source);
+    assert!(
+        scan.sites.is_empty(),
+        "comments, literals and `#[cfg(test)]` modules must not be inventoried: {:?}",
+        scan.sites
+    );
+
+    let real = format!("{source}\npub async fn later() {{\n    let _ = tool.execute(args).await;\n}}\n");
+    let scan = scan_tool_executions("src/gateway/api/channels.rs", &real);
+    assert_eq!(
+        scan.sites.len(),
+        1,
+        "a literal must not end the scan early: {:?}",
+        scan.sites
+    );
+}
+
+/// The escape hatch is exactly as wide as `NON_TOOL_EXECUTE_RECEIVERS` says.
+#[test]
+fn only_listed_non_tool_receivers_escape_the_inventory() {
+    let source =
+        "pub async fn handler() {\n    conn.execute(sql, params)?;\n    let _ = database.execute(sql, params)?;\n}\n";
+    let scan = scan_tool_executions("src/gateway/api/channels.rs", source);
+    assert_eq!(
+        scan.sites.len(),
+        1,
+        "an unlisted receiver must fail closed and appear in the inventory: {:?}",
+        scan.sites
+    );
+    assert_eq!(scan.sites[0].form, "database.execute(...)");
+    assert!(scan.excluded_receivers.contains("conn"));
 }

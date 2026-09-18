@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.146] - 18 September 2026
+
+### Changed
+
+- The architecture guard in `tests/architecture_boundaries.rs` now inventories
+  every direct `Tool` execution form (`execute`, the cancellation variants,
+  `execute_named*`, UFCS and fully qualified calls, multi-line chains) with a
+  token-level scanner that blanks comments and string literals first. Every
+  call site outside `ToolExecutionService` must appear in an explicit allowlist
+  with its reason, and every gateway call site must document the gate chain
+  that replaces the service (`GATEWAY_DIRECT_TOOL_INVOCATION_GATES`), which now
+  records both `post_channel_send` and `post_config_reload`. No production
+  code was rerouted.
+
 ## [0.8.145] - 18 September 2026
 
 ### Fixed
