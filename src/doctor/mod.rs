@@ -1782,18 +1782,64 @@ fn daemon_path_skipped(msg: impl Into<String>) -> DiagItem {
     DiagItem::with_state(Severity::Ok, DiagnosticState::Unknown, DAEMON_PATH_CATEGORY, msg)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn canonical_or_owned(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Directories the daemon PATH must contain for a shell tool to resolve `prx`:
-/// the directory this doctor binary runs from, plus `~/.cargo/bin` when it
-/// exists (the default `cargo install` target).
-fn required_daemon_path_dirs() -> Vec<PathBuf> {
+/// True for a Cargo build output directory (`…/target/debug`,
+/// `…/target/release`, `…/target/<triple>/debug/deps`, …).
+///
+/// Such a directory must never enter the required set: `cargo run -- doctor`,
+/// `./target/release/prx doctor` and one-shot CI copies all run from one, and
+/// the repair text would then tell the operator to put a build directory on the
+/// daemon's `PATH` — an operational step that outlives the build tree.
+#[cfg(any(target_os = "linux", test))]
+fn is_cargo_build_dir(path: &Path) -> bool {
+    let parts: Vec<&std::ffi::OsStr> = path.components().map(std::path::Component::as_os_str).collect();
+    let Some(target_at) = parts.iter().rposition(|part| *part == "target") else {
+        return false;
+    };
+    parts
+        .iter()
+        .skip(target_at + 1)
+        .any(|part| *part == "debug" || *part == "release")
+}
+
+/// The deployed daemon binary as the daemon itself recorded it in
+/// `daemon_state.json`, when that field is present.
+///
+/// This is the authoritative answer to "which directory must the daemon's PATH
+/// contain": it is the daemon's own binary, not the doctor's.
+#[cfg(any(target_os = "linux", test))]
+fn daemon_binary_from_state(config: &Config) -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(crate::daemon::state_file_path(config)).ok()?;
+    let snapshot: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let recorded = snapshot.get("binary_path").and_then(serde_json::Value::as_str)?;
+    let trimmed = recorded.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+/// Directories the daemon PATH must contain for a shell tool to resolve `prx`.
+///
+/// The daemon's own binary directory (from `daemon_state.json`) when it is
+/// recorded, otherwise this doctor's directory as a best-effort stand-in — and
+/// then only when it is not a build output directory. Plus `~/.cargo/bin` when
+/// it exists, the default `cargo install` target.
+#[cfg(any(target_os = "linux", test))]
+fn required_daemon_path_dirs(daemon_binary: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(current) = std::env::current_exe() {
-        if let Some(parent) = current.parent() {
-            dirs.push(canonical_or_owned(parent));
+    let recorded_parent = daemon_binary.and_then(Path::parent).map(canonical_or_owned);
+    if let Some(parent) = recorded_parent {
+        dirs.push(parent);
+    } else if let Ok(current) = std::env::current_exe() {
+        if let Some(parent) = current.parent().map(canonical_or_owned) {
+            if !is_cargo_build_dir(&parent) {
+                dirs.push(parent);
+            }
         }
     }
     if let Some(home) = directories::UserDirs::new().map(|user| user.home_dir().to_path_buf()) {
@@ -1811,7 +1857,31 @@ fn required_daemon_path_dirs() -> Vec<PathBuf> {
     unique
 }
 
+/// True when a process identity (its `exe` link and/or its `cmdline` payload)
+/// belongs to a prx binary.
+///
+/// Only the *file name* is matched, never the whole path: a prx checkout lives
+/// in a directory called `prx`, so a path match would call every process
+/// started from that tree a daemon.
+#[cfg(any(target_os = "linux", test))]
+fn process_identity_looks_like_prx(exe: Option<&Path>, cmdline: &[u8]) -> bool {
+    let named_prx = |path: &Path| {
+        path.file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.contains("prx"))
+    };
+    if exe.is_some_and(named_prx) {
+        return true;
+    }
+    cmdline
+        .split(|byte| *byte == 0)
+        .find(|entry| !entry.is_empty())
+        .and_then(|argv0| std::str::from_utf8(argv0).ok())
+        .is_some_and(|argv0| named_prx(Path::new(argv0)))
+}
+
 /// Extract `PATH` from a NUL-separated `/proc/<pid>/environ` payload.
+#[cfg(any(target_os = "linux", test))]
 fn daemon_path_from_environ(bytes: &[u8]) -> Option<String> {
     bytes
         .split(|byte| *byte == 0)
@@ -1819,6 +1889,7 @@ fn daemon_path_from_environ(bytes: &[u8]) -> Option<String> {
         .find_map(|entry| entry.strip_prefix("PATH=").map(str::to_owned))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn path_contains_dir(path: &str, dir: &Path) -> bool {
     std::env::split_paths(path)
         .filter(|entry| !entry.as_os_str().is_empty())
@@ -1827,6 +1898,7 @@ fn path_contains_dir(path: &str, dir: &Path) -> bool {
 
 /// Pure judgement over a daemon PATH value, so the decision is testable
 /// without a live daemon.
+#[cfg(any(target_os = "linux", test))]
 fn evaluate_daemon_path(path: &str, required_dirs: &[PathBuf]) -> DiagItem {
     let missing: Vec<String> = required_dirs
         .iter()
@@ -1857,6 +1929,7 @@ fn evaluate_daemon_path(path: &str, required_dirs: &[PathBuf]) -> DiagItem {
     )
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn evaluate_daemon_environ(bytes: &[u8], required_dirs: &[PathBuf]) -> DiagItem {
     daemon_path_from_environ(bytes).map_or_else(
         || {
@@ -1884,6 +1957,20 @@ fn read_daemon_environ(pid: u32) -> std::io::Result<Vec<u8>> {
     std::fs::read(format!("/proc/{pid}/environ"))
 }
 
+/// Best-effort ownership check for the pid recorded in `daemon_state.json`.
+///
+/// A pid outlives the daemon that wrote it: after a crash the number is reused
+/// by an unrelated process, and reading *that* process' environment would make
+/// `prx doctor` judge the daemon PATH from a stranger's `PATH`. Unreadable
+/// `/proc` entries (the process is gone, or is owned by another user) answer
+/// `false`, which routes the check to its skip branch rather than a verdict.
+#[cfg(target_os = "linux")]
+fn pid_belongs_to_prx(pid: u32) -> bool {
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    process_identity_looks_like_prx(exe.as_deref(), &cmdline)
+}
+
 fn check_daemon_process_path(config: &Config, items: &mut Vec<DiagItem>) {
     let Some(pid) = daemon_pid_from_state(config) else {
         items.push(daemon_path_skipped(
@@ -1893,11 +1980,19 @@ fn check_daemon_process_path(config: &Config, items: &mut Vec<DiagItem>) {
     };
 
     #[cfg(target_os = "linux")]
-    match read_daemon_environ(pid) {
-        Ok(bytes) => items.push(evaluate_daemon_environ(&bytes, &required_daemon_path_dirs())),
-        Err(error) => items.push(daemon_path_skipped(format!(
-            "cannot read /proc/{pid}/environ ({error}); skipped daemon PATH inspection"
-        ))),
+    if pid_belongs_to_prx(pid) {
+        let required = required_daemon_path_dirs(daemon_binary_from_state(config).as_deref());
+        match read_daemon_environ(pid) {
+            Ok(bytes) => items.push(evaluate_daemon_environ(&bytes, &required)),
+            Err(error) => items.push(daemon_path_skipped(format!(
+                "cannot read /proc/{pid}/environ ({error}); skipped daemon PATH inspection"
+            ))),
+        }
+    } else {
+        items.push(daemon_path_skipped(format!(
+            "daemon state pid {pid} is not a live prx process (pid reuse or a stopped daemon); \
+             skipped reading /proc/{pid}/environ"
+        )));
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -2970,6 +3065,136 @@ mod tests {
             "warn message must carry the systemd fix, got: {}",
             item.message
         );
+    }
+
+    /// `prx doctor` is very often run from a build tree (`cargo run -- doctor`,
+    /// `./target/release/prx doctor`, a one-shot CI copy). Requiring the
+    /// doctor's own directory there produced a warning about a healthy daemon
+    /// *and* told the operator to put a build directory on the unit's PATH.
+    ///
+    /// MUTATION GUARD: drop the `is_cargo_build_dir` filter and this fails,
+    /// because the test binary itself lives in `target/debug/deps`.
+    #[test]
+    fn a_doctor_running_from_a_build_directory_never_demands_it_on_the_daemon_path() {
+        let required = required_daemon_path_dirs(None);
+        assert!(
+            required.iter().all(|dir| !is_cargo_build_dir(dir)),
+            "a build output directory must never be proposed for a systemd unit: {required:?}"
+        );
+        let item = evaluate_daemon_path("/usr/local/bin:/usr/bin:/bin", &required);
+        assert!(
+            !item.message.contains("target/debug"),
+            "the repair text must not name a build directory: {}",
+            item.message
+        );
+    }
+
+    /// The directory that actually matters is the daemon's, and the daemon
+    /// records it. When it does, the doctor's own location is irrelevant.
+    #[test]
+    fn the_required_directory_comes_from_the_daemon_binary_the_state_file_records() {
+        let required = required_daemon_path_dirs(Some(Path::new("/usr/local/bin/prx")));
+        assert!(
+            required.contains(&canonical_or_owned(Path::new("/usr/local/bin"))),
+            "the daemon's own directory must be required: {required:?}"
+        );
+        assert!(
+            required.iter().all(|dir| !is_cargo_build_dir(dir)),
+            "a recorded daemon binary replaces the doctor's own directory: {required:?}"
+        );
+
+        let complete = required
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect::<Vec<_>>()
+            .join(":");
+        let item = evaluate_daemon_path(&complete, &required);
+        assert_eq!(
+            item.severity,
+            Severity::Ok,
+            "a PATH that holds every required directory is healthy: {}",
+            item.message
+        );
+
+        let item = evaluate_daemon_path("/usr/bin:/bin", &required);
+        assert_eq!(item.severity, Severity::Warn);
+        assert!(
+            item.message.contains("/usr/local/bin"),
+            "a PATH without the daemon's own directory must name it: {}",
+            item.message
+        );
+    }
+
+    #[test]
+    fn the_daemon_binary_is_read_back_from_the_state_file_when_it_is_recorded() {
+        let temp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.config_path = temp.path().join("config.toml");
+        assert_eq!(daemon_binary_from_state(&config), None, "no state file, no answer");
+
+        std::fs::write(
+            temp.path().join("daemon_state.json"),
+            br#"{"pid":1,"binary_path":"/usr/local/bin/prx"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            daemon_binary_from_state(&config),
+            Some(PathBuf::from("/usr/local/bin/prx"))
+        );
+
+        std::fs::write(
+            temp.path().join("daemon_state.json"),
+            br#"{"pid":1,"binary_path":"  "}"#,
+        )
+        .unwrap();
+        assert_eq!(daemon_binary_from_state(&config), None, "a blank field is not a path");
+    }
+
+    #[test]
+    fn cargo_build_directories_are_recognized_and_ordinary_bin_directories_are_not() {
+        for build in [
+            "/opt/worker/code/prx/target/debug",
+            "/opt/worker/code/prx/target/debug/deps",
+            "/opt/worker/code/prx/target/release",
+            "/opt/worker/code/prx/target/x86_64-unknown-linux-gnu/release",
+        ] {
+            assert!(
+                is_cargo_build_dir(Path::new(build)),
+                "must be a build directory: {build}"
+            );
+        }
+        for deployed in ["/usr/local/bin", "/home/ck/.cargo/bin", "/opt/prx/target", "/srv/debug"] {
+            assert!(
+                !is_cargo_build_dir(Path::new(deployed)),
+                "must not be mistaken for a build directory: {deployed}"
+            );
+        }
+    }
+
+    /// A pid outlives the daemon that wrote it. Reading the environment of
+    /// whatever process inherited the number judges the daemon PATH from a
+    /// stranger's environment.
+    #[test]
+    fn only_a_process_that_is_prx_is_treated_as_the_daemon() {
+        assert!(process_identity_looks_like_prx(
+            Some(Path::new("/usr/local/bin/prx")),
+            b""
+        ));
+        assert!(process_identity_looks_like_prx(
+            Some(Path::new("/usr/local/bin/prx-node")),
+            b""
+        ));
+        assert!(process_identity_looks_like_prx(
+            None,
+            b"/usr/local/bin/prx\x00daemon\x00"
+        ));
+        assert!(!process_identity_looks_like_prx(Some(Path::new("/usr/bin/sleep")), b""));
+        assert!(!process_identity_looks_like_prx(None, b"/usr/bin/sleep\x00600\x00"));
+        assert!(
+            !process_identity_looks_like_prx(Some(Path::new("/opt/worker/code/prx/target/debug/other")), b""),
+            "a checkout directory called prx is not a prx process"
+        );
+        assert!(!process_identity_looks_like_prx(None, b""), "no evidence is not a yes");
     }
 
     #[test]

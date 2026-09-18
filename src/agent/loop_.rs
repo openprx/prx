@@ -119,6 +119,16 @@ fn append_corrective_aside(messages: &mut Vec<ChatMessage>, instruction: &str) {
     }
 }
 
+/// True when a tool result string reports work that actually happened.
+///
+/// The executor renders refusals as `Denied ...` and failures as `Error ...`;
+/// everything else is a result the model may legitimately talk about. Single
+/// source of truth for both the hook payload's `success` flag and the
+/// fabricated-marker guard's "did this turn really run a tool" question.
+pub(crate) fn tool_result_is_success(result: &str) -> bool {
+    !(result.starts_with("Error") || result.starts_with("Denied"))
+}
+
 pub(crate) fn is_empty_assistant_response(text: &str, has_tool_calls: bool) -> bool {
     text.trim().is_empty() && !has_tool_calls
 }
@@ -172,6 +182,77 @@ pub(crate) fn strip_fabricated_tool_markers(text: &str) -> Cow<'_, str> {
     stripped.drain(..leading);
     stripped.truncate(stripped.trim_end().len());
     Cow::Owned(stripped)
+}
+
+/// Remove fabricated `[Used tools: ...]` fragments that sit *inside* a line.
+///
+/// The line-level strip above cannot see a marker once the quoting preambles
+/// have flattened a stored turn into a single prompt line
+/// (`neutralize_quoted_content` replaces every `\n` with a space), which is
+/// exactly the shape the persisted assistant rows take on their way back into
+/// `[Current session context]`. Only a bracketed fragment that starts with
+/// `[Used tools:`, names at least one tool and closes on the same line is
+/// dropped; every other bracketed text is left byte-for-byte alone, so quoting
+/// prose or media markers cannot be mangled. Whitespace around the removed
+/// fragment is collapsed to a single separator so the sentence still reads.
+pub(crate) fn strip_inline_fabricated_tool_markers(text: &str) -> Cow<'_, str> {
+    const MARKER_PREFIX: &str = "[Used tools:";
+
+    if !text.contains(MARKER_PREFIX) {
+        return Cow::Borrowed(text);
+    }
+
+    let mut kept = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut stripped_any = false;
+    while let Some(start) = rest.find(MARKER_PREFIX) {
+        let after_prefix = &rest[start + MARKER_PREFIX.len()..];
+        let Some(close) = after_prefix.find(']') else {
+            break;
+        };
+        let tool_names = &after_prefix[..close];
+        if tool_names.trim().is_empty() || tool_names.contains(['\n', '\r']) {
+            // Not a marker (empty list, or the bracket spans a line break):
+            // keep it verbatim and resume scanning after the prefix.
+            kept.push_str(&rest[..start + MARKER_PREFIX.len()]);
+            rest = after_prefix;
+            continue;
+        }
+        kept.push_str(&rest[..start]);
+        while kept.ends_with([' ', '\t']) {
+            kept.pop();
+        }
+        rest = after_prefix[close + 1..].trim_start_matches([' ', '\t']);
+        stripped_any = true;
+        let needs_separator = !kept.is_empty()
+            && !kept.ends_with('\n')
+            && !rest.is_empty()
+            && !rest.starts_with(['\n', '.', ',', ';', ':', '!', '?', ')']);
+        if needs_separator {
+            kept.push(' ');
+        }
+    }
+
+    if !stripped_any {
+        return Cow::Borrowed(text);
+    }
+    kept.push_str(rest);
+    Cow::Owned(kept)
+}
+
+/// Strip fabricated tool markers from content that is about to be *quoted*
+/// back into a prompt (session/shared event preambles, document evidence,
+/// recalled cold pages).
+///
+/// Quoted content is flattened to one line on the way in, so both grains are
+/// needed: whole marker lines first (they carry no other content and should
+/// leave no blank line behind), then the in-line remnants the flattening would
+/// otherwise hide from the line-level detector.
+pub(crate) fn strip_quoted_fabricated_tool_markers(text: &str) -> Cow<'_, str> {
+    match strip_fabricated_tool_markers(text) {
+        Cow::Borrowed(borrowed) => strip_inline_fabricated_tool_markers(borrowed),
+        Cow::Owned(owned) => Cow::Owned(strip_inline_fabricated_tool_markers(&owned).into_owned()),
+    }
 }
 
 /// Strip fabricated tool markers from assistant turns of a replayed history.
@@ -2892,8 +2973,11 @@ async fn recall_context_pages(
             continue;
         }
         // A page is a verbatim transcript of older turns: its media markers
-        // belong to those turns, not to the one being assembled now.
-        let quoted = crate::multimodal::neutralize_media_markers(result.chunk.content.trim());
+        // belong to those turns, not to the one being assembled now, and any
+        // fabricated `[Used tools: ...]` those turns carried must not be handed
+        // back to the model as something it once did.
+        let unfabricated = strip_quoted_fabricated_tool_markers(result.chunk.content.trim());
+        let quoted = crate::multimodal::neutralize_media_markers(&unfabricated);
         let snippet = truncate_with_ellipsis(&quoted, COMPACTION_MAX_SUMMARY_CHARS);
         let source_line = page_source_line(&result.chunk.created_at);
         let _ = write!(recalled, "\n\n---\n{source_line}\n{snippet}");
@@ -3009,6 +3093,22 @@ fn neutralize_quoted_content(content: &str) -> String {
     crate::multimodal::neutralize_media_markers(content).replace('\n', " ")
 }
 
+/// Trim a quoted turn and, when it was authored by the assistant, drop the
+/// fabricated `[Used tools: ...]` markers the persisted rows still carry.
+///
+/// The strip must happen *before* `neutralize_quoted_content`, which flattens
+/// the content to one line: after flattening, a marker that used to own a whole
+/// line is in-line and the line-level detector can no longer see it. User turns
+/// are never rewritten — an operator quoting the marker back is real content.
+fn quoted_event_content<'a>(role: &str, content: &'a str) -> Cow<'a, str> {
+    let trimmed = content.trim();
+    if role == "assistant" {
+        strip_quoted_fabricated_tool_markers(trimmed)
+    } else {
+        Cow::Borrowed(trimmed)
+    }
+}
+
 #[allow(dead_code)]
 fn format_shared_event_line(event: &MessageEvent) -> String {
     let channel = event.channel.as_deref().unwrap_or("unknown");
@@ -3018,7 +3118,7 @@ fn format_shared_event_line(event: &MessageEvent) -> String {
         .or(event.agent_id.as_deref())
         .or(event.persona_id.as_deref())
         .unwrap_or("unknown");
-    let mut content = neutralize_quoted_content(event.content.trim());
+    let mut content = neutralize_quoted_content(&quoted_event_content(&event.role, &event.content));
     if content.len() > MAX_MEMORY_ENTRY_BYTES {
         let end = content.floor_char_boundary(MAX_MEMORY_ENTRY_BYTES);
         content = format!("{}...", content.get(..end).unwrap_or_default());
@@ -3034,7 +3134,7 @@ fn format_session_event_line(event: &MessageEvent) -> String {
         .or(event.agent_id.as_deref())
         .or(event.persona_id.as_deref())
         .unwrap_or("unknown");
-    let mut content = neutralize_quoted_content(event.content.trim());
+    let mut content = neutralize_quoted_content(&quoted_event_content(&event.role, &event.content));
     if content.len() > MAX_MEMORY_ENTRY_BYTES {
         let end = content.floor_char_boundary(MAX_MEMORY_ENTRY_BYTES);
         content = format!("{}...", content.get(..end).unwrap_or_default());
@@ -3122,7 +3222,7 @@ fn build_current_session_events_preamble(
 
 #[allow(dead_code)]
 fn format_session_turn_line(turn: &ConversationTurn) -> String {
-    let mut content = neutralize_quoted_content(turn.content.trim());
+    let mut content = neutralize_quoted_content(&quoted_event_content(&turn.role, &turn.content));
     if content.len() > MAX_MEMORY_ENTRY_BYTES {
         let end = content.floor_char_boundary(MAX_MEMORY_ENTRY_BYTES);
         content = format!("{}...", content.get(..end).unwrap_or_default());
@@ -3157,7 +3257,10 @@ fn build_current_session_preamble(turns: &[ConversationTurn], user_msg: &str) ->
 
 fn format_document_result_line(result: &DocumentSearchResult) -> String {
     let chunk = &result.chunk;
-    let mut content = neutralize_quoted_content(chunk.content.trim());
+    // A document chunk can be an evicted context page, i.e. a verbatim
+    // transcript of earlier assistant turns; the same fabricated markers must
+    // not ride back in through document evidence either.
+    let mut content = neutralize_quoted_content(&strip_quoted_fabricated_tool_markers(chunk.content.trim()));
     if content.len() > MAX_MEMORY_ENTRY_BYTES {
         let end = content.floor_char_boundary(MAX_MEMORY_ENTRY_BYTES);
         content = format!("{}...", content.get(..end).unwrap_or_default());
@@ -7243,10 +7346,16 @@ async fn run_tool_call_loop_outcome_unguarded(
 
                 // Preserve native tool call IDs in assistant history so role=tool
                 // follow-up messages can reference the exact call id.
+                // A model can write `[Used tools: ...]` in the very same
+                // response that carries real tool calls; that text goes to
+                // history untouched by the final-reply guard below (which only
+                // sees turns without tool calls), so strip it here before it can
+                // be replayed, compacted or summarized.
+                let history_text = strip_fabricated_tool_markers(&response_text);
                 let assistant_history_content = if resp.tool_calls.is_empty() {
-                    response_text.clone()
+                    history_text.into_owned()
                 } else {
-                    build_native_assistant_history(&response_text, &resp.tool_calls, resp.reasoning_content.as_deref())
+                    build_native_assistant_history(&history_text, &resp.tool_calls, resp.reasoning_content.as_deref())
                 };
 
                 let native_calls = resp.tool_calls;
@@ -7649,9 +7758,6 @@ async fn run_tool_call_loop_outcome_unguarded(
         // to, so a replay repeated every one of them.
         history.push(ChatMessage::assistant(assistant_history_content));
         let executed = ExecutedToolRecords::new(history, &recorder, &tool_calls, &native_tool_calls);
-        // From here on this turn has a real tool batch on the wire, so a later
-        // `[Used tools: ...]` line is no longer provably fabricated.
-        executed_any_tool_call = true;
 
         let individual_results = execute_tools_with_service(
             &tool_calls,
@@ -7666,6 +7772,15 @@ async fn run_tool_call_loop_outcome_unguarded(
         .await?;
         let tools_elapsed_ms = tools_started_at.elapsed().as_millis() as u64;
 
+        // Only a batch that actually produced a result counts as real tool use.
+        // Dispatching is not enough: a batch whose every call was denied by the
+        // permission layer or the idempotency ledger did no work, so a later
+        // `[Used tools: ...]` line is still provably fabricated and still worth
+        // the one corrective retry.
+        if individual_results.iter().any(|result| tool_result_is_success(result)) {
+            executed_any_tool_call = true;
+        }
+
         // FIX-P2-02: persistence (untrusted external copy + oversized tool_output
         // document) happens exactly once per tool result, in this loop, for every
         // mode. The native-history branch below reuses the document status captured
@@ -7673,7 +7788,7 @@ async fn run_tool_call_loop_outcome_unguarded(
         let mut document_statuses: Vec<&'static str> = Vec::with_capacity(individual_results.len());
         let mut repeated_unrecoverable: Option<String> = None;
         for (call, result) in tool_calls.iter().zip(individual_results.iter()) {
-            let success = !(result.starts_with("Error") || result.starts_with("Denied"));
+            let success = tool_result_is_success(result);
             hooks
                 .emit(
                     HookEvent::ToolCall,
@@ -11214,6 +11329,33 @@ mod tests {
 
         fn as_any(&self) -> &dyn std::any::Any {
             self
+        }
+    }
+
+    /// A tool that refuses every call, the way a permission decision or an
+    /// idempotency ledger does: the batch is dispatched, and nothing runs.
+    struct RefusingTool;
+
+    #[async_trait]
+    impl Tool for RefusingTool {
+        fn name(&self) -> &str {
+            "refusing_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Refuses every call"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("refused by policy".to_string()),
+            })
         }
     }
 
@@ -15974,6 +16116,159 @@ ls -la
         );
     }
 
+    /// The 150 persisted assistant turns that started the fabrication are still
+    /// in the message fabric, and the session preamble quotes them into every
+    /// prompt. A marker that reaches the model that way is the same claim about
+    /// work that never happened as one the model just wrote, so it must not
+    /// survive the quoting — in either preamble, and in either grain (the
+    /// preamble flattens content to one line, which turns a whole marker line
+    /// into an in-line fragment on the way in).
+    ///
+    /// MUTATION GUARD: drop the strip from `quoted_event_content` and both
+    /// assistant assertions fail with `[Used tools:` in the preamble.
+    #[test]
+    fn a_persisted_fabricated_marker_never_reaches_the_prompt_through_a_preamble() {
+        let principal = MemoryPrincipal {
+            workspace_id: "workspace-a".to_string(),
+            agent_id: None,
+            persona_id: None,
+            session_key: Some("chat:canonical".to_string()),
+            channel: Some("terminal".to_string()),
+            sender: Some("local-user".to_string()),
+            owner_id: None,
+            legacy_session_key: None,
+        };
+        let events = vec![
+            preamble_event(
+                Some("chat:canonical"),
+                "assistant",
+                "Root is at 41%.\n[Used tools: shell, session_status]",
+            ),
+            preamble_event(
+                Some("chat:canonical"),
+                "assistant",
+                "Disk looks fine. [Used tools: shell] Nothing else to report.",
+            ),
+            preamble_event(Some("chat:canonical"), "user", "stop writing [Used tools: shell] at me"),
+            preamble_event(Some("gateway:external:1"), "assistant", "Deployed. [Used tools: shell]"),
+        ];
+
+        let current = build_current_session_events_preamble(&principal, &events, "and the logs?");
+        let assistant_lines = |preamble: &str| {
+            preamble
+                .lines()
+                .filter(|line| line.starts_with("- [assistant"))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            !assistant_lines(&current).contains("[Used tools:"),
+            "a persisted fabricated marker must not reach the prompt through the session preamble: {current}"
+        );
+        assert!(
+            current.contains("Root is at 41%.") && current.contains("Nothing else to report."),
+            "only the marker is dropped; the answer the model really gave stays: {current}"
+        );
+        assert!(
+            current.contains("stop writing [Used tools: shell] at me"),
+            "an operator quoting the marker back is real conversation content: {current}"
+        );
+
+        let shared = build_shared_events_preamble(&principal, &events);
+        assert!(
+            !shared.contains("[Used tools:"),
+            "the shared-events preamble replays other sessions' assistant turns too: {shared}"
+        );
+        assert!(
+            shared.contains("Deployed."),
+            "the content itself must survive: {shared}"
+        );
+    }
+
+    /// The same guarantee for the other two quoting surfaces: a turn replayed
+    /// from `conversation_turns`, and a document chunk (an evicted context page
+    /// is a verbatim transcript of earlier assistant turns).
+    #[test]
+    fn quoted_turns_and_document_chunks_drop_fabricated_markers_too() {
+        let turn = |role: &str, content: &str| ConversationTurn {
+            id: 0,
+            session_key: "chat:canonical".to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            timestamp: "2026-03-05T00:00:00Z".to_string(),
+            message_id: None,
+        };
+        let turns = vec![
+            turn("assistant", "Cleaned up. [Used tools: shell, file_write]"),
+            turn("user", "why do you keep writing [Used tools: shell]"),
+        ];
+        let preamble = build_current_session_preamble(&turns, "what now?");
+        assert!(
+            preamble.contains("Cleaned up.") && !preamble.contains("[Used tools: shell, file_write]"),
+            "a replayed assistant turn must lose its marker: {preamble}"
+        );
+        assert!(
+            preamble.contains("why do you keep writing [Used tools: shell]"),
+            "a user turn is never rewritten: {preamble}"
+        );
+
+        let chunk = DocumentSearchResult {
+            chunk: crate::memory::traits::DocumentChunkRecord {
+                id: 1,
+                chunk_id: "chunk-1".to_string(),
+                document_id: "context-page:session:1".to_string(),
+                workspace_id: "workspace-a".to_string(),
+                owner_id: None,
+                topic_id: None,
+                task_id: None,
+                chunk_index: 0,
+                heading: None,
+                content: "assistant: Rebuilt the index.\n[Used tools: shell]".to_string(),
+                content_sha256: String::new(),
+                source_anchor: "page-1".to_string(),
+                token_estimate: 8,
+                created_at: "2026-03-05T00:00:00Z".to_string(),
+            },
+            score: 1.0,
+            source_kind: Some("context_page".to_string()),
+        };
+        let line = format_document_result_line(&chunk);
+        assert!(
+            line.contains("Rebuilt the index.") && !line.contains("[Used tools:"),
+            "an evicted context page quotes earlier assistant turns verbatim: {line}"
+        );
+    }
+
+    #[test]
+    fn strip_inline_fabricated_tool_markers_only_touches_the_marker() {
+        assert_eq!(
+            strip_inline_fabricated_tool_markers("Root is at 41%. [Used tools: shell, session_status]").as_ref(),
+            "Root is at 41%."
+        );
+        assert_eq!(
+            strip_inline_fabricated_tool_markers("A [Used tools: shell] B [Used tools: gateway] C").as_ref(),
+            "A B C"
+        );
+        assert_eq!(strip_inline_fabricated_tool_markers("[Used tools: shell]").as_ref(), "");
+        for untouched in [
+            "Plain answer.",
+            "[Used tools:]",
+            "[Used tools: ]",
+            "Used tools: shell",
+            "See [1] and [note: unrelated] plus [Used tools] alone.",
+            "[Used tools: shell\nstill going]",
+            "[IMAGE:/tmp/a.png] stays",
+        ] {
+            let result = strip_inline_fabricated_tool_markers(untouched);
+            assert!(
+                matches!(result, Cow::Borrowed(_)),
+                "a text without an in-line marker must not allocate: {untouched:?}"
+            );
+            assert_eq!(result.as_ref(), untouched);
+        }
+    }
+
     #[test]
     fn compact_tool_result_for_history_emits_document_reference_for_large_output() {
         let content = format!(
@@ -16916,6 +17211,49 @@ Let me check the result."#;
             recalled.content.contains("ZEBRA-PANGOLIN-42"),
             "recalled page must preserve full content verbatim, got: {}",
             &recalled.content[..recalled.content.len().min(200)]
+        );
+    }
+
+    /// A recalled page is a verbatim transcript of earlier turns, so it can carry
+    /// the very `[Used tools: ...]` lines that were written before 0.8.137
+    /// stopped them. Handing one back to the model is the same fabricated claim
+    /// arriving by a slower route.
+    ///
+    /// MUTATION GUARD: drop the `strip_quoted_fabricated_tool_markers` call in
+    /// `recall_context_pages` and this goes red.
+    #[tokio::test]
+    async fn os_paging_recall_strips_fabricated_tool_markers_from_the_page_body() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().to_string_lossy().to_string();
+        let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let envelope = RuntimeEnvelope::agent(workspace, "run-paging-marker-strip");
+        let runtime = DocumentIngestRuntime::from_envelope(mem, &envelope);
+
+        let config = paging_test_config(true);
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("ZEBRA-PANGOLIN disk check please. ".repeat(60)),
+            ChatMessage::assistant(format!(
+                "{}\n[Used tools: shell, session_status]",
+                "ZEBRA-PANGOLIN root is at 41 percent. ".repeat(60)
+            )),
+            ChatMessage::user("latest question please summarize"),
+        ];
+        assert!(apply_os_paging(&mut history, &config, Some(&runtime)).await.unwrap());
+
+        let recalled = recall_context_pages("ZEBRA-PANGOLIN disk check", &config, Some(&runtime))
+            .await
+            .expect("evicted page should be recalled");
+
+        assert!(
+            !recalled.content.contains("[Used tools:"),
+            "a cold page must not carry a fabricated tool-use claim back into the prompt: {}",
+            recalled.content
+        );
+        assert!(
+            recalled.content.contains("ZEBRA-PANGOLIN root is at 41 percent."),
+            "only the marker is dropped; the page itself is still recalled: {}",
+            recalled.content
         );
     }
 
@@ -18022,20 +18360,20 @@ Let me check the result."#;
                     text: None,
                     tool_calls: vec![ToolCall {
                         id: "call-1".to_string(),
-                        name: "noop_tool".to_string(),
+                        name: "file_read".to_string(),
                         arguments: "{}".to_string(),
                     }],
                     reasoning_content: None,
                 },
                 ChatResponse {
-                    text: Some("The check ran.\n[Used tools: noop_tool]".to_string()),
+                    text: Some("The check ran.\n[Used tools: file_read]".to_string()),
                     tool_calls: Vec::new(),
                     reasoning_content: None,
                 },
             ]);
             let remaining = Arc::clone(&provider.responses);
             let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingTool {
-                name: "noop_tool".to_string(),
+                name: "file_read".to_string(),
                 execution_order: Arc::clone(&execution_order),
             })];
             let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("run the check")];
@@ -18076,11 +18414,173 @@ Let me check the result."#;
                 "the turn must really have dispatched a tool batch: {history:?}"
             );
             assert_eq!(
+                execution_order
+                    .lock()
+                    .expect("execution order lock should be valid")
+                    .as_slice(),
+                ["file_read".to_string()],
+                "the premise is a tool that really ran: a batch that was only dispatched and then \
+                 refused is not tool use, and must not buy the model a free marker"
+            );
+            assert_eq!(
                 remaining.lock().expect("responses lock should be valid").len(),
                 0,
                 "a marker backed by a real tool run must not spend a corrective retry"
             );
             assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "The check ran."));
+        }
+
+        /// A model can write the marker in the *same* response that carries real
+        /// tool calls. That text goes straight into history as the assistant
+        /// message requesting the batch, where the final-reply guard never sees
+        /// it — and from there into compaction, summaries and the next prompt.
+        ///
+        /// MUTATION GUARD: drop the strip from `assistant_history_content` and
+        /// the history assertion fails.
+        #[tokio::test]
+        async fn a_marker_written_beside_real_tool_calls_never_reaches_history() {
+            let execution_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let provider = NativeScriptedProvider::new(vec![
+                ChatResponse {
+                    text: Some("Checking now.\n[Used tools: file_read]".to_string()),
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "file_read".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("The check ran.".to_string()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                },
+            ]);
+            let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingTool {
+                name: "file_read".to_string(),
+                execution_order: Arc::clone(&execution_order),
+            })];
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("run the check")];
+            let tmp = TempDir::new().unwrap();
+            let (outcome, _trace) = run_tool_call_loop_outcome(
+                &provider,
+                &mut history,
+                Arc::new(tools_registry),
+                &NoopObserver,
+                &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                None,
+                "cli",
+                &crate::config::MultimodalConfig::default(),
+                2,
+                false,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ToolLoopMemory::none(),
+                ChatMode::default(),
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("a turn that really used a tool must complete");
+
+            assert!(
+                history.iter().any(|message| message.role == "tool"),
+                "the turn must really have dispatched a tool batch: {history:?}"
+            );
+            assert!(
+                history.iter().all(|message| !message.content.contains("[Used tools:")),
+                "the marker written alongside the tool calls must not be stored: {history:?}"
+            );
+            assert!(
+                history.iter().any(|message| message.content.contains("Checking now.")),
+                "only the marker is dropped; the model's own words stay: {history:?}"
+            );
+            assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "The check ran."));
+        }
+
+        /// Dispatching a batch is not using a tool. When every call in it came
+        /// back refused or failed, the turn did no work, so a `[Used tools: ...]`
+        /// line is still provably fabricated and still worth the one corrective
+        /// retry.
+        ///
+        /// MUTATION GUARD: set `executed_any_tool_call` at dispatch time (the
+        /// shape this replaced) and the third scripted response is never
+        /// consumed, because no retry is spent.
+        #[tokio::test]
+        async fn a_batch_whose_calls_all_failed_still_buys_the_corrective_retry() {
+            let provider = NativeScriptedProvider::new(vec![
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "refusing_tool".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("The check is clean.\n[Used tools: refusing_tool]".to_string()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("The check is clean.".to_string()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                },
+            ]);
+            let remaining = Arc::clone(&provider.responses);
+            let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RefusingTool)];
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("run the check")];
+            let tmp = TempDir::new().unwrap();
+            let (outcome, _trace) = run_tool_call_loop_outcome(
+                &provider,
+                &mut history,
+                Arc::new(tools_registry),
+                &NoopObserver,
+                &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                None,
+                "cli",
+                &crate::config::MultimodalConfig::default(),
+                3,
+                false,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ToolLoopMemory::none(),
+                ChatMode::default(),
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("the corrective retry should produce a deliverable answer");
+
+            assert_eq!(
+                remaining.lock().expect("responses lock should be valid").len(),
+                0,
+                "a batch that produced nothing but refusals must not count as tool use, \
+                 so the fabricated marker still costs one corrective retry"
+            );
+            assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "The check is clean."));
         }
 
         async fn run_with_response(response: &str, expose: bool) -> (ToolLoopOutcome, Vec<ChatMessage>) {

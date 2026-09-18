@@ -62,6 +62,17 @@ use super::daemon::{InFlightGuard, InFlightRegistry, register_in_flight_labeled}
 /// nothing here compares an elapsed duration against a limit.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1_500);
 
+/// Shortest gap between two attempts by this poller to register again.
+///
+/// Re-enrolment is idempotent, so a repeat costs the daemon little — but every
+/// successful one puts a line on the operator's screen, and a daemon that keeps
+/// forgetting this session would otherwise write one every [`POLL_INTERVAL`].
+/// A floor of a minute keeps the recovery automatic while bounding what a
+/// pathological daemon can print, at the price of up to a minute of extra
+/// downtime on the pathological path only: a single restart still recovers on
+/// the first unregistered answer.
+pub const RE_ENROLMENT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_mins(1);
+
 /// How many assignments to take in one pull.
 ///
 /// A response-size bound, not a concurrency limit: whatever is left stays at
@@ -1110,6 +1121,10 @@ pub async fn run_poller(
     let _row = row;
     let mut pending_acks: Vec<String> = Vec::new();
     let mut notices = FailureNotices::default();
+    // When this poller last tried to register again, so a daemon that forgets
+    // this session on every pull cannot buy one notice per poll interval. A
+    // clock reading, not a timer: nothing here waits on it.
+    let mut last_re_enrolment: Option<tokio::time::Instant> = None;
     loop {
         let pull = tokio::select! {
             () = cancel.cancelled() => break,
@@ -1139,15 +1154,31 @@ pub async fn run_poller(
                 // recovery. Registering again is, and the next pull is the
                 // natural retry for a registration that also fails: this loop
                 // is already periodic, so nothing here needs a timer.
+                //
+                // Whatever happens next, the acknowledgements were for a mailbox
+                // that no longer exists. Sending them to a new session would
+                // acknowledge ids it never handed out.
+                pending_acks.clear();
+                // At most one attempt per [`RE_ENROLMENT_MIN_INTERVAL`]: a daemon
+                // stuck in "who are you?" answers every pull, and re-registering
+                // on each one would put a notice on screen every poll interval.
+                if last_re_enrolment.is_some_and(|at| at.elapsed() < RE_ENROLMENT_MIN_INTERVAL) {
+                    tracing::debug!(
+                        session = %session_ref,
+                        "daemon still does not know this chat session; re-enrolment is rate limited"
+                    );
+                    tokio::select! {
+                        () = cancel.cancelled() => break,
+                        () = tokio::time::sleep(POLL_INTERVAL) => {}
+                    }
+                    continue;
+                }
+                last_re_enrolment = Some(tokio::time::Instant::now());
                 let stale = mailbox.enrolment_generation();
                 let re_enrolled = tokio::select! {
                     () = cancel.cancelled() => break,
                     outcome = mailbox.re_enrol(stale) => outcome,
                 };
-                // Whatever the outcome, the acknowledgements were for a mailbox
-                // that no longer exists. Sending them to a new session would
-                // acknowledge ids it never handed out.
-                pending_acks.clear();
                 match re_enrolled {
                     Ok(ReEnrolment::Registered { session_ref }) => {
                         notices.settled();
@@ -1248,6 +1279,9 @@ mod tests {
         generation: Mutex<u64>,
         /// How many times the poller registered again.
         registrations: AtomicUsize,
+        /// How many times it *tried*, successful or not: what the re-enrolment
+        /// rate limit is about.
+        re_enrol_attempts: AtomicUsize,
         /// Makes registration fail, for the case where the daemon is not just
         /// forgetful but down.
         refuse_registration: std::sync::atomic::AtomicBool,
@@ -1268,6 +1302,7 @@ mod tests {
                 seq: AtomicUsize::new(0),
                 generation: Mutex::new(1),
                 registrations: AtomicUsize::new(0),
+                re_enrol_attempts: AtomicUsize::new(0),
                 refuse_registration: std::sync::atomic::AtomicBool::new(false),
             })
         }
@@ -1341,6 +1376,7 @@ mod tests {
         }
 
         fn re_enrol(&self, stale: u64) -> MailboxFuture<'_, ReEnrolment> {
+            self.re_enrol_attempts.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 if self.refuse_registration.load(Ordering::SeqCst) {
                     anyhow::bail!("cannot reach a running PRX process at {}", self.base_url);
@@ -1646,6 +1682,42 @@ mod tests {
         );
     }
 
+    /// A daemon stuck in "who are you?" answers every single pull that way. The
+    /// recovery is idempotent, but every successful one puts a line on the
+    /// operator's screen, so re-registering on each answer would write one
+    /// every poll interval — a notification flood from a loop that is supposed
+    /// to be quiet.
+    ///
+    /// MUTATION GUARD: remove the [`RE_ENROLMENT_MIN_INTERVAL`] gate and this
+    /// fails with one attempt (and one notice) per unregistered answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_daemon_that_keeps_forgetting_this_session_is_answered_at_most_once_a_minute() {
+        let (mailbox, said) = drive_script(RecordingMailbox::scripted(vec![
+            Answer::ForgotTheSession,
+            Answer::ForgotTheSession,
+            Answer::ForgotTheSession,
+            Answer::ForgotTheSession,
+            Answer::ForgotTheSession,
+            Answer::ForgotTheSession,
+        ]))
+        .await;
+        assert_eq!(
+            mailbox.re_enrol_attempts.load(Ordering::SeqCst),
+            1,
+            "six unregistered answers inside one minute are one recovery attempt; said:\n{said:#?}"
+        );
+        assert_eq!(
+            said.iter().filter(|line| line.contains("registered again")).count(),
+            1,
+            "and therefore exactly one notice; said:\n{said:#?}"
+        );
+        assert!(
+            mailbox.pulls.lock().len() > 6,
+            "the poller must keep polling while the recovery is rate limited: {:?}",
+            mailbox.pulls.lock().len()
+        );
+    }
+
     /// The same status, a different fact. An unknown *assignment* says nothing
     /// about whether this session is registered, and re-registering on it would
     /// abandon a perfectly good enrolment.
@@ -1669,10 +1741,12 @@ mod tests {
     }
 
     /// A daemon that is gone rather than merely forgetful: registering again
-    /// fails too, and the next pull is the retry. No timer, no backoff, and one
-    /// line about it.
+    /// fails too, a later pull is the retry, and it costs one line however long
+    /// the daemon stays down. The retry is rate limited (see
+    /// [`RE_ENROLMENT_MIN_INTERVAL`]), so the poller keeps polling while the
+    /// recovery attempt itself happens at most once a minute.
     #[tokio::test(start_paused = true)]
-    async fn a_registration_that_also_fails_is_retried_by_the_next_pull_and_said_once() {
+    async fn a_registration_that_also_fails_is_retried_later_and_said_once() {
         let mailbox = RecordingMailbox::scripted(vec![
             Answer::ForgotTheSession,
             Answer::ForgotTheSession,
@@ -1685,6 +1759,11 @@ mod tests {
             mailbox.pulls.lock().len() >= 3,
             "the poll loop is the retry; it must keep asking: {:?}",
             mailbox.pulls.lock().len()
+        );
+        assert_eq!(
+            mailbox.re_enrol_attempts.load(Ordering::SeqCst),
+            1,
+            "three refusals inside one minute buy one recovery attempt, not three"
         );
         assert_eq!(
             complaints_about(&said, "cannot reach"),

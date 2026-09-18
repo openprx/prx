@@ -12,8 +12,14 @@
 //! # Write-through, never write-behind
 //!
 //! Every accepted mutation is written here before the caller is answered, so
-//! "accepted" and "durable" are the same instant. The converse is deliberately
-//! *not* true: a failed write does **not** fail the mailbox operation. The
+//! "accepted" and "durable" are the same instant. `synchronous = FULL` is what
+//! makes that literal rather than approximate: under WAL the cheaper `NORMAL`
+//! setting leaves a committed transaction unflushed, and a power cut — the very
+//! incident this store was built after — can take back an acceptance the caller
+//! was already told about. The cost is one fsync per accepted mutation on a
+//! mailbox that writes at human pace, which is the cheaper side of that trade.
+//! The converse is deliberately *not* true: a failed write does **not** fail the
+//! mailbox operation. The
 //! mailbox is how a message on a phone reaches a terminal, and refusing live
 //! work because a disk is full would trade a recoverable durability gap for an
 //! outright outage. A write that fails is logged at `error` and the in-memory
@@ -26,8 +32,11 @@
 //!   only say that a session with some hash existed.
 //! * **Assignment origins are stored in the clear.** They have to be: after a
 //!   restart the result of a queued assignment still has to find its way back to
-//!   whoever asked for it, and a fingerprint cannot be routed to. The file is
-//!   created `0600` under the workspace for that reason.
+//!   whoever asked for it, and a fingerprint cannot be routed to. The database
+//!   file *and its `-wal` / `-shm` sidecars* are kept `0600` under the workspace
+//!   for that reason: under WAL the sidecar is where an assignment body lives
+//!   until the next checkpoint, so restricting the main file alone would protect
+//!   nothing.
 //! * **Work-registry rows are not stored.** They are process-local addresses, so
 //!   hydration mints fresh ones rather than pretending an old `WorkId` still
 //!   means anything.
@@ -195,12 +204,22 @@ impl SqliteMailboxStore {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create mailbox directory {}", parent.display()))?;
         }
+        // Create the file ourselves, private, *before* SQLite sees it: SQLite
+        // gives the `-wal` and `-shm` sidecars the mode of the main database
+        // file it finds, and those sidecars are where an un-checkpointed
+        // assignment body and its plaintext origin actually live. Letting SQLite
+        // create the main file means 0644 everywhere, and a later chmod of the
+        // main file alone leaves the data readable by every local user.
+        precreate_private(&path);
         let conn =
             Connection::open(&path).with_context(|| format!("failed to open mailbox database {}", path.display()))?;
-        // A busy handler, not a `busy_timeout`: a lock held by another process is
-        // something to wait out, not an error to hand a caller. Same policy as
-        // every other SQLite store in this runtime.
-        crate::runtime::sqlite_pool::install_busy_handler(&conn)?;
+        // A *bounded* busy handler, unlike the other stores here: the mailbox is
+        // written from a request path, and its documented trade-off is that a
+        // failed write costs durability for that mutation and nothing else. An
+        // unbounded wait would mean a second process holding the file lock could
+        // stall a chat pull indefinitely — the one outcome the trade-off was
+        // chosen to avoid — and the tested error branch would never be reached.
+        crate::runtime::sqlite_pool::install_bounded_busy_handler(&conn)?;
         conn.execute_batch(SCHEMA)
             .with_context(|| format!("failed to migrate mailbox database {}", path.display()))?;
         restrict_permissions(&path);
@@ -246,7 +265,7 @@ impl SqliteMailboxStore {
 /// the other SQLite stores here: opening an older file adds what is missing
 /// instead of demanding a migration step nobody ran.
 const SCHEMA: &str = "PRAGMA journal_mode = WAL;
-     PRAGMA synchronous = NORMAL;
+     PRAGMA synchronous = FULL;
      PRAGMA foreign_keys = ON;
 
      CREATE TABLE IF NOT EXISTS chat_sessions (
@@ -291,7 +310,37 @@ const SCHEMA: &str = "PRAGMA journal_mode = WAL;
         origin_chat_type     TEXT NOT NULL DEFAULT ''
      );";
 
-/// Keep the file to its owner: it carries plaintext assignment origins.
+/// Create the database file `0600` before SQLite opens it.
+///
+/// Best effort: an existing file is left with the bytes it has (only its mode is
+/// fixed by [`restrict_permissions`] afterwards), and a filesystem that refuses
+/// the call is tolerated for the same reason a failed chmod is.
+fn precreate_private(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Err(error) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)
+        {
+            tracing::warn!(path = %path.display(), "could not pre-create mailbox database privately: {error}");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+/// Keep the database *and its sidecars* to their owner: they carry plaintext
+/// assignment bodies and origins.
+///
+/// The `-wal` and `-shm` files are not an implementation detail here — under
+/// `journal_mode = WAL` everything written since the last checkpoint is in the
+/// `-wal`, so a 0600 main file next to a 0644 `-wal` keeps no secret at all.
 ///
 /// A failure here is reported and tolerated — a mailbox that refused to run on a
 /// filesystem without Unix modes would be a worse outcome than a file with the
@@ -300,14 +349,29 @@ fn restrict_permissions(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-            tracing::warn!(path = %path.display(), "could not restrict mailbox database permissions: {error}");
+        for target in sidecar_paths(path) {
+            if !target.exists() {
+                continue;
+            }
+            if let Err(error) = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)) {
+                tracing::warn!(path = %target.display(), "could not restrict mailbox database permissions: {error}");
+            }
         }
     }
     #[cfg(not(unix))]
     {
         let _ = path;
     }
+}
+
+/// The database file and every file SQLite keeps beside it.
+#[cfg(any(unix, test))]
+fn sidecar_paths(path: &Path) -> [PathBuf; 3] {
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    let mut shm = path.as_os_str().to_os_string();
+    shm.push("-shm");
+    [path.to_path_buf(), PathBuf::from(wal), PathBuf::from(shm)]
 }
 
 /// Split a principal into the four columns that carry it.
@@ -613,5 +677,77 @@ impl MailboxStore for SqliteMailboxStore {
             .saturating_sub(i64::try_from(STORED_RESULT_CAPACITY).unwrap_or(i64::MAX));
         conn.execute("DELETE FROM chat_results WHERE seq <= ?1", params![floor])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// SQLite gives a `-wal` the mode of the database file it finds, so the file
+    /// has to be *born* private rather than chmod-ed a moment later: between
+    /// SQLite creating it `0644` and a chmod fixing it, the mailbox is readable
+    /// by every local user.
+    ///
+    /// MUTATION GUARD: make `precreate_private` a no-op and the mode assertion
+    /// fails with the process umask's `0644`.
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_mailbox_file_is_born_private_and_an_existing_one_keeps_its_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("test: tempdir");
+        let fresh = dir.path().join("fresh.db");
+        precreate_private(&fresh);
+        let mode = std::fs::metadata(&fresh)
+            .expect("test: the file must exist")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "a mailbox file must never exist world-readable");
+
+        let existing = dir.path().join("existing.db");
+        std::fs::write(&existing, b"already here").expect("test: write");
+        precreate_private(&existing);
+        assert_eq!(
+            std::fs::read(&existing).expect("test: read"),
+            b"already here",
+            "pre-creation must never truncate a database that is already there"
+        );
+    }
+
+    /// The module header promises that "accepted" and "durable" are the same
+    /// instant. Under WAL that is only true with `synchronous = FULL`: with
+    /// `NORMAL` a commit is not flushed and a power cut can take back an
+    /// acceptance the caller was already given.
+    ///
+    /// MUTATION GUARD: put `synchronous = NORMAL` back in `SCHEMA` and this goes
+    /// red.
+    #[test]
+    fn the_mailbox_commits_are_flushed_and_journalled_in_wal_mode() {
+        let dir = tempfile::tempdir().expect("test: tempdir");
+        let store = SqliteMailboxStore::open(dir.path().join("mailbox.db")).expect("test: open");
+        let conn = store.conn.lock();
+        let journal: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("test: journal_mode");
+        assert_eq!(journal.to_lowercase(), "wal");
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .expect("test: synchronous");
+        assert_eq!(synchronous, 2, "2 is FULL: an accepted mutation must be flushed");
+    }
+
+    #[test]
+    fn the_sidecar_set_is_the_database_and_its_two_wal_files() {
+        let paths = sidecar_paths(Path::new("/tmp/chat-mailbox.db"));
+        assert_eq!(
+            paths.map(|path| path.display().to_string()),
+            [
+                "/tmp/chat-mailbox.db".to_string(),
+                "/tmp/chat-mailbox.db-wal".to_string(),
+                "/tmp/chat-mailbox.db-shm".to_string(),
+            ]
+        );
     }
 }

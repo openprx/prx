@@ -34,6 +34,13 @@
 //!   timeout by another name: after it expires the caller gets `SQLITE_BUSY`
 //!   for a lock that is merely held by someone else, usually another process.
 //!
+//! The one deliberate exception is [`install_bounded_busy_handler`], for a store
+//! whose callers sit on a request path and whose failure branch is a real,
+//! tested behaviour rather than an outage (the chat assignment mailbox: a write
+//! that fails costs durability for that mutation and nothing else). There,
+//! waiting forever is the worse answer, because it converts a foreign lock into
+//! a blocked request thread.
+//!
 //! Unbounded waiting is only acceptable because it is observable: every wait is
 //! measured into [`SqlitePoolStats`], and a database lock held by another
 //! process emits a periodic `warn!` for as long as it is held.
@@ -133,6 +140,57 @@ fn wait_for_database_lock(attempts: i32) -> bool {
 /// file with one, so the whole process agrees on what a held lock means.
 pub fn install_busy_handler(conn: &Connection) -> rusqlite::Result<()> {
     conn.busy_handler(Some(wait_for_database_lock))
+}
+
+/// How long the bounded busy handler waits before it gives the caller
+/// `SQLITE_BUSY` instead of another retry.
+///
+/// Long enough to ride out any contention this process can create on its own,
+/// short enough that a caller on a request path (a chat pull, for instance)
+/// fails visibly rather than holding a connection for as long as a foreign
+/// writer cares to keep the lock.
+const BOUNDED_BUSY_WAIT_MS: u64 = 5_000;
+
+/// Total time [`wait_for_database_lock`] has already slept after `attempts`
+/// retries, given its backoff schedule.
+///
+/// The handler is a bare `fn` pointer with no state of its own, so the elapsed
+/// wait is reconstructed from the retry count rather than measured.
+const fn cumulative_backoff_ms(attempts: u64) -> u64 {
+    // Sleeps grow 1, 2, 3 … ms until they saturate at `BUSY_MAX_BACKOFF_MS`.
+    let ramp = if attempts < BUSY_MAX_BACKOFF_MS {
+        attempts
+    } else {
+        BUSY_MAX_BACKOFF_MS
+    };
+    let ramp_total = ramp * (ramp + 1) / 2;
+    let capped = attempts.saturating_sub(ramp);
+    ramp_total + capped * BUSY_MAX_BACKOFF_MS
+}
+
+/// Busy handler with a deadline: wait out contention, but not forever.
+fn wait_for_database_lock_bounded(attempts: i32) -> bool {
+    let attempt = u64::try_from(attempts).unwrap_or(0);
+    if cumulative_backoff_ms(attempt) >= BOUNDED_BUSY_WAIT_MS {
+        tracing::error!(
+            attempts = attempt,
+            waited_ms = BOUNDED_BUSY_WAIT_MS,
+            "SQLite database stayed locked by another process past the bounded wait; failing this write"
+        );
+        return false;
+    }
+    wait_for_database_lock(attempts)
+}
+
+/// Make `conn` wait for a contended lock for at most [`BOUNDED_BUSY_WAIT_MS`]
+/// and then return `SQLITE_BUSY`.
+///
+/// For stores whose callers are on a latency-sensitive path and whose failure
+/// branch is a real, tested behaviour rather than an outage: a bounded wait
+/// turns "another process holds the lock" into an error the caller already
+/// knows how to survive, instead of a blocked thread.
+pub fn install_bounded_busy_handler(conn: &Connection) -> rusqlite::Result<()> {
+    conn.busy_handler(Some(wait_for_database_lock_bounded))
 }
 
 /// Point-in-time view of a [`SqliteConnectionPool`].
@@ -876,6 +934,37 @@ mod tests {
         assert!(
             error.to_string().to_lowercase().contains("readonly"),
             "query_only must reject misrouted writes loudly, got: {error}"
+        );
+    }
+
+    /// The bounded handler is what makes a store's error branch reachable when
+    /// another process sits on the file lock. Its deadline is reconstructed from
+    /// the retry count, so that arithmetic is the thing worth pinning.
+    #[test]
+    fn the_bounded_busy_handler_gives_up_after_its_deadline() {
+        assert_eq!(cumulative_backoff_ms(0), 0);
+        assert_eq!(cumulative_backoff_ms(1), 1);
+        assert_eq!(cumulative_backoff_ms(2), 3, "1 + 2 ms");
+        assert_eq!(
+            cumulative_backoff_ms(BUSY_MAX_BACKOFF_MS + 1),
+            BUSY_MAX_BACKOFF_MS * (BUSY_MAX_BACKOFF_MS + 1) / 2 + BUSY_MAX_BACKOFF_MS,
+            "past the ramp every retry costs the capped sleep"
+        );
+
+        let deadline_attempts = (0u64..10_000)
+            .find(|attempts| cumulative_backoff_ms(*attempts) >= BOUNDED_BUSY_WAIT_MS)
+            .expect("the deadline must be reachable");
+        assert!(
+            !wait_for_database_lock_bounded(i32::try_from(deadline_attempts).unwrap_or(i32::MAX)),
+            "past the deadline the handler must let SQLITE_BUSY through"
+        );
+        assert!(
+            wait_for_database_lock_bounded(0),
+            "before the deadline it must still wait the contention out"
+        );
+        assert!(
+            deadline_attempts.saturating_mul(BUSY_MAX_BACKOFF_MS) >= BOUNDED_BUSY_WAIT_MS,
+            "the deadline must not be reachable in fewer retries than the backoff allows"
         );
     }
 }

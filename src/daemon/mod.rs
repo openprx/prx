@@ -373,6 +373,12 @@ fn spawn_state_writer(config: Config, shared_config: crate::config::SharedConfig
             let mut json = crate::health::snapshot_json();
             if let Some(obj) = json.as_object_mut() {
                 obj.insert("written_at".into(), serde_json::json!(Utc::now().to_rfc3339()));
+                // The daemon's own binary, so `prx doctor` can judge the daemon
+                // PATH against the directory the *daemon* runs from instead of
+                // guessing from wherever the doctor process happens to live.
+                if let Ok(binary) = std::env::current_exe() {
+                    obj.insert("binary_path".into(), serde_json::json!(binary.display().to_string()));
+                }
                 match serde_json::to_value(shared_config.status()) {
                     Ok(status) => {
                         obj.insert("config_generation".into(), status);

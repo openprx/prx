@@ -1396,58 +1396,119 @@ impl ChatSessions {
 
         let polls = session.polls.fetch_add(1, Ordering::Relaxed).saturating_add(1);
         let now_unix_ms = unix_ms();
-        let mut state = session.state.lock();
-        state.last_poll = Some(LastPoll::Observed(Instant::now()));
-        // The evidence of liveness is persisted with the pull that produced it, so
-        // a session restored after a restart is as old as its last real pull rather
-        // than as young as the restart. See [`LastPoll`].
-        self.write_through("record_poll", |store| {
-            store.record_poll(&session.id, polls, now_unix_ms)
-        });
+        // Every write this pull owes the store, planned under the lock and
+        // executed after it. See [`PendingWrite`].
+        let mut pending: Vec<PendingWrite> = Vec::new();
+        let pulled = {
+            let mut state = session.state.lock();
+            state.last_poll = Some(LastPoll::Observed(Instant::now()));
+            // The evidence of liveness is persisted with the pull that produced it,
+            // so a session restored after a restart is as old as its last real pull
+            // rather than as young as the restart. See [`LastPoll`].
+            pending.push(PendingWrite::RecordPoll { polls, now_unix_ms });
 
-        let mut acked = 0;
-        for id in ack {
-            if let Some(index) = state.delivered.iter().position(|entry| &entry.id == id) {
-                let assignment = state.delivered.remove(index);
-                self.write_through("ack", |store| {
-                    store.move_to_queue(&assignment.id, Queue::Accepted, assignment.deliveries, false)
-                });
-                state.accepted.push(assignment);
-                acked += 1;
+            let mut acked = 0;
+            for id in ack {
+                if let Some(index) = state.delivered.iter().position(|entry| &entry.id == id) {
+                    let assignment = state.delivered.remove(index);
+                    pending.push(PendingWrite::move_to("ack", &assignment, Queue::Accepted, false));
+                    state.accepted.push(assignment);
+                    acked += 1;
+                }
+            }
+
+            // Back to the *head*, in their original order, so a redelivery cannot be
+            // starved behind work queued while it was in flight. Popping from the back
+            // and pushing to the front restores the order they were handed out in.
+            let mut reclaimed = std::mem::take(&mut state.delivered);
+            let requeued = reclaimed.len();
+            while let Some(assignment) = reclaimed.pop() {
+                pending.push(PendingWrite::move_to("reclaim", &assignment, Queue::Inbox, true));
+                state.inbox.push_front(assignment);
+            }
+
+            let mut assignments = Vec::new();
+            for _ in 0..max {
+                let Some(mut assignment) = state.inbox.pop_front() else {
+                    break;
+                };
+                assignment.deliveries = assignment.deliveries.saturating_add(1);
+                pending.push(PendingWrite::move_to("deliver", &assignment, Queue::Delivered, false));
+                assignments.push(assignment.view());
+                state.delivered.push(assignment);
+            }
+
+            Pulled {
+                assignments,
+                acked,
+                requeued,
+                queued_remaining: state.inbox.len(),
+            }
+        };
+
+        // Out of the lock, still before the caller is answered: write-through is
+        // preserved, but a contended database can no longer freeze this session.
+        self.flush_pending(&session.id, pending);
+        Ok(pulled)
+    }
+
+    /// Run the writes a pull planned, in the order it planned them.
+    fn flush_pending(&self, session_id: &str, pending: Vec<PendingWrite>) {
+        for write in pending {
+            match write {
+                PendingWrite::RecordPoll { polls, now_unix_ms } => {
+                    self.write_through("record_poll", |store| store.record_poll(session_id, polls, now_unix_ms));
+                }
+                PendingWrite::MoveToQueue {
+                    operation,
+                    assignment_id,
+                    queue,
+                    deliveries,
+                    to_front,
+                } => {
+                    self.write_through(operation, |store| {
+                        store.move_to_queue(&assignment_id, queue, deliveries, to_front)
+                    });
+                }
             }
         }
+    }
+}
 
-        // Back to the *head*, in their original order, so a redelivery cannot be
-        // starved behind work queued while it was in flight. Popping from the back
-        // and pushing to the front restores the order they were handed out in.
-        let mut reclaimed = std::mem::take(&mut state.delivered);
-        let requeued = reclaimed.len();
-        while let Some(assignment) = reclaimed.pop() {
-            self.write_through("reclaim", |store| {
-                store.move_to_queue(&assignment.id, Queue::Inbox, assignment.deliveries, true)
-            });
-            state.inbox.push_front(assignment);
+/// One store write a pull owes, held until the session state lock is released.
+///
+/// A pull mutates three in-memory queues under `session.state.lock()` and the
+/// SQLite mirror of each mutation is a blocking write. Performing them inside
+/// the lock puts a session's whole state behind a file lock this process does
+/// not own — a second `prx` on the same workspace, or an operator's `sqlite3`
+/// write transaction — which is exactly the stall the mailbox's availability
+/// trade-off exists to prevent. Planning under the lock and writing after it
+/// keeps the order (and the write-through promise: the caller is still answered
+/// only once the writes have been attempted) without holding the session
+/// hostage.
+enum PendingWrite {
+    RecordPoll {
+        polls: u64,
+        now_unix_ms: u64,
+    },
+    MoveToQueue {
+        operation: &'static str,
+        assignment_id: String,
+        queue: Queue,
+        deliveries: u32,
+        to_front: bool,
+    },
+}
+
+impl PendingWrite {
+    fn move_to(operation: &'static str, assignment: &Assignment, queue: Queue, to_front: bool) -> Self {
+        Self::MoveToQueue {
+            operation,
+            assignment_id: assignment.id.clone(),
+            queue,
+            deliveries: assignment.deliveries,
+            to_front,
         }
-
-        let mut assignments = Vec::new();
-        for _ in 0..max {
-            let Some(mut assignment) = state.inbox.pop_front() else {
-                break;
-            };
-            assignment.deliveries = assignment.deliveries.saturating_add(1);
-            self.write_through("deliver", |store| {
-                store.move_to_queue(&assignment.id, Queue::Delivered, assignment.deliveries, false)
-            });
-            assignments.push(assignment.view());
-            state.delivered.push(assignment);
-        }
-
-        Ok(Pulled {
-            assignments,
-            acked,
-            requeued,
-            queued_remaining: state.inbox.len(),
-        })
     }
 }
 
@@ -2481,15 +2542,249 @@ mod tests {
             .expect("test: read the stored hash");
         assert_eq!(stored, hash_token(&registration.token));
 
-        // Belt and braces: the raw bytes of the file do not contain it either,
-        // so a token cannot hide in a table this query forgot to name.
+        // Belt and braces: the raw bytes do not contain it either, so a token
+        // cannot hide in a table this query forgot to name. Scanned over the
+        // `-wal` and `-shm` sidecars as well as the database file: under WAL
+        // everything written since the last checkpoint is in the sidecar, so a
+        // scan of the main file alone would pass over a 4 KiB header while the
+        // data sat next to it.
         drop(conn);
-        let bytes = std::fs::read(&db).expect("test: read the mailbox file");
+        let mut scanned = 0usize;
+        for file in mailbox_files(&db) {
+            let Ok(bytes) = std::fs::read(&file) else {
+                continue;
+            };
+            scanned += 1;
+            assert!(
+                !bytes
+                    .windows(registration.token.len())
+                    .any(|window| window == registration.token.as_bytes()),
+                "the token must not appear anywhere in {}",
+                file.display()
+            );
+        }
         assert!(
-            !bytes
-                .windows(registration.token.len())
-                .any(|window| window == registration.token.as_bytes()),
-            "the token must not appear anywhere in the mailbox file"
+            scanned >= 2,
+            "the scan is only meaningful if it saw the sidecars: {scanned} file(s) read"
+        );
+    }
+
+    /// Every file the mailbox database consists of, sidecars included.
+    fn mailbox_files(db: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = vec![db.to_path_buf()];
+        for suffix in ["-wal", "-shm"] {
+            let mut name = db.as_os_str().to_os_string();
+            name.push(suffix);
+            files.push(std::path::PathBuf::from(name));
+        }
+        files
+    }
+
+    /// The module promises `0600` for a file that holds assignment bodies and
+    /// plaintext origins. Under WAL that promise is about three files: the
+    /// `-wal` is where an un-checkpointed assignment actually lives, and it
+    /// used to be created `0644` by SQLite while only the (empty) main file was
+    /// restricted.
+    ///
+    /// MUTATION GUARD: chmod only the database file in `restrict_permissions`
+    /// (the shape this replaced) and the second half — a database file that
+    /// already exists with the mode an older build left behind — fails with a
+    /// `0644` `-wal`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_mailbox_database_and_its_sidecars_are_private_to_their_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("test: tempdir");
+        let db = dir.path().join("state").join("chat-mailbox.db");
+        let sessions = mailbox_at(&db);
+        let registration = sessions.register(LABEL, None).expect("test: registration");
+        sessions
+            .assign(
+                &operator_policy(),
+                &AssignPrincipal::operator_plane(),
+                &registration.session_id,
+                "SECRETTASKMARKER",
+                Disposition::Queue,
+            )
+            .expect("test: assignment accepted");
+
+        let mut checked = 0usize;
+        for file in mailbox_files(&db) {
+            let Ok(metadata) = std::fs::metadata(&file) else {
+                continue;
+            };
+            checked += 1;
+            assert_eq!(
+                metadata.permissions().mode() & 0o777,
+                0o600,
+                "{} must be readable by its owner only",
+                file.display()
+            );
+        }
+        assert_eq!(
+            checked, 3,
+            "a WAL database is three files, and all three carry the assignment body"
+        );
+
+        // The body really is out there in the clear, which is what the mode is
+        // protecting: a test that passed because nothing had been written yet
+        // would be no test at all.
+        let found = mailbox_files(&db).into_iter().any(|file| {
+            std::fs::read(&file).is_ok_and(|bytes| {
+                bytes
+                    .windows("SECRETTASKMARKER".len())
+                    .any(|window| window == b"SECRETTASKMARKER")
+            })
+        });
+        assert!(
+            found,
+            "the assignment body must be on disk for this test to mean anything"
+        );
+
+        // A database file an older build left behind is `0644`, and SQLite gives
+        // its sidecars the mode of the file it finds. Opening such a file has to
+        // fix all three, not just the one this module used to name.
+        let legacy_dir = tempfile::tempdir().expect("test: tempdir");
+        let legacy = legacy_dir.path().join("state").join("chat-mailbox.db");
+        std::fs::create_dir_all(legacy_dir.path().join("state")).expect("test: state directory");
+        std::fs::write(&legacy, b"").expect("test: pre-existing database file");
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o644)).expect("test: legacy mode");
+        let legacy_sessions = mailbox_at(&legacy);
+        let legacy_registration = legacy_sessions.register(LABEL, None).expect("test: registration");
+        legacy_sessions
+            .assign(
+                &operator_policy(),
+                &AssignPrincipal::operator_plane(),
+                &legacy_registration.session_id,
+                "SECRETTASKMARKER",
+                Disposition::Queue,
+            )
+            .expect("test: assignment accepted");
+        for file in mailbox_files(&legacy) {
+            let Ok(metadata) = std::fs::metadata(&file) else {
+                continue;
+            };
+            assert_eq!(
+                metadata.permissions().mode() & 0o777,
+                0o600,
+                "opening a legacy world-readable mailbox must restrict {} too",
+                file.display()
+            );
+        }
+    }
+
+    /// A store write is blocking, and SQLite can be made to block for as long as
+    /// another process holds the file lock. Doing that write inside
+    /// `session.state.lock()` would put the whole session — every `/sessions`
+    /// listing, every new assignment for it — behind a lock this process does
+    /// not own.
+    ///
+    /// MUTATION GUARD: move the `flush_pending` call back inside the
+    /// `session.state.lock()` scope in `pull` and the probe below never gets an
+    /// answer within its timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_blocked_mailbox_write_does_not_freeze_the_session_it_writes_for() {
+        use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+
+        struct BlockingStore {
+            entered: SyncSender<()>,
+            release: Mutex<Receiver<()>>,
+            blocked_once: std::sync::atomic::AtomicBool,
+        }
+
+        impl MailboxStore for BlockingStore {
+            fn hydrate(&self) -> anyhow::Result<StoredState> {
+                Ok(StoredState::default())
+            }
+            fn insert_session(&self, _session: &StoredSession) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn delete_session(&self, _session_id: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn record_poll(&self, _session_id: &str, _polls: u64, _at_unix_ms: u64) -> anyhow::Result<()> {
+                if !self.blocked_once.swap(true, Ordering::SeqCst) {
+                    let _ = self.entered.send(());
+                    // Stands in for a database file locked by another process.
+                    let _ = self.release.lock().recv();
+                }
+                Ok(())
+            }
+            fn enqueue(&self, _assignment: &StoredAssignment, _at_front: bool) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn move_to_queue(
+                &self,
+                _assignment_id: &str,
+                _queue: Queue,
+                _deliveries: u32,
+                _to_front: bool,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn delete_assignment(&self, _assignment_id: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn append_result(&self, _result: &StoredResult) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (entered_tx, entered_rx) = sync_channel::<()>(1);
+        let (release_tx, release_rx) = sync_channel::<()>(1);
+        let sessions = Arc::new(ChatSessions::new());
+        sessions.attach_store(Arc::new(BlockingStore {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            blocked_once: std::sync::atomic::AtomicBool::new(false),
+        }));
+        let registration = sessions.register(LABEL, None).expect("test: registration");
+        sessions
+            .assign(
+                &operator_policy(),
+                &AssignPrincipal::operator_plane(),
+                &registration.session_id,
+                "do a thing",
+                Disposition::Queue,
+            )
+            .expect("test: assignment accepted");
+
+        let puller = {
+            let sessions = Arc::clone(&sessions);
+            let session_id = registration.session_id.clone();
+            let token = registration.token;
+            std::thread::spawn(move || sessions.pull(&session_id, &token, &[], None))
+        };
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("test: the pull must reach the store");
+
+        let (probe_tx, probe_rx) = sync_channel::<usize>(1);
+        let probe = {
+            let sessions = Arc::clone(&sessions);
+            std::thread::spawn(move || {
+                let listed = sessions.list().len();
+                let _ = probe_tx.send(listed);
+            })
+        };
+        let answered = probe_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let _ = release_tx.send(());
+        probe.join().expect("test: the probe thread");
+        let pulled = puller
+            .join()
+            .expect("test: the pulling thread")
+            .expect("test: the pull itself must still succeed");
+
+        assert_eq!(
+            answered.ok(),
+            Some(1),
+            "a mailbox write that is stuck on a foreign lock must not hold the session state lock"
+        );
+        assert_eq!(
+            tasks_in_order(&pulled),
+            vec!["do a thing".to_string()],
+            "the write-through is still owed, and the work is still delivered"
         );
     }
 

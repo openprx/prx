@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.143] - 17 September 2026
+
+### Fixed
+
+- A stored `[Used tools: ...]` marker no longer reaches the model through the
+  quoting surfaces. 0.8.137 closed the paths a *newly written* marker takes, but
+  the ~150 assistant rows that started the imitation were still quoted back into
+  every prompt by `[Current session context]`, `[Recent shared workspace events]`,
+  the replayed conversation turns and `[Document evidence]` -- and those builders
+  flatten content to a single line, which turned a whole marker line into an
+  in-line fragment the line-level detector could never see again. Assistant-role
+  quoted content is now stripped before it is flattened, with a second,
+  sentence-safe strip for markers that are already in-line
+  (`strip_inline_fabricated_tool_markers`: only a `[Used tools: ...]` fragment
+  that names at least one tool and closes on the same line is dropped; every
+  other bracketed text is left byte-for-byte alone). User turns are still never
+  rewritten, and persisted rows are still untouched.
+- Recalled OS-paging context pages are stripped the same way. A page is a
+  verbatim transcript of earlier turns, so the markers written before 0.8.137 sat
+  in the recall text as well.
+- A marker written in the same response that carries real tool calls no longer
+  enters history. That text became the assistant message requesting the batch,
+  which the final-response guard never inspects, so it survived into compaction,
+  summaries and the next prompt.
+- A tool batch now counts as tool use only once at least one call came back with
+  a result that is neither an error nor a denial. The flag was set at dispatch,
+  so a batch whose every call was refused by the permission layer or the
+  idempotency ledger silently spent the turn's right to a corrective retry.
+- The chat mailbox database keeps its `-wal` and `-shm` sidecars `0600`, not just
+  the database file. Under `journal_mode = WAL` everything written since the last
+  checkpoint lives in the sidecar, and SQLite created those with the mode of the
+  main file it found: the file the module promised was owner-only held a 4 KiB
+  header while the assignment bodies and plaintext origins sat next to it
+  world-readable. The database file is now created `0600` before SQLite opens it
+  (so sidecars are born private) and all three are restricted after migration (so
+  a database an older build left behind is fixed on open). The
+  "the token is nowhere in the file" assertion, which read the empty main file
+  and could not have failed, now scans all three.
+- `synchronous` is now `FULL` for that database. Under WAL with `NORMAL` a commit
+  is not flushed, so a power cut -- the incident this store was built after --
+  could take back an acceptance the caller had already been given, while the
+  module documented "accepted" and "durable" as the same instant.
+- A chat pull no longer performs its SQLite writes while holding the session
+  state lock. The writes are planned under the lock and executed after it, and
+  the mailbox connection now uses a bounded busy handler (5 s) instead of the
+  unbounded one: a second process holding the database lock used to block a chat
+  pull indefinitely, which is precisely the outage the mailbox's "a failed write
+  costs durability and nothing else" trade-off exists to avoid, and the tested
+  error branch was unreachable for the real store.
+- A chat re-registers itself at most once a minute. A daemon that answers every
+  pull with "unknown session" made the poller register again -- and announce it
+  -- every 1.5 s.
+- `prx doctor`'s daemon-PATH check no longer demands its own directory when that
+  directory is a Cargo build output. `cargo run -- doctor` and
+  `./target/release/prx doctor` warned about a healthy daemon and told the
+  operator to add a build directory to the unit's `PATH`. The required directory
+  now comes from the daemon binary recorded in `daemon_state.json` (the daemon
+  writes `binary_path` there), falling back to the doctor's own directory only
+  when it is not a build directory.
+- `prx doctor` checks that the pid in the daemon state file still belongs to a
+  prx process before reading `/proc/<pid>/environ`. A reused pid made the daemon
+  PATH verdict come from an unrelated process' environment; it is now an explicit
+  skip.
+- The six daemon-PATH helpers in `src/doctor/mod.rs` are compiled only where they
+  are used. On a non-Linux target they were dead code, so `cargo check` for
+  macOS and Windows carried six `never used` warnings against the zero-warning
+  rule.
+
+### Changed
+
+- Narrowed three CHANGELOG claims in the unreleased 0.8.137, 0.8.140 and 0.8.142
+  entries to what their code actually does: "or replayed", the enforcement scope
+  of the `git_operations` action contract, and the mailbox database's `0600`
+  promise plus the byte-level token assertion behind it.
+
 ## [0.8.142] - 17 September 2026
 
 ### Added
@@ -17,7 +92,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   told was accepted, and every `prx chat` had to register again before it could
   be given work. Registrations, queued assignments, deliveries,
   acknowledgements, deregistrations and results are now written through to
-  `{workspace}/state/chat-mailbox.db` (SQLite, `0600`, parameterised
+  `{workspace}/state/chat-mailbox.db` (SQLite, owner-only, parameterised
   throughout) before the caller is answered, and the gateway replays the file on
   the way up -- the one startup path both `prx gateway` and the daemon's
   supervised gateway pass through, so there is a single attachment point and the
@@ -25,8 +100,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A chat keeps its session id *and* its token across the restart: only the
   token's SHA-256 is stored, so the comparison that authenticates the first pull
   after a restart is the comparison it always was, and
-  `the_mailbox_file_never_holds_a_plaintext_token` asserts the secret appears
-  nowhere in the file. Work handed out and never acknowledged returns to the
+  `the_mailbox_file_never_holds_a_plaintext_token` asserts the secret appears in
+  none of the stored rows. Work handed out and never acknowledged returns to the
   head of the queue on replay, exactly as it does on the next pull; work that
   *was* acknowledged is restored as acknowledged, because the chat holding it
   usually outlives the daemon and redelivering would be the runtime deciding for
@@ -98,7 +173,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   five wired in 0.8.133. `mcp_call`, `git_operations`, `gateway`,
   `skills_manage`, `composio`, `nodes`, `subagents`, `proxy_config`,
   `chat_schedule`, `managed_session` and `hooks_manage` each gained a test in
-  their own module, bringing the enforced set to sixteen surfaces. The contract
+  their own module, bringing the enforced set to sixteen surfaces. One of those
+  sixteen is enforced on a narrower discriminator than it dispatches on:
+  `git_operations` dispatches on `operation` (ten values) and the shared contract
+  reads `action`, so what it holds there is the four-value `'stash'` sub-action
+  enum. `docs/tool-schema-and-child-capability-parity.md` records that gap; the
+  ten `operation` values are described but not contract-enforced. The contract
   requires that the tool-list description, the `action` parameter's own
   description, and the description of every parameter an action cannot be called
   without each name that action, so a capability can no longer be published as a
@@ -155,7 +235,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Fabricated `[Used tools: ...]` lines can no longer be claimed, delivered, or replayed.
+- A fabricated `[Used tools: ...]` line can no longer be claimed or delivered, and the
+  replay path through cached channel turns is closed.
   A final response that carries such a line while the turn never dispatched a tool now
   spends the existing corrective retry; if the next response still carries one, only the
   marker lines are removed and the real answer is still delivered (a response that is
@@ -166,7 +247,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejected a response that was *entirely* a marker, so a marker appended to a real answer
   was persisted, replayed, and imitated: a WhatsApp session announced tool runs for a week
   without ever emitting a single tool call. Persisted rows are untouched — only the copy
-  handed to the model and the user is cleaned.
+  handed to the model and the user is cleaned. The other routes a *stored* marker takes
+  back into a prompt — the session and shared event preambles, recalled context pages, and
+  the assistant message that carries a real tool batch — are closed in 0.8.143.
 
 ## [0.8.136] - 16 September 2026
 
