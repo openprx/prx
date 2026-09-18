@@ -261,15 +261,15 @@ const DISCOVERY_REQUEST_WEIGHT: usize = 8 * SPACED_WORD_WEIGHT;
 /// them. This is a script-class list, not a language list: it only decides how
 /// text is *counted*, never which capability a word names, so it cannot grow
 /// into a multilingual keyword table.
-const UNSPACED_SCRIPT_RANGES: &[(char, char)] = &[
-    ('\u{0e00}', '\u{0eff}'),   // Thai, Lao
-    ('\u{1000}', '\u{109f}'),   // Myanmar
-    ('\u{1780}', '\u{17ff}'),   // Khmer
-    ('\u{3040}', '\u{30ff}'),   // Hiragana, Katakana
-    ('\u{3400}', '\u{4dbf}'),   // CJK unified ideographs extension A
-    ('\u{4e00}', '\u{9fff}'),   // CJK unified ideographs
-    ('\u{f900}', '\u{faff}'),   // CJK compatibility ideographs
-    ('\u{20000}', '\u{2fa1f}'), // CJK unified ideographs, supplementary planes
+const UNSPACED_SCRIPT_RANGES: &[(u32, u32)] = &[
+    (0x0e00, 0x0eff),   // Thai, Lao
+    (0x1000, 0x109f),   // Myanmar
+    (0x1780, 0x17ff),   // Khmer
+    (0x3040, 0x30ff),   // Hiragana, Katakana
+    (0x3400, 0x4dbf),   // CJK unified ideographs extension A
+    (0x4e00, 0x9fff),   // CJK unified ideographs
+    (0xf900, 0xfaff),   // CJK compatibility ideographs
+    (0x20000, 0x2fa1f), // CJK unified ideographs, supplementary planes
 ];
 
 /// Whether a turn the keyword table could not read is asking for something new.
@@ -304,9 +304,10 @@ fn unrouted_turn_requests_discovery(message: &str) -> bool {
 /// Whether this character belongs to a script that does not separate words
 /// with spaces, and therefore has to be counted per character.
 fn character_is_unspaced_script(character: char) -> bool {
+    let code_point = u32::from(character);
     UNSPACED_SCRIPT_RANGES
         .iter()
-        .any(|(first, last)| (*first..=*last).contains(&character))
+        .any(|(first, last)| (*first..=*last).contains(&code_point))
 }
 
 /// Size of the request in language-independent units: one word of a spaced
@@ -1127,10 +1128,10 @@ mod tests {
     /// The same shape written in a script that does not separate words with
     /// spaces. It asks the agent to look something up online and summarize it,
     /// and it names no English capability keyword.
-    const SUBSTANTIVE_UNSUPPORTED_LANGUAGE: &str = "帮我上网找一下最新的发布说明并做个总结";
+    const SUBSTANTIVE_UNSUPPORTED_LANGUAGE: &str = "ช่วยค้นหาบันทึกการเผยแพร่ล่าสุดบนอินเทอร์เน็ตแล้วสรุปให้หน่อย";
 
-    /// A closing line in the same unspaced script ("thanks, that is all").
-    const UNSPACED_CLOSING: &str = "谢谢，就到这里吧";
+    /// A closing line in the same unspaced script ("that is enough").
+    const UNSPACED_CLOSING: &str = "พอแล้ว";
 
     fn assert_fixture_is_unrouted(message: &str) {
         assert!(

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.154] - 18 September 2026
+
+### Fixed
+
+- The unspaced-script table behind discovery routing is expressed as code
+  point ranges and its test fixtures use Thai text, so the repository guard
+  that keeps CJK characters and escapes out of `src/` and `tests/` passes
+  again. Routing behaviour is unchanged.
+
 ## [0.8.153] - 18 September 2026
 
 ### Added
