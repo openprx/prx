@@ -163,7 +163,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `spawn_batch` + `join`, `sessions_list` / `sessions_history`, or
   `GET /api/runtime/tasks`.
 
-
 ## [0.8.140] - 17 September 2026
 
 ### Changed
