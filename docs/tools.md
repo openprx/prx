@@ -263,6 +263,22 @@ to the published document, and its request goes through the same policy
 decision, approval gate, schema check and audit record as a model-issued call.
 Approval there is fail-closed: a remote client cannot answer a prompt, so a tool
 the autonomy level wants confirmed is refused rather than auto-approved.
+
+That client may send an `Idempotency-Key` header with a tool call. The key is
+scoped to the authenticated caller (`{owner id}:{key}`) and reserved in the same
+durable execution ledger the Chat and Agent entry points use, so a retried POST
+of the identical request runs the side effect once and replays the first
+outcome, while reusing the key for a different command is refused. Two callers
+that pick the same key string both execute. Without the header nothing is
+deduplicated: a retry executes the tool again. When no ledger can be opened, a
+keyed call to a tool with side effects is refused rather than run twice — the
+response says the ledger is unavailable — and a read-only tool still runs.
+`mcp_server.rate_limit_rps` is a per-caller budget, in requests per second,
+enforced on `POST /mcp/v1/tools/call` and keyed by the same owner id; `0`
+disables it. `GET /mcp/v1/tools/list` reports each exposed tool's real effect
+(`readonly` or `act`) rather than assuming the list is read-only, and a
+side-effecting entry in `mcp_server.exposed_tools` is warned about at config
+load.
 The `Agent::run_single` shell runs through the same service as of 0.8.128;
 approval there is fail-closed for the same reason.
 `tests/architecture_boundaries.rs` pins the inventory of production call sites

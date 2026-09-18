@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.153] - 18 September 2026
+
+### Added
+
+- `POST /mcp/v1/tools/call` honours an `Idempotency-Key` header (trimmed,
+  256-byte cap shared with `/webhook`), scoped per caller as
+  `{prx_owner_id}:{key}` and attached to the durable tool idempotency ledger,
+  so a transport retry with the same key executes once and replays the first
+  response, a reused key with a different body is rejected, and two callers
+  sharing a key string both execute. With a key but no ledger-capable memory
+  backend, side-effecting tools fail closed with an explicit error while
+  read-only tools proceed; without a key, behaviour is unchanged and retries
+  are not deduplicated.
+- `mcp_server.rate_limit_rps` is now enforced on `/mcp/v1/tools/call` as a
+  per-caller one-second budget (`0` disables); over budget returns 429.
+
+### Changed
+
+- `tools/list` on the MCP endpoint reports the real effect (`readonly` or
+  `act`) of each exposed tool instead of a hard-coded `readonly`, and config
+  load warns when `mcp_server.exposed_tools` names a side-effecting tool.
+
 ## [0.8.152] - 18 September 2026
 
 ### Fixed

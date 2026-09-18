@@ -1957,13 +1957,20 @@ pub struct McpServerRuntimeConfig {
     /// Require an authenticated external identity for mutating calls.
     #[serde(default = "default_true")]
     pub require_auth: bool,
-    /// Read-only tools exposed to MCP discovery.
+    /// Tools exposed to MCP discovery.
+    ///
+    /// The defaults are all read-only. An operator may add a tool that carries
+    /// side effects; it is then advertised with its real effect by
+    /// `GET /mcp/v1/tools/list` and warned about at config load, and a retry-safe
+    /// call of it needs an `Idempotency-Key`.
     #[serde(default = "default_mcp_server_exposed_tools")]
     pub exposed_tools: Vec<String>,
     /// Allowed browser origins for future streamable HTTP clients.
     #[serde(default = "default_mcp_allowed_origins")]
     pub allowed_origins: Vec<String>,
-    /// Per-caller request budget.
+    /// Per-caller request budget, in requests per second, enforced on
+    /// `POST /mcp/v1/tools/call` and keyed by the authenticated owner id.
+    /// `0` disables the budget.
     #[serde(default = "default_mcp_server_rate_limit_rps")]
     pub rate_limit_rps: u32,
     /// Expected `iss` claim for inbound bearer JWTs. When unset, bearer JWT
@@ -2033,6 +2040,25 @@ fn default_mcp_allowed_origins() -> Vec<String> {
 
 const fn default_mcp_server_rate_limit_rps() -> u32 {
     10
+}
+
+impl McpServerRuntimeConfig {
+    /// Exposed tools that are not read-only.
+    ///
+    /// Exposing one is a deliberate operator action rather than a config error:
+    /// the gateway MCP endpoint drives every call through the shared execution
+    /// service, so such a tool is still policy-gated, approval-gated (fail-closed)
+    /// and, with an `Idempotency-Key`, ledger-protected. Rejecting the list here
+    /// would make that supported path unreachable, so the contract is a warning
+    /// plus honest advertisement instead.
+    #[must_use]
+    pub fn side_effecting_exposed_tools(&self) -> Vec<&str> {
+        self.exposed_tools
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !crate::security::policy::is_read_only_tool(name))
+            .collect()
+    }
 }
 
 impl Default for McpServerRuntimeConfig {
@@ -6718,6 +6744,16 @@ impl Config {
 
         // Chat's link to the daemon it borrows channels from.
         self.chat.validate()?;
+
+        // MCP discovery advertises what `exposed_tools` names. A side-effecting
+        // entry is allowed but must be a visible choice, not a silent one.
+        let side_effecting = self.mcp_server.side_effecting_exposed_tools();
+        if !side_effecting.is_empty() {
+            tracing::warn!(
+                tools = side_effecting.join(", "),
+                "mcp_server.exposed_tools exposes tools with side effects; they are advertised with their real effect and need an Idempotency-Key to be retry-safe"
+            );
+        }
 
         Ok(())
     }

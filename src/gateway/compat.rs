@@ -33,6 +33,21 @@ const A2A_CARD_SCHEMA_VERSION: &str = "1.0";
 const A2A_CARD_JWS_ALG: &str = "EdDSA";
 /// Default JWKS path served by this gateway when no explicit URI is configured.
 const A2A_JWKS_PATH: &str = "/a2a/v1/.well-known/jwks.json";
+/// Request header carrying a caller-supplied idempotency key on
+/// `POST /mcp/v1/tools/call`. The length cap is the gateway-wide one applied to
+/// `/webhook`'s `X-Idempotency-Key`.
+const MCP_IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
+/// Window for `mcp_server.rate_limit_rps`, which is documented as a per-caller
+/// budget in requests per second.
+const MCP_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(1);
+
+/// Process-wide per-caller budget for `POST /mcp/v1/tools/call`.
+///
+/// Rebuilt when `mcp_server.rate_limit_rps` changes, so a config reload adopts
+/// the new budget; the in-flight window is reset by that rebuild, which can only
+/// ever admit more traffic for one window and never less.
+static MCP_RATE_LIMITER: LazyLock<RwLock<Option<(u32, Arc<super::SlidingWindowRateLimiter>)>>> =
+    LazyLock::new(|| RwLock::new(None));
 
 #[derive(Debug, Serialize)]
 pub struct McpListServersResponse {
@@ -222,6 +237,80 @@ pub async fn mcp_tools_list(State(state): State<AppState>) -> Json<Vec<McpExpose
     Json(exposed_tools(&state.config.load_full()))
 }
 
+/// Caller-scoped idempotency for one `POST /mcp/v1/tools/call`.
+struct McpIdempotency {
+    /// `{prx_owner_id}:{Idempotency-Key}`.
+    ///
+    /// The ledger's own reservation key already folds in workspace id, session
+    /// key and semantic turn id, but for MCP both of the latter are
+    /// `mcp:{external_subject}` — subject only, never issuer-qualified — so two
+    /// callers that share a subject across issuers would collide on a shared key
+    /// string and one could suppress the other's call. `prx_owner_id` is the
+    /// authenticated composite `owner:{workspace}:agent:{issuer}:{subject}`,
+    /// which is unique per caller.
+    key: String,
+    /// Durable `MessageEvent` ledger backing reservation and replay. `None` only
+    /// when the workspace ledger cannot be opened; the execution service then
+    /// refuses an Act-effect call rather than risk a duplicate side effect, and
+    /// still runs a read-only one.
+    ledger: Option<Arc<dyn crate::memory::Memory>>,
+}
+
+/// Resolve the caller-scoped idempotency of one `POST /mcp/v1/tools/call`.
+///
+/// `Ok(None)` means the caller sent no key: the call then behaves exactly as it
+/// did before, so a transport retry is NOT deduplicated. A malformed or
+/// over-long key is a client error rather than a silently different key.
+fn mcp_idempotency_for_request(
+    headers: &HeaderMap,
+    identity: &ExternalAgentIdentity,
+    memory: &Arc<dyn crate::memory::Memory>,
+    workspace_dir: &Path,
+) -> Result<Option<McpIdempotency>, (StatusCode, Json<Value>)> {
+    let raw_key = super::idempotency_key_from_header(headers, MCP_IDEMPOTENCY_HEADER)
+        .map_err(|message| json_error(StatusCode::BAD_REQUEST, message))?;
+    Ok(raw_key.map(|raw_key| McpIdempotency {
+        key: format!("{}:{raw_key}", identity.prx_owner_id),
+        ledger: crate::memory::tool_execution_ledger(memory, workspace_dir),
+    }))
+}
+
+/// The per-caller limiter for the currently configured budget.
+fn mcp_rate_limiter(rate_limit_rps: u32) -> Arc<super::SlidingWindowRateLimiter> {
+    // The read guard is scoped explicitly: `parking_lot::RwLock` is not
+    // reentrant, so it must be gone before the write lock below is taken.
+    {
+        let guard = MCP_RATE_LIMITER.read();
+        if let Some((rps, limiter)) = guard.as_ref()
+            && *rps == rate_limit_rps
+        {
+            return Arc::clone(limiter);
+        }
+    }
+    let mut guard = MCP_RATE_LIMITER.write();
+    if let Some((rps, limiter)) = guard.as_ref()
+        && *rps == rate_limit_rps
+    {
+        return Arc::clone(limiter);
+    }
+    let limiter = Arc::new(super::SlidingWindowRateLimiter::new(
+        rate_limit_rps,
+        MCP_RATE_LIMIT_WINDOW,
+        super::RATE_LIMIT_MAX_KEYS_DEFAULT,
+    ));
+    *guard = Some((rate_limit_rps, Arc::clone(&limiter)));
+    limiter
+}
+
+/// Enforce `mcp_server.rate_limit_rps` for one authenticated caller.
+///
+/// The key is the issuer-qualified owner id, so one bot token cannot spend
+/// another's budget. `0` disables the budget, as it does for every other
+/// gateway limiter.
+fn mcp_rate_limit_allows(config: &crate::config::Config, caller: &str) -> bool {
+    mcp_rate_limiter(config.mcp_server.rate_limit_rps).allow(caller)
+}
+
 pub async fn mcp_tools_call(
     State(state): State<AppState>,
     uri: axum::http::Uri,
@@ -249,9 +338,18 @@ pub async fn mcp_tools_call(
         )
     })?;
 
+    if !mcp_rate_limit_allows(&config, &identity.prx_owner_id) {
+        return Err(json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "mcp per-caller request budget exceeded",
+        ));
+    }
+
     if !config.mcp_server.exposed_tools.iter().any(|tool| tool == &request.name) {
         return Err(json_error(StatusCode::FORBIDDEN, "tool is not exposed through mcp"));
     }
+
+    let idempotency = mcp_idempotency_for_request(&headers, &identity, &state.mem, &config.workspace_dir)?;
 
     if let Err(error) =
         upsert_agent_identity_binding(&config.workspace_dir, &identity, &config.mcp_server.exposed_tools)
@@ -283,6 +381,7 @@ pub async fn mcp_tools_call(
             request.name,
             request.arguments,
             identity,
+            idempotency,
         ),
     );
 
@@ -311,25 +410,34 @@ async fn run_mcp_tool_call_job(
     tool_name: String,
     args: Value,
     identity: ExternalAgentIdentity,
+    idempotency: Option<McpIdempotency>,
 ) -> Result<jobs::JobOutput, String> {
     if !tools.iter().any(|tool| tool.supports_name(&tool_name)) {
         return Err("exposed tool is not available".to_string());
     }
-    let outcome = execute_mcp_tool_call(tools, &config, &tool_name, args, &identity).await;
+    let outcome = execute_mcp_tool_call(tools, &config, &tool_name, args, &identity, idempotency).await;
     let body = serde_json::to_value(mcp_tool_call_response(tool_name, identity, outcome))
         .map_err(|error| format!("failed to encode mcp tool result: {error}"))?;
     Ok(jobs::JobOutput::new(StatusCode::OK, body))
 }
 
 /// Drive one external MCP tool call through the shared execution service.
+///
+/// With an `Idempotency-Key` the call is reserved and replayed through the same
+/// durable ledger the Chat and Agent entry points use, so a transport retry of
+/// the identical request runs the side effect once and returns the first
+/// outcome. Reusing the key for a different command is refused rather than
+/// silently executed. Without a key nothing is deduplicated: a retry executes
+/// again, which is the contract this route had before the key was accepted.
 async fn execute_mcp_tool_call(
     tools: Arc<Vec<Box<dyn crate::tools::Tool>>>,
     config: &crate::config::Config,
     tool_name: &str,
     args: Value,
     identity: &ExternalAgentIdentity,
+    idempotency: Option<McpIdempotency>,
 ) -> crate::tools::ToolExecutionOutcome {
-    let service = crate::tools::ToolExecutionService::from_shared_boxed_registry(
+    let mut service = crate::tools::ToolExecutionService::from_shared_boxed_registry(
         tools,
         Arc::new(crate::tools::SecurityEffectPolicy::new(
             crate::runtime::bootstrap::build_security_policy(config),
@@ -341,7 +449,16 @@ async fn execute_mcp_tool_call(
     // Runtime-only keys in the request body are dropped and re-authored by the
     // service from this context, so a forged `_zc_scope` / `_zc_approval_grant`
     // in the body cannot survive into execution.
-    let command = crate::tools::ToolExecutionCommand::new(tool_name, normalize_mcp_arguments(args));
+    let mut command = crate::tools::ToolExecutionCommand::new(tool_name, normalize_mcp_arguments(args));
+    if let Some(idempotency) = idempotency {
+        command = command.with_idempotency_key(idempotency.key);
+        // No ledger means no reservation. The service then fails an Act-effect
+        // call closed — "durable tool idempotency ledger is unavailable" reaches
+        // the client as the error text — and lets a read-only one through.
+        if let Some(ledger) = idempotency.ledger {
+            service = service.with_idempotency_memory(ledger);
+        }
+    }
     service.execute(command, mcp_execution_context(identity), None).await
 }
 
@@ -453,11 +570,24 @@ fn exposed_tools(config: &crate::config::Config) -> Vec<McpExposedTool> {
         .exposed_tools
         .iter()
         .map(|name| McpExposedTool {
+            risk: mcp_tool_risk(name),
             name: name.clone(),
-            risk: "readonly",
             default_exposed: true,
         })
         .collect()
+}
+
+/// The declared side effect of an exposed tool.
+///
+/// This is the predicate `ToolDescriptor::effect` is derived from, so discovery
+/// and execution agree. Reporting a fixed `readonly` would advertise a mutating
+/// tool an operator added to `exposed_tools` as harmless.
+fn mcp_tool_risk(name: &str) -> &'static str {
+    if crate::security::policy::is_read_only_tool(name) {
+        "readonly"
+    } else {
+        "act"
+    }
 }
 
 fn derive_external_agent_identity(
@@ -1552,7 +1682,7 @@ mod tests {
     ) -> McpToolCallResponse {
         let identity = mcp_test_identity();
         let registry: Arc<Vec<Box<dyn crate::tools::Tool>>> = Arc::new(vec![Box::new(tool.clone())]);
-        let outcome = execute_mcp_tool_call(registry, config, tool.name, args, &identity).await;
+        let outcome = execute_mcp_tool_call(registry, config, tool.name, args, &identity, None).await;
         mcp_tool_call_response(tool.name.to_string(), identity, outcome)
     }
 
@@ -2487,5 +2617,375 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
             result.is_some(),
             "cache lookup must succeed when using the normalised (trimmed) key"
         );
+    }
+
+    fn mcp_test_ledger(dir: &Path) -> Arc<dyn crate::memory::Memory> {
+        Arc::new(crate::memory::SqliteMemory::new(dir).expect("test: sqlite ledger"))
+    }
+
+    /// Build the idempotency of a request the way the handler does: from a real
+    /// `Idempotency-Key` header, the authenticated identity, and the gateway's
+    /// memory handle.
+    fn mcp_request_idempotency(
+        identity: &ExternalAgentIdentity,
+        raw_key: &str,
+        memory: &Arc<dyn crate::memory::Memory>,
+        workspace: &Path,
+    ) -> McpIdempotency {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            MCP_IDEMPOTENCY_HEADER,
+            HeaderValue::from_str(raw_key).expect("test: header value"),
+        );
+        mcp_idempotency_for_request(&headers, identity, memory, workspace)
+            .expect("test: the header is accepted")
+            .expect("test: a key was supplied")
+    }
+
+    fn mcp_registry(tool: &McpFixtureTool) -> Arc<Vec<Box<dyn crate::tools::Tool>>> {
+        Arc::new(vec![Box::new(tool.clone()) as Box<dyn crate::tools::Tool>])
+    }
+
+    /// V02-R1: a client that retries a timed-out POST with the same
+    /// `Idempotency-Key` gets the first outcome replayed, and the Act-effect
+    /// side effect runs once. Before this change the identical pair ran the
+    /// backend twice (the V02 review's reproduction).
+    #[tokio::test]
+    async fn mcp_tool_call_replays_a_repeated_idempotency_key_without_reexecuting() {
+        let workspace = TempDir::new().expect("test: temp workspace");
+        let config = mcp_test_config(workspace.path());
+        let ledger_dir = TempDir::new().expect("test: temp ledger");
+        let tool = McpFixtureTool::new("mcp_fixture");
+        let identity = mcp_test_identity();
+        let body = serde_json::json!({"mode": "write", "note": "charge-once"});
+        let ledger = mcp_test_ledger(ledger_dir.path());
+        let idempotency = || mcp_request_idempotency(&identity, "retry-key", &ledger, workspace.path());
+
+        let first = execute_mcp_tool_call(
+            mcp_registry(&tool),
+            &config,
+            "mcp_fixture",
+            body.clone(),
+            &identity,
+            Some(idempotency()),
+        )
+        .await;
+        let second = execute_mcp_tool_call(
+            mcp_registry(&tool),
+            &config,
+            "mcp_fixture",
+            body,
+            &identity,
+            Some(idempotency()),
+        )
+        .await;
+
+        assert!(first.result.as_ref().is_some_and(|result| result.success));
+        assert!(!first.replayed, "the first call is a real execution");
+        assert!(second.result.as_ref().is_some_and(|result| result.success));
+        assert!(second.replayed, "the retry must be served from the ledger");
+        assert_eq!(second.model_content, first.model_content);
+        assert_eq!(
+            tool.call_count(),
+            1,
+            "a retried MCP call with the same key must run the side effect once"
+        );
+    }
+
+    /// V02-R1: the key binds to the command it was first used for. Reusing it
+    /// for a different body is refused instead of executing something the
+    /// caller did not ask to deduplicate.
+    #[tokio::test]
+    async fn mcp_tool_call_rejects_an_idempotency_key_reused_for_a_different_body() {
+        let workspace = TempDir::new().expect("test: temp workspace");
+        let config = mcp_test_config(workspace.path());
+        let ledger_dir = TempDir::new().expect("test: temp ledger");
+        let tool = McpFixtureTool::new("mcp_fixture");
+        let identity = mcp_test_identity();
+        let ledger = mcp_test_ledger(ledger_dir.path());
+        let idempotency = || mcp_request_idempotency(&identity, "reused-key", &ledger, workspace.path());
+
+        let first = execute_mcp_tool_call(
+            mcp_registry(&tool),
+            &config,
+            "mcp_fixture",
+            serde_json::json!({"mode": "write", "note": "first"}),
+            &identity,
+            Some(idempotency()),
+        )
+        .await;
+        let conflict = execute_mcp_tool_call(
+            mcp_registry(&tool),
+            &config,
+            "mcp_fixture",
+            serde_json::json!({"mode": "write", "note": "second"}),
+            &identity,
+            Some(idempotency()),
+        )
+        .await;
+
+        assert!(first.result.as_ref().is_some_and(|result| result.success));
+        let response = mcp_tool_call_response("mcp_fixture".to_string(), identity, conflict);
+        assert!(response.is_error, "a key reused for another command must be refused");
+        let text = &response.content.first().expect("test: content").text;
+        assert!(
+            text.contains("idempotency key"),
+            "the refusal must name the idempotency conflict, got {text}"
+        );
+        assert_eq!(tool.call_count(), 1, "the conflicting call must never run");
+    }
+
+    /// V02-R1: the key is scoped by the authenticated owner id. Two callers that
+    /// share an external subject under different issuers collide on the
+    /// service's own reservation key (session key and semantic turn id are both
+    /// `mcp:{subject}`), so without the owner prefix one caller's key would
+    /// suppress the other's call.
+    #[tokio::test]
+    async fn mcp_tool_call_scopes_the_idempotency_key_per_caller() {
+        let workspace = TempDir::new().expect("test: temp workspace");
+        let config = mcp_test_config(workspace.path());
+        let ledger_dir = TempDir::new().expect("test: temp ledger");
+        let first_caller = external_identity_for("issuer-a.example", "bearer", "shared-subject", "ws-1");
+        let second_caller = external_identity_for("issuer-b.example", "mtls", "shared-subject", "ws-1");
+        let ctx_a = mcp_execution_context(&first_caller);
+        let ctx_b = mcp_execution_context(&second_caller);
+        assert_eq!(
+            ctx_a.envelope.session_key, ctx_b.envelope.session_key,
+            "sanity: the service's own key material collides across issuers"
+        );
+
+        let tool = McpFixtureTool::new("mcp_fixture");
+        let ledger = mcp_test_ledger(ledger_dir.path());
+        let body = serde_json::json!({"mode": "write", "note": "per-caller"});
+        for identity in [&first_caller, &second_caller] {
+            let outcome = execute_mcp_tool_call(
+                mcp_registry(&tool),
+                &config,
+                "mcp_fixture",
+                body.clone(),
+                identity,
+                Some(mcp_request_idempotency(
+                    identity,
+                    "shared-key-string",
+                    &ledger,
+                    workspace.path(),
+                )),
+            )
+            .await;
+            assert!(
+                outcome.result.as_ref().is_some_and(|result| result.success),
+                "each caller's own first use of the key string must execute"
+            );
+            assert!(!outcome.replayed);
+        }
+
+        assert_eq!(
+            tool.call_count(),
+            2,
+            "two callers reusing the same key string must both execute"
+        );
+    }
+
+    /// V02-R1 behaviour decision: a key with no ledger fails an Act-effect call
+    /// closed, exactly as the general execution service does, and the response
+    /// says why.
+    #[tokio::test]
+    async fn mcp_tool_call_without_a_ledger_refuses_an_act_effect_idempotent_call() {
+        let workspace = TempDir::new().expect("test: temp workspace");
+        let config = mcp_test_config(workspace.path());
+        let tool = McpFixtureTool::new("mcp_fixture");
+        let identity = mcp_test_identity();
+
+        let outcome = execute_mcp_tool_call(
+            mcp_registry(&tool),
+            &config,
+            "mcp_fixture",
+            serde_json::json!({"mode": "write"}),
+            &identity,
+            Some(McpIdempotency {
+                key: format!("{}:no-ledger", identity.prx_owner_id),
+                ledger: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(outcome.status, crate::tools::ToolExecutionStatus::Indeterminate);
+        let response = mcp_tool_call_response("mcp_fixture".to_string(), identity, outcome);
+        assert!(response.is_error);
+        let text = &response.content.first().expect("test: content").text;
+        assert!(
+            text.contains("durable tool idempotency ledger is unavailable"),
+            "the client must be told why the side effect was refused, got {text}"
+        );
+        assert_eq!(tool.call_count(), 0, "an unledgered side effect must never run");
+    }
+
+    /// The other half of that decision: a read-only exposed tool has nothing to
+    /// deduplicate, so a missing ledger must not make it unusable.
+    #[tokio::test]
+    async fn mcp_tool_call_without_a_ledger_still_runs_a_read_only_idempotent_call() {
+        let workspace = TempDir::new().expect("test: temp workspace");
+        let config = mcp_test_config(workspace.path());
+        assert!(
+            crate::security::policy::is_read_only_tool("sessions_list"),
+            "sanity: the fixture stands in for a read-effect exposed tool"
+        );
+        let tool = McpFixtureTool::new("sessions_list");
+        let identity = mcp_test_identity();
+
+        let outcome = execute_mcp_tool_call(
+            mcp_registry(&tool),
+            &config,
+            "sessions_list",
+            serde_json::json!({"mode": "read"}),
+            &identity,
+            Some(McpIdempotency {
+                key: format!("{}:no-ledger", identity.prx_owner_id),
+                ledger: None,
+            }),
+        )
+        .await;
+
+        assert!(
+            outcome.result.as_ref().is_some_and(|result| result.success),
+            "a read-only call must still run without a ledger"
+        );
+        assert_eq!(tool.call_count(), 1);
+    }
+
+    /// V02-R1: without a key nothing changes. A retry executes again, and that
+    /// is the documented contract rather than an accident.
+    #[tokio::test]
+    async fn mcp_tool_call_without_an_idempotency_key_is_not_deduplicated() {
+        let workspace = TempDir::new().expect("test: temp workspace");
+        let config = mcp_test_config(workspace.path());
+        let tool = McpFixtureTool::new("mcp_fixture");
+        let identity = mcp_test_identity();
+        let body = serde_json::json!({"mode": "write", "note": "no-key"});
+
+        for _ in 0..2 {
+            let outcome = execute_mcp_tool_call(
+                mcp_registry(&tool),
+                &config,
+                "mcp_fixture",
+                body.clone(),
+                &identity,
+                None,
+            )
+            .await;
+            assert!(outcome.result.as_ref().is_some_and(|result| result.success));
+            assert!(!outcome.replayed);
+        }
+
+        assert_eq!(
+            tool.call_count(),
+            2,
+            "a keyless retry keeps the pre-existing duplicate-execution contract"
+        );
+    }
+
+    /// V02-R1: the header is optional, trimmed, capped the way `/webhook` caps
+    /// `X-Idempotency-Key`, and the key the service sees is scoped to the
+    /// authenticated caller rather than to the caller-chosen string.
+    #[test]
+    fn mcp_idempotency_request_key_is_caller_scoped_and_length_capped() {
+        let workspace = TempDir::new().expect("test: temp workspace");
+        let memory = mcp_test_ledger(workspace.path());
+        let identity = mcp_test_identity();
+
+        assert!(
+            mcp_idempotency_for_request(&HeaderMap::new(), &identity, &memory, workspace.path())
+                .expect("test: no header is accepted")
+                .is_none(),
+            "no header means no key, and no deduplication"
+        );
+
+        let mut blank = HeaderMap::new();
+        blank.insert(MCP_IDEMPOTENCY_HEADER, HeaderValue::from_static("   "));
+        assert!(
+            mcp_idempotency_for_request(&blank, &identity, &memory, workspace.path())
+                .expect("test: a blank header is accepted")
+                .is_none(),
+            "a blank header is not the empty key"
+        );
+
+        let resolved = mcp_request_idempotency(&identity, " charge-42 ", &memory, workspace.path());
+        assert_eq!(
+            resolved.key,
+            format!("{}:charge-42", identity.prx_owner_id),
+            "the key must be scoped to the authenticated caller and trimmed"
+        );
+        assert!(
+            resolved.ledger.is_some(),
+            "a ledger-capable memory backend must be attached"
+        );
+
+        let mut oversized = HeaderMap::new();
+        oversized.insert(
+            MCP_IDEMPOTENCY_HEADER,
+            HeaderValue::from_str(&"k".repeat(257)).expect("test: header value"),
+        );
+        let Err((status, body)) = mcp_idempotency_for_request(&oversized, &identity, &memory, workspace.path()) else {
+            panic!("an over-long key must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let message = body.0.get("error").and_then(Value::as_str).unwrap_or_default();
+        assert!(message.contains("256-byte limit"), "unexpected cap message: {message}");
+    }
+
+    /// V02-R2: `mcp_server.rate_limit_rps` is enforced per caller instead of
+    /// being a documented budget that does not exist.
+    #[test]
+    fn mcp_rate_limit_budget_is_enforced_per_caller() {
+        let mut config = crate::config::Config::default();
+        let first_caller = "owner:ws-1:agent:issuer-a.example:alice";
+        let second_caller = "owner:ws-1:agent:issuer-b.example:alice";
+        config.mcp_server.rate_limit_rps = 2;
+
+        assert!(mcp_rate_limit_allows(&config, first_caller));
+        assert!(mcp_rate_limit_allows(&config, first_caller));
+        assert!(
+            !mcp_rate_limit_allows(&config, first_caller),
+            "the third call inside the same second exceeds a budget of 2"
+        );
+        assert!(
+            mcp_rate_limit_allows(&config, second_caller),
+            "one caller must not spend another caller's budget"
+        );
+
+        config.mcp_server.rate_limit_rps = 0;
+        for _ in 0..8 {
+            assert!(
+                mcp_rate_limit_allows(&config, first_caller),
+                "a budget of 0 disables the limit"
+            );
+        }
+    }
+
+    /// V02-R3: discovery reports the real effect of an exposed tool. A hard-coded
+    /// `readonly` advertised an operator-added mutating tool as harmless.
+    #[test]
+    fn mcp_tools_list_reports_the_real_tool_effect() {
+        let mut config = crate::config::Config::default();
+        assert!(
+            exposed_tools(&config).iter().all(|tool| tool.risk == "readonly"),
+            "every default exposed tool is read-only"
+        );
+        assert!(
+            config.mcp_server.side_effecting_exposed_tools().is_empty(),
+            "the defaults must not trip the config-load warning"
+        );
+
+        config.mcp_server.exposed_tools.push("shell".to_string());
+        let listed = exposed_tools(&config);
+        let shell = listed
+            .iter()
+            .find(|tool| tool.name == "shell")
+            .expect("test: exposed shell tool");
+        assert_eq!(
+            shell.risk, "act",
+            "a mutating exposed tool must not be listed as readonly"
+        );
+        assert_eq!(config.mcp_server.side_effecting_exposed_tools(), vec!["shell"]);
     }
 }

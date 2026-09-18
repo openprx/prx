@@ -719,6 +719,32 @@ fn webhook_request_fingerprint(body: &[u8]) -> [u8; 32] {
     Sha256::digest(body).into()
 }
 
+/// Read an idempotency-key request header under a shared length cap.
+///
+/// `/webhook` (`X-Idempotency-Key`) and `POST /mcp/v1/tools/call`
+/// (`Idempotency-Key`) both accept a caller-supplied key, so both cap it the
+/// same way: a non-UTF-8 or over-long value is a client error rather than
+/// something silently truncated into a different key, and a blank value is
+/// treated as "no key" rather than as the empty key.
+fn idempotency_key_from_header(headers: &HeaderMap, header_name: &str) -> Result<Option<String>, String> {
+    let Some(value) = headers.get(header_name) else {
+        return Ok(None);
+    };
+    let Ok(value) = value.to_str() else {
+        return Err(format!("{header_name} must be valid UTF-8"));
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > IDEMPOTENCY_MAX_KEY_BYTES {
+        return Err(format!(
+            "{header_name} exceeds the {IDEMPOTENCY_MAX_KEY_BYTES}-byte limit"
+        ));
+    }
+    Ok(Some(value.to_string()))
+}
+
 fn webhook_idempotency_digest(scope: &str, raw_key: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -2541,24 +2567,11 @@ async fn handle_webhook(
     };
 
     // ── Idempotency (optional) ──
-    let request_idempotency_key = match headers.get("X-Idempotency-Key") {
-        None => None,
-        Some(value) => {
-            let Ok(value) = value.to_str() else {
-                let err = serde_json::json!({"error": "X-Idempotency-Key must be valid UTF-8"});
-                return (StatusCode::BAD_REQUEST, Json(err));
-            };
-            let value = value.trim();
-            if value.is_empty() {
-                None
-            } else if value.len() > IDEMPOTENCY_MAX_KEY_BYTES {
-                let err = serde_json::json!({
-                    "error": "X-Idempotency-Key exceeds the 256-byte limit"
-                });
-                return (StatusCode::BAD_REQUEST, Json(err));
-            } else {
-                Some(value.to_string())
-            }
+    let request_idempotency_key = match idempotency_key_from_header(&headers, "X-Idempotency-Key") {
+        Ok(key) => key,
+        Err(message) => {
+            let err = serde_json::json!({ "error": message });
+            return (StatusCode::BAD_REQUEST, Json(err));
         }
     };
     let mut idempotency_digest = None;
