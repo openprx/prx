@@ -719,13 +719,20 @@ impl SqliteMemory {
                 sensitivity  TEXT NOT NULL DEFAULT 'normal',
                 risk_signals TEXT DEFAULT '[]',
                 policy_version INTEGER DEFAULT 1,
-                useful_count INTEGER NOT NULL DEFAULT 0
+                useful_count INTEGER NOT NULL DEFAULT 0,
+                -- Monotonic per-store write counter, maintained by the
+                -- `memories_update_seq_*` triggers created after the column
+                -- migrations below. It is the only ordering key vector recall
+                -- trusts: `updated_at` is a local-offset RFC 3339 string, and
+                -- `rowid` never moves when an existing key is refreshed.
+                update_seq INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
             CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(key);
-            -- The vector-recall candidate index is created after the column
-            -- migrations below, because the columns it spans are added by
-            -- ALTER TABLE on stores that predate them.
+            -- The vector-recall candidate index and the update-sequence
+            -- triggers are created after the column migrations below, because
+            -- the columns they span are added by ALTER TABLE on stores that
+            -- predate them.
 
             -- FTS5 full-text search (BM25 scoring)
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -741,7 +748,19 @@ impl SqliteMemory {
                 INSERT INTO memories_fts(memories_fts, rowid, key, content)
                 VALUES ('delete', old.rowid, old.key, old.content);
             END;
-            CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+            -- Superseded by `memories_au_fts`: it rewrote the FTS index for
+            -- every UPDATE, including updates that touch no indexed column.
+            -- That is wasted work for a metadata write, and it is a hard error
+            -- for an update issued from inside another trigger on this table
+            -- (`memories_update_seq_ai` below): the FTS 'delete' command then
+            -- runs against a row whose index entry the insert trigger may not
+            -- have written yet, which FTS5 reports as a corrupt external
+            -- content table. Renaming rather than redefining keeps
+            -- `CREATE TRIGGER IF NOT EXISTS` a no-op on later opens.
+            DROP TRIGGER IF EXISTS memories_au;
+            CREATE TRIGGER IF NOT EXISTS memories_au_fts AFTER UPDATE ON memories
+            WHEN new.key IS NOT old.key OR new.content IS NOT old.content
+            BEGIN
                 INSERT INTO memories_fts(memories_fts, rowid, key, content)
                 VALUES ('delete', old.rowid, old.key, old.content);
                 INSERT INTO memories_fts(rowid, key, content)
@@ -1313,6 +1332,10 @@ impl SqliteMemory {
                 "embedding_dimensions",
                 "ALTER TABLE memories ADD COLUMN embedding_dimensions INTEGER",
             ),
+            (
+                "update_seq",
+                "ALTER TABLE memories ADD COLUMN update_seq INTEGER NOT NULL DEFAULT 0",
+            ),
         ];
         for (name, alter_sql) in missing_columns {
             if !names.contains(name) {
@@ -1336,21 +1359,73 @@ impl SqliteMemory {
         // minimal `memories` table) gets them from the ALTER TABLE block above,
         // so an index spanning them cannot live in the CREATE TABLE batch.
         conn.execute_batch(
-            // Superseded index: it led with `updated_at`, a local-offset RFC 3339
-            // string whose lexicographic order is not chronological across
-            // timezone or DST changes, and it carried none of the
-            // embedding-identity columns every vector query filters on, so a
-            // store whose embedding model had changed scanned past large runs of
-            // non-matching rows to fill the candidate set.
-            "DROP INDEX IF EXISTS idx_memories_embedding_recency;
+            // Backfill: every row written before `update_seq` existed takes its
+            // `rowid`, which is the insertion order the 0.8.126 window used, so
+            // an untouched legacy store keeps the exact candidate set it had.
+            // `rowid` is >= 1, so a backfilled row is never confused with the
+            // column default again, and the next write continues above the
+            // highest backfilled value. The `WHERE` clause makes this a no-op on
+            // every later open, and the trigger below does not fire for it
+            // because it changes `update_seq` itself.
+            "UPDATE memories SET update_seq = rowid WHERE update_seq = 0;
+
+             -- Superseded index: it led with `updated_at`, a local-offset RFC
+             -- 3339 string whose lexicographic order is not chronological across
+             -- timezone or DST changes, and it carried none of the
+             -- embedding-identity columns every vector query filters on, so a
+             -- store whose embedding model had changed scanned past large runs
+             -- of non-matching rows to fill the candidate set.
+             DROP INDEX IF EXISTS idx_memories_embedding_recency;
+             -- Superseded index: same three leading columns, but without
+             -- `update_seq` it could only order the window by `rowid`, which
+             -- does not move when `ON CONFLICT(key) DO UPDATE` refreshes an
+             -- existing key. A just-refreshed old memory therefore stayed
+             -- outside the window. Renaming the index rather than redefining it
+             -- keeps `CREATE INDEX IF NOT EXISTS` a no-op on later opens instead
+             -- of rebuilding the index on every process start.
+             DROP INDEX IF EXISTS idx_memories_embedding_candidates;
              -- Leads with the three columns `vector_search` always
-             -- equality-filters, which leaves the matching entries already
-             -- ordered by rowid, so the newest-first candidate window is a
-             -- backward index scan with no sort and no scan of rows belonging to
-             -- another embedding model.
-             CREATE INDEX IF NOT EXISTS idx_memories_embedding_candidates
-                 ON memories(embedding_provider, embedding_model, embedding_dimensions)
-                 WHERE embedding IS NOT NULL;",
+             -- equality-filters and ends with the ordering key, so the
+             -- newest-first candidate window is a backward index scan with no
+             -- sort and no scan of rows belonging to another embedding model.
+             CREATE INDEX IF NOT EXISTS idx_memories_embedding_candidates_seq
+                 ON memories(embedding_provider, embedding_model, embedding_dimensions, update_seq)
+                 WHERE embedding IS NOT NULL;
+             -- Serves the `MAX(update_seq)` lookup in the triggers below as a
+             -- single covering-index descent instead of a table scan per write.
+             CREATE INDEX IF NOT EXISTS idx_memories_update_seq ON memories(update_seq);
+
+             -- The update sequence is maintained in the schema, not in the call
+             -- sites: `memories` is written by upserts here, by metadata and
+             -- useful-count updates, by draft merges and by the webhook and
+             -- fitness writers. A trigger is the one place that cannot be
+             -- forgotten by a new writer, and it also covers rows an older
+             -- build wrote without it.
+             --
+             -- Both bodies update only `update_seq`, which is why
+             -- `memories_au_fts` is guarded on `key`/`content`: an unguarded
+             -- FTS sync trigger would fire for these updates and corrupt the
+             -- external content index.
+             CREATE TRIGGER IF NOT EXISTS memories_update_seq_ai
+             AFTER INSERT ON memories
+             BEGIN
+                 UPDATE memories
+                    SET update_seq = (SELECT COALESCE(MAX(update_seq), 0) + 1 FROM memories)
+                  WHERE rowid = new.rowid;
+             END;
+             -- The `WHEN` guard is what makes the body's own UPDATE terminate:
+             -- it raises `update_seq`, so a re-entry (which only happens under
+             -- `PRAGMA recursive_triggers = ON`) sees new.update_seq <>
+             -- old.update_seq and does nothing. It also leaves the backfill
+             -- above and any deliberate sequence rewrite alone.
+             CREATE TRIGGER IF NOT EXISTS memories_update_seq_au
+             AFTER UPDATE ON memories
+             WHEN new.update_seq = old.update_seq
+             BEGIN
+                 UPDATE memories
+                    SET update_seq = (SELECT COALESCE(MAX(update_seq), 0) + 1 FROM memories)
+                  WHERE rowid = new.rowid;
+             END;",
         )?;
 
         let mut chunk_column_stmt = conn.prepare("PRAGMA table_info(document_chunks)")?;
@@ -2921,17 +2996,32 @@ impl SqliteMemory {
     /// scoring: without a bound this is O(N) over every embedded memory on a
     /// path that runs once per turn.
     ///
-    /// The bound orders by `rowid`, not by `updated_at`. `updated_at` is
-    /// `Local::now().to_rfc3339()` — an RFC 3339 string carrying the writer's
-    /// UTC offset — and it is ordered lexicographically by SQLite. Within one
-    /// fixed offset that happens to match chronological order, but a DST
-    /// transition, a machine timezone change, or a store shared between
+    /// The bound orders by `update_seq`, not by `updated_at` and not by
+    /// `rowid`.
+    ///
+    /// `updated_at` is `Local::now().to_rfc3339()` — an RFC 3339 string carrying
+    /// the writer's UTC offset — and it is ordered lexicographically by SQLite.
+    /// Within one fixed offset that happens to match chronological order, but a
+    /// DST transition, a machine timezone change, or a store shared between
     /// processes in different zones reorders whole blocks of rows, and any row
     /// historically written with `Utc::now()` sorts in a third order again. The
-    /// rows dropped by `LIMIT` would then be the wrong ones. `rowid` is
-    /// monotonic per insert, needs no migration, and cannot be reordered by a
-    /// clock; "newest" here therefore means most recently *created*, not most
-    /// recently touched.
+    /// rows dropped by `LIMIT` would then be the wrong ones.
+    ///
+    /// `rowid` cannot be reordered by a clock, but it does not move either:
+    /// every writer here upserts with `ON CONFLICT(key) DO UPDATE`, which
+    /// rewrites the content and the embedding of an existing key in place. A
+    /// long-lived key refreshed a second ago therefore kept its original
+    /// position, and in a store larger than the cap it stayed outside the
+    /// window — the memory whose embedding was *just* made relevant was the one
+    /// that could not be scored.
+    ///
+    /// `update_seq` is a per-store counter bumped by a trigger on every insert
+    /// and every update (see `init_schema`). It is an integer, so it has no
+    /// timezone, no offset and no DST; it is monotonic, so it cannot be
+    /// reordered by a clock; and it follows the row when the row is refreshed.
+    /// "Newest" here therefore means most recently *written*, created or
+    /// refreshed. `rowid` breaks ties so the window is deterministic on a store
+    /// whose sequence was backfilled by the migration.
     ///
     /// `candidate_cap` is the configured `[memory] vector_candidate_cap`. Hitting it is
     /// a real recall regression — an old-but-relevant memory is never scored —
@@ -2970,7 +3060,7 @@ impl SqliteMemory {
             idx += 1;
         }
         let candidate_cap = vector_candidate_cap(limit, candidate_cap);
-        let _ = write!(sql, " ORDER BY rowid DESC LIMIT ?{idx}");
+        let _ = write!(sql, " ORDER BY update_seq DESC, rowid DESC LIMIT ?{idx}");
         param_values.push(Box::new(i64::try_from(candidate_cap).unwrap_or(i64::MAX)));
 
         let mut stmt = conn.prepare(&sql)?;
@@ -10833,9 +10923,10 @@ source: tool_output\n\
     /// Across a DST transition the later instant sorts *earlier* as a string, so
     /// ordering the candidate window by `updated_at` truncates the wrong rows.
     /// This fixture writes exactly that pair of timestamps and asserts the
-    /// window still follows insertion order.
+    /// window still follows the update sequence: the rows written last are the
+    /// candidates whatever their timestamp text says.
     #[tokio::test]
-    async fn the_candidate_window_follows_insertion_order_not_local_timestamp_text() {
+    async fn the_candidate_window_follows_the_update_sequence_not_local_timestamp_text() {
         let tmp = TempDir::new().expect("test: tempdir");
         let mem = local_embedding_memory(&tmp);
 
@@ -10879,7 +10970,7 @@ source: tool_output\n\
         assert_eq!(
             sorted,
             vec!["note_2".to_string(), "note_3".to_string()],
-            "the two most recently inserted rows must be the candidates; ordering by updated_at text \
+            "the two most recently written rows must be the candidates; ordering by updated_at text \
              would have picked note_0/note_1, whose local-offset strings sort later"
         );
     }
@@ -10942,34 +11033,480 @@ source: tool_output\n\
     }
 
     /// The candidate window must be an index scan, not a sort: the index leads
-    /// with the three embedding-identity columns every vector query filters on,
-    /// which leaves its entries already in rowid order.
+    /// with the three embedding-identity columns every vector query filters on
+    /// and ends with `update_seq`, so a backward scan already yields the
+    /// newest-first order the window wants. Ordering on a column the index does
+    /// not carry would make every recall materialise and sort the whole
+    /// matching set, which is exactly what the cap exists to avoid — so the
+    /// plan is asserted for the unfiltered form and for the fully scoped form.
     #[tokio::test]
     async fn the_candidate_window_is_served_by_an_index_without_a_sort() {
         let tmp = TempDir::new().expect("test: tempdir");
         let mem = local_embedding_memory(&tmp);
-        mem.store("seed", "release deployment", MemoryCategory::Core, None)
+        mem.store("seed", "release deployment", MemoryCategory::Core, Some("session-a"))
             .await
             .expect("test: store seed");
 
         let conn = mem.pool.write();
-        let plan: String = conn
-            .query_row(
+        // Every row of the plan, not just the first: the sort SQLite adds when
+        // the index cannot supply the order is reported on its own line, so a
+        // single-row read would call an index scan plus a temp B-tree "clean".
+        let plan_of = |sql: &str| -> String {
+            let mut stmt = conn.prepare(sql).expect("test: prepare explain query plan");
+            let rows = stmt
+                .query_map(params!["local", "prx-local-hash-v1", 384_i64, 10_i64], |row| {
+                    row.get::<_, String>(3)
+                })
+                .expect("test: explain query plan");
+            rows.collect::<Result<Vec<_>, _>>()
+                .expect("test: collect query plan")
+                .join(" | ")
+        };
+        let plans = [
+            plan_of(
                 "EXPLAIN QUERY PLAN SELECT id, embedding FROM memories \
                  WHERE embedding IS NOT NULL AND embedding_provider = ?1 AND embedding_model = ?2 \
-                 AND embedding_dimensions = ?3 ORDER BY rowid DESC LIMIT ?4",
-                params!["local", "prx-local-hash-v1", 384_i64, 10_i64],
-                |row| row.get::<_, String>(3),
+                 AND embedding_dimensions = ?3 ORDER BY update_seq DESC, rowid DESC LIMIT ?4",
+            ),
+            plan_of(
+                "EXPLAIN QUERY PLAN SELECT id, embedding FROM memories \
+                 WHERE embedding IS NOT NULL AND embedding_provider = ?1 AND embedding_model = ?2 \
+                 AND embedding_dimensions = ?3 AND category = 'core' AND session_id = 'session-a' \
+                 ORDER BY update_seq DESC, rowid DESC LIMIT ?4",
+            ),
+        ];
+        for plan in plans {
+            assert!(
+                plan.contains("idx_memories_embedding_candidates_seq"),
+                "the candidate window must use the embedding-identity index, got: {plan}"
+            );
+            assert!(
+                !plan.to_ascii_uppercase().contains("TEMP B-TREE"),
+                "the candidate window must not sort, got: {plan}"
+            );
+        }
+
+        // The trigger runs on every memory write, so its MAX lookup must be an
+        // index descent rather than a scan of the whole table.
+        let seq_plan: String = {
+            let mut stmt = conn
+                .prepare("EXPLAIN QUERY PLAN SELECT COALESCE(MAX(update_seq), 0) + 1 FROM memories")
+                .expect("test: prepare update sequence plan");
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(3))
+                .expect("test: explain update sequence plan");
+            rows.collect::<Result<Vec<_>, _>>()
+                .expect("test: collect update sequence plan")
+                .join(" | ")
+        };
+        assert!(
+            seq_plan.contains("idx_memories_update_seq"),
+            "the update-sequence allocation must use its index, got: {seq_plan}"
+        );
+    }
+
+    /// The window is bounded, so the question an upsert raises is not whether an
+    /// old key still exists but whether refreshing it puts the key back in the
+    /// window. Ordering by `rowid` answered "no": `ON CONFLICT(key) DO UPDATE`
+    /// rewrites content and embedding in place and never moves the row, so the
+    /// oldest key could be given the only embedding that matches the query one
+    /// second ago and still never be scored. The fixture refreshes through the
+    /// production `store()` path, with the cap genuinely biting first. `limit`
+    /// is held at the cap because the effective window is `max(limit, cap)`.
+    #[tokio::test]
+    async fn refreshing_the_oldest_key_returns_it_to_the_candidate_window() {
+        const CAP: usize = 3;
+        const FILLERS: usize = 9;
+
+        let tmp = TempDir::new().expect("test: tempdir");
+        let mem = local_embedding_memory(&tmp);
+        let query = "release deployment pipeline failure";
+
+        mem.store(
+            "oldest",
+            "unrelated gardening note about compost",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .expect("test: store the oldest key");
+        for index in 0..FILLERS {
+            mem.store(
+                &format!("filler_{index}"),
+                &format!("unrelated gardening note number {index}"),
+                MemoryCategory::Core,
+                None,
             )
-            .expect("test: explain query plan");
+            .await
+            .expect("test: store filler");
+        }
+
+        // Guard the fixture itself: a cap that does not exclude the oldest key
+        // proves nothing about what refreshing it changes.
+        let before: Vec<String> = vector_candidates(&mem, query, CAP, CAP)
+            .iter()
+            .map(|id| memory_key_for_id(&mem, id))
+            .collect();
         assert!(
-            plan.contains("idx_memories_embedding_candidates"),
-            "the candidate window must use the embedding-identity index, got: {plan}"
+            !before.contains(&"oldest".to_string()),
+            "fixture must start with the oldest key outside a cap of {CAP} over {} rows, got: {before:?}",
+            FILLERS + 1
+        );
+
+        // A real upsert: same key, new content, new embedding, same rowid.
+        mem.store("oldest", query, MemoryCategory::Core, None)
+            .await
+            .expect("test: refresh the oldest key");
+        let rowid: i64 = {
+            let conn = mem.pool.write();
+            conn.query_row("SELECT rowid FROM memories WHERE key = 'oldest'", [], |row| row.get(0))
+                .expect("test: read the refreshed rowid")
+        };
+        assert_eq!(rowid, 1, "the upsert must reuse the original row, not append a new one");
+
+        let after: Vec<String> = vector_candidates(&mem, query, CAP, CAP)
+            .iter()
+            .map(|id| memory_key_for_id(&mem, id))
+            .collect();
+        assert_eq!(
+            after.first().map(String::as_str),
+            Some("oldest"),
+            "a key refreshed with the only relevant embedding must be scored again, got: {after:?}"
+        );
+    }
+
+    /// Update recency must be an integer sequence, not a timestamp: the four
+    /// rewrites below disagree on purpose. `note_0` carries the text that sorts
+    /// last, `note_2` the latest real instant, `note_3` the highest `rowid`, and
+    /// `note_1` — earliest by text and by instant — is simply the row written
+    /// last. Only a monotonic update sequence picks `note_1`.
+    #[tokio::test]
+    async fn the_candidate_window_ignores_utc_offsets_and_dst_in_updated_at() {
+        let tmp = TempDir::new().expect("test: tempdir");
+        let mem = local_embedding_memory(&tmp);
+        let query = "release deployment pipeline failure";
+
+        for index in 0..4 {
+            mem.store(&format!("note_{index}"), query, MemoryCategory::Core, None)
+                .await
+                .expect("test: store note");
+        }
+
+        {
+            let conn = mem.pool.write();
+            for (key, updated_at) in [
+                // Sorts last as text; +14:00 makes its instant an early one.
+                ("note_0", "2026-12-31T23:59:59+14:00"),
+                // The latest instant of the four (2026-12-31T10:00:00Z).
+                ("note_2", "2026-12-30T23:00:00-11:00"),
+                // The ambiguous local hour a DST end repeats.
+                ("note_3", "2026-11-01T01:30:00-04:00"),
+                // Earliest by text and by instant, but written last.
+                ("note_1", "2026-01-01T00:00:00+00:00"),
+            ] {
+                conn.execute(
+                    "UPDATE memories SET updated_at = ?1 WHERE key = ?2",
+                    params![updated_at, key],
+                )
+                .expect("test: rewrite updated_at");
+            }
+        }
+
+        let window: Vec<String> = vector_candidates(&mem, query, 1, 1)
+            .iter()
+            .map(|id| memory_key_for_id(&mem, id))
+            .collect();
+        assert_eq!(
+            window,
+            vec!["note_1".to_string()],
+            "a window of one must hold the row written last; updated_at text would pick note_0, its \
+             UTC instant note_2, and insertion order note_3"
+        );
+    }
+
+    /// Recency decides which rows survive the cap, never which rows qualify:
+    /// the embedding identity, category and session filters are applied before
+    /// the window, so a newer row belonging to another embedding model,
+    /// dimension count, category or session must not consume a candidate slot.
+    #[tokio::test]
+    async fn the_candidate_window_keeps_its_scopes_when_newer_rows_are_out_of_scope() {
+        let tmp = TempDir::new().expect("test: tempdir");
+        let mem = local_embedding_memory(&tmp);
+        let query = "release deployment pipeline failure";
+
+        mem.store("wanted", query, MemoryCategory::Core, Some("session-a"))
+            .await
+            .expect("test: store wanted");
+        mem.store("wrong_session", query, MemoryCategory::Core, Some("session-b"))
+            .await
+            .expect("test: store wrong session");
+        mem.store("wrong_category", query, MemoryCategory::Daily, Some("session-a"))
+            .await
+            .expect("test: store wrong category");
+
+        let embedding = local_query_embedding(query);
+        {
+            let conn = mem.pool.write();
+            for (key, provider, model, dimensions) in [
+                ("wrong_provider", "remote", "prx-local-hash-v1", 384_i64),
+                ("wrong_model", "local", "some-other-model", 384_i64),
+                ("wrong_dimensions", "local", "prx-local-hash-v1", 512_i64),
+            ] {
+                conn.execute(
+                    "INSERT INTO memories (
+                        id, key, content, category, embedding, embedding_provider,
+                        embedding_model, embedding_dimensions, created_at, updated_at, session_id
+                     )
+                     VALUES (?1, ?1, ?2, 'core', ?3, ?4, ?5, ?6, '2026-01-01T00:00:00+00:00', \
+                             '2026-01-01T00:00:00+00:00', 'session-a')",
+                    params![
+                        key,
+                        query,
+                        vector::vec_to_bytes(&embedding),
+                        provider,
+                        model,
+                        dimensions
+                    ],
+                )
+                .expect("test: insert an out-of-scope row");
+            }
+        }
+
+        // Every out-of-scope row was written after `wanted`, so an unscoped
+        // window of two would hold none of the rows this query may score.
+        let conn = mem.pool.write();
+        let matched = SqliteMemory::vector_search(
+            &conn,
+            &embedding,
+            "local",
+            "prx-local-hash-v1",
+            384,
+            10,
+            Some("core"),
+            Some("session-a"),
+            2,
+        )
+        .expect("test: scoped vector search");
+        drop(conn);
+
+        let keys: Vec<String> = matched.iter().map(|(id, _)| memory_key_for_id(&mem, id)).collect();
+        assert_eq!(
+            keys,
+            vec!["wanted".to_string()],
+            "provider, model, dimension, category and session scoping must survive the recency window"
+        );
+    }
+
+    /// A store written before the update sequence existed must migrate on open:
+    /// the column is added, every existing row keeps its content and takes its
+    /// insertion order as its sequence, the superseded index is retired, and
+    /// the triggers that maintain the sequence from then on are installed.
+    #[tokio::test]
+    async fn opening_a_pre_update_sequence_store_migrates_it_without_data_loss() {
+        const LEGACY_ROWS: usize = 4;
+
+        let tmp = TempDir::new().expect("test: tempdir");
+        {
+            let mem = local_embedding_memory(&tmp);
+            for index in 0..LEGACY_ROWS {
+                mem.store(
+                    &format!("legacy_{index}"),
+                    &format!("legacy note number {index}"),
+                    MemoryCategory::Core,
+                    None,
+                )
+                .await
+                .expect("test: store legacy row");
+            }
+
+            let conn = mem.pool.write();
+            // Rebuild the 0.8.126 shape: no sequence column, no triggers, and
+            // the candidate index that could only order by rowid.
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS memories_update_seq_ai;
+                 DROP TRIGGER IF EXISTS memories_update_seq_au;
+                 DROP INDEX IF EXISTS idx_memories_update_seq;
+                 DROP INDEX IF EXISTS idx_memories_embedding_candidates_seq;
+                 ALTER TABLE memories DROP COLUMN update_seq;
+                 CREATE INDEX IF NOT EXISTS idx_memories_embedding_candidates
+                     ON memories(embedding_provider, embedding_model, embedding_dimensions)
+                     WHERE embedding IS NOT NULL;",
+            )
+            .expect("test: rebuild the pre-migration schema");
+            assert!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = 'update_seq'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("test: probe the fixture column")
+                    == 0,
+                "the fixture must start without the update sequence column"
+            );
+        }
+
+        let reopened = local_embedding_memory(&tmp);
+        let conn = reopened.pool.write();
+
+        let rows: Vec<(String, String, i64, i64)> = {
+            let mut stmt = conn
+                .prepare("SELECT key, content, rowid, update_seq FROM memories ORDER BY rowid")
+                .expect("test: prepare migrated read");
+            let mapped = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .expect("test: read migrated rows");
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .expect("test: collect migrated rows")
+        };
+        assert_eq!(rows.len(), LEGACY_ROWS, "migration must not lose or duplicate rows");
+        for (index, (key, content, rowid, update_seq)) in rows.iter().enumerate() {
+            assert_eq!(key, &format!("legacy_{index}"), "row {index} lost its key");
+            assert_eq!(
+                content,
+                &format!("legacy note number {index}"),
+                "row {index} lost its content"
+            );
+            assert_eq!(
+                update_seq, rowid,
+                "a backfilled row must keep its insertion order as its sequence"
+            );
+        }
+
+        let object_names: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master \
+                     WHERE type IN ('index', 'trigger') AND tbl_name = 'memories' ORDER BY name",
+                )
+                .expect("test: prepare schema read");
+            let mapped = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("test: read schema objects");
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .expect("test: collect schema objects")
+        };
+        for expected in [
+            "idx_memories_embedding_candidates_seq",
+            "idx_memories_update_seq",
+            "memories_au_fts",
+            "memories_update_seq_ai",
+            "memories_update_seq_au",
+        ] {
+            assert!(
+                object_names.iter().any(|name| name == expected),
+                "migration must create {expected}, got: {object_names:?}"
+            );
+        }
+        assert!(
+            !object_names
+                .iter()
+                .any(|name| name == "idx_memories_embedding_candidates"),
+            "migration must retire the rowid-ordered index, got: {object_names:?}"
         );
         assert!(
-            !plan.to_ascii_uppercase().contains("TEMP B-TREE"),
-            "the candidate window must not sort, got: {plan}"
+            !object_names.iter().any(|name| name == "memories_au"),
+            "migration must retire the unguarded FTS update trigger, got: {object_names:?}"
         );
+        drop(conn);
+
+        // The sequence continues above the backfill, and a refreshed legacy key
+        // is recalled again on the migrated store.
+        let query = "release deployment pipeline failure";
+        reopened
+            .store("legacy_0", query, MemoryCategory::Core, None)
+            .await
+            .expect("test: refresh a migrated key");
+        let refreshed_seq: i64 = {
+            let conn = reopened.pool.write();
+            conn.query_row("SELECT update_seq FROM memories WHERE key = 'legacy_0'", [], |row| {
+                row.get(0)
+            })
+            .expect("test: read the refreshed sequence")
+        };
+        assert!(
+            refreshed_seq > i64::try_from(LEGACY_ROWS).unwrap_or(i64::MAX),
+            "a write after migration must continue above every backfilled sequence, got {refreshed_seq}"
+        );
+        let window: Vec<String> = vector_candidates(&reopened, query, 1, 1)
+            .iter()
+            .map(|id| memory_key_for_id(&reopened, id))
+            .collect();
+        assert_eq!(
+            window,
+            vec!["legacy_0".to_string()],
+            "the refreshed legacy key must lead the migrated candidate window"
+        );
+    }
+
+    /// The update sequence is maintained by a trigger that writes back to
+    /// `memories`, and `memories_fts` is an FTS5 *external content* table whose
+    /// index is only as correct as the triggers that feed it. An unguarded FTS
+    /// update trigger fires for that write-back and issues a 'delete' for an
+    /// index entry that may not exist yet, which FTS5 reports as a corrupt
+    /// virtual table on the very next statement. This asserts the invariant
+    /// directly with FTS5's own integrity check, across an insert, a real
+    /// content upsert and a metadata-only update.
+    #[tokio::test]
+    async fn maintaining_the_update_sequence_keeps_the_fts_index_intact() {
+        let tmp = TempDir::new().expect("test: tempdir");
+        let mem = local_embedding_memory(&tmp);
+        let integrity = |mem: &SqliteMemory, stage: &str| {
+            let conn = mem.pool.write();
+            conn.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('integrity-check');")
+                .unwrap_or_else(|error| panic!("test: FTS index corrupt after {stage}: {error}"));
+        };
+
+        mem.store(
+            "note",
+            "release deployment pipeline failure",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .expect("test: store note");
+        integrity(&mem, "insert");
+
+        mem.store("note", "compost heap turning schedule", MemoryCategory::Core, None)
+            .await
+            .expect("test: refresh note");
+        integrity(&mem, "content upsert");
+
+        {
+            let conn = mem.pool.write();
+            conn.execute(
+                "UPDATE memories SET useful_count = useful_count + 1 WHERE key = 'note'",
+                [],
+            )
+            .expect("test: metadata-only update");
+        }
+        integrity(&mem, "metadata update");
+
+        // The guard must not cost the index its updates: the new content is
+        // searchable and the replaced content is gone.
+        let hits = mem.recall("compost", 5, None).await.expect("test: recall new content");
+        assert!(
+            hits.iter().any(|entry| entry.key == "note"),
+            "the refreshed content must be searchable, got: {:?}",
+            hits.iter().map(|entry| entry.key.as_str()).collect::<Vec<_>>()
+        );
+        let conn = mem.pool.write();
+        let stale: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH 'deployment'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("test: search the replaced content");
+        assert_eq!(stale, 0, "the replaced content must no longer be indexed");
     }
 
     /// Opening an existing store must retire the 0.8.124 index, whose leading

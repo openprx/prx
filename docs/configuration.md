@@ -953,11 +953,24 @@ scored and cannot be recalled. Raise [memory] vector_candidate_cap to score
 more of the store.
 ```
 
-The window is ordered by insertion (`rowid`), not by `updated_at`. `updated_at`
-is a local-offset RFC 3339 string ordered as text, so a DST transition, a
-machine timezone change, or a store shared between processes in different zones
-reorders whole blocks of rows and truncates the wrong ones. "Newest" here
-therefore means most recently **created**, not most recently touched.
+The window is ordered by `update_seq`, an integer counter the store bumps on
+every insert and every update, not by `updated_at` and not by `rowid`.
+
+`updated_at` is a local-offset RFC 3339 string ordered as text, so a DST
+transition, a machine timezone change, or a store shared between processes in
+different zones reorders whole blocks of rows and truncates the wrong ones.
+`rowid` has no timezone but does not move either: writing an existing key
+rewrites its content and embedding in place, so a key refreshed a second ago
+kept the position it was created in and, in a store larger than the cap, stayed
+outside the window. "Newest" therefore means most recently **written** —
+created or refreshed — and re-saving an old memory brings it back into recall
+immediately.
+
+Existing stores migrate on open: the column is added, every row already present
+takes its insertion order as its starting sequence, and the candidate index is
+rebuilt to cover the new ordering key. No configuration change is needed, and
+the cap above is unrelated to this ordering — raising it widens the window,
+it does not decide which rows the window holds.
 
 ### SQLite Connection Pool
 

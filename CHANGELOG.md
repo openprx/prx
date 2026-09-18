@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.149] - 18 September 2026
+
+### Fixed
+
+- The vector candidate window is now ordered by a monotonic `update_seq`
+  column maintained by triggers instead of `rowid`, so a refreshed old memory
+  stays eligible for vector recall when more rows than the cap match. The
+  column is covered by a partial index (`provider, model, dimensions,
+  update_seq` where an embedding exists) and existing databases migrate on
+  open with the sequence backfilled from `rowid`, preserving their candidate
+  set. The FTS update trigger now fires only when `key` or `content` change,
+  which also stops metadata-only updates from rewriting the FTS index. The
+  candidate cap policy is unchanged.
+
 ## [0.8.148] - 18 September 2026
 
 ### Fixed
