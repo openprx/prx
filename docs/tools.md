@@ -417,6 +417,13 @@ work-registry row of its own (its address is `relay_work_id` in the answer), so
 `prx tasks list` shows it while it waits and `prx tasks kill` ends it; nothing
 about it expires on a clock.
 
+An accepted assignment is **durable**: the mailbox is written through to
+`{workspace}/state/chat-mailbox.db` before `chat_assign` answers, and a daemon
+restart replays it, so queued work is still queued and the chat keeps pulling
+with the session id and token it already has. The relay itself is not — it lives
+in the turn that started it — so a restart means the result reaches the
+cross-session result feed rather than being relayed back to the conversation.
+
 Agentic `delegate` configurations require an explicit non-empty
 `allowed_tools`. A named list is intersected with the eligible parent registry;
 unknown or ineligible names fail before the provider turn starts. The exclusive

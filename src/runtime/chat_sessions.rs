@@ -42,11 +42,32 @@
 //! statement of the distinction; the short form is that liveness here is
 //! evidence-based (the last pull actually happened) rather than clock-based.
 //!
+//! # Persistence
+//!
+//! The mailbox **survives a daemon restart.** Every accepted mutation is written
+//! through to `{workspace}/state/chat-mailbox.db` before the caller is answered
+//! — registrations, queued assignments, acknowledgements, deregistrations and
+//! results — and [`attach_store`] replays the whole thing on the way up. A chat
+//! that was registered before the restart keeps pulling with the *same* session
+//! id and the same token: only the token's SHA-256 is stored, so the comparison
+//! that authenticates it is the comparison it always was.
+//!
+//! Two properties are worth stating because they are choices, not consequences:
+//!
+//! * **A failed write never fails an assignment.** The store is how work
+//!   survives a restart; the mailbox is how a message on a phone reaches a
+//!   terminal. Refusing live work because a disk is full would trade a
+//!   recoverable durability gap for an outage, so a write that fails is logged
+//!   at `error` and the in-memory queue carries on. `assign` answering "accepted"
+//!   therefore means "queued, and durable unless the log says otherwise".
+//! * **Work handed out and not acknowledged goes back to the head of the
+//!   queue** on hydration, exactly as it does on the next pull (see [`pull`]).
+//!   Work that *was* acknowledged stays acknowledged: the session that holds it
+//!   may well have survived the daemon, and redelivering it would be this
+//!   runtime deciding a live chat had lost work it is still doing.
+//!
 //! # What is deliberately not here
 //!
-//! * **Persistence.** The mailbox is process memory. A daemon restart forgets
-//!   every session and every queued assignment, and chat sessions re-register on
-//!   their next start. Callers must not treat an accepted assignment as durable.
 //! * **Delivery to the origin.** This module records *who asked* and *what came
 //!   back*; it never sends anything. Routing a result back to a channel is an
 //!   outbound action and must go through the outbound gates, which is a
@@ -66,6 +87,13 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use crate::runtime::registry::{WorkGuard, WorkId};
 use crate::security::op_id::ref_for_channel_recipient;
 use crate::security::policy::SecurityPolicy;
+
+mod store;
+
+pub use store::{
+    MailboxStore, Queue, STORED_RESULT_CAPACITY, SqliteMailboxStore, StoredAssignment, StoredResult, StoredSession,
+    StoredState,
+};
 
 /// Longest session label accepted at registration.
 pub const MAX_LABEL_LEN: usize = 64;
@@ -548,10 +576,40 @@ pub struct AssignmentReceipt {
     pub queued_ahead: usize,
 }
 
+/// Evidence of liveness: when the session last actually pulled.
+///
+/// Two variants because the evidence has two possible provenances and they are
+/// not interchangeable. A pull this process saw is a monotonic reading, so a
+/// clock adjustment cannot make a live session look silent. A pull recorded by
+/// the *previous* process cannot be an `Instant` at all — a monotonic clock has
+/// no name for a moment before this process started — so it is read back as the
+/// wall-clock stamp it was stored as.
+///
+/// What must never happen is a restored session reading as fresh: it would claim
+/// liveness for a chat that has not been heard from since before the restart.
+/// Hence a stamp rather than `None`, which would say `never_polled` and, worse,
+/// `Instant::now()`, which would say `polling`.
+#[derive(Debug, Clone, Copy)]
+enum LastPoll {
+    /// A pull this process handled.
+    Observed(Instant),
+    /// A pull the store remembers from before this process started.
+    Restored(u64),
+}
+
+impl LastPoll {
+    /// How long ago this pull happened, as the listing reports it.
+    fn age(self, now: Instant, now_unix_ms: u64) -> Duration {
+        match self {
+            Self::Observed(last) => now.saturating_duration_since(last),
+            Self::Restored(at) => Duration::from_millis(now_unix_ms.saturating_sub(at)),
+        }
+    }
+}
+
 struct SessionState {
-    /// Evidence of liveness: when the session last actually pulled. Monotonic,
-    /// so a clock adjustment cannot make a live session look silent.
-    last_poll: Option<Instant>,
+    /// When the session last actually pulled, or `None` if it never has.
+    last_poll: Option<LastPoll>,
     /// Waiting to be handed out.
     inbox: VecDeque<Assignment>,
     /// Handed out, not yet acknowledged. Returned to the head of the inbox on
@@ -583,21 +641,65 @@ struct ResultLog {
     oldest_seq: u64,
 }
 
+/// One registry and one mailbox.
+///
+/// A type with methods rather than a bag of free functions over a global,
+/// because persistence has to be testable: "restart the daemon" is expressed as
+/// *a second instance opened on the same database*, which is only possible if a
+/// second instance can exist at all. The process still has exactly one — the
+/// free functions below all delegate to [`SESSIONS`] — and nothing outside this
+/// module can build another.
 struct ChatSessions {
     sessions: RwLock<HashMap<String, Arc<Session>>>,
     results: Mutex<ResultLog>,
+    /// Where mutations are written through. `None` until a gateway attaches one,
+    /// which is what keeps every unit test that never asks for persistence on
+    /// the in-memory behaviour it was written against.
+    store: RwLock<Option<Arc<dyn MailboxStore>>>,
 }
 
-static SESSIONS: LazyLock<ChatSessions> = LazyLock::new(|| ChatSessions {
-    sessions: RwLock::new(HashMap::new()),
-    results: Mutex::new(ResultLog {
-        entries: VecDeque::new(),
-        // Sequence 0 is never used, so `after_seq=0` means "from the start"
-        // without a sentinel that a real entry could collide with.
-        next_seq: 1,
-        oldest_seq: 1,
-    }),
-});
+static SESSIONS: LazyLock<Arc<ChatSessions>> = LazyLock::new(|| Arc::new(ChatSessions::new()));
+
+impl ChatSessions {
+    fn new() -> Self {
+        Self {
+            sessions: RwLock::new(HashMap::new()),
+            results: Mutex::new(ResultLog {
+                entries: VecDeque::new(),
+                // Sequence 0 is never used, so `after_seq=0` means "from the
+                // start" without a sentinel that a real entry could collide
+                // with.
+                next_seq: 1,
+                oldest_seq: 1,
+            }),
+            store: RwLock::new(None),
+        }
+    }
+
+    fn store(&self) -> Option<Arc<dyn MailboxStore>> {
+        self.store.read().clone()
+    }
+
+    /// Run one write-through, and let the mailbox carry on if it fails.
+    ///
+    /// The whole availability trade-off lives in these four lines: a store that
+    /// refuses a write costs durability for that mutation and nothing else. It
+    /// is `error` rather than `warn` because an operator who has lost durability
+    /// has lost the property this module advertises, and must be able to find
+    /// out from the log rather than from a restart.
+    fn write_through(&self, operation: &'static str, write: impl FnOnce(&dyn MailboxStore) -> anyhow::Result<()>) {
+        let Some(store) = self.store() else {
+            return;
+        };
+        if let Err(error) = write(store.as_ref()) {
+            tracing::error!(operation, "chat mailbox write-through failed: {error:#}");
+        }
+    }
+
+    fn find(&self, session_id: &str) -> Option<Arc<Session>> {
+        self.sessions.read().get(session_id.trim()).map(Arc::clone)
+    }
+}
 
 fn unix_ms() -> u64 {
     SystemTime::now()
@@ -623,8 +725,222 @@ fn bounded(value: &str, field: &str, limit: usize) -> Result<String, ChatSession
     Ok(trimmed.to_string())
 }
 
-fn find(session_id: &str) -> Option<Arc<Session>> {
-    SESSIONS.sessions.read().get(session_id.trim()).map(Arc::clone)
+// ── Persistence ─────────────────────────────────────────────────────────────
+
+/// Give the process mailbox a store and replay what it holds.
+///
+/// Called from the gateway's startup path, which is the one place both launch
+/// modes (`prx gateway` and the daemon's supervised gateway) pass through. It is
+/// **idempotent**: the daemon's supervisor restarts the gateway in-process on
+/// failure, and a second call must not duplicate sessions that are still live in
+/// memory, so hydration skips any id already registered.
+///
+/// Attaching a store that cannot be read is not fatal. The mailbox runs from
+/// memory in that case, exactly as it did before there was a store at all.
+pub fn attach_store(store: Arc<dyn MailboxStore>) {
+    SESSIONS.attach_store(store);
+}
+
+/// Open the mailbox database under a workspace and attach it.
+///
+/// Returns the path it attached, or `None` when the database could not be
+/// opened — reported here rather than propagated, because a gateway that
+/// refused to start over a mailbox file would fail *every* capability to
+/// preserve one.
+pub fn attach_workspace_store(workspace_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let path = workspace_dir.join("state").join("chat-mailbox.db");
+    match SqliteMailboxStore::open(&path) {
+        Ok(store) => {
+            attach_store(Arc::new(store));
+            Some(path)
+        }
+        Err(error) => {
+            tracing::error!(
+                path = %path.display(),
+                "chat mailbox persistence unavailable, running from memory only: {error:#}"
+            );
+            None
+        }
+    }
+}
+
+impl ChatSessions {
+    /// Attach a store and replay it.
+    ///
+    /// Idempotent in both halves: attaching replaces whatever store was there,
+    /// and hydration skips every session id already live in memory, so the
+    /// gateway supervisor restarting the gateway inside one process cannot
+    /// duplicate a session or its queue.
+    fn attach_store(self: &Arc<Self>, store: Arc<dyn MailboxStore>) {
+        *self.store.write() = Some(Arc::clone(&store));
+        match store.hydrate() {
+            Ok(state) => self.hydrate(state),
+            Err(error) => {
+                // Not fatal, and deliberately not a reason to detach: new
+                // mutations may still be writable even when a read failed, and
+                // a mailbox that silently stopped persisting would be worse
+                // than one that lost a replay.
+                tracing::error!("chat mailbox could not be replayed: {error:#}");
+            }
+        }
+    }
+
+    /// Rebuild sessions, queues and the result feed from stored state.
+    ///
+    /// # Ordering
+    ///
+    /// Each session's inbox is rebuilt as *delivered-but-unacknowledged first,
+    /// then queued*, which is the same reclaim rule [`pull`] applies on every
+    /// poll: an assignment that was handed out and never acknowledged can only
+    /// be one that never arrived, and it must not end up behind work that was
+    /// queued after it. Acknowledged assignments are restored as acknowledged —
+    /// the chat holding them may have outlived the daemon, and redelivering
+    /// would be this runtime deciding for it that it had lost them.
+    ///
+    /// Work-registry rows are minted fresh: a `WorkId` is a process-local
+    /// address, so the alternative to a new row is an assignment nobody can
+    /// list or kill.
+    fn hydrate(self: &Arc<Self>, state: StoredState) {
+        let mut queues: HashMap<String, Vec<StoredAssignment>> = HashMap::new();
+        for assignment in state.assignments {
+            queues
+                .entry(assignment.session_id.clone())
+                .or_default()
+                .push(assignment);
+        }
+
+        let mut restored_sessions = 0_usize;
+        let mut restored_assignments = 0_usize;
+        for stored in state.sessions {
+            if self.sessions.read().contains_key(&stored.session_id) {
+                continue;
+            }
+            let session = Arc::new(Session {
+                id: stored.session_id.clone(),
+                label: stored.label,
+                pid: stored.pid,
+                token_hash: stored.token_hash,
+                registered_at_unix_ms: stored.registered_at_unix_ms,
+                polls: AtomicU64::new(stored.polls),
+                state: Mutex::new(SessionState {
+                    last_poll: stored.last_poll_at_unix_ms.map(LastPoll::Restored),
+                    inbox: VecDeque::new(),
+                    delivered: Vec::new(),
+                    accepted: Vec::new(),
+                }),
+            });
+
+            let stored_queue = queues.remove(&stored.session_id).unwrap_or_default();
+            let mut reclaimed = Vec::new();
+            let mut queued = Vec::new();
+            let mut accepted = Vec::new();
+            for assignment in stored_queue {
+                match assignment.queue {
+                    Queue::Delivered => reclaimed.push(assignment),
+                    Queue::Inbox => queued.push(assignment),
+                    Queue::Accepted => accepted.push(assignment),
+                }
+            }
+
+            // Move the reclaimed rows to the head of the *stored* queue too,
+            // walking backwards exactly as `pull` does, so the order this
+            // replay produces is the order a second replay would produce. Left
+            // alone, their old positions would interleave with the queued ones
+            // and the two replays would disagree.
+            for stored_assignment in reclaimed.iter().rev() {
+                self.write_through("hydrate_reclaim", |store| {
+                    store.move_to_queue(
+                        &stored_assignment.assignment_id,
+                        Queue::Inbox,
+                        stored_assignment.deliveries,
+                        true,
+                    )
+                });
+            }
+
+            {
+                let mut live = session.state.lock();
+                for stored_assignment in reclaimed.into_iter().chain(queued) {
+                    let restored = self.restore_assignment(&session, &stored_assignment);
+                    live.inbox.push_back(restored);
+                    restored_assignments += 1;
+                }
+                for stored_assignment in accepted {
+                    let restored = self.restore_assignment(&session, &stored_assignment);
+                    live.accepted.push(restored);
+                    restored_assignments += 1;
+                }
+            }
+
+            self.sessions.write().insert(stored.session_id, session);
+            restored_sessions += 1;
+        }
+
+        if !state.results.is_empty() {
+            let mut log = self.results.lock();
+            for result in state.results {
+                // The sequence keeps climbing across restarts. Restarting it at
+                // 1 would hand a consumer that cached a cursor a feed whose new
+                // entries look older than the ones it already saw.
+                log.next_seq = log.next_seq.max(result.seq.saturating_add(1));
+                log.entries.push_back(AssignmentResult {
+                    seq: result.seq,
+                    assignment_id: result.assignment_id,
+                    session_id: result.session_id,
+                    session_label: result.session_label,
+                    disposition: result.disposition,
+                    status: result.status,
+                    summary: result.summary,
+                    completed_at_unix_ms: result.completed_at_unix_ms,
+                    origin: result.origin,
+                });
+            }
+            while log.entries.len() > RESULT_LOG_CAPACITY {
+                if let Some(dropped) = log.entries.pop_front() {
+                    log.oldest_seq = dropped.seq.saturating_add(1);
+                }
+            }
+            if let Some(first) = log.entries.front() {
+                log.oldest_seq = log.oldest_seq.max(first.seq);
+            }
+        }
+
+        if restored_sessions > 0 || restored_assignments > 0 {
+            tracing::info!(
+                sessions = restored_sessions,
+                assignments = restored_assignments,
+                "restored chat session mailboxes from disk"
+            );
+        }
+    }
+
+    /// Rebuild one assignment, with a fresh registry row and kill watcher.
+    fn restore_assignment(self: &Arc<Self>, session: &Arc<Session>, stored: &StoredAssignment) -> Assignment {
+        let cancel = CancellationToken::new();
+        let finished = CancellationToken::new();
+        let work_name = work_row_name(stored.disposition, &session.reference(), &stored.origin);
+        let work = crate::runtime::registry::register_sub_agent(
+            &work_name,
+            &stored.assignment_id,
+            None,
+            None,
+            Some(cancel.clone()),
+        );
+        let work_id = work.id();
+        self.watch_for_kill(session, stored.assignment_id.clone(), cancel, finished.clone());
+        Assignment {
+            id: stored.assignment_id.clone(),
+            session_id: session.id.clone(),
+            task: stored.task.clone(),
+            disposition: stored.disposition,
+            origin: stored.origin.clone(),
+            created_at_unix_ms: stored.created_at_unix_ms,
+            deliveries: stored.deliveries,
+            _work: work,
+            work_id,
+            _finished: finished.drop_guard(),
+        }
+    }
 }
 
 // ── Registration ────────────────────────────────────────────────────────────
@@ -639,35 +955,7 @@ fn find(session_id: &str) -> Option<Arc<Session>> {
 ///
 /// [`ChatSessionError::Invalid`] when the label is empty or too long.
 pub fn register(label: &str, pid: Option<u32>) -> Result<Registration, ChatSessionError> {
-    let label = bounded(label, "label", MAX_LABEL_LEN)?;
-    // Two v4s: the id is public and correlates a session with its rows, the
-    // token is the secret and is 256 bits of the same CSPRNG.
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let token = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
-    let registered_at_unix_ms = unix_ms();
-    let session = Arc::new(Session {
-        id: session_id.clone(),
-        label: label.clone(),
-        pid,
-        token_hash: hash_token(&token),
-        registered_at_unix_ms,
-        polls: AtomicU64::new(0),
-        state: Mutex::new(SessionState {
-            last_poll: None,
-            inbox: VecDeque::new(),
-            delivered: Vec::new(),
-            accepted: Vec::new(),
-        }),
-    });
-    let session_ref = session.reference();
-    SESSIONS.sessions.write().insert(session_id.clone(), session);
-    Ok(Registration {
-        session_id,
-        session_ref,
-        token,
-        label,
-        registered_at_unix_ms,
-    })
+    SESSIONS.register(label, pid)
 }
 
 /// Remove a session and cancel everything still outstanding for it.
@@ -677,58 +965,117 @@ pub fn register(label: &str, pid: Option<u32>) -> Result<Registration, ChatSessi
 /// [`ResultStatus::Cancelled`], so an assigner waiting on an answer is told the
 /// work went away instead of waiting on it forever.
 pub fn deregister(session_id: &str) -> Option<usize> {
-    let session = SESSIONS.sessions.write().remove(session_id.trim())?;
-    let outstanding = {
-        let mut state = session.state.lock();
-        let mut outstanding = Vec::new();
-        outstanding.extend(state.inbox.drain(..));
-        outstanding.append(&mut state.delivered);
-        outstanding.append(&mut state.accepted);
-        outstanding
-    };
-    let count = outstanding.len();
-    for assignment in outstanding {
-        record_result(
-            &session,
-            &assignment,
-            ResultStatus::Cancelled,
-            "the chat session deregistered while this assignment was still outstanding".to_string(),
-        );
-    }
-    Some(count)
+    SESSIONS.deregister(session_id)
 }
 
 /// Every registered session, oldest registration first.
 #[must_use]
 pub fn list() -> Vec<SessionView> {
-    let sessions = SESSIONS.sessions.read().values().map(Arc::clone).collect::<Vec<_>>();
-    let now = Instant::now();
-    let mut views = sessions
-        .iter()
-        .map(|session| {
-            let state = session.state.lock();
-            let age = state.last_poll.map(|last| now.saturating_duration_since(last));
-            SessionView {
-                session_id: session.id.clone(),
-                session_ref: session.reference(),
-                label: session.label.clone(),
-                pid: session.pid,
-                registered_at_unix_ms: session.registered_at_unix_ms,
-                liveness: liveness_for(age),
-                last_poll_age_secs: age.map(|age| age.as_secs()),
-                polls: session.polls.load(Ordering::Relaxed),
-                queued: state.inbox.len(),
-                delivered: state.delivered.len(),
-                accepted: state.accepted.len(),
-            }
+    SESSIONS.list()
+}
+
+impl ChatSessions {
+    fn register(&self, label: &str, pid: Option<u32>) -> Result<Registration, ChatSessionError> {
+        let label = bounded(label, "label", MAX_LABEL_LEN)?;
+        // Two v4s: the id is public and correlates a session with its rows, the
+        // token is the secret and is 256 bits of the same CSPRNG.
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let token = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+        let registered_at_unix_ms = unix_ms();
+        let session = Arc::new(Session {
+            id: session_id.clone(),
+            label: label.clone(),
+            pid,
+            token_hash: hash_token(&token),
+            registered_at_unix_ms,
+            polls: AtomicU64::new(0),
+            state: Mutex::new(SessionState {
+                last_poll: None,
+                inbox: VecDeque::new(),
+                delivered: Vec::new(),
+                accepted: Vec::new(),
+            }),
+        });
+        let session_ref = session.reference();
+        self.write_through("insert_session", |store| {
+            store.insert_session(&StoredSession {
+                session_id: session_id.clone(),
+                label: label.clone(),
+                pid,
+                // The hash, never the token. A stolen database file can say a
+                // session existed; it cannot drain that session's mailbox.
+                token_hash: session.token_hash.clone(),
+                registered_at_unix_ms,
+                polls: 0,
+                last_poll_at_unix_ms: None,
+            })
+        });
+        self.sessions.write().insert(session_id.clone(), session);
+        Ok(Registration {
+            session_id,
+            session_ref,
+            token,
+            label,
+            registered_at_unix_ms,
         })
-        .collect::<Vec<_>>();
-    views.sort_by(|left, right| {
-        left.registered_at_unix_ms
-            .cmp(&right.registered_at_unix_ms)
-            .then_with(|| left.session_id.cmp(&right.session_id))
-    });
-    views
+    }
+
+    fn deregister(&self, session_id: &str) -> Option<usize> {
+        let session = self.sessions.write().remove(session_id.trim())?;
+        // The cascade takes the queued rows with it, so the discarded assignments
+        // below need no individual delete — only their results have to be written.
+        self.write_through("delete_session", |store| store.delete_session(&session.id));
+        let outstanding = {
+            let mut state = session.state.lock();
+            let mut outstanding = Vec::new();
+            outstanding.extend(state.inbox.drain(..));
+            outstanding.append(&mut state.delivered);
+            outstanding.append(&mut state.accepted);
+            outstanding
+        };
+        let count = outstanding.len();
+        for assignment in outstanding {
+            self.record_result(
+                &session,
+                &assignment,
+                ResultStatus::Cancelled,
+                "the chat session deregistered while this assignment was still outstanding".to_string(),
+            );
+        }
+        Some(count)
+    }
+
+    fn list(&self) -> Vec<SessionView> {
+        let sessions = self.sessions.read().values().map(Arc::clone).collect::<Vec<_>>();
+        let now = Instant::now();
+        let now_unix_ms = unix_ms();
+        let mut views = sessions
+            .iter()
+            .map(|session| {
+                let state = session.state.lock();
+                let age = state.last_poll.map(|last| last.age(now, now_unix_ms));
+                SessionView {
+                    session_id: session.id.clone(),
+                    session_ref: session.reference(),
+                    label: session.label.clone(),
+                    pid: session.pid,
+                    registered_at_unix_ms: session.registered_at_unix_ms,
+                    liveness: liveness_for(age),
+                    last_poll_age_secs: age.map(|age| age.as_secs()),
+                    polls: session.polls.load(Ordering::Relaxed),
+                    queued: state.inbox.len(),
+                    delivered: state.delivered.len(),
+                    accepted: state.accepted.len(),
+                }
+            })
+            .collect::<Vec<_>>();
+        views.sort_by(|left, right| {
+            left.registered_at_unix_ms
+                .cmp(&right.registered_at_unix_ms)
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        });
+        views
+    }
 }
 
 /// Classify a session from how long ago it last pulled.
@@ -773,102 +1120,129 @@ pub fn assign(
     task: &str,
     disposition: Disposition,
 ) -> Result<AssignmentReceipt, ChatSessionError> {
-    let session_id = session_id.trim();
-    let task = bounded(task, "task", MAX_TASK_LEN)?;
-    let session = find(session_id);
-    let label = session.as_ref().map_or("", |session| session.label.as_str());
+    SESSIONS.assign(policy, principal, session_id, task, disposition)
+}
 
-    if let AssignPrincipal::Correspondent {
-        channel,
-        sender,
-        chat_type,
-    } = principal
-    {
-        if !policy.is_assignment_allowed(sender, channel, chat_type, label, session_id) {
-            return Err(ChatSessionError::NotAuthorized {
-                principal: principal.label(),
-                session_ref: ref_for_channel_recipient(CHAT_SESSION_CHANNEL, session_id),
-            });
+impl ChatSessions {
+    fn assign(
+        self: &Arc<Self>,
+        policy: &SecurityPolicy,
+        principal: &AssignPrincipal,
+        session_id: &str,
+        task: &str,
+        disposition: Disposition,
+    ) -> Result<AssignmentReceipt, ChatSessionError> {
+        let session_id = session_id.trim();
+        let task = bounded(task, "task", MAX_TASK_LEN)?;
+        let session = self.find(session_id);
+        let label = session.as_ref().map_or("", |session| session.label.as_str());
+
+        if let AssignPrincipal::Correspondent {
+            channel,
+            sender,
+            chat_type,
+        } = principal
+        {
+            if !policy.is_assignment_allowed(sender, channel, chat_type, label, session_id) {
+                return Err(ChatSessionError::NotAuthorized {
+                    principal: principal.label(),
+                    session_ref: ref_for_channel_recipient(CHAT_SESSION_CHANNEL, session_id),
+                });
+            }
         }
+
+        let session = session.ok_or(ChatSessionError::UnknownSession)?;
+        let assignment_id = uuid::Uuid::new_v4().to_string();
+        let cancel = CancellationToken::new();
+        let finished = CancellationToken::new();
+
+        // The row is a lineage **root** on purpose. An assignment outlives the turn
+        // that requested it — that turn answers "queued" and ends — so hanging it
+        // under `current_work_id()` would put it inside a cascade that kills it the
+        // moment the requester finishes, and would leave it pointing at a parent row
+        // that no longer exists.
+        //
+        // Its `run_id` is its own assignment id and nothing else's. Borrowing the
+        // requester's would be actively harmful: `registry::resolve_address` answers
+        // a run id with that run's lineage root, so an operator killing by the only
+        // portable address would land on live work they never aimed at. Minting its
+        // own also makes the assignment id a working `prx tasks kill` address.
+        //
+        // The name carries the disposition and the *channel* in the clear — neither
+        // is sensitive, and without the channel the row could not say where the work
+        // came from — while the correspondent and the target session are the
+        // `op_id::ref_for_channel_recipient` fingerprints, the same function over
+        // the same inputs that the refusal on this very assignment and the session
+        // listing use. The task body is never in the row.
+        //
+        // MUTATION GUARD: drop the registration and
+        // `a_queued_assignment_is_listed_and_a_kill_discards_it` fails; write either
+        // identifier out in the clear and
+        // `an_assignment_row_names_the_channel_but_fingerprints_the_parties` fails.
+        let work_name = work_row_name(disposition, &session.reference(), principal);
+        let work =
+            crate::runtime::registry::register_sub_agent(&work_name, &assignment_id, None, None, Some(cancel.clone()));
+        let work_id = work.id();
+
+        let created_at_unix_ms = unix_ms();
+        let assignment = Assignment {
+            id: assignment_id.clone(),
+            session_id: session.id.clone(),
+            task: task.clone(),
+            disposition,
+            origin: principal.clone(),
+            created_at_unix_ms,
+            deliveries: 0,
+            _work: work,
+            work_id,
+            _finished: finished.clone().drop_guard(),
+        };
+
+        // Written before the receipt is handed back, so "accepted" and "durable"
+        // are the same instant for every caller that reads one.
+        self.write_through("enqueue", |store| {
+            store.enqueue(
+                &StoredAssignment {
+                    assignment_id: assignment_id.clone(),
+                    session_id: session.id.clone(),
+                    task,
+                    disposition,
+                    queue: Queue::Inbox,
+                    deliveries: 0,
+                    created_at_unix_ms,
+                    origin: principal.clone(),
+                },
+                disposition.is_immediate(),
+            )
+        });
+
+        let queued_ahead = {
+            let mut state = session.state.lock();
+            if disposition.is_immediate() {
+                // Steer and interrupt exist to reach the turn running *now*, so they
+                // go to the head. Queueing them behind unrelated work would turn
+                // both into a delayed `queue` and silently discard the caller's
+                // whole reason for choosing them.
+                state.inbox.push_front(assignment);
+                0
+            } else {
+                let ahead = state.inbox.len();
+                state.inbox.push_back(assignment);
+                ahead
+            }
+        };
+
+        self.watch_for_kill(&session, assignment_id.clone(), cancel, finished);
+
+        Ok(AssignmentReceipt {
+            assignment_id,
+            session_id: session.id.clone(),
+            session_ref: session.reference(),
+            disposition,
+            work_id,
+            queued_ahead,
+        })
     }
-
-    let session = session.ok_or(ChatSessionError::UnknownSession)?;
-    let assignment_id = uuid::Uuid::new_v4().to_string();
-    let cancel = CancellationToken::new();
-    let finished = CancellationToken::new();
-
-    // The row is a lineage **root** on purpose. An assignment outlives the turn
-    // that requested it — that turn answers "queued" and ends — so hanging it
-    // under `current_work_id()` would put it inside a cascade that kills it the
-    // moment the requester finishes, and would leave it pointing at a parent row
-    // that no longer exists.
-    //
-    // Its `run_id` is its own assignment id and nothing else's. Borrowing the
-    // requester's would be actively harmful: `registry::resolve_address` answers
-    // a run id with that run's lineage root, so an operator killing by the only
-    // portable address would land on live work they never aimed at. Minting its
-    // own also makes the assignment id a working `prx tasks kill` address.
-    //
-    // The name carries the disposition and the *channel* in the clear — neither
-    // is sensitive, and without the channel the row could not say where the work
-    // came from — while the correspondent and the target session are the
-    // `op_id::ref_for_channel_recipient` fingerprints, the same function over
-    // the same inputs that the refusal on this very assignment and the session
-    // listing use. The task body is never in the row.
-    //
-    // MUTATION GUARD: drop the registration and
-    // `a_queued_assignment_is_listed_and_a_kill_discards_it` fails; write either
-    // identifier out in the clear and
-    // `an_assignment_row_names_the_channel_but_fingerprints_the_parties` fails.
-    let work_name = format!(
-        "chat_assign {} → {CHAT_SESSION_CHANNEL} {} from {}",
-        disposition.as_str(),
-        session.reference(),
-        principal.label(),
-    );
-    let work =
-        crate::runtime::registry::register_sub_agent(&work_name, &assignment_id, None, None, Some(cancel.clone()));
-    let work_id = work.id();
-
-    let assignment = Assignment {
-        id: assignment_id.clone(),
-        session_id: session.id.clone(),
-        task,
-        disposition,
-        origin: principal.clone(),
-        created_at_unix_ms: unix_ms(),
-        deliveries: 0,
-        _work: work,
-        work_id,
-        _finished: finished.clone().drop_guard(),
-    };
-
-    let queued_ahead = {
-        let mut state = session.state.lock();
-        if disposition.is_immediate() {
-            // Steer and interrupt exist to reach the turn running *now*, so they
-            // go to the head. Queueing them behind unrelated work would turn
-            // both into a delayed `queue` and silently discard the caller's
-            // whole reason for choosing them.
-            state.inbox.push_front(assignment);
-            0
-        } else {
-            let ahead = state.inbox.len();
-            state.inbox.push_back(assignment);
-            ahead
-        }
-    };
-
-    watch_for_kill(&session, assignment_id.clone(), cancel, finished);
-
-    Ok(AssignmentReceipt {
-        assignment_id,
-        session_id: session.id.clone(),
-        session_ref: session.reference(),
-        disposition,
-        work_id,
-        queued_ahead,
-    })
 }
 
 /// Retire an assignment as soon as an operator kills its work-registry row.
@@ -882,41 +1256,66 @@ pub fn assign(
 /// dropping the assignment cancels `finished`, which ends the task. Watching
 /// only `cancel` would leave one dormant task per assignment for the life of the
 /// process.
-fn watch_for_kill(
-    session: &Arc<Session>,
-    assignment_id: String,
-    cancel: CancellationToken,
-    finished: CancellationToken,
-) {
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    let session = Arc::clone(session);
-    handle.spawn(async move {
-        tokio::select! {
-            () = cancel.cancelled() => {
-                discard(&session, &assignment_id);
-            }
-            () = finished.cancelled() => {}
-        }
-    });
+/// The work-registry row name for one assignment.
+///
+/// One function so the row a restart mints reads exactly like the row the
+/// original assignment had: same channel in the clear, same two fingerprints,
+/// same absent task body.
+fn work_row_name(disposition: Disposition, session_ref: &str, origin: &AssignPrincipal) -> String {
+    format!(
+        "chat_assign {} → {CHAT_SESSION_CHANNEL} {session_ref} from {}",
+        disposition.as_str(),
+        origin.label(),
+    )
 }
 
-/// Take one assignment out of every queue it could be in and record it as
-/// cancelled. Dropping it retires its registry row, which is what confirms the
-/// kill.
-fn discard(session: &Arc<Session>, assignment_id: &str) {
-    let removed = {
-        let mut state = session.state.lock();
-        take_assignment(&mut state, assignment_id)
-    };
-    if let Some(assignment) = removed {
-        record_result(
-            session,
-            &assignment,
-            ResultStatus::Cancelled,
-            "the assignment's work item was killed by an operator".to_string(),
-        );
+impl ChatSessions {
+    fn watch_for_kill(
+        self: &Arc<Self>,
+        session: &Arc<Session>,
+        assignment_id: String,
+        cancel: CancellationToken,
+        finished: CancellationToken,
+    ) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let session = Arc::clone(session);
+        // Weak, not strong. The watcher outlives nothing: it holds the registry
+        // only for the instant it records the cancellation, and a strong handle
+        // would close a cycle (registry → session → assignment → drop guard →
+        // this task) that keeps a registry alive precisely while it still has
+        // queued work to release.
+        let registry = Arc::downgrade(self);
+        handle.spawn(async move {
+            tokio::select! {
+                () = cancel.cancelled() => {
+                    if let Some(registry) = registry.upgrade() {
+                        registry.discard(&session, &assignment_id);
+                    }
+                }
+                () = finished.cancelled() => {}
+            }
+        });
+    }
+
+    /// Take one assignment out of every queue it could be in and record it as
+    /// cancelled. Dropping it retires its registry row, which is what confirms
+    /// the kill.
+    fn discard(&self, session: &Arc<Session>, assignment_id: &str) {
+        let removed = {
+            let mut state = session.state.lock();
+            take_assignment(&mut state, assignment_id)
+        };
+        if let Some(assignment) = removed {
+            self.write_through("delete_assignment", |store| store.delete_assignment(&assignment.id));
+            self.record_result(
+                session,
+                &assignment,
+                ResultStatus::Cancelled,
+                "the assignment's work item was killed by an operator".to_string(),
+            );
+        }
     }
 }
 
@@ -980,48 +1379,76 @@ pub struct Pulled {
 ///
 /// [`ChatSessionError::UnknownSession`] / [`ChatSessionError::BadToken`].
 pub fn pull(session_id: &str, token: &str, ack: &[String], max: Option<usize>) -> Result<Pulled, ChatSessionError> {
-    let session = find(session_id).ok_or(ChatSessionError::UnknownSession)?;
-    authenticate(&session, token)?;
-    let max = max.unwrap_or(DEFAULT_PULL_BATCH).clamp(1, MAX_PULL_BATCH);
+    SESSIONS.pull(session_id, token, ack, max)
+}
 
-    session.polls.fetch_add(1, Ordering::Relaxed);
-    let mut state = session.state.lock();
-    state.last_poll = Some(Instant::now());
+impl ChatSessions {
+    fn pull(
+        &self,
+        session_id: &str,
+        token: &str,
+        ack: &[String],
+        max: Option<usize>,
+    ) -> Result<Pulled, ChatSessionError> {
+        let session = self.find(session_id).ok_or(ChatSessionError::UnknownSession)?;
+        authenticate(&session, token)?;
+        let max = max.unwrap_or(DEFAULT_PULL_BATCH).clamp(1, MAX_PULL_BATCH);
 
-    let mut acked = 0;
-    for id in ack {
-        if let Some(index) = state.delivered.iter().position(|entry| &entry.id == id) {
-            let assignment = state.delivered.remove(index);
-            state.accepted.push(assignment);
-            acked += 1;
+        let polls = session.polls.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        let now_unix_ms = unix_ms();
+        let mut state = session.state.lock();
+        state.last_poll = Some(LastPoll::Observed(Instant::now()));
+        // The evidence of liveness is persisted with the pull that produced it, so
+        // a session restored after a restart is as old as its last real pull rather
+        // than as young as the restart. See [`LastPoll`].
+        self.write_through("record_poll", |store| {
+            store.record_poll(&session.id, polls, now_unix_ms)
+        });
+
+        let mut acked = 0;
+        for id in ack {
+            if let Some(index) = state.delivered.iter().position(|entry| &entry.id == id) {
+                let assignment = state.delivered.remove(index);
+                self.write_through("ack", |store| {
+                    store.move_to_queue(&assignment.id, Queue::Accepted, assignment.deliveries, false)
+                });
+                state.accepted.push(assignment);
+                acked += 1;
+            }
         }
-    }
 
-    // Back to the *head*, in their original order, so a redelivery cannot be
-    // starved behind work queued while it was in flight. Popping from the back
-    // and pushing to the front restores the order they were handed out in.
-    let mut reclaimed = std::mem::take(&mut state.delivered);
-    let requeued = reclaimed.len();
-    while let Some(assignment) = reclaimed.pop() {
-        state.inbox.push_front(assignment);
-    }
+        // Back to the *head*, in their original order, so a redelivery cannot be
+        // starved behind work queued while it was in flight. Popping from the back
+        // and pushing to the front restores the order they were handed out in.
+        let mut reclaimed = std::mem::take(&mut state.delivered);
+        let requeued = reclaimed.len();
+        while let Some(assignment) = reclaimed.pop() {
+            self.write_through("reclaim", |store| {
+                store.move_to_queue(&assignment.id, Queue::Inbox, assignment.deliveries, true)
+            });
+            state.inbox.push_front(assignment);
+        }
 
-    let mut assignments = Vec::new();
-    for _ in 0..max {
-        let Some(mut assignment) = state.inbox.pop_front() else {
-            break;
-        };
-        assignment.deliveries = assignment.deliveries.saturating_add(1);
-        assignments.push(assignment.view());
-        state.delivered.push(assignment);
-    }
+        let mut assignments = Vec::new();
+        for _ in 0..max {
+            let Some(mut assignment) = state.inbox.pop_front() else {
+                break;
+            };
+            assignment.deliveries = assignment.deliveries.saturating_add(1);
+            self.write_through("deliver", |store| {
+                store.move_to_queue(&assignment.id, Queue::Delivered, assignment.deliveries, false)
+            });
+            assignments.push(assignment.view());
+            state.delivered.push(assignment);
+        }
 
-    Ok(Pulled {
-        assignments,
-        acked,
-        requeued,
-        queued_remaining: state.inbox.len(),
-    })
+        Ok(Pulled {
+            assignments,
+            acked,
+            requeued,
+            queued_remaining: state.inbox.len(),
+        })
+    }
 }
 
 fn authenticate(session: &Session, token: &str) -> Result<(), ChatSessionError> {
@@ -1052,83 +1479,115 @@ pub fn report(
     status: ResultStatus,
     summary: &str,
 ) -> Result<u64, ChatSessionError> {
-    let session = find(session_id).ok_or(ChatSessionError::UnknownSession)?;
-    authenticate(&session, token)?;
-    let summary = bounded(summary, "summary", MAX_SUMMARY_LEN)?;
-    let assignment_id = assignment_id.trim();
-
-    let assignment = {
-        let mut state = session.state.lock();
-        let index = state
-            .accepted
-            .iter()
-            .position(|entry| entry.id == assignment_id)
-            .map(|index| state.accepted.remove(index))
-            .or_else(|| {
-                state
-                    .delivered
-                    .iter()
-                    .position(|entry| entry.id == assignment_id)
-                    .map(|index| state.delivered.remove(index))
-            });
-        index.ok_or(ChatSessionError::UnknownAssignment)?
-    };
-
-    Ok(record_result(&session, &assignment, status, summary))
-}
-
-/// Append one finished assignment to the feed. Dropping the assignment
-/// afterwards retires its registry row.
-fn record_result(session: &Session, assignment: &Assignment, status: ResultStatus, summary: String) -> u64 {
-    let mut log = SESSIONS.results.lock();
-    let seq = log.next_seq;
-    log.next_seq = log.next_seq.saturating_add(1);
-    log.entries.push_back(AssignmentResult {
-        seq,
-        assignment_id: assignment.id.clone(),
-        session_id: session.id.clone(),
-        session_label: session.label.clone(),
-        disposition: assignment.disposition,
-        status,
-        summary,
-        completed_at_unix_ms: unix_ms(),
-        origin: assignment.origin.clone(),
-    });
-    while log.entries.len() > RESULT_LOG_CAPACITY {
-        if let Some(dropped) = log.entries.pop_front() {
-            log.oldest_seq = dropped.seq.saturating_add(1);
-        }
-    }
-    seq
+    SESSIONS.report(session_id, token, assignment_id, status, summary)
 }
 
 /// Results with a sequence greater than `after_seq`, oldest first.
 #[must_use]
 pub fn results_after(after_seq: u64, limit: usize) -> ResultsPage {
-    let log = SESSIONS.results.lock();
-    let limit = limit.clamp(1, RESULT_LOG_CAPACITY);
-    let results = log
-        .entries
-        .iter()
-        .filter(|entry| entry.seq > after_seq)
-        .take(limit)
-        .map(|entry| AssignmentResult {
-            seq: entry.seq,
-            assignment_id: entry.assignment_id.clone(),
-            session_id: entry.session_id.clone(),
-            session_label: entry.session_label.clone(),
-            disposition: entry.disposition,
-            status: entry.status,
-            summary: entry.summary.clone(),
-            completed_at_unix_ms: entry.completed_at_unix_ms,
-            origin: entry.origin.clone(),
-        })
-        .collect::<Vec<_>>();
-    let next_seq = results.last().map_or(after_seq, |entry| entry.seq);
-    ResultsPage {
-        results,
-        next_seq,
-        oldest_seq: log.oldest_seq,
+    SESSIONS.results_after(after_seq, limit)
+}
+
+impl ChatSessions {
+    fn report(
+        &self,
+        session_id: &str,
+        token: &str,
+        assignment_id: &str,
+        status: ResultStatus,
+        summary: &str,
+    ) -> Result<u64, ChatSessionError> {
+        let session = self.find(session_id).ok_or(ChatSessionError::UnknownSession)?;
+        authenticate(&session, token)?;
+        let summary = bounded(summary, "summary", MAX_SUMMARY_LEN)?;
+        let assignment_id = assignment_id.trim();
+
+        let assignment = {
+            let mut state = session.state.lock();
+            let index = state
+                .accepted
+                .iter()
+                .position(|entry| entry.id == assignment_id)
+                .map(|index| state.accepted.remove(index))
+                .or_else(|| {
+                    state
+                        .delivered
+                        .iter()
+                        .position(|entry| entry.id == assignment_id)
+                        .map(|index| state.delivered.remove(index))
+                });
+            index.ok_or(ChatSessionError::UnknownAssignment)?
+        };
+
+        self.write_through("delete_assignment", |store| store.delete_assignment(&assignment.id));
+        Ok(self.record_result(&session, &assignment, status, summary))
+    }
+
+    /// Append one finished assignment to the feed. Dropping the assignment
+    /// afterwards retires its registry row.
+    fn record_result(&self, session: &Session, assignment: &Assignment, status: ResultStatus, summary: String) -> u64 {
+        let mut log = self.results.lock();
+        let seq = log.next_seq;
+        log.next_seq = log.next_seq.saturating_add(1);
+        let completed_at_unix_ms = unix_ms();
+        self.write_through("append_result", |store| {
+            store.append_result(&StoredResult {
+                seq,
+                assignment_id: assignment.id.clone(),
+                session_id: session.id.clone(),
+                session_label: session.label.clone(),
+                disposition: assignment.disposition,
+                status,
+                summary: summary.clone(),
+                completed_at_unix_ms,
+                origin: assignment.origin.clone(),
+            })
+        });
+        log.entries.push_back(AssignmentResult {
+            seq,
+            assignment_id: assignment.id.clone(),
+            session_id: session.id.clone(),
+            session_label: session.label.clone(),
+            disposition: assignment.disposition,
+            status,
+            summary,
+            completed_at_unix_ms,
+            origin: assignment.origin.clone(),
+        });
+        while log.entries.len() > RESULT_LOG_CAPACITY {
+            if let Some(dropped) = log.entries.pop_front() {
+                log.oldest_seq = dropped.seq.saturating_add(1);
+            }
+        }
+        seq
+    }
+
+    fn results_after(&self, after_seq: u64, limit: usize) -> ResultsPage {
+        let log = self.results.lock();
+        let limit = limit.clamp(1, RESULT_LOG_CAPACITY);
+        let results = log
+            .entries
+            .iter()
+            .filter(|entry| entry.seq > after_seq)
+            .take(limit)
+            .map(|entry| AssignmentResult {
+                seq: entry.seq,
+                assignment_id: entry.assignment_id.clone(),
+                session_id: entry.session_id.clone(),
+                session_label: entry.session_label.clone(),
+                disposition: entry.disposition,
+                status: entry.status,
+                summary: entry.summary.clone(),
+                completed_at_unix_ms: entry.completed_at_unix_ms,
+                origin: entry.origin.clone(),
+            })
+            .collect::<Vec<_>>();
+        let next_seq = results.last().map_or(after_seq, |entry| entry.seq);
+        ResultsPage {
+            results,
+            next_seq,
+            oldest_seq: log.oldest_seq,
+        }
     }
 }
 
@@ -1146,9 +1605,14 @@ mod tests {
     /// exercised without waiting [`SILENT_AFTER`] out in real time. Test-only:
     /// production has no way to move this clock, which is the point.
     fn backdate_last_poll(session_id: &str, by: Duration) {
-        if let Some(session) = find(session_id) {
+        if let Some(session) = SESSIONS.find(session_id) {
             let mut state = session.state.lock();
-            state.last_poll = state.last_poll.and_then(|last| last.checked_sub(by));
+            state.last_poll = state.last_poll.and_then(|last| match last {
+                LastPoll::Observed(at) => at.checked_sub(by).map(LastPoll::Observed),
+                LastPoll::Restored(at) => Some(LastPoll::Restored(
+                    at.saturating_sub(u64::try_from(by.as_millis()).unwrap_or(u64::MAX)),
+                )),
+            });
         }
     }
 
@@ -1838,6 +2302,379 @@ mod tests {
             Err(ChatSessionError::Invalid(_))
         ));
         deregister(&session.session_id);
+    }
+
+    // ── Persistence ─────────────────────────────────────────────────────────
+    //
+    // "Restart the daemon" is expressed here as *a second `ChatSessions`
+    // instance opened on the same database file*, which is exactly what the
+    // gateway does on the way up. These tests deliberately never touch the
+    // process-wide `SESSIONS`: a global that every other test in this file
+    // shares could not be restarted without destroying them, and a persistence
+    // test that had to serialize against the whole module would be the first
+    // thing to be quietly disabled.
+
+    /// Open a fresh registry over `path` and replay whatever is there.
+    fn mailbox_at(path: &std::path::Path) -> Arc<ChatSessions> {
+        let store = SqliteMailboxStore::open(path).expect("test: open the mailbox store");
+        let sessions = Arc::new(ChatSessions::new());
+        sessions.attach_store(Arc::new(store));
+        sessions
+    }
+
+    fn operator_policy() -> SecurityPolicy {
+        policy_with(vec![], &[])
+    }
+
+    /// Everything a session would be handed on its next pull, as task strings.
+    fn tasks_in_order(pulled: &Pulled) -> Vec<String> {
+        pulled
+            .assignments
+            .iter()
+            .map(|assignment| assignment.task.clone())
+            .collect()
+    }
+
+    /// The whole durability claim in one flow: a restart keeps the queue, keeps
+    /// its order, keeps the credential, and keeps the accounting.
+    ///
+    /// MUTATION GUARD: drop the "delivered goes back to the head" arm of
+    /// `hydrate` and the order assertion fails; drop the `enqueue`
+    /// write-through in `assign` and the count assertion fails (nothing is
+    /// stored to replay); store the token instead of its hash and
+    /// `the_mailbox_file_never_holds_a_plaintext_token` fails.
+    #[tokio::test]
+    async fn a_restart_replays_the_mailbox_and_the_old_token_still_pulls() {
+        let dir = tempfile::tempdir().expect("test: tempdir");
+        let db = dir.path().join("state").join("chat-mailbox.db");
+        let policy = operator_policy();
+        let principal = AssignPrincipal::operator_plane();
+
+        let registration = {
+            let before = mailbox_at(&db);
+            let registration = before.register(LABEL, Some(4242)).expect("test: registration");
+            for task in ["first", "second", "third"] {
+                before
+                    .assign(&policy, &principal, &registration.session_id, task, Disposition::Queue)
+                    .expect("test: assignment accepted");
+            }
+            // One handed out and deliberately left unacknowledged: it is the
+            // assignment whose position after the restart is the whole point.
+            let pulled = before
+                .pull(&registration.session_id, &registration.token, &[], Some(1))
+                .expect("test: pull");
+            assert_eq!(tasks_in_order(&pulled), vec!["first".to_string()]);
+            registration
+        };
+
+        // ── Restart ──
+        let after = mailbox_at(&db);
+        let pulled = after
+            .pull(&registration.session_id, &registration.token, &[], None)
+            .expect("test: the session id and token minted before the restart must still pull");
+        assert_eq!(
+            tasks_in_order(&pulled),
+            vec!["first".to_string(), "second".to_string(), "third".to_string()],
+            "nothing may be lost, and the unacknowledged delivery must come back at the head"
+        );
+        assert_eq!(
+            pulled.assignments.first().map(|assignment| assignment.deliveries),
+            Some(2),
+            "the redelivered assignment must say it is a repeat, so its id can be used as an idempotency key"
+        );
+
+        // A wrong token is still a wrong token after a restart: the stored hash
+        // is the same comparison the live registry made.
+        assert_eq!(
+            after
+                .pull(&registration.session_id, "not-the-token", &[], None)
+                .expect_err("test: refused"),
+            ChatSessionError::BadToken
+        );
+
+        // ── Acknowledge one, restart again ──
+        let acked = pulled
+            .assignments
+            .first()
+            .map(|assignment| assignment.assignment_id.clone())
+            .expect("test: an assignment to acknowledge");
+        after
+            .pull(
+                &registration.session_id,
+                &registration.token,
+                std::slice::from_ref(&acked),
+                Some(0),
+            )
+            .expect("test: acknowledging pull");
+
+        let after_ack = mailbox_at(&db);
+        let pulled = after_ack
+            .pull(&registration.session_id, &registration.token, &[], None)
+            .expect("test: pull");
+        assert_eq!(
+            tasks_in_order(&pulled),
+            vec!["second".to_string(), "third".to_string()],
+            "work the session acknowledged is work it still holds; redelivering it would be this runtime \
+             deciding a live chat had lost it"
+        );
+        assert!(
+            after_ack
+                .list()
+                .iter()
+                .any(|session| session.session_id == registration.session_id && session.accepted == 1),
+            "the acknowledged assignment must be restored as accepted, not silently dropped"
+        );
+
+        // ── Deregister, restart again ──
+        after_ack.deregister(&registration.session_id);
+        let after_exit = mailbox_at(&db);
+        assert_eq!(
+            after_exit
+                .pull(&registration.session_id, &registration.token, &[], None)
+                .expect_err("test: a withdrawn session must not come back"),
+            ChatSessionError::UnknownSession
+        );
+        assert!(after_exit.list().is_empty(), "the session row itself must be gone");
+    }
+
+    /// The token is a secret that exists in the clear for exactly one response.
+    ///
+    /// Asserted against the file rather than against the code, because the way
+    /// this regresses is a well-meant "store the token so a chat can recover
+    /// it" — which the wording of `Registration` already forbids.
+    #[tokio::test]
+    async fn the_mailbox_file_never_holds_a_plaintext_token() {
+        let dir = tempfile::tempdir().expect("test: tempdir");
+        let db = dir.path().join("state").join("chat-mailbox.db");
+        let sessions = mailbox_at(&db);
+        let registration = sessions.register(LABEL, None).expect("test: registration");
+        sessions
+            .assign(
+                &operator_policy(),
+                &AssignPrincipal::operator_plane(),
+                &registration.session_id,
+                "do a thing",
+                Disposition::Queue,
+            )
+            .expect("test: assignment accepted");
+
+        let conn = rusqlite::Connection::open(&db).expect("test: open the mailbox file");
+        let pattern = format!("%{}%", registration.token);
+        let hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_sessions
+                 WHERE session_id LIKE ?1 OR label LIKE ?1 OR token_hash LIKE ?1",
+                rusqlite::params![pattern],
+                |row| row.get(0),
+            )
+            .expect("test: query the session rows");
+        assert_eq!(hits, 0, "the mailbox database must never hold the token in the clear");
+
+        // And the hash that *is* there is the one the live registry compares
+        // against, so the check is not merely "some other string".
+        let stored: String = conn
+            .query_row(
+                "SELECT token_hash FROM chat_sessions WHERE session_id = ?1",
+                rusqlite::params![registration.session_id],
+                |row| row.get(0),
+            )
+            .expect("test: read the stored hash");
+        assert_eq!(stored, hash_token(&registration.token));
+
+        // Belt and braces: the raw bytes of the file do not contain it either,
+        // so a token cannot hide in a table this query forgot to name.
+        drop(conn);
+        let bytes = std::fs::read(&db).expect("test: read the mailbox file");
+        assert!(
+            !bytes
+                .windows(registration.token.len())
+                .any(|window| window == registration.token.as_bytes()),
+            "the token must not appear anywhere in the mailbox file"
+        );
+    }
+
+    /// A store that refuses every write costs durability and nothing else.
+    ///
+    /// This is the availability trade-off stated in the module header, and it
+    /// is only a claim until something asserts it: an assignment must still be
+    /// accepted, delivered and reported while the disk is saying no.
+    #[tokio::test]
+    async fn a_store_that_fails_every_write_still_delivers_work() {
+        struct RefusingStore;
+        impl MailboxStore for RefusingStore {
+            fn hydrate(&self) -> anyhow::Result<StoredState> {
+                anyhow::bail!("no")
+            }
+            fn insert_session(&self, _session: &StoredSession) -> anyhow::Result<()> {
+                anyhow::bail!("no")
+            }
+            fn delete_session(&self, _session_id: &str) -> anyhow::Result<()> {
+                anyhow::bail!("no")
+            }
+            fn record_poll(&self, _session_id: &str, _polls: u64, _at_unix_ms: u64) -> anyhow::Result<()> {
+                anyhow::bail!("no")
+            }
+            fn enqueue(&self, _assignment: &StoredAssignment, _at_front: bool) -> anyhow::Result<()> {
+                anyhow::bail!("no")
+            }
+            fn move_to_queue(
+                &self,
+                _assignment_id: &str,
+                _queue: Queue,
+                _deliveries: u32,
+                _to_front: bool,
+            ) -> anyhow::Result<()> {
+                anyhow::bail!("no")
+            }
+            fn delete_assignment(&self, _assignment_id: &str) -> anyhow::Result<()> {
+                anyhow::bail!("no")
+            }
+            fn append_result(&self, _result: &StoredResult) -> anyhow::Result<()> {
+                anyhow::bail!("no")
+            }
+        }
+
+        let sessions = Arc::new(ChatSessions::new());
+        sessions.attach_store(Arc::new(RefusingStore));
+        let registration = sessions
+            .register(LABEL, None)
+            .expect("test: registration must still succeed");
+        sessions
+            .assign(
+                &operator_policy(),
+                &AssignPrincipal::operator_plane(),
+                &registration.session_id,
+                "do a thing",
+                Disposition::Queue,
+            )
+            .expect("test: a failed write must not fail the assignment");
+        let pulled = sessions
+            .pull(&registration.session_id, &registration.token, &[], None)
+            .expect("test: pull");
+        assert_eq!(tasks_in_order(&pulled), vec!["do a thing".to_string()]);
+        let assignment_id = pulled
+            .assignments
+            .first()
+            .map(|assignment| assignment.assignment_id.clone())
+            .expect("test: one assignment");
+        sessions
+            .report(
+                &registration.session_id,
+                &registration.token,
+                &assignment_id,
+                ResultStatus::Completed,
+                "done",
+            )
+            .expect("test: reporting must still succeed");
+    }
+
+    /// A restored session is as old as its last real pull.
+    ///
+    /// The failure this forbids is a restart that makes every session look
+    /// freshly alive: an operator would read `polling` for chats that died with
+    /// the daemon, and the listing's whole job is to hand them evidence.
+    #[tokio::test]
+    async fn a_restored_session_is_stale_until_it_pulls_again() {
+        let dir = tempfile::tempdir().expect("test: tempdir");
+        let db = dir.path().join("state").join("chat-mailbox.db");
+
+        let registration = {
+            let before = mailbox_at(&db);
+            let registration = before.register(LABEL, None).expect("test: registration");
+            before
+                .pull(&registration.session_id, &registration.token, &[], None)
+                .expect("test: pull");
+            registration
+        };
+
+        // Backdate the stored evidence rather than the live one: the question
+        // is what the *next* process believes about a pull it never saw.
+        let conn = rusqlite::Connection::open(&db).expect("test: open the mailbox file");
+        let silent_ms = u64::try_from(SILENT_AFTER.as_millis()).unwrap_or(u64::MAX);
+        let long_ago = unix_ms().saturating_sub(silent_ms.saturating_mul(4));
+        conn.execute(
+            "UPDATE chat_sessions SET last_poll_at_unix_ms = ?1",
+            rusqlite::params![i64::try_from(long_ago).unwrap_or(i64::MAX)],
+        )
+        .expect("test: backdate the stored pull");
+        drop(conn);
+
+        let after = mailbox_at(&db);
+        let listed = after.list();
+        let session = listed
+            .iter()
+            .find(|session| session.session_id == registration.session_id)
+            .expect("test: the session must be restored");
+        assert_eq!(
+            session.liveness,
+            ChatLiveness::Silent,
+            "a session restored from disk must report the age of its last real pull, not the age of the restart"
+        );
+        assert_eq!(session.polls, 1, "the pull count survives the restart too");
+
+        // And a real pull clears it, because the evidence is now first-hand.
+        after
+            .pull(&registration.session_id, &registration.token, &[], None)
+            .expect("test: pull");
+        let listed = after.list();
+        let session = listed
+            .iter()
+            .find(|session| session.session_id == registration.session_id)
+            .expect("test: the session is still there");
+        assert_eq!(session.liveness, ChatLiveness::Polling);
+    }
+
+    /// Results outlive the process that recorded them, and their sequence keeps
+    /// climbing so a consumer's cursor still means something.
+    #[tokio::test]
+    async fn the_result_feed_survives_a_restart_and_keeps_its_sequence() {
+        let dir = tempfile::tempdir().expect("test: tempdir");
+        let db = dir.path().join("state").join("chat-mailbox.db");
+
+        let first_seq = {
+            let before = mailbox_at(&db);
+            let registration = before.register(LABEL, None).expect("test: registration");
+            before
+                .assign(
+                    &operator_policy(),
+                    &AssignPrincipal::operator_plane(),
+                    &registration.session_id,
+                    "count the crates",
+                    Disposition::Queue,
+                )
+                .expect("test: assignment accepted");
+            let pulled = before
+                .pull(&registration.session_id, &registration.token, &[], None)
+                .expect("test: pull");
+            let assignment_id = pulled
+                .assignments
+                .first()
+                .map(|assignment| assignment.assignment_id.clone())
+                .expect("test: one assignment");
+            before
+                .report(
+                    &registration.session_id,
+                    &registration.token,
+                    &assignment_id,
+                    ResultStatus::Completed,
+                    "42 crates",
+                )
+                .expect("test: report")
+        };
+
+        let after = mailbox_at(&db);
+        let page = after.results_after(0, RESULT_LOG_CAPACITY);
+        let restored = page
+            .results
+            .iter()
+            .find(|result| result.seq == first_seq)
+            .expect("test: the result must survive the restart");
+        assert_eq!(restored.status, ResultStatus::Completed);
+        assert_eq!(restored.summary, "42 crates");
+        assert!(
+            after.results.lock().next_seq > first_seq,
+            "the sequence must keep climbing across restarts, or a cached cursor starts lying"
+        );
     }
 
     #[tokio::test]

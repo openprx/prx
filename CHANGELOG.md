@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.142] - 17 September 2026
+
+### Added
+
+- The daemon's chat-session mailbox is now durable. `chat_sessions` kept its
+  registry and every queued assignment in process memory, and said so: a daemon
+  restart forgot every session and every assignment somebody had already been
+  told was accepted, and every `prx chat` had to register again before it could
+  be given work. Registrations, queued assignments, deliveries,
+  acknowledgements, deregistrations and results are now written through to
+  `{workspace}/state/chat-mailbox.db` (SQLite, `0600`, parameterised
+  throughout) before the caller is answered, and the gateway replays the file on
+  the way up -- the one startup path both `prx gateway` and the daemon's
+  supervised gateway pass through, so there is a single attachment point and the
+  replay is idempotent against the supervisor restarting the gateway in-process.
+  A chat keeps its session id *and* its token across the restart: only the
+  token's SHA-256 is stored, so the comparison that authenticates the first pull
+  after a restart is the comparison it always was, and
+  `the_mailbox_file_never_holds_a_plaintext_token` asserts the secret appears
+  nowhere in the file. Work handed out and never acknowledged returns to the
+  head of the queue on replay, exactly as it does on the next pull; work that
+  *was* acknowledged is restored as acknowledged, because the chat holding it
+  usually outlives the daemon and redelivering would be the runtime deciding for
+  it that it had lost work it is still doing. Liveness is restored from the
+  stored evidence rather than reset, so a chat that died with the daemon reads
+  as `silent` instead of as freshly `polling`.
+- Durability never costs availability: a store that cannot be written logs at
+  `error` and the in-memory mailbox carries on, so a full disk degrades the
+  guarantee instead of refusing live work.
+  `a_store_that_fails_every_write_still_delivers_work` holds that trade-off to
+  an assignment being accepted, delivered and reported while every write fails.
+
 ## [0.8.141] - 17 September 2026
 
 ### Fixed

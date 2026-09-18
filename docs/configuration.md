@@ -535,6 +535,30 @@ and records a `cancelled` result. That is deliberate: nothing here expires, so a
 session that has stopped pulling is *reported* as `silent` and never evicted,
 and being seen is what makes a stuck assignment endable.
 
+**The mailbox survives a daemon restart.** Registrations, queued assignments,
+acknowledgements and results are written through to
+`{workspace}/state/chat-mailbox.db` (SQLite, created `0600`) before the caller
+is answered, and the gateway replays the file on the way up. Three consequences
+are worth knowing:
+
+- **A chat keeps its session id and its token.** Only the token's SHA-256 is
+  stored, so the check that authenticates a pull after a restart is the same
+  check it was before one. A chat does not need restarting, and does not
+  re-register.
+- **Work handed out but never acknowledged goes back to the head of the queue**,
+  exactly as it does on the next pull. Work the session *did* acknowledge stays
+  acknowledged: the chat holding it usually outlives the daemon, and
+  redelivering it would be the daemon deciding a live chat had lost it.
+- **Liveness is not reset by the restart.** A restored session reports the age
+  of its last real pull, so a chat that died with the daemon reads as `silent`
+  rather than as freshly `polling`.
+
+Durability never costs availability: if the database cannot be written, the
+mutation is logged at `error` and the in-memory mailbox carries on, so a full
+disk degrades the guarantee instead of refusing live work. Deleting the file
+while the daemon is down is therefore a supported way to reset the mailbox — a
+chat whose session went with it registers again by itself on its next poll.
+
 ### `[chat.daemon]`
 
 `prx chat` deliberately opens no IM connection: a second listener on the same
@@ -588,7 +612,13 @@ chat that tried anyway would announce a refusal on every start.
   raising the number of open chats no longer costs the operator theirs.
 - **Exiting withdraws the session.** Nothing on the daemon side expires a chat
   session, so a chat killed with `SIGKILL` leaves a row listed as `silent` until
-  an operator reaps it with `DELETE /api/chat-sessions/{id}`.
+  an operator reaps it with `DELETE /api/chat-sessions/{id}`. The row survives a
+  daemon restart too — the mailbox is persisted — so reaping it is an operator
+  act rather than something a restart does by accident.
+- **A daemon restart no longer loses assignments.** Queued work is replayed from
+  `{workspace}/state/chat-mailbox.db` and the chat carries on pulling with the
+  same session id and token. If the file *is* removed, the pull is refused with
+  `unknown_session` and the chat registers again by itself on its next poll.
 
 The three dispositions map onto paths chat already had: `queue` joins the input
 backlog, `steer` joins it in front (the same place `/now` puts a typed line),

@@ -1317,6 +1317,16 @@ pub async fn run_gateway(
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
+    // The chat-session mailbox is durable, and this is the one startup path
+    // both launch modes share (`prx gateway`, and the daemon's supervised
+    // gateway), so it is the only place the store has to be attached. Attaching
+    // replays what the previous process left queued, and is idempotent: the
+    // daemon's supervisor restarts the gateway inside one process, and a replay
+    // never duplicates a session that is still live in memory.
+    if let Some(path) = runtime::chat_sessions::attach_workspace_store(&config.workspace_dir) {
+        tracing::debug!(path = %path.display(), "chat session mailbox is durable");
+    }
+
     #[cfg(feature = "wasm-plugins")]
     let wasm_early_runtime = if config
         .default_provider
