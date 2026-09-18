@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.151] - 18 September 2026
+
+### Changed
+
+- Skills catalog tests pin both community skill roots (open-skills and
+  OpenClaw) inside each fixture's own temporary directory instead of falling
+  back to the home-directory defaults, so a machine holding real community
+  checkouts no longer fails twenty unrelated tests. Default resolver behaviour
+  is unchanged and still covered by its own tests. Test-only change.
+
 ## [0.8.150] - 18 September 2026
 
 ### Fixed
