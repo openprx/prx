@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.152] - 18 September 2026
+
+### Fixed
+
+- An established chat session with a narrow pinned tool set can now discover a
+  different capability on a later substantive request that the keyword table
+  does not recognise (another language or an unrecognised paraphrase). Such an
+  unrouted turn is classified structurally, by concrete objects (URLs, paths,
+  flags, code spans) or request weight measured per script class, and earns a
+  one-turn discovery exposure of the tools operator policy allows; the exposure
+  is never absorbed into the session, so greetings, closings and one-word
+  follow-ups still republish the pinned set. Channel exclusions, model
+  allowlists and worker manifests are unchanged and still outrank discovery.
+
 ## [0.8.151] - 18 September 2026
 
 ### Changed

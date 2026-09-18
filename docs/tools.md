@@ -93,10 +93,31 @@ capability is named and is byte-identical on every turn that names nothing new.
 An unrouted turn is absorbed into that union **only on the session's first
 turn**, where there is no earlier decision to keep — so a session opened in a
 language the table cannot read still starts at the full registry. Afterwards an
-unrouted turn adds nothing: a greeting, a "thanks, that is all", or a request in
-another language re-publishes the set the session already had. Absorbing the
+unrouted turn adds nothing: a greeting, a "thanks, that is all", or a one-word
+acknowledgement re-publishes the set the session already had. Absorbing the
 full-registry fallback on every unrouted turn is what used to make one such turn
 pin a session at the whole catalog for the rest of its life.
+
+A session still has to be able to reach a capability it never named in English,
+though — a request in another language, or an English paraphrase the keyword
+table does not recognise, activates nothing and would otherwise be stuck with
+whatever the session happened to route on its first turn. So an unrouted turn
+that is nonetheless a *request* gets one **discovery turn** at the whole allowed
+registry. The signal is structural, never a second keyword table:
+
+- the turn points at a **concrete object** — a URL, a filesystem path, a file
+  name, a command flag, or a backtick code span; or
+- the turn carries the **weight of a request**: roughly eight words of a spaced
+  script, or fourteen characters of one that writes words without spaces. A
+  greeting, a closing or a one-word follow-up never reaches that.
+
+Discovery is published for that turn only and is never absorbed into the union,
+so the next quiet turn goes back to the session's own set — one unreadable
+request cannot pin a session at the whole catalog. `always_exclude`, the channel
+surface and `model_allowlists` all still outrank it, exactly as they outrank the
+stateless fallback. The trade-off is deliberate: an occasional chatty line pays
+one turn of wider tool schemas, while the alternative costs the user a
+capability they explicitly asked for.
 
 `/new` and `/clear` reset the union. Channel, gateway, console and worker turns
 are unaffected — each of those turns is its own session.

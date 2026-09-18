@@ -20,6 +20,16 @@
 //! names nothing new must add nothing. Folding both into the router made a
 //! single greeting absorb the full catalog into a chat session's union and hold
 //! it there for the rest of the session.
+//!
+//! "Names nothing new" is itself a judgement the keyword table cannot make, so
+//! a session makes it structurally instead: a substantive unrouted turn — one
+//! that points at a concrete object, or carries the weight of a real request in
+//! any script — gets one *discovery* turn at the whole allowed registry
+//! (`unrouted_turn_requests_discovery`). That surface is published for the
+//! turn and never absorbed, so a session can reach a capability its wording
+//! never named in English without one unreadable line pinning it at the full
+//! catalog. Greetings, closings and one-word follow-ups keep publishing the
+//! session set unchanged.
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -230,7 +240,144 @@ pub enum UnroutedToolPolicy {
     /// names nothing new, so it must add nothing. Widening to the whole
     /// registry here is what let a single greeting pull the entire catalog into
     /// a chat session's union and keep it there for the rest of the session.
+    /// A session that decides the turn *is* a request answers
+    /// [`Self::PublishEverything`] for that turn instead, without absorbing it.
     KeepPinnedExposure,
+}
+
+/// Weight of one word of a script that separates words with spaces.
+const SPACED_WORD_WEIGHT: usize = 5;
+
+/// Weight of one character of a script that writes words without spaces
+/// between them. Those scripts pack roughly one and a half characters into a
+/// word, so a character is worth a little over half of one.
+const UNSPACED_CHARACTER_WEIGHT: usize = 3;
+
+/// Eight spaced words, or about fourteen unspaced characters: the point where
+/// a line stops reading like a pleasantry and starts reading like a request.
+const DISCOVERY_REQUEST_WEIGHT: usize = 8 * SPACED_WORD_WEIGHT;
+
+/// Character ranges of the scripts that write words without spaces between
+/// them. This is a script-class list, not a language list: it only decides how
+/// text is *counted*, never which capability a word names, so it cannot grow
+/// into a multilingual keyword table.
+const UNSPACED_SCRIPT_RANGES: &[(char, char)] = &[
+    ('\u{0e00}', '\u{0eff}'),   // Thai, Lao
+    ('\u{1000}', '\u{109f}'),   // Myanmar
+    ('\u{1780}', '\u{17ff}'),   // Khmer
+    ('\u{3040}', '\u{30ff}'),   // Hiragana, Katakana
+    ('\u{3400}', '\u{4dbf}'),   // CJK unified ideographs extension A
+    ('\u{4e00}', '\u{9fff}'),   // CJK unified ideographs
+    ('\u{f900}', '\u{faff}'),   // CJK compatibility ideographs
+    ('\u{20000}', '\u{2fa1f}'), // CJK unified ideographs, supplementary planes
+];
+
+/// Whether a turn the keyword table could not read is asking for something new.
+///
+/// An unrouted turn is one of two very different things: a request the
+/// English-only table cannot read (another language, or a paraphrase that names
+/// no capability), or an ordinary conversational line that asks for nothing at
+/// all. Treating both as "nothing new" left an established session unable to
+/// ever reach a capability it had not already named in English, which is the
+/// defect this closes; treating both as a new request would let one greeting
+/// pull the whole catalog back in.
+///
+/// The evidence is structural rather than lexical, so it carries across
+/// languages and cannot be extended into a multilingual keyword list:
+///
+/// - a **concrete object** the turn points at — a URL, a filesystem path, a
+///   file name, a command flag, or a backtick code span — which makes even a
+///   short line a real request;
+/// - the **request weight** of the text: a clause long enough to carry a verb
+///   and an object reads as a request, while a greeting, a closing or a
+///   one-word acknowledgement does not. Weight counts words for scripts that
+///   separate them and characters for scripts that do not, so the threshold
+///   means roughly the same thing in both.
+///
+/// Both halves are deliberately coarse, and the asymmetry is deliberate too:
+/// answering "yes" too often costs one turn of wider tool schemas, while
+/// answering "no" costs the user a capability they explicitly asked for.
+fn unrouted_turn_requests_discovery(message: &str) -> bool {
+    mentions_concrete_object(message) || request_weight(message) >= DISCOVERY_REQUEST_WEIGHT
+}
+
+/// Whether this character belongs to a script that does not separate words
+/// with spaces, and therefore has to be counted per character.
+fn character_is_unspaced_script(character: char) -> bool {
+    UNSPACED_SCRIPT_RANGES
+        .iter()
+        .any(|(first, last)| (*first..=*last).contains(&character))
+}
+
+/// Size of the request in language-independent units: one word of a spaced
+/// script, or one character of an unspaced one.
+fn request_weight(message: &str) -> usize {
+    let mut weight = 0;
+    let mut inside_word = false;
+    for character in message.chars() {
+        if character_is_unspaced_script(character) {
+            if inside_word {
+                weight += SPACED_WORD_WEIGHT;
+                inside_word = false;
+            }
+            weight += UNSPACED_CHARACTER_WEIGHT;
+        } else if character.is_alphanumeric() {
+            inside_word = true;
+        } else if inside_word {
+            weight += SPACED_WORD_WEIGHT;
+            inside_word = false;
+        }
+    }
+    if inside_word {
+        weight += SPACED_WORD_WEIGHT;
+    }
+    weight
+}
+
+/// Whether the message points at something concrete enough to act on. A short
+/// line is still a request when it names a URL, a path, a file, a command flag
+/// or a quoted command.
+fn mentions_concrete_object(message: &str) -> bool {
+    message.contains("://")
+        || message.matches('`').count() >= 2
+        || message.split_whitespace().any(token_names_a_concrete_object)
+}
+
+/// Punctuation that is part of a path, file name or flag rather than prose, so
+/// it must survive the trim that strips ordinary sentence punctuation.
+const OBJECT_PUNCTUATION: &[char] = &['/', '\\', '.', '-', '_', '~'];
+
+fn token_names_a_concrete_object(token: &str) -> bool {
+    let trimmed =
+        token.trim_matches(|character: char| !character.is_alphanumeric() && !OBJECT_PUNCTUATION.contains(&character));
+    if trimmed.chars().count() < 2 || !trimmed.chars().any(char::is_alphanumeric) {
+        return false;
+    }
+
+    // A long command flag: `--all-features`.
+    if trimmed
+        .strip_prefix("--")
+        .is_some_and(|rest| rest.starts_with(char::is_alphanumeric))
+    {
+        return true;
+    }
+
+    // A path: rooted, relative, nested, or a Windows-style one. A bare
+    // `and/or` is prose, not a path, so one interior slash is not enough.
+    let looks_like_a_path = trimmed.rsplit_once('/').map_or_else(
+        || trimmed.split('\\').filter(|segment| !segment.is_empty()).count() >= 2,
+        |(head, tail)| trimmed.starts_with(['/', '.', '~']) || head.contains('/') || tail.contains('.'),
+    );
+    if looks_like_a_path {
+        return true;
+    }
+
+    // A file or host name: a stem, a dot, and a short alphabetic suffix.
+    trimmed.rsplit_once('.').is_some_and(|(stem, suffix)| {
+        !stem.is_empty()
+            && (2..=8).contains(&suffix.chars().count())
+            && suffix.chars().all(|character| character.is_ascii_alphabetic())
+    })
 }
 
 /// Every tool operator policy allows, in registry order, ignoring intent.
@@ -457,6 +604,14 @@ impl SessionToolExposure {
     /// re-publishes what is already there. Absorbing the fallback every time
     /// made one unreadable turn (a greeting, a non-English request) swallow the
     /// entire registry and pin the session at full width from then on.
+    ///
+    /// An unrouted turn that is nonetheless a *request*
+    /// (`unrouted_turn_requests_discovery`) is the third case: the returned
+    /// surface publishes everything operator policy allows for this one turn,
+    /// while the union stays exactly where it was. Without it an established
+    /// session could never reach a capability it had not already named in
+    /// English — a request in another language, or a paraphrase the table does
+    /// not recognise, activated nothing and therefore changed nothing.
     #[must_use]
     pub fn sticky_surface(
         &self,
@@ -466,10 +621,21 @@ impl SessionToolExposure {
     ) -> SessionToolSurface {
         let outcome = select_tools_for_intent(all_tools, routing_input, &base.always_include, &base.always_exclude);
         let mut names = self.names.lock();
+        let mut unrouted = UnroutedToolPolicy::KeepPinnedExposure;
         let absorbed = match outcome {
             RoutingOutcome::Routed(routed) => Some(routed),
             RoutingOutcome::Unrouted if names.is_empty() => Some(full_tool_surface(all_tools, &base.always_exclude)),
-            RoutingOutcome::Unrouted => None,
+            RoutingOutcome::Unrouted => {
+                if unrouted_turn_requests_discovery(routing_input) {
+                    // Discovery turn: publish everything operator policy allows
+                    // for this turn only, and leave the union untouched. The
+                    // session can reach a capability its wording never named,
+                    // without one unreadable request pinning it at the whole
+                    // catalog for the rest of its life.
+                    unrouted = UnroutedToolPolicy::PublishEverything;
+                }
+                None
+            }
         };
         for tool in absorbed.into_iter().flatten() {
             if !names.contains(tool.name()) {
@@ -482,10 +648,7 @@ impl SessionToolExposure {
                 tiering.always_include.push(name.clone());
             }
         }
-        SessionToolSurface {
-            tiering,
-            unrouted: UnroutedToolPolicy::KeepPinnedExposure,
-        }
+        SessionToolSurface { tiering, unrouted }
     }
 }
 
@@ -954,5 +1117,162 @@ mod tests {
             .insert("small-model".to_string(), vec!["shell".to_string()]);
         assert!(!core_dependency_is_available("skill_read", "small-model", &config));
         assert!(core_dependency_is_available("skill_read", "other-model", &config));
+    }
+
+    /// A request the English keyword table cannot read, but which is
+    /// unmistakably a request: a full clause with a verb and an object.
+    const SUBSTANTIVE_PARAPHRASE: &str =
+        "please take another careful look at what we have so far and tell me what you would do next";
+
+    /// The same shape written in a script that does not separate words with
+    /// spaces. It asks the agent to look something up online and summarize it,
+    /// and it names no English capability keyword.
+    const SUBSTANTIVE_UNSUPPORTED_LANGUAGE: &str = "帮我上网找一下最新的发布说明并做个总结";
+
+    /// A closing line in the same unspaced script ("thanks, that is all").
+    const UNSPACED_CLOSING: &str = "谢谢，就到这里吧";
+
+    fn assert_fixture_is_unrouted(message: &str) {
+        assert!(
+            CLASSIFIER.classify(message).is_empty(),
+            "fixture must be genuinely unrouted, otherwise the assertion is vacuous: {message}"
+        );
+    }
+
+    /// R06: an established narrow session must still be able to reach a
+    /// capability it never named in English. A substantive turn the keyword
+    /// table cannot read republishes the whole allowed catalog **for that turn
+    /// only**; the session union is left exactly as it was, so a discovery turn
+    /// cannot pin the session at full width.
+    ///
+    /// MUTATION GUARD: make `sticky_surface` always return
+    /// `KeepPinnedExposure`, or make `unrouted_turn_requests_discovery` answer
+    /// `false` for everything, and the discovery assertion goes red; absorb the
+    /// discovery surface into `names` and the snapshot assertion goes red.
+    #[test]
+    fn a_substantive_unrouted_turn_reopens_the_catalog_for_one_turn() {
+        let tools = probe_registry();
+        let base = crate::config::ToolTieringConfig::default();
+
+        for request in [SUBSTANTIVE_PARAPHRASE, SUBSTANTIVE_UNSUPPORTED_LANGUAGE] {
+            assert_fixture_is_unrouted(request);
+            let exposure = SessionToolExposure::new();
+
+            let routed = exposure.sticky_surface(&base, &tools, "commit this change");
+            assert_eq!(
+                session_names(&tools, "commit this change", &routed),
+                vec!["probe_core", "probe_devops"],
+                "the session must start narrow, or the discovery assertion is vacuous"
+            );
+
+            let discovery = exposure.sticky_surface(&base, &tools, request);
+            assert_eq!(
+                session_names(&tools, request, &discovery),
+                vec!["probe_core", "probe_devops", "probe_web"],
+                "a substantive unrouted request must reach a capability the session never named"
+            );
+            assert_eq!(
+                exposure.snapshot(),
+                vec!["probe_core".to_string(), "probe_devops".to_string()],
+                "discovery lasts one turn and must not be absorbed into the session union"
+            );
+
+            let quiet = exposure.sticky_surface(&base, &tools, "thanks, that is all");
+            assert_eq!(
+                session_names(&tools, "thanks, that is all", &quiet),
+                vec!["probe_core", "probe_devops"],
+                "the turn after a discovery turn returns to the session set"
+            );
+        }
+    }
+
+    /// The other half of the contract: a greeting, a closing or a one-word
+    /// acknowledgement is not a capability request in any language, so it must
+    /// leave an established session exactly as narrow as it was.
+    #[test]
+    fn a_harmless_unrouted_follow_up_never_reopens_the_catalog() {
+        let tools = probe_registry();
+        let base = crate::config::ToolTieringConfig::default();
+        let exposure = SessionToolExposure::new();
+
+        let routed = exposure.sticky_surface(&base, &tools, "commit this change");
+        let established = session_names(&tools, "commit this change", &routed);
+        assert_eq!(established, vec!["probe_core", "probe_devops"]);
+
+        for follow_up in ["gracias, eso es todo", "hola", "ok", UNSPACED_CLOSING] {
+            assert_fixture_is_unrouted(follow_up);
+            let surface = exposure.sticky_surface(&base, &tools, follow_up);
+            assert_eq!(
+                session_names(&tools, follow_up, &surface),
+                established,
+                "`{follow_up}` names nothing new and must publish the session set unchanged"
+            );
+            assert_eq!(
+                exposure.snapshot(),
+                vec!["probe_core".to_string(), "probe_devops".to_string()],
+                "`{follow_up}` must not absorb anything into the session union"
+            );
+        }
+    }
+
+    /// Discovery widens what routing may hide, never what operator policy
+    /// forbids: an excluded tool stays invisible on the discovery turn too.
+    #[test]
+    fn a_discovery_turn_never_exposes_an_excluded_tool() {
+        let tools = probe_registry();
+        let base = crate::config::ToolTieringConfig {
+            always_exclude: vec!["probe_web".to_string()],
+            ..crate::config::ToolTieringConfig::default()
+        };
+        let exposure = SessionToolExposure::new();
+
+        let routed = exposure.sticky_surface(&base, &tools, "commit this change");
+        assert_eq!(
+            session_names(&tools, "commit this change", &routed),
+            vec!["probe_core", "probe_devops"]
+        );
+
+        let discovery = exposure.sticky_surface(&base, &tools, SUBSTANTIVE_PARAPHRASE);
+        assert_eq!(
+            session_names(&tools, SUBSTANTIVE_PARAPHRASE, &discovery),
+            vec!["probe_core", "probe_devops"],
+            "always_exclude outranks a discovery turn"
+        );
+        assert!(!exposure.snapshot().iter().any(|name| name == "probe_web"));
+    }
+
+    /// The discovery signal itself, at the level it is decided: structure, not
+    /// vocabulary. Nothing here may be satisfied by adding words to the
+    /// keyword table.
+    #[test]
+    fn the_discovery_signal_separates_requests_from_conversation() {
+        for quiet in [
+            "gracias, eso es todo",
+            "thanks, that is all",
+            "ok",
+            "hola",
+            "sounds good, thank you very much",
+            UNSPACED_CLOSING,
+        ] {
+            assert!(
+                !unrouted_turn_requests_discovery(quiet),
+                "`{quiet}` is conversation and must not reopen the catalog"
+            );
+        }
+
+        for request in [
+            SUBSTANTIVE_PARAPHRASE,
+            SUBSTANTIVE_UNSUPPORTED_LANGUAGE,
+            // Short, but each names a concrete object the turn must act on.
+            "open https://example.com/report",
+            "look at src/tools/intent.rs",
+            "run `cargo check` for me",
+            "check /etc/hosts",
+        ] {
+            assert!(
+                unrouted_turn_requests_discovery(request),
+                "`{request}` is a request and must reopen the catalog"
+            );
+        }
     }
 }

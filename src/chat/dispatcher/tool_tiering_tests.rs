@@ -379,3 +379,77 @@ async fn a_quiet_turn_republishes_the_chat_session_set_through_the_driver() {
         "a turn the keyword table cannot read must republish the session set, not the registry"
     );
 }
+
+/// A request the English keyword table cannot read, but which is unmistakably a
+/// request rather than a pleasantry.
+const SUBSTANTIVE_UNROUTED_REQUEST: &str =
+    "please take another careful look at what we have so far and tell me what you would do next";
+
+/// R06, driven end to end: an established narrow session must still be able to
+/// reach a capability it never named in English. The dispatcher folds the turn
+/// into the session exposure and the shared tool loop re-routes the same text,
+/// and what the provider was actually offered is read off the catalog.
+///
+/// MUTATION GUARD: make `sticky_surface` keep the pinned exposure for a
+/// substantive unrouted turn and the web probe disappears from the discovery
+/// offer; absorb the discovery surface into the session union instead of
+/// publishing it for one turn, and the closing-turn assertion goes red.
+#[tokio::test]
+async fn a_substantive_unrouted_turn_discovers_capabilities_through_the_driver() {
+    let base = crate::config::ToolTieringConfig::default();
+    let exposure = crate::tools::intent::SessionToolExposure::new();
+
+    let routed = offered_tools_for_session(&exposure, "spawn a sub-agent for this", &base).await;
+    // Fixture self-check: the session really is narrow before the discovery turn.
+    assert!(
+        routed.iter().any(|name| name == EXTENDED_TOOL),
+        "the routed turn must reach the automation probe: {routed:?}"
+    );
+    assert!(
+        !routed.iter().any(|name| name == WEB_TOOL),
+        "the routed turn must not reach the web probe: {routed:?}"
+    );
+
+    let discovery = offered_tools_for_session(&exposure, SUBSTANTIVE_UNROUTED_REQUEST, &base).await;
+    assert!(
+        discovery.iter().any(|name| name == WEB_TOOL),
+        "a substantive request the keyword table cannot read must reach a capability the session never named: {discovery:?}"
+    );
+    assert!(
+        discovery.iter().any(|name| name == CORE_TOOL),
+        "core tools stay on every turn: {discovery:?}"
+    );
+
+    let quiet = offered_tools_for_session(&exposure, "thanks, that is all", &base).await;
+    assert_eq!(
+        quiet, routed,
+        "discovery lasts one turn: a closing line afterwards must publish the session set again"
+    );
+}
+
+/// Operator policy still wins on a discovery turn: an excluded tool is never
+/// published, whatever the turn looks like.
+#[tokio::test]
+async fn a_discovery_turn_cannot_publish_an_excluded_tool_through_the_driver() {
+    let base = crate::config::ToolTieringConfig {
+        always_exclude: vec![WEB_TOOL.to_string()],
+        ..crate::config::ToolTieringConfig::default()
+    };
+    let exposure = crate::tools::intent::SessionToolExposure::new();
+
+    let routed = offered_tools_for_session(&exposure, "spawn a sub-agent for this", &base).await;
+    assert!(
+        routed.iter().any(|name| name == EXTENDED_TOOL),
+        "the routed turn must reach the automation probe: {routed:?}"
+    );
+
+    let discovery = offered_tools_for_session(&exposure, SUBSTANTIVE_UNROUTED_REQUEST, &base).await;
+    assert!(
+        !discovery.iter().any(|name| name == WEB_TOOL),
+        "always_exclude outranks discovery: {discovery:?}"
+    );
+    assert!(
+        discovery.iter().any(|name| name == CORE_TOOL),
+        "core tools stay on every turn: {discovery:?}"
+    );
+}
