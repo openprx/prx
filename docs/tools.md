@@ -420,7 +420,11 @@ about it expires on a clock.
 An accepted assignment is **durable**: the mailbox is written through to
 `{workspace}/state/chat-mailbox.db` before `chat_assign` answers, and a daemon
 restart replays it, so queued work is still queued and the chat keeps pulling
-with the session id and token it already has. The relay itself is not — it lives
+with the session id and token it already has. Retiring an assignment and
+recording its result are one commit, so a failed write leaves the work
+outstanding rather than leaving the assigner with neither the work nor an answer
+about it; see [the mailbox section](configuration.md#chatdaemon) for the ordering
+and idempotence guarantees that go with it. The relay itself is not — it lives
 in the turn that started it — so a restart means the result reaches the
 cross-session result feed rather than being relayed back to the conversation.
 

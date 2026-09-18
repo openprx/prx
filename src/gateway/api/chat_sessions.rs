@@ -58,6 +58,36 @@ fn into_refusal(error: &ChatSessionError) -> Refusal {
     )
 }
 
+/// Run one synchronous mailbox call off the async worker that is serving the
+/// request.
+///
+/// The mailbox is write-through to SQLite, and SQLite waits for a contended
+/// file lock by *sleeping the calling thread*. Calling it straight from a
+/// handler therefore parks an async worker for as long as another process holds
+/// the database, and enough such requests park every worker — the whole API,
+/// including endpoints that never touch a database, stops being answered. The
+/// blocking pool is where work that sleeps belongs, and
+/// [`crate::runtime::blocking::spawn_blocking`] is this process's tracked
+/// entrance to it, so the occupancy shows up in `prx tasks pools` alongside
+/// every other blocking caller.
+///
+/// This changes no mailbox semantics: the call still runs to completion before
+/// the response is written, so "accepted" still means "queued, and durable
+/// unless the log says otherwise".
+async fn offload<T, F>(operation: &'static str, work: F) -> Result<T, Refusal>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    crate::runtime::blocking::spawn_blocking(work).await.map_err(|error| {
+        tracing::error!(operation, "chat mailbox worker did not finish: {error}");
+        refusal(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{operation} could not be completed"),
+        )
+    })
+}
+
 fn session_token(headers: &HeaderMap) -> String {
     headers
         .get(SESSION_TOKEN_HEADER)
@@ -94,7 +124,10 @@ pub async fn post_register(
     Json(request): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<RegisterResponse>), Refusal> {
     authorize_resource_mutation(&state, "chat_session_register", ResourceRiskLevel::Low)?;
-    let registration = chat_sessions::register(&request.label, request.pid).map_err(|error| into_refusal(&error))?;
+    let RegisterRequest { label, pid } = request;
+    let registration = offload("chat_session_register", move || chat_sessions::register(&label, pid))
+        .await?
+        .map_err(|error| into_refusal(&error))?;
     Ok((
         StatusCode::CREATED,
         Json(RegisterResponse {
@@ -171,7 +204,11 @@ pub async fn delete_session(
     Path(id): Path<String>,
 ) -> Result<Json<DeregisterResponse>, Refusal> {
     authorize_resource_mutation(&state, "chat_session_deregister", ResourceRiskLevel::Medium)?;
-    let discarded = chat_sessions::deregister(&id).ok_or_else(|| into_refusal(&ChatSessionError::UnknownSession))?;
+    let discarded = {
+        let id = id.clone();
+        offload("chat_session_deregister", move || chat_sessions::deregister(&id)).await?
+    }
+    .ok_or_else(|| into_refusal(&ChatSessionError::UnknownSession))?;
     Ok(Json(DeregisterResponse {
         session_id: id,
         discarded,
@@ -262,9 +299,13 @@ pub async fn post_assign(
         });
 
     let config = state.config.load_full();
-    let policy = crate::runtime::bootstrap::build_security_policy(&config);
-    let receipt = chat_sessions::assign(&policy, &principal, &id, &request.task, disposition)
-        .map_err(|error| into_refusal(&error))?;
+    let task = request.task;
+    let receipt = offload("chat_session_assign", move || {
+        let policy = crate::runtime::bootstrap::build_security_policy(&config);
+        chat_sessions::assign(&policy, &principal, &id, &task, disposition)
+    })
+    .await?
+    .map_err(|error| into_refusal(&error))?;
 
     Ok((
         StatusCode::ACCEPTED,
@@ -326,8 +367,12 @@ pub async fn post_pull(
 ) -> Result<Json<PullResponse>, Refusal> {
     authorize_resource_mutation(&state, "chat_session_pull", ResourceRiskLevel::Low)?;
     let request = body.map(|Json(request)| request).unwrap_or_default();
-    let pulled = chat_sessions::pull(&id, &session_token(&headers), &request.ack, request.max)
-        .map_err(|error| into_refusal(&error))?;
+    let token = session_token(&headers);
+    let pulled = offload("chat_session_pull", move || {
+        chat_sessions::pull(&id, &token, &request.ack, request.max)
+    })
+    .await?
+    .map_err(|error| into_refusal(&error))?;
     Ok(Json(PullResponse {
         assignments: pulled
             .assignments
@@ -389,16 +434,19 @@ pub async fn post_result(
             ),
         )
     })?;
-    let seq = chat_sessions::report(
-        &id,
-        &session_token(&headers),
-        &request.assignment_id,
-        status,
-        &request.summary,
-    )
+    let token = session_token(&headers);
+    let assignment_id = request.assignment_id;
+    let summary = request.summary;
+    let seq = {
+        let assignment_id = assignment_id.clone();
+        offload("chat_session_result", move || {
+            chat_sessions::report(&id, &token, &assignment_id, status, &summary)
+        })
+        .await?
+    }
     .map_err(|error| into_refusal(&error))?;
     Ok(Json(ResultResponse {
-        assignment_id: request.assignment_id,
+        assignment_id,
         status: status.as_str().to_string(),
         seq,
     }))
@@ -1206,5 +1254,128 @@ mod tests {
         assert_eq!(status, 200, "test: body was {body}");
 
         server.abort();
+    }
+
+    /// A store that accepts everything and keeps nothing.
+    ///
+    /// The process mailbox is a global, so a test that attaches a real store
+    /// under a temporary directory has to leave it attached to something that
+    /// outlives the directory; this is that something.
+    struct QuietStore;
+
+    impl chat_sessions::MailboxStore for QuietStore {
+        fn hydrate(&self) -> anyhow::Result<chat_sessions::StoredState> {
+            Ok(chat_sessions::StoredState::default())
+        }
+        fn insert_session(&self, _session: &chat_sessions::StoredSession) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn record_poll(&self, _session_id: &str, _polls: u64, _at_unix_ms: u64, _revision: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn enqueue(&self, _assignment: &chat_sessions::StoredAssignment, _at_front: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn move_to_queue(
+            &self,
+            _assignment_id: &str,
+            _queue: chat_sessions::Queue,
+            _deliveries: u32,
+            _to_front: bool,
+            _revision: u64,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn complete_assignment(
+            &self,
+            _assignment_id: &str,
+            _result: &chat_sessions::StoredResult,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn cascade_session(&self, _session_id: &str, _results: &[chat_sessions::StoredResult]) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Work the mailbox cannot persist must not take the rest of the API down
+    /// with it.
+    ///
+    /// The contention is real — a second connection holds `BEGIN IMMEDIATE` on
+    /// the production mailbox file, exactly as a second `prx` or an operator's
+    /// `sqlite3` session would — and the pulls go through the mounted routes,
+    /// not through the registry directly. While they are waiting, the listing
+    /// endpoint (which touches memory only) must still answer.
+    ///
+    /// MUTATION GUARD: call `chat_sessions::pull` directly from `post_pull`
+    /// instead of handing it to the blocking pool and the listing below is
+    /// never answered inside its timeout, because every async worker is asleep
+    /// in SQLite's busy handler.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unrelated_request_stays_answered_while_pulls_wait_on_a_locked_mailbox() {
+        let workspace = TempDir::new().expect("test: workspace");
+        let db = workspace.path().join("state").join("chat-mailbox.db");
+        let store = chat_sessions::SqliteMailboxStore::open(&db).expect("test: open the mailbox store");
+        chat_sessions::attach_store(Arc::new(store));
+
+        let config = config_with(workspace.path(), vec![], &[]);
+        let (base_url, server) = serve(test_app_state(config)).await;
+        let (session_id, session_token) = register_session(&base_url).await;
+        for task in ["first", "second"] {
+            let (status, body) = post(
+                &base_url,
+                &format!("/chat-sessions/{session_id}/assign"),
+                Some(TOKEN),
+                None,
+                serde_json::json!({ "task": task }),
+            )
+            .await;
+            assert_eq!(status, 202, "test: body was {body}");
+        }
+
+        let foreign = rusqlite::Connection::open(&db).expect("test: open the mailbox file");
+        foreign
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("test: hold the write lock as a second process would");
+
+        let mut pulls = Vec::new();
+        for _ in 0..8 {
+            let base_url = base_url.clone();
+            let session_id = session_id.clone();
+            let session_token = session_token.clone();
+            pulls.push(tokio::spawn(async move {
+                post(
+                    &base_url,
+                    &format!("/chat-sessions/{session_id}/inbox/pull"),
+                    Some(TOKEN),
+                    Some(&session_token),
+                    serde_json::json!({ "max": 1 }),
+                )
+                .await
+            }));
+        }
+        // Let the pulls reach the handler and settle into the busy handler
+        // before the unrelated request asks for its turn.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let started = Instant::now();
+        let listed = tokio::time::timeout(Duration::from_secs(3), get(&base_url, "/chat-sessions")).await;
+        let elapsed = started.elapsed();
+
+        foreign.execute_batch("ROLLBACK").expect("test: release the write lock");
+        for pull in pulls {
+            let _ = pull.await;
+        }
+        server.abort();
+        // Leave the process mailbox on a store that cannot outlive this
+        // workspace directory.
+        chat_sessions::attach_store(Arc::new(QuietStore));
+
+        let (status, body) = listed.expect("an unrelated request must still be answered while the mailbox is locked");
+        assert_eq!(status, 200, "test: body was {body}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the listing must not queue behind mailbox persistence: took {elapsed:?}"
+        );
     }
 }

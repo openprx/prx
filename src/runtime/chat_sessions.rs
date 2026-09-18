@@ -66,6 +66,24 @@
 //!   may well have survived the daemon, and redelivering it would be this
 //!   runtime deciding a live chat had lost work it is still doing.
 //!
+//! Three properties keep that last sentence true under concurrency, and each is
+//! a rule rather than an accident:
+//!
+//! * **Writes are ordered by revision, not by arrival.** A mutation is planned
+//!   while a session's state lock is held and written after it is released, so
+//!   two overlapping pulls can reach the file in the opposite order to the
+//!   transitions that produced them. Every write therefore carries the
+//!   monotonic revision it was planned at, and the store refuses one that is
+//!   older than the row already holds. Without it a delivery planned before an
+//!   acknowledgement could land after it, and the next restart would hand
+//!   acknowledged work back out.
+//! * **Retirement and result are one commit**, as are a deregistration and the
+//!   cancellations that cascade with it. A failure between two separate writes
+//!   would take work out of every queue while leaving no record of it.
+//! * **A report is idempotent.** A chat whose report lost its response retries
+//!   it, and the retry is answered with the sequence the first one recorded
+//!   rather than refused as unknown work.
+//!
 //! # What is deliberately not here
 //!
 //! * **Delivery to the origin.** This module records *who asked* and *what came
@@ -641,6 +659,69 @@ struct ResultLog {
     oldest_seq: u64,
 }
 
+impl ResultLog {
+    const fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            // Sequence 0 is never used, so `after_seq=0` means "from the start"
+            // without a sentinel that a real entry could collide with.
+            next_seq: 1,
+            oldest_seq: 1,
+        }
+    }
+
+    /// Reserve the next sequence.
+    ///
+    /// Taken before the store is asked and published after, so no lock is held
+    /// across a database wait; [`Self::insert`] puts the entry in sequence
+    /// order whatever order the publications arrive in.
+    const fn mint(&mut self) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        seq
+    }
+
+    /// Merge one result into the feed by its sequence.
+    ///
+    /// A *merge*, not an append, because the feed is written from two places
+    /// that can both offer the same record: a live completion, and a replay of
+    /// the stored feed when a store is attached. The gateway supervisor
+    /// re-attaches on every in-process gateway restart, so appending blindly
+    /// duplicated every persisted result — and duplicates break exactly what
+    /// [`ResultsPage`] promises, an ordered feed whose sequences a consumer can
+    /// use as a cursor.
+    fn insert(&mut self, result: AssignmentResult) {
+        if result.seq < self.oldest_seq {
+            // Already trimmed. Re-admitting it would move the feed's floor
+            // backwards and tell a consumer it had *not* missed entries it had.
+            return;
+        }
+        let seq = result.seq;
+        match self.entries.binary_search_by(|entry| entry.seq.cmp(&seq)) {
+            Ok(_) => return,
+            Err(index) => self.entries.insert(index, result),
+        }
+        // The sequence keeps climbing across restarts. Restarting it at 1 would
+        // hand a consumer that cached a cursor a feed whose new entries look
+        // older than the ones it already saw.
+        self.next_seq = self.next_seq.max(seq.saturating_add(1));
+        self.trim();
+    }
+
+    /// Drop the oldest entries past the buffer's capacity and move the floor
+    /// with them, so a consumer that fell behind can tell.
+    fn trim(&mut self) {
+        while self.entries.len() > RESULT_LOG_CAPACITY {
+            if let Some(dropped) = self.entries.pop_front() {
+                self.oldest_seq = dropped.seq.saturating_add(1);
+            }
+        }
+        if let Some(first) = self.entries.front() {
+            self.oldest_seq = self.oldest_seq.max(first.seq);
+        }
+    }
+}
+
 /// One registry and one mailbox.
 ///
 /// A type with methods rather than a bag of free functions over a global,
@@ -652,6 +733,15 @@ struct ResultLog {
 struct ChatSessions {
     sessions: RwLock<HashMap<String, Arc<Session>>>,
     results: Mutex<ResultLog>,
+    /// Monotonic revision stamped on every store write.
+    ///
+    /// Writes are planned while a session's state lock is held and executed
+    /// after it is released — deliberately, so a contended database cannot
+    /// freeze a session — which means two overlapping pulls can reach the file
+    /// in the opposite order to the transitions that produced them. The
+    /// revision is what the store compares to refuse the older one; see
+    /// [`MailboxStore`].
+    revision: AtomicU64,
     /// Where mutations are written through. `None` until a gateway attaches one,
     /// which is what keeps every unit test that never asks for persistence on
     /// the in-memory behaviour it was written against.
@@ -664,16 +754,16 @@ impl ChatSessions {
     fn new() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
-            results: Mutex::new(ResultLog {
-                entries: VecDeque::new(),
-                // Sequence 0 is never used, so `after_seq=0` means "from the
-                // start" without a sentinel that a real entry could collide
-                // with.
-                next_seq: 1,
-                oldest_seq: 1,
-            }),
+            results: Mutex::new(ResultLog::new()),
+            revision: AtomicU64::new(0),
             store: RwLock::new(None),
         }
+    }
+
+    /// Stamp for the next store write. Minted while the state lock that
+    /// produced the transition is held, so revision order is transition order.
+    fn next_revision(&self) -> u64 {
+        self.revision.fetch_add(1, Ordering::SeqCst).saturating_add(1)
     }
 
     fn store(&self) -> Option<Arc<dyn MailboxStore>> {
@@ -691,6 +781,11 @@ impl ChatSessions {
         let Some(store) = self.store() else {
             return;
         };
+        // One contention budget for this mutation, or — when the caller already
+        // opened one for a whole request — a share of that one. Without it the
+        // bound is per statement, and a request that owes the database four
+        // writes waits out the bound four times.
+        let _budget = crate::runtime::sqlite_pool::BoundedBusyBudget::start();
         if let Err(error) = write(store.as_ref()) {
             tracing::error!(operation, "chat mailbox write-through failed: {error:#}");
         }
@@ -751,7 +846,16 @@ pub fn attach_workspace_store(workspace_dir: &std::path::Path) -> Option<std::pa
     let path = workspace_dir.join("state").join("chat-mailbox.db");
     match SqliteMailboxStore::open(&path) {
         Ok(store) => {
-            attach_store(Arc::new(store));
+            let store = Arc::new(store);
+            // Durability is allowed to degrade here without failing live work,
+            // which is only tolerable while an operator can see that it has.
+            // `prx tasks pools` and `GET /api/runtime/pools` already report
+            // every other database this process keeps; the registry holds only
+            // a `Weak`, so the mailbox drops out of the report by itself when a
+            // later attachment replaces it.
+            let stats: Arc<dyn crate::runtime::registry::PoolStatsSource> = Arc::clone(&store) as _;
+            crate::runtime::registry::register_pool(&stats);
+            attach_store(store);
             Some(path)
         }
         Err(error) => {
@@ -801,6 +905,17 @@ impl ChatSessions {
     /// address, so the alternative to a new row is an assignment nobody can
     /// list or kill.
     fn hydrate(self: &Arc<Self>, state: StoredState) {
+        // Past every revision the file already holds, so a write this process
+        // plans can never be mistaken for one an earlier process planned.
+        let restored_revision = state
+            .sessions
+            .iter()
+            .map(|session| session.revision)
+            .chain(state.assignments.iter().map(|assignment| assignment.revision))
+            .max()
+            .unwrap_or(0);
+        self.revision.fetch_max(restored_revision, Ordering::SeqCst);
+
         let mut queues: HashMap<String, Vec<StoredAssignment>> = HashMap::new();
         for assignment in state.assignments {
             queues
@@ -848,12 +963,14 @@ impl ChatSessions {
             // alone, their old positions would interleave with the queued ones
             // and the two replays would disagree.
             for stored_assignment in reclaimed.iter().rev() {
+                let revision = self.next_revision();
                 self.write_through("hydrate_reclaim", |store| {
                     store.move_to_queue(
                         &stored_assignment.assignment_id,
                         Queue::Inbox,
                         stored_assignment.deliveries,
                         true,
+                        revision,
                     )
                 });
             }
@@ -879,11 +996,10 @@ impl ChatSessions {
         if !state.results.is_empty() {
             let mut log = self.results.lock();
             for result in state.results {
-                // The sequence keeps climbing across restarts. Restarting it at
-                // 1 would hand a consumer that cached a cursor a feed whose new
-                // entries look older than the ones it already saw.
-                log.next_seq = log.next_seq.max(result.seq.saturating_add(1));
-                log.entries.push_back(AssignmentResult {
+                // Merged by sequence, never appended: this replay runs again on
+                // every in-process gateway restart, and the same record offered
+                // twice must stay one entry. See [`ResultLog::insert`].
+                log.insert(AssignmentResult {
                     seq: result.seq,
                     assignment_id: result.assignment_id,
                     session_id: result.session_id,
@@ -894,14 +1010,6 @@ impl ChatSessions {
                     completed_at_unix_ms: result.completed_at_unix_ms,
                     origin: result.origin,
                 });
-            }
-            while log.entries.len() > RESULT_LOG_CAPACITY {
-                if let Some(dropped) = log.entries.pop_front() {
-                    log.oldest_seq = dropped.seq.saturating_add(1);
-                }
-            }
-            if let Some(first) = log.entries.front() {
-                log.oldest_seq = log.oldest_seq.max(first.seq);
             }
         }
 
@@ -997,6 +1105,7 @@ impl ChatSessions {
             }),
         });
         let session_ref = session.reference();
+        let revision = self.next_revision();
         self.write_through("insert_session", |store| {
             store.insert_session(&StoredSession {
                 session_id: session_id.clone(),
@@ -1008,6 +1117,7 @@ impl ChatSessions {
                 registered_at_unix_ms,
                 polls: 0,
                 last_poll_at_unix_ms: None,
+                revision,
             })
         });
         self.sessions.write().insert(session_id.clone(), session);
@@ -1022,9 +1132,6 @@ impl ChatSessions {
 
     fn deregister(&self, session_id: &str) -> Option<usize> {
         let session = self.sessions.write().remove(session_id.trim())?;
-        // The cascade takes the queued rows with it, so the discarded assignments
-        // below need no individual delete — only their results have to be written.
-        self.write_through("delete_session", |store| store.delete_session(&session.id));
         let outstanding = {
             let mut state = session.state.lock();
             let mut outstanding = Vec::new();
@@ -1034,13 +1141,27 @@ impl ChatSessions {
             outstanding
         };
         let count = outstanding.len();
-        for assignment in outstanding {
-            self.record_result(
+
+        // The session cascade takes the queued rows with it, so the discarded
+        // assignments need no individual delete — but the cascade and the
+        // cancellations that replace them have to be **one** commit. Written
+        // separately, a failure between them leaves an assigner with neither
+        // outstanding work nor an answer about it.
+        let mut stored = Vec::with_capacity(count);
+        let mut live = Vec::with_capacity(count);
+        for assignment in &outstanding {
+            let (record, entry) = self.mint_result(
                 &session,
-                &assignment,
+                assignment,
                 ResultStatus::Cancelled,
                 "the chat session deregistered while this assignment was still outstanding".to_string(),
             );
+            stored.push(record);
+            live.push(entry);
+        }
+        self.write_through("cascade_session", |store| store.cascade_session(&session.id, &stored));
+        for entry in live {
+            self.publish_result(entry);
         }
         Some(count)
     }
@@ -1200,6 +1321,7 @@ impl ChatSessions {
 
         // Written before the receipt is handed back, so "accepted" and "durable"
         // are the same instant for every caller that reads one.
+        let revision = self.next_revision();
         self.write_through("enqueue", |store| {
             store.enqueue(
                 &StoredAssignment {
@@ -1211,6 +1333,7 @@ impl ChatSessions {
                     deliveries: 0,
                     created_at_unix_ms,
                     origin: principal.clone(),
+                    revision,
                 },
                 disposition.is_immediate(),
             )
@@ -1308,13 +1431,16 @@ impl ChatSessions {
             take_assignment(&mut state, assignment_id)
         };
         if let Some(assignment) = removed {
-            self.write_through("delete_assignment", |store| store.delete_assignment(&assignment.id));
-            self.record_result(
+            let (record, entry) = self.mint_result(
                 session,
                 &assignment,
                 ResultStatus::Cancelled,
                 "the assignment's work item was killed by an operator".to_string(),
             );
+            self.write_through("complete_assignment", |store| {
+                store.complete_assignment(&assignment.id, &record)
+            });
+            self.publish_result(entry);
         }
     }
 }
@@ -1405,13 +1531,23 @@ impl ChatSessions {
             // The evidence of liveness is persisted with the pull that produced it,
             // so a session restored after a restart is as old as its last real pull
             // rather than as young as the restart. See [`LastPoll`].
-            pending.push(PendingWrite::RecordPoll { polls, now_unix_ms });
+            pending.push(PendingWrite::RecordPoll {
+                polls,
+                now_unix_ms,
+                revision: self.next_revision(),
+            });
 
             let mut acked = 0;
             for id in ack {
                 if let Some(index) = state.delivered.iter().position(|entry| &entry.id == id) {
                     let assignment = state.delivered.remove(index);
-                    pending.push(PendingWrite::move_to("ack", &assignment, Queue::Accepted, false));
+                    pending.push(PendingWrite::move_to(
+                        "ack",
+                        &assignment,
+                        Queue::Accepted,
+                        false,
+                        self.next_revision(),
+                    ));
                     state.accepted.push(assignment);
                     acked += 1;
                 }
@@ -1423,7 +1559,13 @@ impl ChatSessions {
             let mut reclaimed = std::mem::take(&mut state.delivered);
             let requeued = reclaimed.len();
             while let Some(assignment) = reclaimed.pop() {
-                pending.push(PendingWrite::move_to("reclaim", &assignment, Queue::Inbox, true));
+                pending.push(PendingWrite::move_to(
+                    "reclaim",
+                    &assignment,
+                    Queue::Inbox,
+                    true,
+                    self.next_revision(),
+                ));
                 state.inbox.push_front(assignment);
             }
 
@@ -1433,7 +1575,13 @@ impl ChatSessions {
                     break;
                 };
                 assignment.deliveries = assignment.deliveries.saturating_add(1);
-                pending.push(PendingWrite::move_to("deliver", &assignment, Queue::Delivered, false));
+                pending.push(PendingWrite::move_to(
+                    "deliver",
+                    &assignment,
+                    Queue::Delivered,
+                    false,
+                    self.next_revision(),
+                ));
                 assignments.push(assignment.view());
                 state.delivered.push(assignment);
             }
@@ -1453,11 +1601,24 @@ impl ChatSessions {
     }
 
     /// Run the writes a pull planned, in the order it planned them.
+    ///
+    /// One contention budget covers the whole flush: the pull is a single
+    /// request, and a database another process is holding must cost it one
+    /// bounded wait rather than one per row it touches. Each write still
+    /// carries the revision it was planned at, so a flush that loses the race
+    /// to a later pull writes nothing instead of writing something stale.
     fn flush_pending(&self, session_id: &str, pending: Vec<PendingWrite>) {
+        let _budget = crate::runtime::sqlite_pool::BoundedBusyBudget::start();
         for write in pending {
             match write {
-                PendingWrite::RecordPoll { polls, now_unix_ms } => {
-                    self.write_through("record_poll", |store| store.record_poll(session_id, polls, now_unix_ms));
+                PendingWrite::RecordPoll {
+                    polls,
+                    now_unix_ms,
+                    revision,
+                } => {
+                    self.write_through("record_poll", |store| {
+                        store.record_poll(session_id, polls, now_unix_ms, revision)
+                    });
                 }
                 PendingWrite::MoveToQueue {
                     operation,
@@ -1465,9 +1626,10 @@ impl ChatSessions {
                     queue,
                     deliveries,
                     to_front,
+                    revision,
                 } => {
                     self.write_through(operation, |store| {
-                        store.move_to_queue(&assignment_id, queue, deliveries, to_front)
+                        store.move_to_queue(&assignment_id, queue, deliveries, to_front, revision)
                     });
                 }
             }
@@ -1490,6 +1652,7 @@ enum PendingWrite {
     RecordPoll {
         polls: u64,
         now_unix_ms: u64,
+        revision: u64,
     },
     MoveToQueue {
         operation: &'static str,
@@ -1497,17 +1660,19 @@ enum PendingWrite {
         queue: Queue,
         deliveries: u32,
         to_front: bool,
+        revision: u64,
     },
 }
 
 impl PendingWrite {
-    fn move_to(operation: &'static str, assignment: &Assignment, queue: Queue, to_front: bool) -> Self {
+    fn move_to(operation: &'static str, assignment: &Assignment, queue: Queue, to_front: bool, revision: u64) -> Self {
         Self::MoveToQueue {
             operation,
             assignment_id: assignment.id.clone(),
             queue,
             deliveries: assignment.deliveries,
             to_front,
+            revision,
         }
     }
 }
@@ -1565,7 +1730,7 @@ impl ChatSessions {
 
         let assignment = {
             let mut state = session.state.lock();
-            let index = state
+            state
                 .accepted
                 .iter()
                 .position(|entry| entry.id == assignment_id)
@@ -1576,35 +1741,73 @@ impl ChatSessions {
                         .iter()
                         .position(|entry| entry.id == assignment_id)
                         .map(|index| state.delivered.remove(index))
-                });
-            index.ok_or(ChatSessionError::UnknownAssignment)?
+                })
         };
 
-        self.write_through("delete_assignment", |store| store.delete_assignment(&assignment.id));
-        Ok(self.record_result(&session, &assignment, status, summary))
+        let Some(assignment) = assignment else {
+            // Not outstanding. Either this session never held it — the refusal
+            // it has always been — or this *is* the report, arriving a second
+            // time because the first answer was lost in flight. A chat that is
+            // told to retry a report it already made must not be told the work
+            // is unknown, and must not mint a second completion sequence for
+            // it, so the recorded result answers the replay.
+            return self
+                .replayed_result(&session.id, assignment_id)
+                .ok_or(ChatSessionError::UnknownAssignment);
+        };
+
+        // Retirement and result are one commit. Written separately, a failure
+        // between them takes the work out of every queue while leaving no
+        // record of it, and the reporter cannot recover by retrying because the
+        // assignment is no longer anywhere to retry against.
+        let (record, entry) = self.mint_result(&session, &assignment, status, summary);
+        self.write_through("complete_assignment", |store| {
+            store.complete_assignment(&assignment.id, &record)
+        });
+        Ok(self.publish_result(entry))
     }
 
-    /// Append one finished assignment to the feed. Dropping the assignment
-    /// afterwards retires its registry row.
-    fn record_result(&self, session: &Session, assignment: &Assignment, status: ResultStatus, summary: String) -> u64 {
-        let mut log = self.results.lock();
-        let seq = log.next_seq;
-        log.next_seq = log.next_seq.saturating_add(1);
+    /// The sequence a previous report of this assignment was recorded under.
+    ///
+    /// Bounded by the feed's retention: a replay that arrives after the record
+    /// has been trimmed is still refused as unknown, which is honest — the
+    /// answer it is asking for no longer exists to be handed back.
+    fn replayed_result(&self, session_id: &str, assignment_id: &str) -> Option<u64> {
+        let log = self.results.lock();
+        log.entries
+            .iter()
+            .rev()
+            .find(|entry| entry.assignment_id == assignment_id && entry.session_id == session_id)
+            .map(|entry| entry.seq)
+    }
+
+    /// Reserve a sequence and build the two forms of one finished assignment:
+    /// the row to persist, and the entry to publish once the store has been
+    /// asked.
+    ///
+    /// Split from [`Self::publish_result`] so the result log's lock is never
+    /// held across a database wait.
+    fn mint_result(
+        &self,
+        session: &Session,
+        assignment: &Assignment,
+        status: ResultStatus,
+        summary: String,
+    ) -> (StoredResult, AssignmentResult) {
+        let seq = self.results.lock().mint();
         let completed_at_unix_ms = unix_ms();
-        self.write_through("append_result", |store| {
-            store.append_result(&StoredResult {
-                seq,
-                assignment_id: assignment.id.clone(),
-                session_id: session.id.clone(),
-                session_label: session.label.clone(),
-                disposition: assignment.disposition,
-                status,
-                summary: summary.clone(),
-                completed_at_unix_ms,
-                origin: assignment.origin.clone(),
-            })
-        });
-        log.entries.push_back(AssignmentResult {
+        let stored = StoredResult {
+            seq,
+            assignment_id: assignment.id.clone(),
+            session_id: session.id.clone(),
+            session_label: session.label.clone(),
+            disposition: assignment.disposition,
+            status,
+            summary: summary.clone(),
+            completed_at_unix_ms,
+            origin: assignment.origin.clone(),
+        };
+        let live = AssignmentResult {
             seq,
             assignment_id: assignment.id.clone(),
             session_id: session.id.clone(),
@@ -1614,12 +1817,15 @@ impl ChatSessions {
             summary,
             completed_at_unix_ms,
             origin: assignment.origin.clone(),
-        });
-        while log.entries.len() > RESULT_LOG_CAPACITY {
-            if let Some(dropped) = log.entries.pop_front() {
-                log.oldest_seq = dropped.seq.saturating_add(1);
-            }
-        }
+        };
+        (stored, live)
+    }
+
+    /// Put one finished assignment on the live feed. Dropping the assignment
+    /// afterwards retires its registry row.
+    fn publish_result(&self, result: AssignmentResult) -> u64 {
+        let seq = result.seq;
+        self.results.lock().insert(result);
         seq
     }
 
@@ -2225,7 +2431,9 @@ mod tests {
             "the in-process feed keeps the origin so the answer can be routed back"
         );
 
-        // Reporting twice is refused rather than duplicated.
+        // Reporting twice is a *replay*, not a second completion: a chat whose
+        // report lost its response retries it, and the recorded sequence is
+        // what answers the retry.
         assert_eq!(
             report(
                 &session.session_id,
@@ -2234,8 +2442,14 @@ mod tests {
                 ResultStatus::Completed,
                 "again",
             )
-            .expect_err("test: refused"),
-            ChatSessionError::UnknownAssignment
+            .expect("test: a replayed report is answered, not refused"),
+            seq,
+            "a replay may not mint a second completion sequence"
+        );
+        assert_eq!(
+            results_for(&receipt.assignment_id).len(),
+            1,
+            "and it may not duplicate the record either"
         );
         deregister(&session.session_id);
     }
@@ -2700,10 +2914,13 @@ mod tests {
             fn insert_session(&self, _session: &StoredSession) -> anyhow::Result<()> {
                 Ok(())
             }
-            fn delete_session(&self, _session_id: &str) -> anyhow::Result<()> {
-                Ok(())
-            }
-            fn record_poll(&self, _session_id: &str, _polls: u64, _at_unix_ms: u64) -> anyhow::Result<()> {
+            fn record_poll(
+                &self,
+                _session_id: &str,
+                _polls: u64,
+                _at_unix_ms: u64,
+                _revision: u64,
+            ) -> anyhow::Result<()> {
                 if !self.blocked_once.swap(true, Ordering::SeqCst) {
                     let _ = self.entered.send(());
                     // Stands in for a database file locked by another process.
@@ -2720,13 +2937,14 @@ mod tests {
                 _queue: Queue,
                 _deliveries: u32,
                 _to_front: bool,
+                _revision: u64,
             ) -> anyhow::Result<()> {
                 Ok(())
             }
-            fn delete_assignment(&self, _assignment_id: &str) -> anyhow::Result<()> {
+            fn complete_assignment(&self, _assignment_id: &str, _result: &StoredResult) -> anyhow::Result<()> {
                 Ok(())
             }
-            fn append_result(&self, _result: &StoredResult) -> anyhow::Result<()> {
+            fn cascade_session(&self, _session_id: &str, _results: &[StoredResult]) -> anyhow::Result<()> {
                 Ok(())
             }
         }
@@ -2803,10 +3021,13 @@ mod tests {
             fn insert_session(&self, _session: &StoredSession) -> anyhow::Result<()> {
                 anyhow::bail!("no")
             }
-            fn delete_session(&self, _session_id: &str) -> anyhow::Result<()> {
-                anyhow::bail!("no")
-            }
-            fn record_poll(&self, _session_id: &str, _polls: u64, _at_unix_ms: u64) -> anyhow::Result<()> {
+            fn record_poll(
+                &self,
+                _session_id: &str,
+                _polls: u64,
+                _at_unix_ms: u64,
+                _revision: u64,
+            ) -> anyhow::Result<()> {
                 anyhow::bail!("no")
             }
             fn enqueue(&self, _assignment: &StoredAssignment, _at_front: bool) -> anyhow::Result<()> {
@@ -2818,13 +3039,14 @@ mod tests {
                 _queue: Queue,
                 _deliveries: u32,
                 _to_front: bool,
+                _revision: u64,
             ) -> anyhow::Result<()> {
                 anyhow::bail!("no")
             }
-            fn delete_assignment(&self, _assignment_id: &str) -> anyhow::Result<()> {
+            fn complete_assignment(&self, _assignment_id: &str, _result: &StoredResult) -> anyhow::Result<()> {
                 anyhow::bail!("no")
             }
-            fn append_result(&self, _result: &StoredResult) -> anyhow::Result<()> {
+            fn cascade_session(&self, _session_id: &str, _results: &[StoredResult]) -> anyhow::Result<()> {
                 anyhow::bail!("no")
             }
         }
@@ -2988,6 +3210,518 @@ mod tests {
             )
             .expect_err("test: refused"),
             ChatSessionError::UnknownSession
+        );
+    }
+
+    // ── Ordering, idempotence and atomicity ─────────────────────────────────
+
+    /// A pull whose persistence is still in flight must not be able to undo a
+    /// later pull's acknowledgement once it finally lands.
+    ///
+    /// The schedule is the one the audit reproduced: the first pull mutates
+    /// memory and then pauses at its first store write; a retry reclaims and
+    /// redelivers the same assignment; a third pull acknowledges it; only then
+    /// is the first pull's flush released. Every write *succeeds* — the defect
+    /// is ordering, not durability — so the assertions are on what the file
+    /// says afterwards and on what a fresh process makes of it.
+    ///
+    /// MUTATION GUARD: drop the revision guard from `move_to_queue` and the
+    /// stored queue reads `delivered` again and the replay hands acknowledged
+    /// work back out; drop it from `record_poll` and the stored poll count
+    /// falls back to 1.
+    #[tokio::test]
+    async fn a_stale_flush_cannot_overwrite_a_newer_acknowledgement() {
+        use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+
+        /// Delegates every call to the real store, and holds the *first*
+        /// `record_poll` at the door until the test lets it through.
+        struct GatedStore {
+            inner: SqliteMailboxStore,
+            armed: std::sync::atomic::AtomicBool,
+            entered: SyncSender<()>,
+            release: Mutex<Receiver<()>>,
+        }
+
+        impl MailboxStore for GatedStore {
+            fn hydrate(&self) -> anyhow::Result<StoredState> {
+                self.inner.hydrate()
+            }
+            fn insert_session(&self, session: &StoredSession) -> anyhow::Result<()> {
+                self.inner.insert_session(session)
+            }
+            fn record_poll(&self, session_id: &str, polls: u64, at_unix_ms: u64, revision: u64) -> anyhow::Result<()> {
+                if self.armed.swap(false, Ordering::SeqCst) {
+                    let _ = self.entered.send(());
+                    let _ = self.release.lock().recv();
+                }
+                self.inner.record_poll(session_id, polls, at_unix_ms, revision)
+            }
+            fn enqueue(&self, assignment: &StoredAssignment, at_front: bool) -> anyhow::Result<()> {
+                self.inner.enqueue(assignment, at_front)
+            }
+            fn move_to_queue(
+                &self,
+                assignment_id: &str,
+                queue: Queue,
+                deliveries: u32,
+                to_front: bool,
+                revision: u64,
+            ) -> anyhow::Result<()> {
+                self.inner
+                    .move_to_queue(assignment_id, queue, deliveries, to_front, revision)
+            }
+            fn complete_assignment(&self, assignment_id: &str, result: &StoredResult) -> anyhow::Result<()> {
+                self.inner.complete_assignment(assignment_id, result)
+            }
+            fn cascade_session(&self, session_id: &str, results: &[StoredResult]) -> anyhow::Result<()> {
+                self.inner.cascade_session(session_id, results)
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("test: tempdir");
+        let db = dir.path().join("state").join("chat-mailbox.db");
+        let (entered_tx, entered_rx) = sync_channel::<()>(1);
+        let (release_tx, release_rx) = sync_channel::<()>(1);
+        let store = Arc::new(GatedStore {
+            inner: SqliteMailboxStore::open(&db).expect("test: open the mailbox store"),
+            armed: std::sync::atomic::AtomicBool::new(true),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let sessions = Arc::new(ChatSessions::new());
+        sessions.attach_store(Arc::clone(&store) as Arc<dyn MailboxStore>);
+
+        let registration = sessions.register(LABEL, None).expect("test: registration");
+        let receipt = sessions
+            .assign(
+                &operator_policy(),
+                &AssignPrincipal::operator_plane(),
+                &registration.session_id,
+                "inspect fixture",
+                Disposition::Queue,
+            )
+            .expect("test: assignment accepted");
+
+        let delayed = {
+            let sessions = Arc::clone(&sessions);
+            let session_id = registration.session_id.clone();
+            let token = registration.token.clone();
+            std::thread::spawn(move || sessions.pull(&session_id, &token, &[], Some(1)))
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("test: the first pull must reach the store");
+
+        let retry = sessions
+            .pull(&registration.session_id, &registration.token, &[], Some(1))
+            .expect("test: the retry pull");
+        assert_eq!(
+            retry.assignments.first().map(|entry| entry.assignment_id.clone()),
+            Some(receipt.assignment_id.clone()),
+            "the retry must reclaim and redeliver the same assignment"
+        );
+        let acked = sessions
+            .pull(
+                &registration.session_id,
+                &registration.token,
+                std::slice::from_ref(&receipt.assignment_id),
+                Some(1),
+            )
+            .expect("test: the acknowledging pull");
+        assert_eq!(acked.acked, 1);
+
+        let _ = release_tx.send(());
+        delayed
+            .join()
+            .expect("test: the delayed pulling thread")
+            .expect("test: the delayed pull still answers");
+
+        let listed = sessions.list();
+        let live = listed.first().expect("test: the session is registered");
+        assert_eq!(live.accepted, 1, "memory holds the acknowledgement");
+        assert_eq!(live.polls, 3);
+
+        let disk = store.hydrate().expect("test: read the mailbox file back");
+        assert_eq!(
+            disk.assignments.first().map(|entry| entry.queue),
+            Some(Queue::Accepted),
+            "a flush planned before the acknowledgement must not put the assignment back on disk as delivered"
+        );
+        assert_eq!(
+            disk.sessions.first().map(|entry| entry.polls),
+            Some(3),
+            "the stored poll count may not run backwards either"
+        );
+
+        drop(sessions);
+        drop(store);
+
+        let after = mailbox_at(&db);
+        let listed = after.list();
+        let restored = listed.first().expect("test: the session survives the restart");
+        assert_eq!(
+            (restored.queued, restored.delivered, restored.accepted),
+            (0, 0, 1),
+            "a fresh process must not hand acknowledged work back out"
+        );
+    }
+
+    /// Attaching the same store again — which the gateway supervisor does every
+    /// time it restarts the gateway inside one daemon process — must not
+    /// duplicate the result feed.
+    ///
+    /// MUTATION GUARD: replace `ResultLog::insert` with a plain `push_back` and
+    /// the sequences read `[1, 1, 1]`, which is what the audit reproduced.
+    #[tokio::test]
+    async fn reattaching_the_store_never_duplicates_the_result_feed() {
+        let dir = tempfile::tempdir().expect("test: tempdir");
+        let db = dir.path().join("state").join("chat-mailbox.db");
+        let store: Arc<dyn MailboxStore> =
+            Arc::new(SqliteMailboxStore::open(&db).expect("test: open the mailbox store"));
+        let sessions = Arc::new(ChatSessions::new());
+        sessions.attach_store(Arc::clone(&store));
+
+        let registration = sessions.register(LABEL, None).expect("test: registration");
+        let finish = |task: &str| {
+            let receipt = sessions
+                .assign(
+                    &operator_policy(),
+                    &AssignPrincipal::operator_plane(),
+                    &registration.session_id,
+                    task,
+                    Disposition::Queue,
+                )
+                .expect("test: assignment accepted");
+            sessions
+                .pull(&registration.session_id, &registration.token, &[], Some(1))
+                .expect("test: pull");
+            sessions
+                .report(
+                    &registration.session_id,
+                    &registration.token,
+                    &receipt.assignment_id,
+                    ResultStatus::Completed,
+                    "done",
+                )
+                .expect("test: report")
+        };
+        let seqs = || {
+            sessions
+                .results_after(0, RESULT_LOG_CAPACITY)
+                .results
+                .iter()
+                .map(|result| result.seq)
+                .collect::<Vec<_>>()
+        };
+
+        let first = finish("count the crates");
+        assert_eq!(seqs(), vec![first]);
+
+        sessions.attach_store(Arc::clone(&store));
+        assert_eq!(seqs(), vec![first], "a second attachment replays the same result once");
+        sessions.attach_store(Arc::clone(&store));
+        assert_eq!(seqs(), vec![first], "and a third changes nothing either");
+
+        let second = finish("count them again");
+        assert_eq!(seqs(), vec![first, second]);
+        sessions.attach_store(Arc::clone(&store));
+        assert_eq!(
+            seqs(),
+            vec![first, second],
+            "replaying old and new results together must keep one ordered entry each"
+        );
+
+        let page = sessions.results_after(first, RESULT_LOG_CAPACITY);
+        assert_eq!(
+            page.results.iter().map(|result| result.seq).collect::<Vec<_>>(),
+            vec![second],
+            "a consumer cursor must still mean what it meant"
+        );
+        assert_eq!(
+            page.oldest_seq, first,
+            "nothing was trimmed, so nothing may be reported missed"
+        );
+    }
+
+    /// The feed is a bounded, ordered, duplicate-free log whatever order
+    /// entries arrive in — a replay may hand it sequences it already has, and
+    /// sequences it trimmed long ago.
+    #[test]
+    fn the_result_log_merges_by_sequence_and_keeps_its_retention_floor() {
+        fn entry(seq: u64) -> AssignmentResult {
+            AssignmentResult {
+                seq,
+                assignment_id: format!("assignment-{seq}"),
+                session_id: "session".to_string(),
+                session_label: LABEL.to_string(),
+                disposition: Disposition::Queue,
+                status: ResultStatus::Completed,
+                summary: "done".to_string(),
+                completed_at_unix_ms: 0,
+                origin: AssignPrincipal::operator_plane(),
+            }
+        }
+
+        let mut log = ResultLog::new();
+        let overflow = u64::try_from(RESULT_LOG_CAPACITY).unwrap_or(u64::MAX) + 2;
+        for seq in 1..=overflow {
+            log.insert(entry(seq));
+        }
+        assert_eq!(log.entries.len(), RESULT_LOG_CAPACITY);
+        assert_eq!(log.oldest_seq, 3, "the two oldest entries were trimmed");
+
+        log.insert(entry(overflow));
+        assert_eq!(
+            log.entries.len(),
+            RESULT_LOG_CAPACITY,
+            "a duplicate sequence is merged, not appended"
+        );
+
+        log.insert(entry(1));
+        assert_eq!(
+            log.oldest_seq, 3,
+            "a sequence the feed already trimmed must not come back below its floor"
+        );
+        assert_eq!(log.entries.front().map(|first| first.seq), Some(3));
+
+        log.insert(entry(overflow + 5));
+        assert!(
+            log.entries.iter().map(|held| held.seq).is_sorted(),
+            "the feed stays ordered by sequence"
+        );
+        assert!(
+            log.next_seq > overflow + 5,
+            "minting must never reuse a sequence it replayed"
+        );
+    }
+
+    /// Retiring an assignment and recording its result are one commit.
+    ///
+    /// The failure is injected into the real database rather than into a
+    /// double: a trigger makes every result insert abort, which is exactly the
+    /// boundary the audit crashed at. Either both halves land or neither does,
+    /// so a failure has to leave the work outstanding on disk where a restart
+    /// can find it.
+    ///
+    /// MUTATION GUARD: split `complete_assignment` back into a delete and an
+    /// append and the stored assignment count reads 0.
+    #[tokio::test]
+    async fn a_failed_result_write_leaves_the_assignment_outstanding_on_disk() {
+        let dir = tempfile::tempdir().expect("test: tempdir");
+        let db = dir.path().join("state").join("chat-mailbox.db");
+        let sessions = mailbox_at(&db);
+
+        let registration = sessions.register(LABEL, None).expect("test: registration");
+        let receipt = sessions
+            .assign(
+                &operator_policy(),
+                &AssignPrincipal::operator_plane(),
+                &registration.session_id,
+                "inspect fixture",
+                Disposition::Queue,
+            )
+            .expect("test: assignment accepted");
+        sessions
+            .pull(&registration.session_id, &registration.token, &[], Some(1))
+            .expect("test: pull");
+
+        let injector = rusqlite::Connection::open(&db).expect("test: open the mailbox file");
+        injector
+            .execute_batch(
+                "CREATE TRIGGER refuse_results BEFORE INSERT ON chat_results
+                 BEGIN SELECT RAISE(ABORT, 'injected result failure'); END;",
+            )
+            .expect("test: install the failure trigger");
+
+        sessions
+            .report(
+                &registration.session_id,
+                &registration.token,
+                &receipt.assignment_id,
+                ResultStatus::Completed,
+                "fixture checked",
+            )
+            .expect("test: a failed write costs durability, never the answer");
+
+        let disk = {
+            let reader = SqliteMailboxStore::open(&db).expect("test: reopen the mailbox file");
+            reader.hydrate().expect("test: read the mailbox file back")
+        };
+        assert!(
+            disk.results.is_empty(),
+            "the injected failure must keep the result off disk"
+        );
+        assert_eq!(
+            disk.assignments.len(),
+            1,
+            "an assignment whose result could not be recorded must stay outstanding, not vanish with it"
+        );
+        assert_eq!(
+            disk.assignments.first().map(|entry| entry.assignment_id.clone()),
+            Some(receipt.assignment_id.clone())
+        );
+
+        injector
+            .execute_batch("DROP TRIGGER refuse_results")
+            .expect("test: remove the failure trigger");
+        drop(injector);
+        drop(sessions);
+
+        let after = mailbox_at(&db);
+        let pulled = after
+            .pull(&registration.session_id, &registration.token, &[], None)
+            .expect("test: pull after the restart");
+        assert_eq!(
+            pulled.assignments.first().map(|entry| entry.assignment_id.clone()),
+            Some(receipt.assignment_id),
+            "work whose completion never committed must come back, not be lost between two writes"
+        );
+    }
+
+    /// A report whose response was lost is replayed by the chat session. The
+    /// replay must find its own result rather than be told the assignment is
+    /// unknown, and it must not mint a second completion sequence.
+    ///
+    /// MUTATION GUARD: remove the replay lookup from `report` and the second
+    /// call refuses with `UnknownAssignment`.
+    #[tokio::test]
+    async fn replaying_a_report_returns_the_original_sequence() {
+        let dir = tempfile::tempdir().expect("test: tempdir");
+        let db = dir.path().join("state").join("chat-mailbox.db");
+        let sessions = mailbox_at(&db);
+
+        let registration = sessions.register(LABEL, None).expect("test: registration");
+        let receipt = sessions
+            .assign(
+                &operator_policy(),
+                &AssignPrincipal::operator_plane(),
+                &registration.session_id,
+                "inspect fixture",
+                Disposition::Queue,
+            )
+            .expect("test: assignment accepted");
+        sessions
+            .pull(&registration.session_id, &registration.token, &[], Some(1))
+            .expect("test: pull");
+
+        let report_once = || {
+            sessions.report(
+                &registration.session_id,
+                &registration.token,
+                &receipt.assignment_id,
+                ResultStatus::Completed,
+                "fixture checked",
+            )
+        };
+        let seq = report_once().expect("test: the first report");
+        let replayed = report_once().expect("test: the replay must be answered, not refused");
+        assert_eq!(replayed, seq, "a replay may not mint a second completion sequence");
+
+        let recorded = sessions
+            .results_after(0, RESULT_LOG_CAPACITY)
+            .results
+            .into_iter()
+            .filter(|result| result.assignment_id == receipt.assignment_id)
+            .count();
+        assert_eq!(recorded, 1, "the feed holds one record for one assignment");
+
+        let disk = {
+            let reader = SqliteMailboxStore::open(&db).expect("test: reopen the mailbox file");
+            reader.hydrate().expect("test: read the mailbox file back")
+        };
+        assert_eq!(disk.results.len(), 1, "and so does the file");
+        assert!(disk.assignments.is_empty(), "the assignment is retired exactly once");
+    }
+
+    /// Deregistration is the same commit: the session cascade and every
+    /// cancellation it owes go together, so a failure cannot leave an assigner
+    /// with neither its work nor an answer.
+    ///
+    /// MUTATION GUARD: delete the session before recording the cancellations
+    /// and the stored session count reads 0.
+    #[tokio::test]
+    async fn a_failed_deregistration_keeps_the_session_and_its_queue_on_disk() {
+        let dir = tempfile::tempdir().expect("test: tempdir");
+        let db = dir.path().join("state").join("chat-mailbox.db");
+        let sessions = mailbox_at(&db);
+
+        let registration = sessions.register(LABEL, None).expect("test: registration");
+        sessions
+            .assign(
+                &operator_policy(),
+                &AssignPrincipal::operator_plane(),
+                &registration.session_id,
+                "inspect fixture",
+                Disposition::Queue,
+            )
+            .expect("test: assignment accepted");
+
+        let injector = rusqlite::Connection::open(&db).expect("test: open the mailbox file");
+        injector
+            .execute_batch(
+                "CREATE TRIGGER refuse_results BEFORE INSERT ON chat_results
+                 BEGIN SELECT RAISE(ABORT, 'injected result failure'); END;",
+            )
+            .expect("test: install the failure trigger");
+
+        assert_eq!(
+            sessions.deregister(&registration.session_id),
+            Some(1),
+            "deregistration still answers while the disk is refusing"
+        );
+
+        let disk = {
+            let reader = SqliteMailboxStore::open(&db).expect("test: reopen the mailbox file");
+            reader.hydrate().expect("test: read the mailbox file back")
+        };
+        assert_eq!(
+            disk.sessions.len(),
+            1,
+            "a cascade whose cancellation records could not be written must not commit half of itself"
+        );
+        assert_eq!(disk.assignments.len(), 1);
+        assert!(disk.results.is_empty());
+    }
+
+    /// A pull that has to wait on a database another process holds spends
+    /// **one** contention budget, not one per write it owes.
+    ///
+    /// MUTATION GUARD: drop the `BoundedBusyBudget` from `flush_pending` and
+    /// each of the pull's writes waits out the full bound on its own, which is
+    /// the eleven seconds the audit measured for a single assignment.
+    #[tokio::test]
+    async fn a_locked_mailbox_costs_one_contention_budget_for_a_whole_pull() {
+        let dir = tempfile::tempdir().expect("test: tempdir");
+        let db = dir.path().join("state").join("chat-mailbox.db");
+        let sessions = mailbox_at(&db);
+
+        let registration = sessions.register(LABEL, None).expect("test: registration");
+        sessions
+            .assign(
+                &operator_policy(),
+                &AssignPrincipal::operator_plane(),
+                &registration.session_id,
+                "inspect fixture",
+                Disposition::Queue,
+            )
+            .expect("test: assignment accepted");
+
+        let foreign = rusqlite::Connection::open(&db).expect("test: open the mailbox file");
+        foreign
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("test: hold the write lock as a second process would");
+        let started = Instant::now();
+        let pulled = sessions
+            .pull(&registration.session_id, &registration.token, &[], Some(1))
+            .expect("test: a locked database costs durability, never the work");
+        let elapsed = started.elapsed();
+        foreign.execute_batch("ROLLBACK").expect("test: release the write lock");
+
+        assert_eq!(tasks_in_order(&pulled), vec!["inspect fixture".to_string()]);
+        let budget = crate::runtime::sqlite_pool::BOUNDED_BUSY_WAIT;
+        assert!(
+            elapsed < budget.mul_f32(1.5),
+            "one pull must spend one contention budget ({budget:?}), not one per write: took {elapsed:?}"
         );
     }
 }

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.148] - 18 September 2026
+
+### Fixed
+
+- Chat assignment mailbox persistence is now ordered, idempotent and atomic.
+  Every store write carries the revision it was planned at and stale flushes
+  write nothing, so a slow pull can no longer overwrite a newer acknowledgement
+  on disk or roll liveness counters back; existing databases gain the revision
+  columns on open. Re-attaching the store merges the result feed by sequence
+  instead of duplicating it. Completion and deregistration cascades retire the
+  assignment and record its result in one SQLite transaction, and a replayed
+  report answers with the original sequence. Gateway mailbox handlers run their
+  SQLite work on the tracked blocking pool with one contention budget per
+  request, so a locked database no longer stalls unrelated HTTP requests;
+  degradation is visible through the pool statistics surface.
+
 ## [0.8.147] - 18 September 2026
 
 ### Fixed

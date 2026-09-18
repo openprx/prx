@@ -558,6 +558,32 @@ mutation is logged at `error` and the in-memory mailbox carries on, so a full
 disk degrades the guarantee instead of refusing live work. Deleting the file
 while the daemon is down is therefore a supported way to reset the mailbox — a
 chat whose session went with it registers again by itself on its next poll.
+Degraded durability is reported rather than only logged: the mailbox publishes
+`writes_total`, `writes_failed`, `lock_contention` and `durable` next to every
+other database this process keeps, in `prx tasks pools` and
+`GET /api/runtime/pools`.
+
+Three further guarantees hold while more than one request touches a session at
+once:
+
+- **A later transition always wins on disk.** Mailbox writes leave the session
+  state lock before they run, so a contended database cannot freeze a session;
+  each write carries the revision it was planned at and the store refuses one
+  older than the row already holds. An acknowledgement therefore cannot be
+  overwritten by a delivery that was planned before it, and no restart hands
+  acknowledged work back out.
+- **Retiring work and recording its result are one commit**, as are a
+  deregistration and the cancellations that cascade with it. A write that fails
+  leaves the work outstanding — where the next pull or the next restart finds
+  it — instead of losing the work and the answer together.
+- **Reporting a result is idempotent.** A chat whose report lost its response
+  retries it and is answered with the sequence the first report recorded, for as
+  long as that record is retained. A retry never mints a second completion.
+
+Mailbox persistence runs on the blocking pool rather than on the API's async
+workers, and one request spends **one** contention budget however many rows it
+touches. A database another process is holding therefore slows the chat sessions
+using it and leaves the rest of the API answering.
 
 ### `[chat.daemon]`
 

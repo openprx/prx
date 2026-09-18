@@ -45,6 +45,7 @@
 //! measured into [`SqlitePoolStats`], and a database lock held by another
 //! process emits a periodic `warn!` for as long as it is held.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -151,6 +152,67 @@ pub fn install_busy_handler(conn: &Connection) -> rusqlite::Result<()> {
 /// writer cares to keep the lock.
 const BOUNDED_BUSY_WAIT_MS: u64 = 5_000;
 
+/// [`BOUNDED_BUSY_WAIT_MS`] as a [`Duration`], for callers that budget a whole
+/// request against it rather than a single statement.
+pub const BOUNDED_BUSY_WAIT: Duration = Duration::from_millis(BOUNDED_BUSY_WAIT_MS);
+
+thread_local! {
+    /// Deadline shared by every bounded-busy statement this thread runs inside
+    /// one [`BoundedBusyBudget`]. `None` means each statement is bounded on its
+    /// own, which is the behaviour a caller that opened no budget gets.
+    static BOUNDED_BUSY_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// One contention budget for a whole transaction or request.
+///
+/// Without it the bound is *per statement*: a request that owes the database
+/// four writes waits out [`BOUNDED_BUSY_WAIT`] four times while a foreign
+/// process holds the file lock, so the caller's worst case grows with the
+/// number of rows it touches rather than staying a property of the request.
+/// Opening a budget pins one deadline for everything the thread does inside it,
+/// so the first write spends the wait and the rest fail immediately.
+///
+/// Nesting is deliberate and safe: an inner budget observes the outer deadline
+/// and restores it on drop, so a store method that opens one of its own does
+/// not restart the clock its caller started.
+pub struct BoundedBusyBudget {
+    /// Deadline to put back on drop: `Some` when this guard nested inside
+    /// another budget, `None` when it opened the outermost one.
+    restore: Option<Instant>,
+}
+
+impl BoundedBusyBudget {
+    /// Open (or join) a contention budget for the calling thread.
+    #[must_use]
+    pub fn start() -> Self {
+        let restore = BOUNDED_BUSY_DEADLINE.with(Cell::get);
+        if restore.is_none() {
+            let deadline = Instant::now().checked_add(BOUNDED_BUSY_WAIT);
+            BOUNDED_BUSY_DEADLINE.with(|cell| cell.set(deadline));
+        }
+        Self { restore }
+    }
+}
+
+impl Drop for BoundedBusyBudget {
+    fn drop(&mut self) {
+        BOUNDED_BUSY_DEADLINE.with(|cell| cell.set(self.restore));
+    }
+}
+
+/// How much of the calling thread's contention budget is left.
+///
+/// [`BOUNDED_BUSY_WAIT`] when no budget is open, so a caller that bounds a
+/// lock acquisition with it behaves the same way a single statement would.
+#[must_use]
+pub fn bounded_busy_remaining() -> Duration {
+    BOUNDED_BUSY_DEADLINE
+        .with(Cell::get)
+        .map_or(BOUNDED_BUSY_WAIT, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        })
+}
+
 /// Total time [`wait_for_database_lock`] has already slept after `attempts`
 /// retries, given its backoff schedule.
 ///
@@ -171,7 +233,13 @@ const fn cumulative_backoff_ms(attempts: u64) -> u64 {
 /// Busy handler with a deadline: wait out contention, but not forever.
 fn wait_for_database_lock_bounded(attempts: i32) -> bool {
     let attempt = u64::try_from(attempts).unwrap_or(0);
-    if cumulative_backoff_ms(attempt) >= BOUNDED_BUSY_WAIT_MS {
+    // A budget, when one is open, is the whole request's clock; without one the
+    // retry count is the only evidence this stateless handler has.
+    let exhausted = BOUNDED_BUSY_DEADLINE.with(Cell::get).map_or_else(
+        || cumulative_backoff_ms(attempt) >= BOUNDED_BUSY_WAIT_MS,
+        |deadline| Instant::now() >= deadline,
+    );
+    if exhausted {
         tracing::error!(
             attempts = attempt,
             waited_ms = BOUNDED_BUSY_WAIT_MS,

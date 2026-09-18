@@ -53,11 +53,13 @@
 //! ones minted before it.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use rusqlite::{Connection, OptionalExtension, params};
+
+use crate::runtime::sqlite_pool::{BoundedBusyBudget, bounded_busy_remaining};
 
 use super::{AssignPrincipal, Disposition, ResultStatus};
 
@@ -115,6 +117,8 @@ pub struct StoredSession {
     /// clock rather than a monotonic reading because it has to survive the
     /// process that took it.
     pub last_poll_at_unix_ms: Option<u64>,
+    /// Mutation revision this row was last written at. See [`MailboxStore`].
+    pub revision: u64,
 }
 
 /// One queued assignment, as stored.
@@ -128,6 +132,8 @@ pub struct StoredAssignment {
     pub deliveries: u32,
     pub created_at_unix_ms: u64,
     pub origin: AssignPrincipal,
+    /// Mutation revision this row was last written at. See [`MailboxStore`].
+    pub revision: u64,
 }
 
 /// One finished assignment, as stored.
@@ -159,23 +165,70 @@ pub struct StoredState {
 /// A trait rather than a concrete type so the registry can be exercised against
 /// a store that fails every write — the availability trade-off above is only a
 /// claim until something asserts that a failing store still delivers work.
+///
+/// # Revisions
+///
+/// Every mutating write carries the **revision** the mailbox planned it at:
+/// one monotonic counter, advanced while the session state lock is held, so the
+/// order of the revisions is the order of the in-memory transitions that
+/// produced them. Writes themselves are *not* ordered — they run after the lock
+/// is released, precisely so a contended database cannot freeze a session — and
+/// two overlapping pulls can therefore reach the file out of order. An
+/// implementation must refuse a write whose revision is older than the one the
+/// row already holds, or an acknowledgement can be overwritten on disk by a
+/// delivery that was planned before it and a restart will hand acknowledged
+/// work back out.
+///
+/// # Atomicity
+///
+/// Retiring an assignment and recording its result are one commit
+/// ([`MailboxStore::complete_assignment`]), as are deregistering a session and
+/// the cancellations that cascade with it
+/// ([`MailboxStore::cascade_session`]). Written separately, a failure between
+/// them leaves an assigner with neither outstanding work nor an answer.
 pub trait MailboxStore: Send + Sync {
     /// Read the whole mailbox back, for a process that has just started.
     fn hydrate(&self) -> Result<StoredState>;
     /// Record a newly registered session.
     fn insert_session(&self, session: &StoredSession) -> Result<()>;
-    /// Forget a session and, by cascade, everything still queued for it.
-    fn delete_session(&self, session_id: &str) -> Result<()>;
-    /// Record the evidence of one pull.
-    fn record_poll(&self, session_id: &str, polls: u64, at_unix_ms: u64) -> Result<()>;
+    /// Record the evidence of one pull, unless a later pull already did.
+    fn record_poll(&self, session_id: &str, polls: u64, at_unix_ms: u64, revision: u64) -> Result<()>;
     /// Add one assignment at the tail (`at_front == false`) or the head.
     fn enqueue(&self, assignment: &StoredAssignment, at_front: bool) -> Result<()>;
-    /// Move one assignment between queues, optionally back to the head.
-    fn move_to_queue(&self, assignment_id: &str, queue: Queue, deliveries: u32, to_front: bool) -> Result<()>;
-    /// Drop one assignment: it was reported, killed, or cancelled.
-    fn delete_assignment(&self, assignment_id: &str) -> Result<()>;
-    /// Append one finished assignment to the stored feed.
-    fn append_result(&self, result: &StoredResult) -> Result<()>;
+    /// Move one assignment between queues, optionally back to the head, unless
+    /// a later transition already moved it.
+    fn move_to_queue(
+        &self,
+        assignment_id: &str,
+        queue: Queue,
+        deliveries: u32,
+        to_front: bool,
+        revision: u64,
+    ) -> Result<()>;
+    /// Retire one assignment and record its result in the same commit.
+    fn complete_assignment(&self, assignment_id: &str, result: &StoredResult) -> Result<()>;
+    /// Forget a session, everything still queued for it, and the cancellation
+    /// records that replace them, in the same commit.
+    fn cascade_session(&self, session_id: &str, results: &[StoredResult]) -> Result<()>;
+}
+
+/// Durability counters for one mailbox file.
+///
+/// The store's stated trade-off is that a write which fails costs durability
+/// and nothing else. That is only tolerable while an operator can *see* it, so
+/// the degradation is published on the existing pool report
+/// (`prx tasks pools`, `GET /api/runtime/pools`) rather than living only in the
+/// log line each failure emits.
+#[derive(Default)]
+struct MailboxMetrics {
+    /// Mutations attempted since this store was opened.
+    writes_total: AtomicU64,
+    /// Mutations that did not land. Every one of them is a mutation the mailbox
+    /// still applied in memory and would lose on a restart.
+    writes_failed: AtomicU64,
+    /// Failures attributable to somebody else holding the database or the
+    /// store's own connection.
+    lock_contention: AtomicU64,
 }
 
 /// The SQLite implementation, one file under the workspace.
@@ -189,6 +242,7 @@ pub struct SqliteMailboxStore {
     tail: AtomicI64,
     /// Next position handed out at the head of a queue.
     head: AtomicI64,
+    metrics: MailboxMetrics,
 }
 
 impl SqliteMailboxStore {
@@ -222,6 +276,7 @@ impl SqliteMailboxStore {
         crate::runtime::sqlite_pool::install_bounded_busy_handler(&conn)?;
         conn.execute_batch(SCHEMA)
             .with_context(|| format!("failed to migrate mailbox database {}", path.display()))?;
+        add_missing_columns(&conn).with_context(|| format!("failed to migrate mailbox database {}", path.display()))?;
         restrict_permissions(&path);
 
         // Seed both counters from what is already stored, so a position minted
@@ -239,7 +294,47 @@ impl SqliteMailboxStore {
             conn: Mutex::new(conn),
             tail: AtomicI64::new(max.saturating_add(1)),
             head: AtomicI64::new(min.saturating_sub(1)),
+            metrics: MailboxMetrics::default(),
         })
+    }
+
+    /// Take the connection, waiting no longer than the caller's remaining
+    /// contention budget.
+    ///
+    /// The connection mutex is the store's own serialization, and an unbounded
+    /// wait on it would put every queued request behind whichever one is
+    /// currently stuck on a foreign file lock — the accumulation this store's
+    /// bounded busy handler exists to prevent, one level up.
+    fn conn(&self) -> Result<MutexGuard<'_, Connection>> {
+        let budget = bounded_busy_remaining();
+        match self.conn.try_lock_for(budget) {
+            Some(conn) => Ok(conn),
+            None => {
+                self.metrics.lock_contention.fetch_add(1, Ordering::Relaxed);
+                anyhow::bail!(
+                    "the mailbox connection stayed busy for {}ms; this mutation is not durable",
+                    budget.as_millis()
+                )
+            }
+        }
+    }
+
+    /// Run one mutation under a contention budget and count what it cost.
+    ///
+    /// The budget is opened here so a store used directly is still bounded; a
+    /// caller that already opened one for a whole request joins it instead of
+    /// restarting the clock.
+    fn measure<T>(&self, write: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _budget = BoundedBusyBudget::start();
+        self.metrics.writes_total.fetch_add(1, Ordering::Relaxed);
+        let outcome = write();
+        if let Err(error) = &outcome {
+            self.metrics.writes_failed.fetch_add(1, Ordering::Relaxed);
+            if is_lock_contention(error) {
+                self.metrics.lock_contention.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        outcome
     }
 
     /// Where this store keeps its file, for logs and for the operator.
@@ -275,7 +370,8 @@ const SCHEMA: &str = "PRAGMA journal_mode = WAL;
         token_hash            TEXT NOT NULL,
         registered_at_unix_ms INTEGER NOT NULL,
         polls                 INTEGER NOT NULL DEFAULT 0,
-        last_poll_at_unix_ms  INTEGER
+        last_poll_at_unix_ms  INTEGER,
+        revision              INTEGER NOT NULL DEFAULT 0
      );
 
      CREATE TABLE IF NOT EXISTS chat_assignments (
@@ -290,7 +386,8 @@ const SCHEMA: &str = "PRAGMA journal_mode = WAL;
         origin_kind        TEXT NOT NULL,
         origin_channel     TEXT NOT NULL,
         origin_sender      TEXT NOT NULL DEFAULT '',
-        origin_chat_type   TEXT NOT NULL DEFAULT ''
+        origin_chat_type   TEXT NOT NULL DEFAULT '',
+        revision           INTEGER NOT NULL DEFAULT 0
      );
      CREATE INDEX IF NOT EXISTS idx_chat_assignments_queue
         ON chat_assignments(session_id, position);
@@ -309,6 +406,97 @@ const SCHEMA: &str = "PRAGMA journal_mode = WAL;
         origin_sender        TEXT NOT NULL DEFAULT '',
         origin_chat_type     TEXT NOT NULL DEFAULT ''
      );";
+
+/// Columns added after the first released schema, in the same "add what is
+/// missing" migration style as `CREATE TABLE IF NOT EXISTS` above.
+///
+/// Every name here is a literal from this file — never a value from a row, a
+/// request or a configuration file — which is why formatting them into the
+/// statement cannot be a SQL injection.
+const ADDED_COLUMNS: [(&str, &str, &str); 2] = [
+    ("chat_sessions", "revision", "INTEGER NOT NULL DEFAULT 0"),
+    ("chat_assignments", "revision", "INTEGER NOT NULL DEFAULT 0"),
+];
+
+/// Bring a database written by an older PRX up to the current column set.
+///
+/// A row that predates a column keeps its `DEFAULT`, which for `revision` is 0:
+/// lower than every revision this process mints, so the first write after the
+/// migration wins rather than being refused as stale.
+fn add_missing_columns(conn: &Connection) -> Result<()> {
+    for (table, column, definition) in ADDED_COLUMNS {
+        let present = {
+            let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let mut names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            names.any(|name| name.is_ok_and(|name| name == column))
+        };
+        if !present {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether a failed write failed because somebody else held the database.
+fn is_lock_contention(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<rusqlite::Error>().is_some_and(|error| {
+        matches!(
+            error,
+            rusqlite::Error::SqliteFailure(inner, _)
+                if matches!(
+                    inner.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    })
+}
+
+/// Insert one finished assignment. Shared by the two commits that record
+/// results, so both write the same row the same way.
+fn insert_result(conn: &Connection, result: &StoredResult) -> Result<()> {
+    let (kind, channel, sender, chat_type) = origin_columns(&result.origin);
+    conn.execute(
+        "INSERT OR REPLACE INTO chat_results
+            (seq, assignment_id, session_id, session_label, disposition, status, summary,
+             completed_at_unix_ms, origin_kind, origin_channel, origin_sender, origin_chat_type)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            i64::try_from(result.seq).unwrap_or(i64::MAX),
+            result.assignment_id,
+            result.session_id,
+            result.session_label,
+            result.disposition.as_str(),
+            result.status.as_str(),
+            result.summary,
+            i64::try_from(result.completed_at_unix_ms).unwrap_or(i64::MAX),
+            kind,
+            channel,
+            sender,
+            chat_type,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Drop results past the retained window.
+///
+/// Retention is a trim, not a quota: the oldest rows go and the sequence keeps
+/// climbing, so a consumer that fell behind can still tell it missed results
+/// instead of silently believing it saw them all.
+fn trim_results(conn: &Connection) -> Result<()> {
+    let Some(highest) = conn
+        .query_row("SELECT MAX(seq) FROM chat_results", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })
+        .optional()?
+        .flatten()
+    else {
+        return Ok(());
+    };
+    let floor = highest.saturating_sub(i64::try_from(STORED_RESULT_CAPACITY).unwrap_or(i64::MAX));
+    conn.execute("DELETE FROM chat_results WHERE seq <= ?1", params![floor])?;
+    Ok(())
+}
 
 /// Create the database file `0600` before SQLite opens it.
 ///
@@ -421,12 +609,14 @@ fn status_from_stored(value: &str) -> Option<ResultStatus> {
 
 impl MailboxStore for SqliteMailboxStore {
     fn hydrate(&self) -> Result<StoredState> {
-        let conn = self.conn.lock();
+        let _budget = BoundedBusyBudget::start();
+        let conn = self.conn()?;
         let mut state = StoredState::default();
 
         {
             let mut stmt = conn.prepare(
-                "SELECT session_id, label, pid, token_hash, registered_at_unix_ms, polls, last_poll_at_unix_ms
+                "SELECT session_id, label, pid, token_hash, registered_at_unix_ms, polls, last_poll_at_unix_ms,
+                        revision
                  FROM chat_sessions ORDER BY registered_at_unix_ms, session_id",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -438,6 +628,7 @@ impl MailboxStore for SqliteMailboxStore {
                     registered_at_unix_ms: row.get::<_, i64>(4)?.unsigned_abs(),
                     polls: row.get::<_, i64>(5)?.unsigned_abs(),
                     last_poll_at_unix_ms: row.get::<_, Option<i64>>(6)?.map(i64::unsigned_abs),
+                    revision: row.get::<_, i64>(7)?.unsigned_abs(),
                 })
             })?;
             for session in rows {
@@ -448,7 +639,7 @@ impl MailboxStore for SqliteMailboxStore {
         {
             let mut stmt = conn.prepare(
                 "SELECT assignment_id, session_id, task, disposition, queue, deliveries, created_at_unix_ms,
-                        origin_kind, origin_channel, origin_sender, origin_chat_type
+                        origin_kind, origin_channel, origin_sender, origin_chat_type, revision
                  FROM chat_assignments ORDER BY position, assignment_id",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -464,11 +655,24 @@ impl MailboxStore for SqliteMailboxStore {
                     row.get::<_, String>(8)?,
                     row.get::<_, String>(9)?,
                     row.get::<_, String>(10)?,
+                    row.get::<_, i64>(11)?,
                 ))
             })?;
             for row in rows {
-                let (id, session_id, task, disposition, queue, deliveries, created, kind, channel, sender, chat_type) =
-                    row?;
+                let (
+                    id,
+                    session_id,
+                    task,
+                    disposition,
+                    queue,
+                    deliveries,
+                    created,
+                    kind,
+                    channel,
+                    sender,
+                    chat_type,
+                    revision,
+                ) = row?;
                 let (Some(disposition), Some(queue)) = (Disposition::parse(&disposition), Queue::parse(&queue)) else {
                     tracing::warn!(assignment = %id, "skipping unreadable stored assignment row");
                     continue;
@@ -482,6 +686,7 @@ impl MailboxStore for SqliteMailboxStore {
                     deliveries: u32::try_from(deliveries).unwrap_or(u32::MAX),
                     created_at_unix_ms: created.unsigned_abs(),
                     origin: origin_from_columns(&kind, channel, sender, chat_type),
+                    revision: revision.unsigned_abs(),
                 });
             }
         }
@@ -546,137 +751,163 @@ impl MailboxStore for SqliteMailboxStore {
     }
 
     fn insert_session(&self, session: &StoredSession) -> Result<()> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT OR REPLACE INTO chat_sessions
-                (session_id, label, pid, token_hash, registered_at_unix_ms, polls, last_poll_at_unix_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                session.session_id,
-                session.label,
-                session.pid.map(i64::from),
-                session.token_hash,
-                i64::try_from(session.registered_at_unix_ms).unwrap_or(i64::MAX),
-                i64::try_from(session.polls).unwrap_or(i64::MAX),
-                session
-                    .last_poll_at_unix_ms
-                    .map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
-            ],
-        )?;
-        Ok(())
+        self.measure(|| {
+            let conn = self.conn()?;
+            conn.execute(
+                "INSERT OR REPLACE INTO chat_sessions
+                    (session_id, label, pid, token_hash, registered_at_unix_ms, polls, last_poll_at_unix_ms,
+                     revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    session.session_id,
+                    session.label,
+                    session.pid.map(i64::from),
+                    session.token_hash,
+                    i64::try_from(session.registered_at_unix_ms).unwrap_or(i64::MAX),
+                    i64::try_from(session.polls).unwrap_or(i64::MAX),
+                    session
+                        .last_poll_at_unix_ms
+                        .map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
+                    i64::try_from(session.revision).unwrap_or(i64::MAX),
+                ],
+            )?;
+            Ok(())
+        })
     }
 
-    fn delete_session(&self, session_id: &str) -> Result<()> {
-        let conn = self.conn.lock();
-        // The cascade is what removes the queued rows, so `foreign_keys` being
-        // on is load-bearing rather than decorative.
-        conn.execute("DELETE FROM chat_sessions WHERE session_id = ?1", params![session_id])?;
-        Ok(())
-    }
-
-    fn record_poll(&self, session_id: &str, polls: u64, at_unix_ms: u64) -> Result<()> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE chat_sessions SET polls = ?2, last_poll_at_unix_ms = ?3 WHERE session_id = ?1",
-            params![
-                session_id,
-                i64::try_from(polls).unwrap_or(i64::MAX),
-                i64::try_from(at_unix_ms).unwrap_or(i64::MAX),
-            ],
-        )?;
-        Ok(())
+    fn record_poll(&self, session_id: &str, polls: u64, at_unix_ms: u64, revision: u64) -> Result<()> {
+        self.measure(|| {
+            let conn = self.conn()?;
+            // `revision <= ?4` is the whole ordering guarantee: a pull whose
+            // flush was overtaken writes nothing rather than rolling the poll
+            // count and the liveness stamp back to what it saw.
+            conn.execute(
+                "UPDATE chat_sessions SET polls = ?2, last_poll_at_unix_ms = ?3, revision = ?4
+                 WHERE session_id = ?1 AND revision <= ?4",
+                params![
+                    session_id,
+                    i64::try_from(polls).unwrap_or(i64::MAX),
+                    i64::try_from(at_unix_ms).unwrap_or(i64::MAX),
+                    i64::try_from(revision).unwrap_or(i64::MAX),
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     fn enqueue(&self, assignment: &StoredAssignment, at_front: bool) -> Result<()> {
-        let position = self.position(at_front);
-        let (kind, channel, sender, chat_type) = origin_columns(&assignment.origin);
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT OR REPLACE INTO chat_assignments
-                (assignment_id, session_id, task, disposition, queue, position, deliveries,
-                 created_at_unix_ms, origin_kind, origin_channel, origin_sender, origin_chat_type)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                assignment.assignment_id,
-                assignment.session_id,
-                assignment.task,
-                assignment.disposition.as_str(),
-                assignment.queue.as_str(),
-                position,
-                i64::from(assignment.deliveries),
-                i64::try_from(assignment.created_at_unix_ms).unwrap_or(i64::MAX),
-                kind,
-                channel,
-                sender,
-                chat_type,
-            ],
-        )?;
-        Ok(())
-    }
-
-    fn move_to_queue(&self, assignment_id: &str, queue: Queue, deliveries: u32, to_front: bool) -> Result<()> {
-        let conn = self.conn.lock();
-        if to_front {
-            let position = self.next_head();
+        self.measure(|| {
+            let position = self.position(at_front);
+            let (kind, channel, sender, chat_type) = origin_columns(&assignment.origin);
+            let conn = self.conn()?;
             conn.execute(
-                "UPDATE chat_assignments SET queue = ?2, deliveries = ?3, position = ?4 WHERE assignment_id = ?1",
-                params![assignment_id, queue.as_str(), i64::from(deliveries), position],
+                "INSERT OR REPLACE INTO chat_assignments
+                    (assignment_id, session_id, task, disposition, queue, position, deliveries,
+                     created_at_unix_ms, origin_kind, origin_channel, origin_sender, origin_chat_type, revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    assignment.assignment_id,
+                    assignment.session_id,
+                    assignment.task,
+                    assignment.disposition.as_str(),
+                    assignment.queue.as_str(),
+                    position,
+                    i64::from(assignment.deliveries),
+                    i64::try_from(assignment.created_at_unix_ms).unwrap_or(i64::MAX),
+                    kind,
+                    channel,
+                    sender,
+                    chat_type,
+                    i64::try_from(assignment.revision).unwrap_or(i64::MAX),
+                ],
             )?;
-        } else {
-            conn.execute(
-                "UPDATE chat_assignments SET queue = ?2, deliveries = ?3 WHERE assignment_id = ?1",
-                params![assignment_id, queue.as_str(), i64::from(deliveries)],
-            )?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
-    fn delete_assignment(&self, assignment_id: &str) -> Result<()> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "DELETE FROM chat_assignments WHERE assignment_id = ?1",
-            params![assignment_id],
-        )?;
-        Ok(())
+    fn move_to_queue(
+        &self,
+        assignment_id: &str,
+        queue: Queue,
+        deliveries: u32,
+        to_front: bool,
+        revision: u64,
+    ) -> Result<()> {
+        self.measure(|| {
+            let revision = i64::try_from(revision).unwrap_or(i64::MAX);
+            let conn = self.conn()?;
+            // Same guard as `record_poll`, and the one that matters most: an
+            // acknowledgement on disk must not be undone by a delivery that was
+            // planned before it and only reached the file afterwards.
+            if to_front {
+                let position = self.next_head();
+                conn.execute(
+                    "UPDATE chat_assignments SET queue = ?2, deliveries = ?3, position = ?4, revision = ?5
+                     WHERE assignment_id = ?1 AND revision <= ?5",
+                    params![assignment_id, queue.as_str(), i64::from(deliveries), position, revision],
+                )?;
+            } else {
+                conn.execute(
+                    "UPDATE chat_assignments SET queue = ?2, deliveries = ?3, revision = ?4
+                     WHERE assignment_id = ?1 AND revision <= ?4",
+                    params![assignment_id, queue.as_str(), i64::from(deliveries), revision],
+                )?;
+            }
+            Ok(())
+        })
     }
 
-    fn append_result(&self, result: &StoredResult) -> Result<()> {
-        let (kind, channel, sender, chat_type) = origin_columns(&result.origin);
-        let seq = i64::try_from(result.seq).unwrap_or(i64::MAX);
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT OR REPLACE INTO chat_results
-                (seq, assignment_id, session_id, session_label, disposition, status, summary,
-                 completed_at_unix_ms, origin_kind, origin_channel, origin_sender, origin_chat_type)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                seq,
-                result.assignment_id,
-                result.session_id,
-                result.session_label,
-                result.disposition.as_str(),
-                result.status.as_str(),
-                result.summary,
-                i64::try_from(result.completed_at_unix_ms).unwrap_or(i64::MAX),
-                kind,
-                channel,
-                sender,
-                chat_type,
-            ],
-        )?;
-        // Retention is a trim, not a quota: the oldest rows go and the sequence
-        // keeps climbing, so a consumer that fell behind can still tell it
-        // missed results instead of silently believing it saw them all.
-        let floor = conn
-            .query_row("SELECT MAX(seq) FROM chat_results", [], |row| {
-                row.get::<_, Option<i64>>(0)
-            })
-            .optional()?
-            .flatten()
-            .unwrap_or(seq)
-            .saturating_sub(i64::try_from(STORED_RESULT_CAPACITY).unwrap_or(i64::MAX));
-        conn.execute("DELETE FROM chat_results WHERE seq <= ?1", params![floor])?;
-        Ok(())
+    fn complete_assignment(&self, assignment_id: &str, result: &StoredResult) -> Result<()> {
+        self.measure(|| {
+            let mut conn = self.conn()?;
+            let tx = conn.transaction()?;
+            tx.execute(
+                "DELETE FROM chat_assignments WHERE assignment_id = ?1",
+                params![assignment_id],
+            )?;
+            insert_result(&tx, result)?;
+            trim_results(&tx)?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    fn cascade_session(&self, session_id: &str, results: &[StoredResult]) -> Result<()> {
+        self.measure(|| {
+            let mut conn = self.conn()?;
+            let tx = conn.transaction()?;
+            // The cascade is what removes the queued rows, so `foreign_keys`
+            // being on is load-bearing rather than decorative.
+            tx.execute("DELETE FROM chat_sessions WHERE session_id = ?1", params![session_id])?;
+            for result in results {
+                insert_result(&tx, result)?;
+            }
+            trim_results(&tx)?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+}
+
+impl crate::runtime::registry::PoolStatsSource for SqliteMailboxStore {
+    fn pool_kind(&self) -> &'static str {
+        "sqlite"
+    }
+
+    fn pool_name(&self) -> String {
+        self.path.display().to_string()
+    }
+
+    fn pool_metrics(&self) -> serde_json::Value {
+        let failed = self.metrics.writes_failed.load(Ordering::Relaxed);
+        serde_json::json!({
+            "writes_total": self.metrics.writes_total.load(Ordering::Relaxed),
+            "writes_failed": failed,
+            "lock_contention": self.metrics.lock_contention.load(Ordering::Relaxed),
+            // The mailbox's own word for the trade-off it advertises: false
+            // means live work was accepted that a restart would not find.
+            "durable": failed == 0,
+        })
     }
 }
 
