@@ -367,7 +367,9 @@ enum CompiledCondition {
 /// This is deliberately not a general JSON Schema engine. It covers the
 /// structures PRX emits: object/array/scalar types, required fields, enums,
 /// constants, `anyOf`/`oneOf`, bounds, `additionalProperties`, and action
-/// requirements expressed as `allOf` `if`/`then` pairs.
+/// requirements expressed as `allOf` `if`/`then` pairs. Composition is
+/// value-kind agnostic: an `allOf` member or an `if`/`then`/`else` branch is
+/// enforced on a scalar and on an array, not only on an object.
 ///
 /// Compilation is *fail-open on unknown keywords*: a keyword this subset does
 /// not model is dropped at compile time, so a dynamic MCP or WASM schema that
@@ -807,6 +809,27 @@ impl CompiledToolSchema {
             && !self.pattern_properties.iter().any(|entry| entry.pattern.is_match(name))
     }
 
+    /// Collect every violation `value` commits against this node.
+    ///
+    /// Each keyword group is applied to the value kinds JSON Schema defines it
+    /// for — string bounds to strings, item bounds to arrays, `required` and
+    /// `additionalProperties` to objects — and a value of some other kind is
+    /// simply not constrained by that group. Composition is *not* one of those
+    /// groups: `anyOf`, `oneOf`, `allOf` and `if` / `then` / `else` apply to
+    /// every JSON value type, so they are evaluated for scalars and arrays as
+    /// well as objects.
+    ///
+    /// A failing `type` constraint ends the walk for this node, because the
+    /// keywords below it would then report violations that are consequences of
+    /// the one issue the caller has to fix.
+    ///
+    /// The fail-open rule the type-level documentation states reaches inside
+    /// composition unchanged: a member whose `$ref` points outside the
+    /// document, names a missing definition, closes a cycle, or falls beyond
+    /// [`COMPILE_NODE_BUDGET`] / [`COMPILE_DEPTH_BUDGET`] compiles to no
+    /// constraints, so it contributes no issues. The parts of such a document
+    /// that *were* compiled — including the non-cyclic members of an `allOf`
+    /// whose sibling is cyclic — stay enforced.
     fn validate(&self, value: &Value, path: &str, issues: &mut Vec<ArgumentValidationIssue>) {
         if let Some(any_of) = self.any_of.as_ref()
             && !any_of.iter().any(|candidate| candidate.matches(value))
@@ -937,24 +960,6 @@ impl CompiledToolSchema {
                     }
                 }
             }
-            for condition in &self.conditions {
-                match condition {
-                    CompiledCondition::Always(schema) => schema.validate(value, path, issues),
-                    CompiledCondition::Branch {
-                        condition,
-                        then_schema,
-                        else_schema,
-                    } => {
-                        if condition.matches(value) {
-                            if let Some(then_schema) = then_schema {
-                                then_schema.validate(value, path, issues);
-                            }
-                        } else if let Some(else_schema) = else_schema {
-                            else_schema.validate(value, path, issues);
-                        }
-                    }
-                }
-            }
         }
 
         if let Some(items) = value.as_array() {
@@ -979,6 +984,34 @@ impl CompiledToolSchema {
                     path: path.to_string(),
                     message: format!("must contain at most {maximum} item(s)"),
                 });
+            }
+        }
+
+        // Composition applies to every JSON value type. `allOf` members and
+        // `if` / `then` / `else` branches constrain a string, a number or an
+        // array exactly as they constrain an object, so this loop must not sit
+        // inside the object branch: while it did, a field published as
+        // `{"allOf": [{"type": "integer", "minimum": 1}]}` compiled its member
+        // and then never evaluated it, and every scalar and array reached the
+        // executor unchecked. `normalize_integral_numbers` already descends
+        // through `conditions` for all value types; this is the same rule on
+        // the verdict side.
+        for condition in &self.conditions {
+            match condition {
+                CompiledCondition::Always(schema) => schema.validate(value, path, issues),
+                CompiledCondition::Branch {
+                    condition,
+                    then_schema,
+                    else_schema,
+                } => {
+                    if condition.matches(value) {
+                        if let Some(then_schema) = then_schema {
+                            then_schema.validate(value, path, issues);
+                        }
+                    } else if let Some(else_schema) = else_schema {
+                        else_schema.validate(value, path, issues);
+                    }
+                }
             }
         }
     }
@@ -3249,5 +3282,134 @@ mod tests {
         });
         let (_, exhausted) = CompiledToolSchema::compile_reporting_budget(&schema);
         assert!(exhausted, "a reference chain deeper than the budget must report it");
+    }
+
+    #[test]
+    fn scalar_composition_members_are_evaluated() {
+        // R07: `allOf` on a scalar field was compiled and then never reached,
+        // because composition was evaluated inside the object-only branch.
+        let schema = json!({
+            "type": "object",
+            "properties": {"limit": {"allOf": [{"type": "integer", "minimum": 1}]}}
+        });
+        assert!(validate_tool_arguments(&schema, &json!({"limit": 5})).is_empty());
+        let wrong_type = validate_tool_arguments(&schema, &json!({"limit": "invalid"}));
+        assert!(
+            wrong_type.iter().any(|issue| issue.path == "$.limit"),
+            "a scalar `allOf` member must bind: {wrong_type:?}"
+        );
+        let below_bound = validate_tool_arguments(&schema, &json!({"limit": 0}));
+        assert!(
+            below_bound.iter().any(|issue| issue.path == "$.limit"),
+            "a bound inside a scalar `allOf` member must bind: {below_bound:?}"
+        );
+    }
+
+    #[test]
+    fn scalar_conditional_composition_is_evaluated() {
+        // `if` / `then` / `else` written on a scalar node, which is the same
+        // contract as the object spelling enforced by `root_level_if_then_else`.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "window": {
+                    "type": "integer",
+                    "if": {"minimum": 10},
+                    "then": {"maximum": 20},
+                    "else": {"minimum": 0}
+                }
+            }
+        });
+        assert!(validate_tool_arguments(&schema, &json!({"window": 15})).is_empty());
+        assert!(validate_tool_arguments(&schema, &json!({"window": 5})).is_empty());
+        let above_then = validate_tool_arguments(&schema, &json!({"window": 25}));
+        assert!(
+            above_then.iter().any(|issue| issue.path == "$.window"),
+            "the `then` branch must bind on a scalar: {above_then:?}"
+        );
+        let below_else = validate_tool_arguments(&schema, &json!({"window": -1}));
+        assert!(
+            below_else.iter().any(|issue| issue.path == "$.window"),
+            "the `else` branch must bind on a scalar: {below_else:?}"
+        );
+    }
+
+    #[test]
+    fn array_composition_members_are_evaluated() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "tags": {
+                    "allOf": [
+                        {"type": "array", "minItems": 1, "maxItems": 3},
+                        {"items": {"allOf": [{"type": "string", "minLength": 2}]}}
+                    ]
+                }
+            }
+        });
+        assert!(validate_tool_arguments(&schema, &json!({"tags": ["ops", "prod"]})).is_empty());
+        let empty = validate_tool_arguments(&schema, &json!({"tags": []}));
+        assert!(
+            empty.iter().any(|issue| issue.path == "$.tags"),
+            "an array bound inside `allOf` must bind: {empty:?}"
+        );
+        let too_many = validate_tool_arguments(&schema, &json!({"tags": ["aa", "bb", "cc", "dd"]}));
+        assert!(
+            too_many.iter().any(|issue| issue.path == "$.tags"),
+            "maxItems inside `allOf` must bind: {too_many:?}"
+        );
+        let wrong_item = validate_tool_arguments(&schema, &json!({"tags": ["ops", 7]}));
+        assert!(
+            wrong_item.iter().any(|issue| issue.path == "$.tags[1]"),
+            "an item contract inside `allOf` must bind: {wrong_item:?}"
+        );
+        let short_item = validate_tool_arguments(&schema, &json!({"tags": ["x"]}));
+        assert!(
+            short_item.iter().any(|issue| issue.path == "$.tags[0]"),
+            "a nested scalar `allOf` inside `items` must bind: {short_item:?}"
+        );
+    }
+
+    #[test]
+    fn root_composition_binds_documents_that_are_not_objects() {
+        let scalar_root = json!({"allOf": [{"type": "string", "minLength": 3}]});
+        assert!(validate_tool_arguments(&scalar_root, &json!("ops")).is_empty());
+        assert!(!validate_tool_arguments(&scalar_root, &json!("no")).is_empty());
+        assert!(!validate_tool_arguments(&scalar_root, &json!(7)).is_empty());
+
+        let array_root = json!({"type": "array", "allOf": [{"maxItems": 2}]});
+        assert!(validate_tool_arguments(&array_root, &json!([1])).is_empty());
+        assert!(!validate_tool_arguments(&array_root, &json!([1, 2, 3])).is_empty());
+
+        let conditional_root = json!({"if": {"type": "string"}, "then": {"minLength": 2}});
+        assert!(validate_tool_arguments(&conditional_root, &json!("ok")).is_empty());
+        assert!(!validate_tool_arguments(&conditional_root, &json!("x")).is_empty());
+        assert!(
+            validate_tool_arguments(&conditional_root, &json!(1)).is_empty(),
+            "a document the `if` does not select stays unconstrained"
+        );
+    }
+
+    #[test]
+    fn composition_members_behind_an_unfollowable_reference_stay_open() {
+        // The documented fail-open rule reaches inside composition too: a
+        // member this document cannot resolve contributes no constraints
+        // rather than rejecting an argument that may well be correct.
+        let external = json!({
+            "type": "object",
+            "properties": {"limit": {"allOf": [{"$ref": "https://example.test/schema.json#/Limit"}]}}
+        });
+        assert!(validate_tool_arguments(&external, &json!({"limit": "invalid"})).is_empty());
+
+        let cyclic = json!({
+            "type": "object",
+            "properties": {"limit": {"allOf": [{"$ref": "#/$defs/Limit"}]}},
+            "$defs": {"Limit": {"allOf": [{"$ref": "#/$defs/Limit"}, {"type": "integer"}]}}
+        });
+        let cyclic_issues = validate_tool_arguments(&cyclic, &json!({"limit": "invalid"}));
+        assert!(
+            cyclic_issues.iter().any(|issue| issue.path == "$.limit"),
+            "the part of a cycle that was walked must still bind: {cyclic_issues:?}"
+        );
     }
 }

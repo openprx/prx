@@ -3863,6 +3863,225 @@ mod tests {
         assert_eq!(&*fixture.stages.lock(), &["policy", "preparation", "audit"]);
         assert_eq!(fixture.records.lock().len(), 1);
     }
+
+    /// A tool whose published contract expresses every constraint through
+    /// composition, on values that are not objects: a scalar `allOf`, an array
+    /// `allOf` with its own item composition, and a scalar `if`/`then`/`else`.
+    ///
+    /// Composition used to be compiled and then skipped for anything but an
+    /// object, so a contract shaped like this validated nothing at all.
+    struct CompositionTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for CompositionTool {
+        fn name(&self) -> &str {
+            "composition_tool"
+        }
+
+        fn description(&self) -> &str {
+            "composition fixture"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "allOf": [{"type": "integer", "minimum": 1}],
+                        "description": "Page size."
+                    },
+                    "tags": {
+                        "allOf": [
+                            {"type": "array", "minItems": 1},
+                            {"items": {"allOf": [{"type": "string", "minLength": 2}]}}
+                        ],
+                        "description": "Labels to attach."
+                    },
+                    "window": {
+                        "type": "integer",
+                        "if": {"minimum": 10},
+                        "then": {"maximum": 20},
+                        "else": {"minimum": 0},
+                        "description": "Lookback window."
+                    }
+                }
+            })
+        }
+
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.execute_named(self.name(), args).await
+        }
+
+        async fn execute_named(&self, _name: &str, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: "executed".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    async fn composition_outcome_for_dialect(
+        arguments: serde_json::Value,
+        dialect: ToolSchemaDialect,
+    ) -> (ToolExecutionOutcome, usize) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = ToolExecutionService::new(
+            vec![Arc::new(CompositionTool {
+                calls: Arc::clone(&calls),
+            })],
+            Arc::new(FixedPolicy {
+                decision: ToolExecutionDecision::Allow,
+                stages: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(FixedApproval {
+                decision: approved(),
+                stages: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(AdapterOwnedPreparation),
+            Arc::new(TracingToolExecutionAudit),
+        );
+        let outcome = service
+            .execute(
+                ToolExecutionCommand::new("composition_tool", arguments),
+                context().with_schema_dialect(dialect),
+                None,
+            )
+            .await;
+        let observed = calls.load(Ordering::SeqCst);
+        (outcome, observed)
+    }
+
+    async fn composition_outcome(arguments: serde_json::Value) -> (ToolExecutionOutcome, usize) {
+        composition_outcome_for_dialect(arguments, ToolSchemaDialect::Raw).await
+    }
+
+    #[tokio::test]
+    async fn production_path_rejects_scalar_composition_violations_before_the_backend_runs() {
+        for (arguments, expected_path) in [
+            (serde_json::json!({"limit": "invalid"}), "$.limit"),
+            (serde_json::json!({"limit": 0}), "$.limit"),
+            (serde_json::json!({"window": 25}), "$.window"),
+            (serde_json::json!({"window": -1}), "$.window"),
+        ] {
+            let (outcome, calls) = composition_outcome(arguments.clone()).await;
+            assert_eq!(
+                outcome.status,
+                ToolExecutionStatus::InvalidArguments,
+                "{arguments} violates the published composition, got {}",
+                outcome.model_content
+            );
+            assert_eq!(
+                calls, 0,
+                "a contract violation must not reach the executor: {arguments}"
+            );
+            assert!(
+                outcome.model_content.contains(expected_path),
+                "expected {expected_path} in {}",
+                outcome.model_content
+            );
+            assert!(
+                outcome
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains(expected_path)),
+                "the audit record must carry the same issue: {arguments}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn production_path_rejects_array_composition_violations_before_the_backend_runs() {
+        for (arguments, expected_path) in [
+            (serde_json::json!({"tags": "ops"}), "$.tags"),
+            (serde_json::json!({"tags": []}), "$.tags"),
+            (serde_json::json!({"tags": ["ops", 7]}), "$.tags[1]"),
+            (serde_json::json!({"tags": ["x"]}), "$.tags[0]"),
+        ] {
+            let (outcome, calls) = composition_outcome(arguments.clone()).await;
+            assert_eq!(
+                outcome.status,
+                ToolExecutionStatus::InvalidArguments,
+                "{arguments} violates the published composition, got {}",
+                outcome.model_content
+            );
+            assert_eq!(
+                calls, 0,
+                "a contract violation must not reach the executor: {arguments}"
+            );
+            assert!(
+                outcome.model_content.contains(expected_path),
+                "expected {expected_path} in {}",
+                outcome.model_content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn production_path_accepts_composition_respecting_scalars_and_arrays() {
+        for arguments in [
+            serde_json::json!({"limit": 5}),
+            serde_json::json!({"tags": ["ops", "prod"]}),
+            serde_json::json!({"window": 15}),
+            serde_json::json!({"window": 5}),
+            serde_json::json!({"limit": 1, "tags": ["ops"], "window": 20}),
+        ] {
+            let (outcome, calls) = composition_outcome(arguments.clone()).await;
+            assert_eq!(
+                outcome.status,
+                ToolExecutionStatus::Succeeded,
+                "{arguments} satisfies the published composition: {:?}",
+                outcome.error
+            );
+            assert_eq!(
+                calls, 1,
+                "a contract-respecting call must reach the executor: {arguments}"
+            );
+        }
+    }
+
+    /// Composition is enforced against the document the provider was actually
+    /// shown, exactly like every other keyword: `clean_for_gemini` deletes
+    /// `minimum` and `minLength` from inside the `allOf` members too, so those
+    /// bounds are not held against a Gemini call, while `type` and `minItems`
+    /// survive cleaning inside `items` and stay enforced.
+    #[tokio::test]
+    async fn composition_is_enforced_per_provider_dialect() {
+        let (gemini, gemini_calls) =
+            composition_outcome_for_dialect(serde_json::json!({"limit": 0}), ToolSchemaDialect::Gemini).await;
+        assert_eq!(
+            gemini.status,
+            ToolExecutionStatus::Succeeded,
+            "clean_for_gemini strips `minimum` inside `allOf`: {}",
+            gemini.model_content
+        );
+        assert_eq!(gemini_calls, 1);
+
+        let (gemini, gemini_calls) =
+            composition_outcome_for_dialect(serde_json::json!({"limit": "invalid"}), ToolSchemaDialect::Gemini).await;
+        assert_eq!(
+            gemini.status,
+            ToolExecutionStatus::InvalidArguments,
+            "`type` survives clean_for_gemini inside `allOf`: {}",
+            gemini.model_content
+        );
+        assert_eq!(gemini_calls, 0);
+        assert!(gemini.model_content.contains("$.limit"), "{}", gemini.model_content);
+
+        let (gemini, gemini_calls) =
+            composition_outcome_for_dialect(serde_json::json!({"tags": ["ops", 7]}), ToolSchemaDialect::Gemini).await;
+        assert_eq!(
+            gemini.status,
+            ToolExecutionStatus::InvalidArguments,
+            "an item `type` inside `allOf` survives cleaning: {}",
+            gemini.model_content
+        );
+        assert_eq!(gemini_calls, 0);
+        assert!(gemini.model_content.contains("$.tags[1]"), "{}", gemini.model_content);
+    }
 }
 
 /// T18 — local-operator origin marker (`_prx_scope_trusted`).

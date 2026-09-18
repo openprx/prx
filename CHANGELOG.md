@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.145] - 18 September 2026
+
+### Fixed
+
+- Schema composition (`allOf`, `anyOf`, `oneOf`, `if`/`then`/`else`) is now
+  evaluated for scalar and array values, not only objects. A field published as
+  `{"allOf": [{"type": "integer", "minimum": 1}]}` previously compiled its
+  member and never evaluated it, so invalid scalars and arrays reached the
+  executor unchecked. Production execution-service tests prove such arguments
+  are rejected before the backend runs; unfollowable references and cycles
+  still compile to no constraints and are documented as such.
+
 ## [0.8.144] - 18 September 2026
 
 ### Changed
