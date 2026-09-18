@@ -1305,6 +1305,14 @@ impl ToolExecutionService {
                                 started,
                             )
                         })?;
+                    // The reservation is a durable write the turn owed, and it
+                    // sits between `ToolStart` and the backend's first poll
+                    // with nothing else to show for it. Recorded now that it
+                    // has come back, so a turn whose ledger is merely slow is
+                    // not read as a turn that went silent — and so the hang
+                    // report, when one is warranted, names where the turn
+                    // actually was.
+                    crate::agent::idle::beat(crate::agent::idle::ProgressKind::DurableWrite);
                     let recorded = event
                         .raw_payload_json
                         .as_deref()
@@ -1374,7 +1382,7 @@ impl ToolExecutionService {
                 return;
             }
         };
-        if let Err(error) = lease
+        let appended = lease
             .memory
             .append_message_event(tool_execution_event_input(
                 context,
@@ -1383,8 +1391,12 @@ impl ToolExecutionService {
                 format!("operation_id={} status={:?}", outcome.operation_id, outcome.status),
                 payload,
             ))
-            .await
-        {
+            .await;
+        // Same reasoning as the reservation write above, at the other end of
+        // the call: this is the last thing the turn does before the loop can
+        // announce the result, and until now it was silent.
+        crate::agent::idle::beat(crate::agent::idle::ProgressKind::DurableWrite);
+        if let Err(error) = appended {
             tracing::error!(
                 operation_id = %outcome.operation_id,
                 error = %error,
@@ -2661,6 +2673,114 @@ mod tests {
         assert!(replay.replayed);
         assert_eq!(replay.model_content, first.model_content);
         assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Reads the turn's idle beat from inside the tool, which is the only
+    /// vantage point from which the *reservation* write can be observed: it
+    /// happens after the call is announced and before the backend is polled.
+    struct BeatProbeTool {
+        seen_before_invoke: Arc<Mutex<Option<crate::agent::idle::ProgressKind>>>,
+    }
+
+    #[async_trait]
+    impl Tool for BeatProbeTool {
+        fn name(&self) -> &str {
+            "native_write"
+        }
+
+        fn description(&self) -> &str {
+            "records what the turn was last seen doing"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {"value": {}},
+                "required": ["value"]
+            })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            *self.seen_before_invoke.lock() = crate::agent::idle::current_beat().map(|beat| beat.last_kind());
+            Ok(ToolResult {
+                success: true,
+                output: "executed".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    /// The durable idempotency-ledger writes that bracket a side-effecting tool
+    /// call are progress, and are recorded as such.
+    ///
+    /// Both of them are `spawn_blocking` hops into the database — work the turn
+    /// owes and is visibly doing — and both sit outside the `tool_start` /
+    /// `tool_end` pair, so until they were recorded a turn waiting on its own
+    /// ledger was indistinguishable from a turn that had gone quiet. That is
+    /// not a theoretical gap: it is where GitHub run 35396387399 found the
+    /// agent loop ("Last progress: tool_end after 14 event(s)" is the turn
+    /// inside `commit_idempotent_execution`).
+    ///
+    /// MUTATION GUARD: delete either `ProgressKind::DurableWrite` beat and one
+    /// assertion below goes red. The reservation beat is read from inside the
+    /// backend, so nothing recorded later can stand in for it; the terminal
+    /// beat is read after the call returned, where `ToolEnd` would otherwise be
+    /// the last word.
+    #[tokio::test]
+    async fn the_durable_idempotency_ledger_writes_are_recorded_as_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(temp.path()).unwrap());
+        let seen_before_invoke = Arc::new(Mutex::new(None));
+        let stages = Arc::new(Mutex::new(Vec::new()));
+        let service = ToolExecutionService::new(
+            vec![Arc::new(BeatProbeTool {
+                seen_before_invoke: Arc::clone(&seen_before_invoke),
+            })],
+            Arc::new(FixedPolicy {
+                decision: ToolExecutionDecision::Allow,
+                stages: Arc::clone(&stages),
+            }),
+            Arc::new(FixedApproval {
+                decision: approved(),
+                stages: Arc::clone(&stages),
+            }),
+            Arc::new(RecordingPreparation {
+                stages: Arc::clone(&stages),
+                allowed: true,
+            }),
+            Arc::new(RecordingAudit {
+                records: Arc::new(Mutex::new(Vec::new())),
+                stages: Arc::clone(&stages),
+            }),
+        )
+        .with_idempotency_memory(memory);
+
+        let beat = crate::agent::idle::child_beat();
+        let outcome = crate::agent::idle::scope_beat(Some(Arc::clone(&beat)), async {
+            service
+                .execute(
+                    ToolExecutionCommand::new("native_write", serde_json::json!({"value":"ok"}))
+                        .with_operation_id("ledger-progress")
+                        .with_idempotency_key("ledger-progress"),
+                    context(),
+                    None,
+                )
+                .await
+        })
+        .await;
+
+        assert_eq!(outcome.status, ToolExecutionStatus::Succeeded);
+        assert_eq!(
+            *seen_before_invoke.lock(),
+            Some(crate::agent::idle::ProgressKind::DurableWrite),
+            "the reservation write must be recorded before the backend is polled, so a turn \
+             waiting on the ledger is not read as a silent one"
+        );
+        assert_eq!(
+            beat.last_kind(),
+            crate::agent::idle::ProgressKind::DurableWrite,
+            "the terminal write is the last thing the call does; the turn must be seen doing it"
+        );
     }
 
     #[tokio::test]

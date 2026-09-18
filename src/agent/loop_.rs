@@ -12331,7 +12331,13 @@ mod tests {
     /// Core evidence 1, at the production entrypoint: a turn whose provider
     /// call never returns is terminated by the idle detector, and the error
     /// identifies it as a hang rather than a failure or an operator kill.
-    #[tokio::test]
+    ///
+    /// Runs on the paused runtime clock for the reason given on
+    /// `production_turn_far_longer_than_the_idle_window_survives_on_progress`:
+    /// the window is then measured in the same virtual time the watchdog
+    /// sleeps in, so the verdict is reached because the turn is silent and not
+    /// because a loaded machine got there first.
+    #[tokio::test(start_paused = true)]
     async fn production_turn_that_hangs_is_terminated_by_the_idle_detector() {
         let provider = HangingProvider;
         let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user("hang please")];
@@ -12390,7 +12396,31 @@ mod tests {
     /// total elapsed time instead of time since the last progress event and
     /// this test fails, because the turn's total run time is six times the
     /// window while its longest silence is a fraction of it.
-    #[tokio::test]
+    ///
+    /// # Why the runtime clock is paused
+    ///
+    /// The fixture window is 200ms, which is 150 times below the smallest
+    /// window `[runtime] idle_hang_secs` will accept
+    /// ([`crate::agent::idle::MIN_IDLE_HANG_SECS`]). On wall-clock time that
+    /// turns every ordinary silent moment of the real tool round trip into a
+    /// candidate verdict: the durable idempotency-ledger writes around each
+    /// call are `spawn_blocking` hops into SQLite, and on a contended CI runner
+    /// one of them outlasts 200ms perfectly often — which is exactly how this
+    /// test failed on GitHub run 35396387399 ("Last progress: tool_end after 14
+    /// event(s)", the turn sitting in `commit_idempotent_execution`).
+    ///
+    /// Pausing the clock removes the race instead of hiding it. Virtual time
+    /// advances only when the runtime has nothing to run, and tokio refuses to
+    /// auto-advance while a blocking task is outstanding, so the real SQLite
+    /// writes — which this test deliberately keeps, they are the production
+    /// path — cost zero virtual time while the tool's own
+    /// `tokio::time::sleep` still spends the full 120ms of it. The guard
+    /// measures silence on that same clock
+    /// ([`crate::agent::idle::ProgressBeat`] reads `tokio::time::Instant`), so
+    /// what is being asserted is the contract and nothing else. The control
+    /// below proves virtual time really does reach the verdict when the turn
+    /// really does go quiet.
+    #[tokio::test(start_paused = true)]
     async fn production_turn_far_longer_than_the_idle_window_survives_on_progress() {
         const ROUNDS: usize = 10;
         const TOOL_DELAY_MS: u64 = 120;
@@ -12421,7 +12451,9 @@ mod tests {
         let guard = crate::agent::idle::IdleGuard {
             idle: Some(idle_window),
         };
-        let started = std::time::Instant::now();
+        // The runtime clock, so the elapsed-time assertion below measures the
+        // same time the guard does.
+        let started = tokio::time::Instant::now();
         let result = crate::agent::idle::with_guard(
             guard,
             run_tool_call_loop(
@@ -12465,6 +12497,93 @@ mod tests {
             executions.load(Ordering::SeqCst),
             ROUNDS,
             "every scripted round must have done real work"
+        );
+    }
+
+    /// The control for the test above, and the half of the contract that must
+    /// never be traded away for a green: the same production entrypoint, the
+    /// same fixture, the same paused clock — but the tool stays quiet for
+    /// longer than one whole window, and the turn is terminated with the hang
+    /// report.
+    ///
+    /// Without this, the survival test's green would be ambiguous: a paused
+    /// clock that never advanced would also "survive". Here virtual time
+    /// advances to the watchdog's deadline while the turn is genuinely silent,
+    /// the verdict is reached mid-tool, and the tool never gets to finish —
+    /// so the guard is provably still armed under exactly the conditions the
+    /// other test runs in.
+    #[tokio::test(start_paused = true)]
+    async fn production_turn_whose_tool_goes_silent_past_the_window_is_terminated() {
+        let idle_window = Duration::from_millis(200);
+
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"delay_progress","arguments":{"value":"tick"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let executions = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(SteadyTool {
+            // Five windows of complete silence inside a single tool call: this
+            // is a stall by the module's own definition, not a slow turn.
+            delay: idle_window * 5,
+            executions: Arc::clone(&executions),
+        })];
+        let ledger_dir = TempDir::new().unwrap();
+        let ledger_memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(ledger_dir.path()).unwrap());
+        let ledger_envelope = RuntimeEnvelope::agent(ledger_dir.path().to_string_lossy().to_string(), "idle-stall");
+        let document_ingest = DocumentIngestRuntime::from_envelope(ledger_memory, &ledger_envelope);
+
+        let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user("stall please")];
+        let observer = NoopObserver;
+
+        let guard = crate::agent::idle::IdleGuard {
+            idle: Some(idle_window),
+        };
+        let error = crate::agent::idle::with_guard(
+            guard,
+            run_tool_call_loop(
+                &provider,
+                &mut history,
+                Arc::new(tools_registry),
+                &observer,
+                &crate::hooks::HookManager::new(std::env::temp_dir()),
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                Some(Arc::new(ApprovalManager::new())),
+                "telegram",
+                &crate::config::MultimodalConfig::default(),
+                2,
+                false,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None, // no scope context
+                None,
+                None, // no tool tiering
+                ToolLoopMemory::from_ingest_for_test(document_ingest),
+                ChatMode::default(),
+            ),
+        )
+        .await
+        .expect_err("a turn silent for longer than the whole window must be terminated");
+
+        assert!(
+            crate::agent::idle::is_hang_termination(&error),
+            "the stall must surface as a hang termination, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("no observable progress"),
+            "the hang report must say why: {error}"
+        );
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            0,
+            "the verdict must land while the tool is still silent, not after it returned"
         );
     }
 

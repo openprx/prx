@@ -56,8 +56,9 @@
 //!
 //! Progress is *observable activity attributable to this turn*: provider stream
 //! chunks, a completed provider round-trip, a tool call starting or finishing,
-//! history compaction/paging, and output emitted to a channel or event sink.
-//! Any single one of them resets the window; see [`ProgressKind`].
+//! history compaction/paging, a durable write the turn owed coming back, and
+//! output emitted to a channel or event sink. Any single one of them resets the
+//! window; see [`ProgressKind`].
 //!
 //! Two things this definition intentionally does **not** do:
 //!
@@ -78,7 +79,16 @@
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// The detector's own clock. `tokio::time::Instant` is the monotonic clock that
+// `tokio::time::sleep` — the watchdog's only way of waiting — is measured
+// against, so reading elapsed time from the same source is what keeps "the
+// watchdog woke up" and "the turn has been silent this long" answers to the
+// same question. In a production build it *is* `std::time::Instant`; only a
+// test that explicitly freezes the runtime clock (`tokio::time::pause`) makes
+// the two diverge, and such a test then drives the beat and the watchdog
+// together instead of racing them against a loaded machine's scheduler.
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::runtime::registry::{self, KillOutcome, WorkId};
@@ -252,6 +262,22 @@ pub enum ProgressKind {
     ///
     /// The rule as code is `crate::tools::sessions_spawn::member_vouches_for_the_waiter`.
     SubtaskAlive,
+    /// A durable write the turn owed completed — today the tool-execution
+    /// idempotency ledger's reservation and terminal records
+    /// ([`crate::tools::ToolExecutionService`]).
+    ///
+    /// These writes sit *outside* the `tool_start` / `tool_end` bracket: the
+    /// reservation is persisted after the call is announced and before the
+    /// backend runs, and the terminal record is persisted after the outcome is
+    /// built. Each is a `spawn_blocking` hop into a database, so a turn doing
+    /// exactly what it should was previously reported as last seen doing
+    /// `tool_start` or `tool_end` while it was in fact mid-write.
+    ///
+    /// Recorded **after** the write returns, never before. That ordering is
+    /// what keeps it evidence: a write that never returns — the blocking-pool
+    /// wedge `crate::runtime::blocking` documents — records nothing, so the
+    /// window still runs out and the verdict is still reached.
+    DurableWrite,
 }
 
 impl ProgressKind {
@@ -269,6 +295,7 @@ impl ProgressKind {
             Self::ProviderRetry => "provider_retry",
             Self::RuntimeSubtree => "runtime_subtree",
             Self::SubtaskAlive => "subtask_alive",
+            Self::DurableWrite => "durable_write",
         }
     }
 
@@ -284,6 +311,7 @@ impl ProgressKind {
             Self::ProviderRetry => 7,
             Self::RuntimeSubtree => 8,
             Self::SubtaskAlive => 9,
+            Self::DurableWrite => 10,
         }
     }
 
@@ -298,6 +326,7 @@ impl ProgressKind {
             7 => Self::ProviderRetry,
             8 => Self::RuntimeSubtree,
             9 => Self::SubtaskAlive,
+            10 => Self::DurableWrite,
             _ => Self::TurnStart,
         }
     }

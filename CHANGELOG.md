@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.158] - 19 September 2026
+
+### Fixed
+
+- The idle (no-progress) hang detector measures a turn's silence on the tokio
+  runtime clock (identical to `std::time::Instant` in a release build), so its
+  regression tests can drive time deterministically instead of racing a loaded
+  CI runner. The tool-execution idempotency ledger's reservation and terminal
+  writes are recorded as progress once they return; a write that never returns
+  still records nothing, so a wedged blocking pool is still terminated. No
+  threshold, default or configuration bound changed.
+
 ## [0.8.157] - 19 September 2026
 
 ### Fixed
