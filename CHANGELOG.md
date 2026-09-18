@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.157] - 19 September 2026
+
+### Fixed
+
+- The architecture guard no longer exempts a direct tool execution because of
+  the name its receiver happens to have. Every `execute` call form is recorded,
+  and a call is exempt only when the receiver's binding in the enclosing
+  function proves a non-tool type or the site is listed with its file, function,
+  receiver, exact call count and cited declaration. Shadowing a database handle
+  with a `Tool`, an extra call at a listed site, or a stale entry now fails the
+  guard.
+
 ## [0.8.156] - 19 September 2026
 
 ### Fixed

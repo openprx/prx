@@ -1036,55 +1036,123 @@ const TOOL_EXECUTION_METHODS: &[&str] = &[
     "execute_with_cancellation",
 ];
 
-/// Receiver identifiers whose `.execute(...)` belongs to some *other* trait, and
-/// the type each one actually names.
+/// Types whose `execute(...)` is not `Tool::execute`, with the crate or module
+/// each one comes from.
 ///
 /// Rust's `execute` is a popular method name: `rusqlite`, `tokio-postgres`, the
 /// shell process adapter, the chat effect executor, the xin builtin registry and
-/// `ToolExecutionService` itself all have one. A scanner with no type
-/// information has to separate them by hand, so this list is the hand: it is the
-/// *only* way a `.execute(` call escapes the inventory, every entry names the
-/// type it stands for, and `non_tool_execute_receivers_are_all_still_in_use`
-/// fails the moment one of them stops matching a real call site, so the list
-/// cannot quietly rot into a wildcard.
+/// `ToolExecutionService` itself all have one. The scanner has no type
+/// information, so this table *is* the type information. It is consulted only
+/// against the receiver's own binding inside the enclosing function - never
+/// against a bare identifier - so naming a `Tool` variable `conn` no longer
+/// hides it.
+const NON_TOOL_RECEIVER_TYPES: &[(&str, &str)] = &[
+    (
+        "BuiltinRegistry",
+        "xin `BuiltinRegistry::execute(payload, config)` - internal task builtins",
+    ),
+    ("Client", "tokio-postgres `Client::execute(statement, params)`"),
+    ("Connection", "rusqlite `Connection::execute(sql, params)`"),
+    (
+        "EffectExecutor",
+        "chat `EffectExecutor::execute(effect)` - terminal UI effects, not tools",
+    ),
+    (
+        "GenericClient",
+        "the tokio-postgres trait shared by `Client` and `Transaction`",
+    ),
+    (
+        "PooledConnection",
+        "a checked-out tokio-postgres client from the memory pool",
+    ),
+    (
+        "PostgresConnectionPool",
+        "the tokio-postgres pool wrapper, which forwards `execute`",
+    ),
+    ("ShellProcessAdapter", "the shared child-process seam"),
+    ("Transaction", "rusqlite / tokio-postgres transaction handle"),
+    (
+        "ToolExecutionService",
+        "the approved execution path itself: policy, approval, schema check and audit",
+    ),
+];
+
+/// Initialiser expressions that produce one of [`NON_TOOL_RECEIVER_TYPES`].
 ///
-/// Everything else is treated as a `Tool` call, including a receiver the scanner
-/// cannot reduce to an identifier. The guard fails closed on purpose: a false
-/// entry in the inventory costs one review, a false *absence* costs an
-/// unauthorised tool execution.
-const NON_TOOL_EXECUTE_RECEIVERS: &[(&str, &str)] = &[
+/// A `let` binding with no type annotation carries its type in the expression
+/// that built it. Each pattern here is matched against the whole initialiser of
+/// the receiver's own binding in the enclosing function, and names the type it
+/// yields; nothing matches a plain move of an existing value, so
+/// `let conn = some_tool;` stays a reviewable tool execution.
+const NON_TOOL_RECEIVER_PRODUCERS: &[(&str, &str)] = &[
     (
-        "client",
-        "tokio-postgres `Client::execute(statement, params)` and the reqwest client",
+        ".build_transaction()",
+        "tokio-postgres transaction builder -> Transaction",
     ),
     (
-        "client_mut",
-        "pooled tokio-postgres client accessor in the webhook ingestion store",
-    ),
-    ("conn", "rusqlite / tokio-postgres connection handle"),
-    (
-        "executor",
-        "chat `EffectExecutor::execute(effect)` — UI effects, not tools",
+        ".transaction()",
+        "rusqlite / tokio-postgres `transaction()` -> Transaction",
     ),
     (
-        "process",
-        "`ShellProcessAdapter::execute(ShellProcessRequest)` — the shared child-process seam",
+        ".transaction_with_behavior(",
+        "rusqlite `transaction_with_behavior()` -> Transaction",
     ),
     (
-        "registry",
-        "xin `BuiltinRegistry::execute(payload, config)` — internal task builtins",
+        ".unchecked_transaction()",
+        "rusqlite `unchecked_transaction()` -> Transaction",
+    ),
+    ("Connection::open(", "rusqlite `Connection::open()` -> Connection"),
+    (
+        "self.client.clone()",
+        "the memory Postgres pool's own tokio-postgres Client handle",
+    ),
+    ("self.conn()", "the store's rusqlite connection accessor -> Connection"),
+    (
+        "self.conn.lock()",
+        "the webhook store's `parking_lot` guard over its rusqlite Connection",
     ),
     (
-        "service",
-        "`ToolExecutionService::execute(command)` — the approved path itself, not a bypass",
+        "open_approval_ledger(",
+        "the approval ledger opener -> rusqlite Connection",
     ),
-    ("shell", "`ShellProcessAdapter` held by the skills tool"),
     (
-        "tool_execution",
-        "the `ToolExecutionService` field on `Agent` — the approved path itself",
+        "ToolExecutionService::from_shared_boxed_registry(",
+        "the gateway MCP compatibility layer building the approved execution service",
     ),
-    ("transaction", "rusqlite / tokio-postgres transaction handle"),
-    ("tx", "rusqlite / tokio-postgres transaction handle"),
+    (
+        "pool.write()",
+        "the `parking_lot` write guard over the shared rusqlite Connection",
+    ),
+    (
+        "reader.connection()",
+        "the snapshot reader's rusqlite Connection accessor",
+    ),
+];
+
+/// Helpers that hand a non-`Tool` handle to a closure, and the type each one
+/// passes.
+///
+/// `with_connection(config, |conn| conn.execute(...))` leaves the closure
+/// parameter untyped, so the type lives in the helper's own signature. Each
+/// entry is checked against that signature by
+/// `non_tool_closure_providers_match_their_definitions`, so renaming or
+/// retyping a helper fails the guard instead of silently widening it.
+const NON_TOOL_CLOSURE_PROVIDERS: &[(&str, &str, &str)] = &[
+    (
+        "with_client",
+        "Client",
+        "the memory and cron Postgres stores hand the pooled tokio-postgres client to a closure",
+    ),
+    (
+        "with_connection",
+        "Connection",
+        "the cron and xin SQLite stores hand the rusqlite connection to a closure",
+    ),
+    (
+        "with_immediate_connection",
+        "Connection",
+        "the xin SQLite store's BEGIN IMMEDIATE variant of `with_connection`",
+    ),
 ];
 
 /// Production call sites that invoke a `Tool` directly instead of going through
@@ -1456,6 +1524,45 @@ fn receiver_identifier(characters: &[char], dot: usize) -> String {
     }
 }
 
+/// The receiver expression as it is written: `self.tool_execution`, `state.tool`,
+/// `conn`.
+///
+/// The bare identifier is not enough to review a call site — `conn` could be a
+/// pooled database handle or a field holding a `Tool` — so the scanner keeps the
+/// dotted path that produced it. Anything it cannot reduce to a dotted
+/// identifier path (a call, an index, `?`) falls back to
+/// [`receiver_identifier`], which collapses those to `<expression>`.
+fn receiver_expression(characters: &[char], dot: usize) -> String {
+    let mut segments: Vec<String> = Vec::new();
+    let mut index = dot;
+    loop {
+        while index > 0 && characters[index - 1].is_whitespace() {
+            index -= 1;
+        }
+        if index == 0 || !is_ident_char(characters[index - 1]) {
+            break;
+        }
+        let mut start = index - 1;
+        while start > 0 && is_ident_char(characters[start - 1]) {
+            start -= 1;
+        }
+        segments.push(characters[start..index].iter().collect());
+        let mut joint = start;
+        while joint > 0 && characters[joint - 1].is_whitespace() {
+            joint -= 1;
+        }
+        if joint == 0 || characters[joint - 1] != '.' {
+            break;
+        }
+        index = joint - 1;
+    }
+    if segments.is_empty() {
+        return receiver_identifier(characters, dot);
+    }
+    segments.reverse();
+    segments.join(".")
+}
+
 /// The type or trait a UFCS call names: `Tool::execute`, `MessageSendTool::execute`
 /// and `<Self as Tool>::execute` all reduce to one segment.
 fn qualified_path_segment(characters: &[char], colons: usize) -> String {
@@ -1498,13 +1605,349 @@ fn qualified_path_segment(characters: &[char], colons: usize) -> String {
     "<path>".to_string()
 }
 
-/// One direct `Tool` execution the scanner found.
+/// The production text of the function that contains `line_index`.
+///
+/// The same backwards scan [`enclosing_function`] uses to name the function,
+/// followed forwards to the closing brace, so the binding rule below reads
+/// exactly the body the call site sits in.
+fn enclosing_function_body(lines: &[&str], line_index: usize) -> Option<String> {
+    let mut start = None;
+    for (offset, line) in lines[..=line_index].iter().enumerate().rev() {
+        let Some(fn_offset) = line.find("fn ") else {
+            continue;
+        };
+        let name: String = line[fn_offset + 3..]
+            .chars()
+            .take_while(|character| is_ident_char(*character))
+            .collect();
+        if !name.is_empty() {
+            start = Some(offset);
+            break;
+        }
+    }
+    let start = start?;
+    let text = lines[start..].join("\n");
+    let mut depth = 0usize;
+    let mut opened = false;
+    for (offset, character) in text.char_indices() {
+        match character {
+            '{' => {
+                depth += 1;
+                opened = true;
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if opened && depth == 0 {
+                    return Some(text[..=offset].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(text)
+}
+
+/// Read a type annotation starting at `from`, stopping at the first `stops`
+/// character that is not nested inside `<>`, `()` or `[]`.
+fn type_annotation(characters: &[char], from: usize, stops: &[char]) -> String {
+    let mut depth = 0i32;
+    let mut text = String::new();
+    for character in characters.iter().skip(from) {
+        if depth <= 0 && stops.contains(character) {
+            break;
+        }
+        match character {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            _ => {}
+        }
+        text.push(*character);
+        if text.len() > 200 {
+            break;
+        }
+    }
+    normalize_line(&text)
+}
+
+/// Read an initialiser expression starting at `from`, stopping at the statement
+/// terminator that is not nested inside a bracket.
+fn expression_text(characters: &[char], from: usize) -> String {
+    let mut depth = 0i32;
+    let mut text = String::new();
+    for character in characters.iter().skip(from) {
+        match character {
+            '<' | '(' | '[' | '{' => depth += 1,
+            '>' | ')' | ']' | '}' => depth -= 1,
+            ';' if depth <= 0 => break,
+            _ => {}
+        }
+        text.push(*character);
+        if text.len() > 400 {
+            break;
+        }
+    }
+    normalize_line(&text)
+}
+
+/// Whether the identifier at `position` sits on the binding side of a `let`,
+/// `if let` or `while let` - a destructuring pattern - rather than in the
+/// initialiser or in an ordinary call argument.
+fn is_let_pattern_position(characters: &[char], position: usize) -> bool {
+    let mut index = position;
+    while index > 0 {
+        let character = characters[index - 1];
+        if character == ';' || character == '{' || character == '}' {
+            return false;
+        }
+        if character == '=' {
+            let previous = if index >= 2 { characters[index - 2] } else { ' ' };
+            let next = characters.get(index).copied().unwrap_or(' ');
+            if !matches!(next, '=' | '>') && !matches!(previous, '=' | '!' | '<' | '>') {
+                return false;
+            }
+        }
+        if is_ident_char(character) {
+            let mut word_start = index - 1;
+            while word_start > 0 && is_ident_char(characters[word_start - 1]) {
+                word_start -= 1;
+            }
+            let word: String = characters[word_start..index].iter().collect();
+            if word == "let" {
+                return true;
+            }
+            index = word_start;
+            continue;
+        }
+        index -= 1;
+    }
+    false
+}
+
+/// The callee of the call whose argument list contains `position`.
+///
+/// `with_connection(config, |conn| ...)` resolves to `with_connection`, which is
+/// how an untyped closure parameter recovers a type.
+fn enclosing_call_name(characters: &[char], position: usize) -> Option<String> {
+    let mut depth = 0i32;
+    let mut index = position;
+    while index > 0 {
+        index -= 1;
+        match characters[index] {
+            ')' | ']' => depth += 1,
+            '(' | '[' if depth > 0 => depth -= 1,
+            '(' => {
+                let mut end = index;
+                while end > 0 && characters[end - 1].is_whitespace() {
+                    end -= 1;
+                }
+                if end == 0 || !is_ident_char(characters[end - 1]) {
+                    return None;
+                }
+                let mut start = end;
+                while start > 0 && is_ident_char(characters[start - 1]) {
+                    start -= 1;
+                }
+                return Some(characters[start..end].iter().collect());
+            }
+            '[' | '{' | '}' | ';' => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// What one occurrence of the receiver identifier says about the receiver's
+/// type, or `None` when the occurrence is a use rather than a binding.
+///
+/// A binding form the scanner cannot read yields an `<unparsed ...>` marker that
+/// no table approves, so the call site falls through to review instead of being
+/// guessed at.
+fn classify_receiver_binding(characters: &[char], start: usize, end: usize) -> Option<String> {
+    let mut before = start;
+    let mut keyword: Option<String> = None;
+    loop {
+        while before > 0 && characters[before - 1].is_whitespace() {
+            before -= 1;
+        }
+        if before == 0 {
+            return None;
+        }
+        if !is_ident_char(characters[before - 1]) {
+            break;
+        }
+        let mut word_start = before - 1;
+        while word_start > 0 && is_ident_char(characters[word_start - 1]) {
+            word_start -= 1;
+        }
+        let candidate: String = characters[word_start..before].iter().collect();
+        if candidate == "mut" || candidate == "ref" {
+            before = word_start;
+            continue;
+        }
+        keyword = Some(candidate);
+        break;
+    }
+
+    let mut after = end;
+    while after < characters.len() && characters[after].is_whitespace() {
+        after += 1;
+    }
+    let annotated = characters.get(after) == Some(&':') && characters.get(after + 1) != Some(&':');
+
+    if let Some(keyword) = keyword {
+        return match keyword.as_str() {
+            "let" => Some(if annotated {
+                format!("let type: {}", type_annotation(characters, after + 1, &['=', ';']))
+            } else if characters.get(after) == Some(&'=') {
+                format!("let value: {}", expression_text(characters, after + 1))
+            } else {
+                "<unparsed let binding>".to_string()
+            }),
+            "for" => Some("<for-loop binding>".to_string()),
+            _ => None,
+        };
+    }
+
+    let previous = characters[before - 1];
+    match previous {
+        '(' | ',' if annotated => Some(format!(
+            "parameter: {}",
+            type_annotation(characters, after + 1, &[',', ')', '|'])
+        )),
+        '|' if annotated => Some(format!(
+            "closure parameter: {}",
+            type_annotation(characters, after + 1, &[',', '|'])
+        )),
+        '|' if before < 2 || characters[before - 2] != '|' => {
+            Some(enclosing_call_name(characters, before - 1).map_or_else(
+                || "<untyped closure parameter>".to_string(),
+                |callee| format!("closure parameter of {callee}"),
+            ))
+        }
+        '(' | ',' if is_let_pattern_position(characters, before - 1) => Some("<unparsed let binding>".to_string()),
+        _ => None,
+    }
+}
+
+/// Every binding of `name` the scanner can see inside one function body.
+fn receiver_bindings(body: &str, name: &str) -> Vec<String> {
+    let characters: Vec<char> = body.chars().collect();
+    let mut bindings = Vec::new();
+    let mut index = 0usize;
+    while index < characters.len() {
+        if !is_ident_char(characters[index]) || (index > 0 && is_ident_char(characters[index - 1])) {
+            index += 1;
+            continue;
+        }
+        let mut end = index;
+        while end < characters.len() && is_ident_char(characters[end]) {
+            end += 1;
+        }
+        if characters[index..end].iter().collect::<String>() == name
+            && let Some(binding) = classify_receiver_binding(&characters, index, end)
+        {
+            bindings.push(binding);
+        }
+        index = end;
+    }
+    bindings
+}
+
+/// The bare type name a type annotation resolves to: `&mut Connection`,
+/// `&rusqlite::Transaction<'_>` and `PooledConnection<'_>` all reduce to one
+/// identifier, and a wrapper such as `Arc<dyn Tool>` reduces to `Arc`, which no
+/// table approves.
+fn base_type_identifier(annotation: &str) -> String {
+    let mut text = annotation.trim();
+    loop {
+        let stripped = text.trim_start_matches('&').trim_start();
+        let stripped = stripped.strip_prefix("mut ").unwrap_or(stripped).trim_start();
+        let stripped = stripped.strip_prefix("dyn ").unwrap_or(stripped).trim_start();
+        let stripped = if stripped.starts_with('\'') {
+            stripped
+                .split_once(char::is_whitespace)
+                .map_or("", |(_, rest)| rest)
+                .trim_start()
+        } else {
+            stripped
+        };
+        if stripped == text {
+            break;
+        }
+        text = stripped;
+    }
+    let head: String = text
+        .chars()
+        .take_while(|character| is_ident_char(*character) || *character == ':')
+        .collect();
+    head.rsplit("::").next().unwrap_or(&head).to_string()
+}
+
+/// The non-`Tool` type one binding proves, if any.
+fn non_tool_binding_type(binding: &str) -> Option<&'static str> {
+    if let Some(annotation) = binding
+        .strip_prefix("parameter: ")
+        .or_else(|| binding.strip_prefix("closure parameter: "))
+        .or_else(|| binding.strip_prefix("let type: "))
+    {
+        let base = base_type_identifier(annotation);
+        return NON_TOOL_RECEIVER_TYPES
+            .iter()
+            .find(|(name, _)| *name == base)
+            .map(|(name, _)| *name);
+    }
+    if let Some(callee) = binding.strip_prefix("closure parameter of ") {
+        return NON_TOOL_CLOSURE_PROVIDERS
+            .iter()
+            .find(|(name, parameter, _)| {
+                *name == callee && NON_TOOL_RECEIVER_TYPES.iter().any(|(known, _)| known == parameter)
+            })
+            .map(|(_, parameter, _)| *parameter);
+    }
+    if let Some(value) = binding.strip_prefix("let value: ") {
+        return NON_TOOL_RECEIVER_PRODUCERS
+            .iter()
+            .find(|(pattern, _)| value.contains(pattern))
+            .map(|(pattern, _)| *pattern);
+    }
+    None
+}
+
+/// The non-`Tool` type every binding of the receiver agrees on, or `None` when
+/// the receiver has no readable binding or any one of its bindings is not
+/// provably a non-`Tool` type.
+///
+/// "Every binding" is what makes shadowing visible: a function that binds `conn`
+/// to a `Connection` and later rebinds it to a `Tool` has one unprovable
+/// binding, so both of its call sites return to the inventory.
+fn proven_non_tool_receiver(bindings: &[String]) -> Option<String> {
+    if bindings.is_empty() {
+        return None;
+    }
+    let mut proofs: Vec<&'static str> = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        proofs.push(non_tool_binding_type(binding)?);
+    }
+    proofs.sort_unstable();
+    proofs.dedup();
+    Some(proofs.join(", "))
+}
+
+/// One `execute(...)` call the scanner found in production source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ToolExecutionSite {
     /// `<file>::<enclosing function>`, the inventory key.
     entry: String,
     /// The call form, for the failure message: `tool.execute(...)`, UFCS, and so on.
     form: String,
+    /// The receiver identifier, empty for a UFCS call that has no receiver.
+    receiver: String,
+    /// The receiver expression as written, e.g. `self.tool_execution`.
+    receiver_path: String,
+    /// Every binding of the receiver identifier inside the enclosing function.
+    bindings: Vec<String>,
+    /// The non-`Tool` type the receiver's own bindings prove, when they do.
+    non_tool_binding: Option<String>,
     line: usize,
 }
 
@@ -1512,8 +1955,6 @@ struct ToolExecutionSite {
 #[derive(Debug, Default)]
 struct ToolExecutionScan {
     sites: Vec<ToolExecutionSite>,
-    /// Receivers that matched `NON_TOOL_EXECUTE_RECEIVERS` and were skipped.
-    excluded_receivers: BTreeSet<String>,
 }
 
 /// Find every direct `Tool` execution in one file's production source.
@@ -1566,41 +2007,248 @@ fn scan_tool_executions(relative: &str, source: &str) -> ToolExecutionScan {
         while before > 0 && characters[before - 1].is_whitespace() {
             before -= 1;
         }
-        let (receiver, form) = if before > 0 && characters[before - 1] == '.' {
+        let (receiver, receiver_path, form) = if before > 0 && characters[before - 1] == '.' {
             let receiver = receiver_identifier(&characters, before - 1);
-            let form = format!("{receiver}.{name}(...)");
-            (receiver, form)
+            let path = receiver_expression(&characters, before - 1);
+            let form = format!("{path}.{name}(...)");
+            (receiver, path, form)
         } else if before > 1 && characters[before - 1] == ':' && characters[before - 2] == ':' {
             let segment = qualified_path_segment(&characters, before - 2);
             let form = format!("{segment}::{name}(...)");
-            // A UFCS call has no receiver to exclude: every `Path::execute(...)`
-            // in this tree is a tool execution, and a new non-tool one is a
-            // review event rather than something the scanner may guess about.
-            (String::new(), form)
+            // A UFCS call has no receiver binding to reason about: every
+            // `Path::execute(...)` in this tree is a tool execution, and a new
+            // non-tool one is a review event rather than something the scanner
+            // may guess about.
+            (String::new(), String::new(), form)
         } else {
             index = end;
             continue;
         };
 
-        if !receiver.is_empty()
-            && NON_TOOL_EXECUTE_RECEIVERS
-                .iter()
-                .any(|(candidate, _)| *candidate == receiver)
-        {
-            scan.excluded_receivers.insert(receiver);
-            index = end;
-            continue;
-        }
-
         let line = newlines.partition_point(|offset| *offset < index);
+        let bindings = if receiver.is_empty() {
+            Vec::new()
+        } else {
+            enclosing_function_body(&lines, line)
+                .map(|body| receiver_bindings(&body, &receiver))
+                .unwrap_or_default()
+        };
+        let non_tool_binding = proven_non_tool_receiver(&bindings);
         scan.sites.push(ToolExecutionSite {
             entry: format!("{relative}::{}", enclosing_function(&lines, line)),
             form,
+            receiver,
+            receiver_path,
+            bindings,
+            non_tool_binding,
             line: line + 1,
         });
         index = end;
     }
     scan
+}
+
+/// One reviewed `execute(...)` call site whose receiver is not a `Tool` and
+/// whose binding the scanner cannot read on its own.
+///
+/// This is the whole of the escape hatch that used to be a list of bare
+/// identifiers. An entry pins the file, the enclosing function, the receiver
+/// expression *as written* and how many `execute*` calls on that receiver the
+/// function contains, and it points at the source fragment that names the
+/// receiver's real type. Nothing here covers a file or a function wholesale: a
+/// second call on the same receiver, a differently spelled receiver, or the same
+/// call moved to another function all fail the guard.
+#[derive(Debug, Clone, Copy)]
+struct NonToolCallSite {
+    /// `<file>::<enclosing function>`, exactly as the scanner reports it.
+    entry: &'static str,
+    /// The receiver expression, exactly as the scanner reports it.
+    receiver: &'static str,
+    /// How many unproven `execute*` calls on that receiver the entry contains.
+    occurrences: usize,
+    /// The file holding the declaration that gives the receiver its type.
+    evidence_file: &'static str,
+    /// That declaration, verbatim. It must name a [`NON_TOOL_RECEIVER_TYPES`]
+    /// type, and it must still be in the source.
+    evidence: &'static str,
+    reason: &'static str,
+}
+
+/// The non-`Tool` `execute(...)` call sites that survive the binding rule.
+///
+/// Field receivers (`self.process`) have no binding inside the function, and a
+/// `let Some(x) = ... else` pattern or a generic parameter carries its type
+/// somewhere the scanner does not read. Each one is pinned here instead of being
+/// waved through by its name.
+const NON_TOOL_EXECUTE_CALL_SITES: &[NonToolCallSite] = &[
+    NonToolCallSite {
+        entry: "src/agent/agent.rs::execute_tool_call",
+        receiver: "self.tool_execution",
+        occurrences: 1,
+        evidence_file: "src/agent/agent.rs",
+        evidence: "tool_execution: Arc<crate::tools::ToolExecutionService>",
+        reason: "the approved path itself: `Agent::execute_tool_call` was routed through \
+                 ToolExecutionService in 0.8.128 and this is that call",
+    },
+    NonToolCallSite {
+        entry: "src/agent/loop_.rs::execute_one_unrecorded",
+        receiver: "service",
+        occurrences: 1,
+        evidence_file: "src/agent/loop_.rs",
+        evidence: "pub tool_execution_service: Option<Arc<crate::tools::ToolExecutionService>>",
+        reason: "`let Some(service) = adapter.tool_execution_service.as_ref() else` - the tool \
+                 loop's own handle on the approved execution service",
+    },
+    NonToolCallSite {
+        entry: "src/chat/dispatcher.rs::execute_single_tool_call",
+        receiver: "service",
+        occurrences: 1,
+        evidence_file: "src/chat/dispatcher.rs",
+        evidence: "service: Option<&ToolExecutionService>",
+        reason: "the Redux dispatcher's tool call goes through the service parameter it was \
+                 handed; `let Some(service) = service else` only unwraps the Option",
+    },
+    NonToolCallSite {
+        entry: "src/memory/postgres.rs::acquire_reset",
+        receiver: "client",
+        occurrences: 1,
+        evidence_file: "src/memory/postgres.rs",
+        evidence: "pub(crate) fn client_mut(&mut self) -> Result<&mut Client>",
+        reason: "`checkout.client_mut().and_then(|client| client.execute(...))` resets the \
+                 PostgreSQL session context on a pooled tokio-postgres client",
+    },
+    NonToolCallSite {
+        entry: "src/memory/postgres.rs::apply_rls_context_raw",
+        receiver: "client",
+        occurrences: 4,
+        evidence_file: "src/memory/postgres.rs",
+        evidence: "fn apply_rls_context_raw<C: GenericClient>",
+        reason: "binds the row-level-security context on a generic tokio-postgres client or \
+                 transaction; the four calls are the four SET LOCAL statements",
+    },
+    NonToolCallSite {
+        entry: "src/tools/shell.rs::execute_inner",
+        receiver: "self.process",
+        occurrences: 1,
+        evidence_file: "src/tools/shell.rs",
+        evidence: "process: ShellProcessAdapter",
+        reason: "the shell tool's own child-process seam: this is the adapter call the shell \
+                 tool exists to make, not a second tool execution",
+    },
+    NonToolCallSite {
+        entry: "src/tools/skills.rs::execute_resolved",
+        receiver: "self.shell",
+        occurrences: 1,
+        evidence_file: "src/tools/skills.rs",
+        evidence: "shell: ShellProcessAdapter",
+        reason: "the skills tool runs a resolved skill command through the same shared \
+                 child-process adapter; its `self.http` call in the same function stays in the \
+                 direct-invocation inventory",
+    },
+    NonToolCallSite {
+        entry: "src/webhook/mod.rs::fail_blocking",
+        receiver: "client_mut",
+        occurrences: 1,
+        evidence_file: "src/memory/postgres.rs",
+        evidence: "pub(crate) fn client_mut(&mut self) -> Result<&mut Client>",
+        reason: "`checkout.client_mut()?.execute(...)` marks a webhook ingestion failed on the \
+                 pooled tokio-postgres client; the SQLite twin of the same function reaches its \
+                 rusqlite connection through a proven binding",
+    },
+];
+
+/// Whether `needle` occurs in `haystack` as a whole identifier.
+fn contains_identifier(haystack: &str, needle: &str) -> bool {
+    let characters: Vec<char> = haystack.chars().collect();
+    let target: Vec<char> = needle.chars().collect();
+    if target.is_empty() || target.len() > characters.len() {
+        return false;
+    }
+    (0..=characters.len() - target.len()).any(|start| {
+        characters[start..start + target.len()] == target[..]
+            && (start == 0 || !is_ident_char(characters[start - 1]))
+            && characters
+                .get(start + target.len())
+                .is_none_or(|character| !is_ident_char(*character))
+    })
+}
+
+/// Whether one reviewed exception covers one call site: same file, same
+/// enclosing function, same receiver expression.
+fn exception_covers(exception: &NonToolCallSite, site: &ToolExecutionSite) -> bool {
+    (exception.entry, exception.receiver) == (site.entry.as_str(), site.receiver_path.as_str())
+}
+
+/// Count, duplication and staleness checks for the reviewed non-`Tool` call
+/// sites.
+///
+/// A pure function so the rules can be exercised against a synthetic inventory
+/// as well as against the real tree.
+fn non_tool_call_site_errors(sites: &[ToolExecutionSite], exceptions: &[NonToolCallSite]) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut seen: BTreeSet<(&str, &str)> = BTreeSet::new();
+    for exception in exceptions {
+        let label = format!("{} / {}", exception.entry, exception.receiver);
+        if !seen.insert((exception.entry, exception.receiver)) {
+            errors.push(format!("{label} is listed twice"));
+        }
+        if exception.receiver.is_empty() {
+            errors.push(format!(
+                "{label} has no receiver: a UFCS call has no binding to review and is never exempt"
+            ));
+        }
+        if exception.occurrences == 0 {
+            errors.push(format!(
+                "{label} declares zero occurrences; delete the entry instead of leaving a \
+                 standing exemption"
+            ));
+        }
+        if exception.reason.len() <= 20 {
+            errors.push(format!(
+                "{label} needs a real reason naming the type whose `execute` this is, not {:?}",
+                exception.reason
+            ));
+        }
+        if exception.evidence.len() <= 10 {
+            errors.push(format!(
+                "{label} needs a source fragment that names the receiver's type, not {:?}",
+                exception.evidence
+            ));
+        }
+        let actual = sites
+            .iter()
+            .filter(|site| site.non_tool_binding.is_none() && exception_covers(exception, site))
+            .count();
+        if actual == 0 {
+            errors.push(format!(
+                "{label} no longer matches any `execute` call site; remove the entry instead of \
+                 leaving a standing exemption"
+            ));
+        } else if actual != exception.occurrences {
+            errors.push(format!(
+                "{label} declares {} `execute` call(s) but the tree now has {actual}. Every call \
+                 on an exempt receiver is reviewed one at a time: if the new call is another \
+                 non-tool call raise the count, and if it is a tool call route it through \
+                 ToolExecutionService",
+                exception.occurrences
+            ));
+        }
+    }
+    errors
+}
+
+/// The direct `Tool` executions in a scan: every call whose receiver binding
+/// does not prove another type, minus the reviewed non-`Tool` sites.
+fn direct_tool_execution_sites<'a>(
+    sites: &'a [ToolExecutionSite],
+    exceptions: &[NonToolCallSite],
+) -> Vec<&'a ToolExecutionSite> {
+    sites
+        .iter()
+        .filter(|site| {
+            site.non_tool_binding.is_none() && !exceptions.iter().any(|exception| exception_covers(exception, site))
+        })
+        .collect()
 }
 
 fn scan_repository_tool_executions() -> ToolExecutionScan {
@@ -1610,7 +2258,6 @@ fn scan_repository_tool_executions() -> ToolExecutionScan {
         let source = fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {relative}: {error}"));
         let scan = scan_tool_executions(&relative, &source);
         combined.sites.extend(scan.sites);
-        combined.excluded_receivers.extend(scan.excluded_receivers);
     }
     combined
 }
@@ -1622,12 +2269,13 @@ fn scan_repository_tool_executions() -> ToolExecutionScan {
 #[test]
 fn direct_tool_invocations_outside_the_execution_service_are_allowlisted() {
     let scan = scan_repository_tool_executions();
+    let direct = direct_tool_execution_sites(&scan.sites, NON_TOOL_EXECUTE_CALL_SITES);
 
     let gateway_gates: BTreeSet<&str> = GATEWAY_DIRECT_TOOL_INVOCATION_GATES
         .iter()
         .map(|(entry, _)| *entry)
         .collect();
-    for site in &scan.sites {
+    for site in &direct {
         if site.entry.starts_with("src/gateway/") {
             assert!(
                 gateway_gates.contains(site.entry.as_str()),
@@ -1649,7 +2297,7 @@ fn direct_tool_invocations_outside_the_execution_service_are_allowlisted() {
         );
     }
 
-    let mut found: Vec<String> = scan.sites.into_iter().map(|site| site.entry).collect();
+    let mut found: Vec<String> = direct.iter().map(|site| site.entry.clone()).collect();
     found.sort();
     found.dedup();
 
@@ -1669,8 +2317,7 @@ fn direct_tool_invocations_outside_the_execution_service_are_allowlisted() {
 #[test]
 fn every_gateway_tool_execution_documents_its_alternative_gate() {
     let scan = scan_repository_tool_executions();
-    let gateway_sites: BTreeSet<String> = scan
-        .sites
+    let gateway_sites: BTreeSet<String> = direct_tool_execution_sites(&scan.sites, NON_TOOL_EXECUTE_CALL_SITES)
         .iter()
         .filter(|site| site.entry.starts_with("src/gateway/"))
         .map(|site| site.entry.clone())
@@ -1719,28 +2366,396 @@ fn direct_tool_invocation_allowlist_entries_carry_a_reason() {
     }
 }
 
-/// The non-tool receiver list is the only escape hatch in the scanner, so it is
-/// held to the same standard as the allowlist: every entry must still match a
-/// real call site, or it is a wildcard waiting for a tool variable to be named
-/// after it.
+/// The names the 0.8.155 guard exempted globally, whatever they were bound to.
+/// Every one of them is now only as exempt as its own binding makes it.
+const FORMERLY_EXEMPT_RECEIVERS: &[&str] = &[
+    "client",
+    "client_mut",
+    "conn",
+    "executor",
+    "process",
+    "registry",
+    "service",
+    "shell",
+    "tool_execution",
+    "transaction",
+    "tx",
+];
+
+/// One synthetic handler that holds an approved `Connection` call and a `Tool`
+/// call on a receiver named `receiver`.
+fn probe_handler(receiver: &str, call: &str) -> String {
+    format!(
+        "pub async fn post_channel_send(conn: &Connection) {{\n    \
+         conn.execute(sql, params)?;\n    \
+         let {receiver}: &dyn Tool = resolve();\n    \
+         {call}\n}}\n"
+    )
+}
+
+/// The Mac cross-audit probe, replayed for every name the old guard exempted.
+///
+/// An explicitly typed `Tool` receiver called `service`, `client`, `conn` or
+/// `executor` used to vanish from the inventory because of its spelling alone,
+/// even when it sat next to a real database call. It must now be reported.
 #[test]
-fn non_tool_execute_receivers_are_all_still_in_use() {
-    let scan = scan_repository_tool_executions();
-    let mut stale: Vec<&str> = NON_TOOL_EXECUTE_RECEIVERS
-        .iter()
-        .map(|(receiver, _)| *receiver)
-        .filter(|receiver| !scan.excluded_receivers.contains(*receiver))
-        .collect();
-    stale.sort_unstable();
+fn a_tool_receiver_named_like_a_non_tool_handle_is_still_inventoried() {
+    for receiver in FORMERLY_EXEMPT_RECEIVERS {
+        let source = probe_handler(receiver, &format!("let _ = {receiver}.execute(args).await;"));
+        let scan = scan_tool_executions("src/gateway/api/channels.rs", &source);
+        let direct = direct_tool_execution_sites(&scan.sites, NON_TOOL_EXECUTE_CALL_SITES);
+        assert!(
+            direct.iter().any(|site| site.receiver_path == *receiver),
+            "a `&dyn Tool` bound to `{receiver}` escaped the inventory; scan was {:?}",
+            scan.sites
+        );
+        assert!(
+            scan.sites
+                .iter()
+                .any(|site| site.receiver_path == "conn" && site.non_tool_binding.is_some())
+                || *receiver == "conn",
+            "the approved `&Connection` call in the same function should stay proven"
+        );
+    }
+}
+
+/// The same probe in every call form the scanner claims to cover, so a bypass
+/// cannot be spelled around the method name.
+#[test]
+fn a_tool_receiver_named_like_a_non_tool_handle_is_inventoried_in_every_call_form() {
+    let calls: &[(&str, &str)] = &[
+        ("method", "let _ = service.execute(args).await;"),
+        (
+            "cancellation twin",
+            "let _ = service.execute_with_cancellation(args, None).await;",
+        ),
+        ("named", "let _ = service.execute_named(name, args).await;"),
+        (
+            "named cancellation twin",
+            "let _ = service.execute_named_with_cancellation(name, args, None).await;",
+        ),
+        (
+            "multi-line chain",
+            "let _ = service\n        .execute(args)\n        .await;",
+        ),
+    ];
+    for (label, call) in calls {
+        let source = probe_handler("service", call);
+        let scan = scan_tool_executions("src/gateway/api/channels.rs", &source);
+        let direct = direct_tool_execution_sites(&scan.sites, NON_TOOL_EXECUTE_CALL_SITES);
+        assert!(
+            direct.iter().any(|site| site.receiver_path == "service"),
+            "the {label} form on a `Tool` named `service` escaped the inventory: {:?}",
+            scan.sites
+        );
+    }
+
+    // UFCS has no receiver at all, so no binding and no exception can reach it.
+    let ufcs = "pub async fn post_channel_send(conn: &Connection) {\n    \
+                conn.execute(sql, params)?;\n    \
+                let _ = <ShellTool as Tool>::execute(&service, args).await;\n}\n";
+    let scan = scan_tool_executions("src/gateway/api/channels.rs", ufcs);
+    let direct = direct_tool_execution_sites(&scan.sites, NON_TOOL_EXECUTE_CALL_SITES);
     assert!(
-        stale.is_empty(),
-        "these receivers no longer name any `.execute(` call site and must be deleted from \
-         NON_TOOL_EXECUTE_RECEIVERS: {stale:?}"
+        direct.iter().any(|site| site.form.contains("Tool::execute")),
+        "a UFCS tool execution escaped the inventory: {:?}",
+        scan.sites
     );
-    for (receiver, reason) in NON_TOOL_EXECUTE_RECEIVERS {
+}
+
+/// Rebinding a proven receiver to a `Tool` makes the whole receiver unproven,
+/// so the shadowed call cannot hide behind the binding that came before it.
+#[test]
+fn shadowing_a_proven_receiver_with_a_tool_returns_every_call_to_the_inventory() {
+    let source = "pub async fn handler(conn: &Connection) {\n    \
+                  conn.execute(sql, params)?;\n    \
+                  let conn: &dyn Tool = resolve();\n    \
+                  let _ = conn.execute(args).await;\n}\n";
+    let scan = scan_tool_executions("src/gateway/api/channels.rs", source);
+    assert_eq!(scan.sites.len(), 2, "both calls must be seen: {:?}", scan.sites);
+    assert!(
+        scan.sites.iter().all(|site| site.non_tool_binding.is_none()),
+        "a function that rebinds `conn` to a Tool has no proven binding left: {:?}",
+        scan.sites
+    );
+    assert_eq!(
+        direct_tool_execution_sites(&scan.sites, NON_TOOL_EXECUTE_CALL_SITES).len(),
+        2
+    );
+}
+
+/// A receiver with no readable binding fails closed: the guard reports it rather
+/// than guessing that a name it has seen before means the same type here.
+#[test]
+fn only_a_proven_non_tool_binding_escapes_the_inventory() {
+    let source = "pub async fn handler(conn: &Connection) {\n    \
+                  conn.execute(sql, params)?;\n    \
+                  let _ = database.execute(sql, params)?;\n    \
+                  let _ = tx.execute(sql, params)?;\n}\n";
+    let scan = scan_tool_executions("src/gateway/api/channels.rs", source);
+    let proven: Vec<&str> = scan
+        .sites
+        .iter()
+        .filter(|site| site.non_tool_binding.is_some())
+        .map(|site| site.receiver_path.as_str())
+        .collect();
+    assert_eq!(
+        proven,
+        vec!["conn"],
+        "only the typed parameter is proven: {:?}",
+        scan.sites
+    );
+    let direct: Vec<&str> = direct_tool_execution_sites(&scan.sites, NON_TOOL_EXECUTE_CALL_SITES)
+        .iter()
+        .map(|site| site.receiver_path.as_str())
+        .collect();
+    assert_eq!(direct, vec!["database", "tx"]);
+}
+
+/// The binding rule reads the forms the tree actually uses, and nothing else.
+#[test]
+fn the_binding_rule_proves_only_the_declared_non_tool_types() {
+    let cases: &[(&str, &str, Option<&str>)] = &[
+        (
+            "typed parameter",
+            "pub fn f(conn: &Connection) {\n    conn.execute(sql, params)?;\n}\n",
+            Some("Connection"),
+        ),
+        (
+            "typed closure parameter",
+            "pub fn f() {\n    with_write(move |conn: &mut Connection| {\n        conn.execute(sql, params)\n    })\n}\n",
+            Some("Connection"),
+        ),
+        (
+            "untyped closure parameter of a declared provider",
+            "pub fn f() {\n    with_connection(config, |conn| {\n        conn.execute(sql, params)\n    })\n}\n",
+            Some("Connection"),
+        ),
+        (
+            "untyped closure parameter of an undeclared helper",
+            "pub fn f() {\n    with_tools(config, |conn| {\n        conn.execute(sql, params)\n    })\n}\n",
+            None,
+        ),
+        (
+            "declared producer expression",
+            "pub fn f() {\n    let tx = conn.transaction()?;\n    tx.execute(sql, params)?;\n}\n",
+            Some(".transaction()"),
+        ),
+        (
+            "plain move of an existing value",
+            "pub fn f() {\n    let tx = chosen_tool;\n    tx.execute(args).await;\n}\n",
+            None,
+        ),
+        (
+            "wrapper type around a Tool",
+            "pub fn f() {\n    let conn: Arc<dyn Tool> = resolve();\n    conn.execute(args).await;\n}\n",
+            None,
+        ),
+        (
+            "field receiver",
+            "pub fn f(&self) {\n    self.conn.execute(sql, params)?;\n}\n",
+            None,
+        ),
+    ];
+    for (label, source, expected) in cases {
+        let scan = scan_tool_executions("src/example.rs", source);
+        assert_eq!(scan.sites.len(), 1, "{label}: {:?}", scan.sites);
+        assert_eq!(
+            scan.sites[0].non_tool_binding.as_deref(),
+            *expected,
+            "{label} resolved to the wrong binding: {:?}",
+            scan.sites[0]
+        );
+    }
+}
+
+/// Every reviewed non-`Tool` call site still matches exactly the calls it
+/// declares, on the real tree.
+#[test]
+fn non_tool_execute_call_sites_match_their_declared_occurrences() {
+    let scan = scan_repository_tool_executions();
+    let errors = non_tool_call_site_errors(&scan.sites, NON_TOOL_EXECUTE_CALL_SITES);
+    assert!(
+        errors.is_empty(),
+        "NON_TOOL_EXECUTE_CALL_SITES is out of date:\n{}",
+        errors.join("\n")
+    );
+}
+
+/// The occurrence rule itself: an extra identical call, a vanished call site and
+/// a duplicate entry all have to be reported, or the exception list would be a
+/// name exemption wearing a longer key.
+#[test]
+fn the_occurrence_rule_reports_extra_calls_stale_entries_and_duplicates() {
+    let exception = NonToolCallSite {
+        entry: "src/example.rs::handler",
+        receiver: "service",
+        occurrences: 1,
+        evidence_file: "src/example.rs",
+        evidence: "service: Option<&ToolExecutionService>",
+        reason: "synthetic fixture for the occurrence rule, long enough to pass the reason check",
+    };
+
+    let one = scan_tool_executions(
+        "src/example.rs",
+        "pub async fn handler() {\n    let _ = service.execute(args).await;\n}\n",
+    );
+    assert!(non_tool_call_site_errors(&one.sites, &[exception]).is_empty());
+
+    let two = scan_tool_executions(
+        "src/example.rs",
+        "pub async fn handler() {\n    let _ = service.execute(args).await;\n    let _ = service.execute(args).await;\n}\n",
+    );
+    let errors = non_tool_call_site_errors(&two.sites, &[exception]);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("declares 1 `execute` call(s) but the tree now has 2")),
+        "a second identical call must not be absorbed by the first: {errors:?}"
+    );
+
+    let twin = scan_tool_executions(
+        "src/example.rs",
+        "pub async fn handler() {\n    let _ = service.execute(args).await;\n    let _ = service.execute_with_cancellation(args, None).await;\n}\n",
+    );
+    assert!(
+        non_tool_call_site_errors(&twin.sites, &[exception])
+            .iter()
+            .any(|error| error.contains("the tree now has 2")),
+        "the cancellation twin counts as its own call"
+    );
+
+    let moved = scan_tool_executions(
+        "src/example.rs",
+        "pub async fn other_handler() {\n    let _ = service.execute(args).await;\n}\n",
+    );
+    assert!(
+        non_tool_call_site_errors(&moved.sites, &[exception])
+            .iter()
+            .any(|error| error.contains("no longer matches any `execute` call site")),
+        "an exception whose call site moved must go stale"
+    );
+
+    assert!(
+        non_tool_call_site_errors(&one.sites, &[exception, exception])
+            .iter()
+            .any(|error| error.contains("is listed twice")),
+        "a duplicated exception must be reported"
+    );
+
+    let proven = scan_tool_executions(
+        "src/example.rs",
+        "pub async fn handler(service: &Connection) {\n    let _ = service.execute(sql, params)?;\n}\n",
+    );
+    assert!(
+        non_tool_call_site_errors(&proven.sites, &[exception])
+            .iter()
+            .any(|error| error.contains("no longer matches any `execute` call site")),
+        "an exception the binding rule now covers is redundant and must be reported"
+    );
+}
+
+/// Every reviewed call site points at a declaration that is still in the source
+/// and that names a type the tables know is not a `Tool`.
+#[test]
+fn every_non_tool_execute_call_site_shows_its_type_evidence() {
+    for exception in NON_TOOL_EXECUTE_CALL_SITES {
+        let source = fs::read_to_string(repository_root().join(exception.evidence_file))
+            .unwrap_or_else(|error| panic!("read {}: {error}", exception.evidence_file));
+        let production = strip_cfg_test_items(&blank_comments_and_literals(&source));
+        assert!(
+            production.contains(exception.evidence),
+            "{} / {} cites {:?} in {} but that declaration is gone",
+            exception.entry,
+            exception.receiver,
+            exception.evidence,
+            exception.evidence_file
+        );
+        assert!(
+            NON_TOOL_RECEIVER_TYPES
+                .iter()
+                .any(|(name, _)| contains_identifier(exception.evidence, name)),
+            "{} / {} cites {:?}, which names no type in NON_TOOL_RECEIVER_TYPES",
+            exception.entry,
+            exception.receiver,
+            exception.evidence
+        );
+    }
+}
+
+/// Every closure provider still hands out the type the table claims.
+#[test]
+fn non_tool_closure_providers_match_their_definitions() {
+    let mut sources = Vec::new();
+    for path in rust_source_files() {
+        let source = fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {}: {error}", relative_path(&path)));
+        sources.push((
+            relative_path(&path),
+            strip_cfg_test_items(&blank_comments_and_literals(&source)),
+        ));
+    }
+
+    for (provider, parameter, reason) in NON_TOOL_CLOSURE_PROVIDERS {
+        assert!(
+            NON_TOOL_RECEIVER_TYPES.iter().any(|(name, _)| name == parameter),
+            "{provider} claims to hand out {parameter}, which is not a declared non-tool type"
+        );
         assert!(
             reason.len() > 20,
-            "{receiver} needs a reason naming the type whose `execute` this is, not {reason:?}"
+            "{provider} needs a reason naming the store it belongs to, not {reason:?}"
+        );
+        let needle = format!("fn {provider}");
+        let mut definitions = 0usize;
+        for (relative, source) in &sources {
+            for (offset, _) in source.match_indices(&needle) {
+                if source[offset + needle.len()..].starts_with(|c: char| is_ident_char(c)) {
+                    continue;
+                }
+                let signature = source[offset..]
+                    .split_once('{')
+                    .map_or_else(|| source[offset..].to_string(), |(head, _)| head.to_string());
+                assert!(
+                    signature.contains("FnOnce(") && contains_identifier(&signature, parameter),
+                    "{relative} defines `{provider}` but its closure parameter is not a \
+                     {parameter}: {}",
+                    normalize_line(&signature)
+                );
+                definitions += 1;
+            }
+        }
+        assert!(
+            definitions > 0,
+            "{provider} is declared as a non-tool closure provider but no production function \
+             defines it; remove the entry instead of leaving a standing exemption"
+        );
+    }
+}
+
+/// The two type tables are review records, so they carry reasons and no entry
+/// appears twice.
+#[test]
+fn the_non_tool_receiver_tables_are_reviewable() {
+    let mut types = BTreeSet::new();
+    for (name, reason) in NON_TOOL_RECEIVER_TYPES {
+        assert!(types.insert(*name), "{name} is listed twice in NON_TOOL_RECEIVER_TYPES");
+        assert!(
+            reason.len() > 20,
+            "{name} needs a reason naming the crate its `execute` comes from, not {reason:?}"
+        );
+    }
+    let mut producers = BTreeSet::new();
+    for (pattern, reason) in NON_TOOL_RECEIVER_PRODUCERS {
+        assert!(
+            producers.insert(*pattern),
+            "{pattern} is listed twice in NON_TOOL_RECEIVER_PRODUCERS"
+        );
+        assert!(
+            reason.len() > 20,
+            "{pattern} needs a reason naming the type it yields, not {reason:?}"
+        );
+        assert!(
+            pattern.contains('(') || pattern.contains("::"),
+            "{pattern} must be a call expression, not a bare name that any variable could carry"
         );
     }
 }
@@ -1839,20 +2854,4 @@ mod tests {
         "a literal must not end the scan early: {:?}",
         scan.sites
     );
-}
-
-/// The escape hatch is exactly as wide as `NON_TOOL_EXECUTE_RECEIVERS` says.
-#[test]
-fn only_listed_non_tool_receivers_escape_the_inventory() {
-    let source =
-        "pub async fn handler() {\n    conn.execute(sql, params)?;\n    let _ = database.execute(sql, params)?;\n}\n";
-    let scan = scan_tool_executions("src/gateway/api/channels.rs", source);
-    assert_eq!(
-        scan.sites.len(),
-        1,
-        "an unlisted receiver must fail closed and appear in the inventory: {:?}",
-        scan.sites
-    );
-    assert_eq!(scan.sites[0].form, "database.execute(...)");
-    assert!(scan.excluded_receivers.contains("conn"));
 }
