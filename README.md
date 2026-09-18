@@ -111,6 +111,7 @@ cargo build --release --locked --bin prx
 | [WASM Plugins](docs/plugin-developer-guide.md) | Plugin developer guide (Rust/Python/JS/Go) |
 | [Host Function Reference](docs/host-function-reference.md) | WASM plugin host API reference |
 | [Plugin Runtime Lifecycle](docs/plugin-runtime-lifecycle.md) | Atomic generations, subscriber pumps, trust and hook bounds |
+| [Release Gate](docs/release-gate.md) | Exact-SHA CI/security gate that guards release publication |
 
 ## Links
 

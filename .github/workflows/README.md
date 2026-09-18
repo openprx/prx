@@ -26,4 +26,5 @@ Current workflow helper scripts:
 - `.github/workflows/scripts/pr_check_status_nudge.js`
 - `.github/workflows/scripts/pr_intake_checks.js`
 - `.github/workflows/scripts/pr_labeler.js`
+- `.github/workflows/scripts/release_gate.py` (fixtures and tests live beside it)
 - `.github/workflows/scripts/test_benchmarks_pr_comment.js`

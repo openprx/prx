@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.144] - 18 September 2026
+
+### Changed
+
+- Release publication is now gated on the exact tag SHA: a new `release-gate` job
+  reads the newest completed `CI Run` and `Sec Audit` runs for that commit and
+  fails closed when any required job is missing, skipped, failed, cancelled, or
+  still running after a bounded wait. The decision logic lives in
+  `.github/workflows/scripts/release_gate.py` with recorded fixtures and a local
+  test runner (`scripts/ci/release_gate_tests.sh`). The gate job requests
+  `actions: read`. See `docs/release-gate.md`.
+
 ## [0.8.143] - 17 September 2026
 
 ### Fixed

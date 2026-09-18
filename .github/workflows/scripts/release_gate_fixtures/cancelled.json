@@ -1,0 +1,148 @@
+{
+  "_note": "CI Run cancelled on the release SHA (concurrency cancel-in-progress).",
+  "sha": "9ca7acd52e55a602aab8588d293088d42d6b052f",
+  "runs": [
+    {
+      "id": 35308881609,
+      "name": "CI Run",
+      "head_sha": "9ca7acd52e55a602aab8588d293088d42d6b052f",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "run_attempt": 1,
+      "run_started_at": "2026-09-18T04:56:36Z",
+      "event": "push",
+      "html_url": "https://github.com/openprx/prx/actions/runs/35308881609"
+    },
+    {
+      "id": 35308924283,
+      "name": "Sec Audit",
+      "head_sha": "9ca7acd52e55a602aab8588d293088d42d6b052f",
+      "status": "completed",
+      "conclusion": "success",
+      "run_attempt": 1,
+      "run_started_at": "2026-09-18T04:57:30Z",
+      "event": "push",
+      "html_url": "https://github.com/openprx/prx/actions/runs/35308924283"
+    }
+  ],
+  "jobs": {
+    "35308881609": [
+      {
+        "id": 105486591077,
+        "name": "Installer and Toolchain Contracts",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 105486591220,
+        "name": "Detect Change Scope",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 105486591324,
+        "name": "Windows Installer Contract",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 105486623013,
+        "name": "Lint Gate (Format + Clippy + Strict Delta)",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 105486623016,
+        "name": "Docs Quality",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 105486623024,
+        "name": "Build (Smoke)",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 105486623038,
+        "name": "Windows Check",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 105486623795,
+        "name": "Workflow Owner Approval",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "id": 105486623899,
+        "name": "Docs-Only Fast Path",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "id": 105486624101,
+        "name": "Non-Rust Fast Path",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "id": 105488304061,
+        "name": "Test",
+        "status": "completed",
+        "conclusion": "cancelled"
+      },
+      {
+        "id": 105488304862,
+        "name": "Lint Feedback",
+        "status": "completed",
+        "conclusion": "skipped"
+      }
+    ],
+    "35308924283": [
+      {
+        "id": 105486767256,
+        "name": "Security Audit",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 105486767340,
+        "name": "License & Supply Chain (bans licenses sources)",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 105486767343,
+        "name": "License & Supply Chain (advisories)",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 105486767348,
+        "name": "Miri UB Smoke",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 105486767904,
+        "name": "Fuzz Smoke",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "id": 105486768021,
+        "name": "Mutation Smoke",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "id": 105486792087,
+        "name": "Coverage",
+        "status": "completed",
+        "conclusion": "skipped"
+      }
+    ]
+  }
+}
