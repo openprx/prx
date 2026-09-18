@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.155] - 18 September 2026
+
+### Fixed
+
+- A chat session that reports on an assignment the operator has already
+  killed is now refused with `assignment_cancelled` (HTTP 409) carrying the
+  cancellation summary, instead of being answered with the operator's result
+  sequence as if its own report had been recorded. Genuine replays of the
+  session's own report still return the original sequence.
+- The mailbox pull samples the poll counter and the wall clock inside the
+  critical section that mints the ordering revision, so a higher revision can
+  never carry a lower poll count.
+- The MCP rate limiter keeps each caller's window across configuration
+  reloads; changing `mcp_server.rate_limit_rps` adopts the new budget in place
+  instead of resetting every caller.
+- Tests: the discovery-routing exclusion tests use a registry where discovery
+  would expose an excluded tool, so they fail if exclusions stop outranking
+  discovery; the gateway mailbox contention test restores the process store it
+  swaps in.
+
 ## [0.8.154] - 18 September 2026
 
 ### Fixed

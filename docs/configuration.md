@@ -645,6 +645,12 @@ chat that tried anyway would announce a refusal on every start.
   `{workspace}/state/chat-mailbox.db` and the chat carries on pulling with the
   same session id and token. If the file *is* removed, the pull is refused with
   `unknown_session` and the chat registers again by itself on its next poll.
+- **A report of work that was killed is refused, not acknowledged.** Reporting an
+  assignment twice answers with the original sequence, so a retry after a lost
+  response is safe. Reporting one an operator killed in the meantime is answered
+  `409` with code `assignment_cancelled` and the reason the work ended: the
+  cancellation already stands in the result feed, and the late report is neither
+  recorded as a second result nor silently acknowledged as the session's own.
 
 The three dispositions map onto paths chat already had: `queue` joins the input
 backlog, `steer` joins it in front (the same place `/now` puts a typed line),

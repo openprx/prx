@@ -22,6 +22,13 @@ const TIERING_DRAFT: &str = "tool-tiering-draft";
 const CORE_TOOL: &str = "tiering_core_probe";
 const EXTENDED_TOOL: &str = "tiering_extended_probe";
 const WEB_TOOL: &str = "tiering_web_probe";
+/// A second Extended-tier probe in a category none of the routed fixtures name.
+///
+/// It exists so an exclusion assertion on a discovery turn is not vacuous: with
+/// `WEB_TOOL` excluded and nothing else at Extended tier that the routed turn
+/// misses, the discovery surface and the routed surface are the same set, and
+/// the assertion passes whether discovery ran or not.
+const MEDIA_TOOL: &str = "tiering_media_probe";
 
 /// Records the tool catalog the provider was offered for the turn.
 struct CatalogRecordingProvider {
@@ -144,6 +151,11 @@ fn probe_registry() -> Arc<Vec<Box<dyn Tool>>> {
             name: WEB_TOOL,
             tier: ToolTier::Extended,
             categories: &[ToolCategory::WebBrowsing],
+        }) as Box<dyn Tool>,
+        Box::new(TierProbeTool {
+            name: MEDIA_TOOL,
+            tier: ToolTier::Extended,
+            categories: &[ToolCategory::Media],
         }) as Box<dyn Tool>,
     ])
 }
@@ -429,6 +441,18 @@ async fn a_substantive_unrouted_turn_discovers_capabilities_through_the_driver()
 
 /// Operator policy still wins on a discovery turn: an excluded tool is never
 /// published, whatever the turn looks like.
+///
+/// Both halves are asserted against tools that behave differently, because an
+/// assertion that only names the excluded tool cannot fail for the right
+/// reason: a registry whose only unrouted Extended tool is the excluded one
+/// publishes the same set whether discovery ran or not. `MEDIA_TOOL` is
+/// published only by discovery, `WEB_TOOL` only by a discovery that ignored
+/// `always_exclude`.
+///
+/// MUTATION GUARD: resolve the `PublishEverything` branch of
+/// `resolve_tools_for_intent` with `full_tool_surface(all_tools, &[])` and
+/// `WEB_TOOL` is offered; make `unrouted_turn_requests_discovery` answer
+/// `false` and `MEDIA_TOOL` is not.
 #[tokio::test]
 async fn a_discovery_turn_cannot_publish_an_excluded_tool_through_the_driver() {
     let base = crate::config::ToolTieringConfig {
@@ -442,8 +466,19 @@ async fn a_discovery_turn_cannot_publish_an_excluded_tool_through_the_driver() {
         routed.iter().any(|name| name == EXTENDED_TOOL),
         "the routed turn must reach the automation probe: {routed:?}"
     );
+    // Fixture self-check: the session is narrower than the allowed catalog, so
+    // the discovery assertion below has something to widen to.
+    assert!(
+        !routed.iter().any(|name| name == MEDIA_TOOL),
+        "the routed turn must not reach the media probe: {routed:?}"
+    );
 
     let discovery = offered_tools_for_session(&exposure, SUBSTANTIVE_UNROUTED_REQUEST, &base).await;
+    assert!(
+        discovery.iter().any(|name| name == MEDIA_TOOL),
+        "the discovery turn must publish what operator policy allows, or this test cannot tell a withheld \
+         tool from a discovery that never ran: {discovery:?}"
+    );
     assert!(
         !discovery.iter().any(|name| name == WEB_TOOL),
         "always_exclude outranks discovery: {discovery:?}"

@@ -59,6 +59,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -247,7 +248,11 @@ const RATE_LIMITER_SWEEP_INTERVAL_SECS: u64 = 300; // 5 minutes
 
 #[derive(Debug)]
 struct SlidingWindowRateLimiter {
-    limit_per_window: u32,
+    /// The budget, re-readable at runtime so a configuration reload can adopt a
+    /// new one **without** discarding the windows already recorded. Rebuilding
+    /// the limiter instead would hand every caller a fresh window, which is
+    /// precisely the moment a throttled caller must not be allowed to burst.
+    limit_per_window: AtomicU32,
     window: Duration,
     max_keys: usize,
     requests: Mutex<(HashMap<String, Vec<Instant>>, Instant)>,
@@ -256,11 +261,21 @@ struct SlidingWindowRateLimiter {
 impl SlidingWindowRateLimiter {
     fn new(limit_per_window: u32, window: Duration, max_keys: usize) -> Self {
         Self {
-            limit_per_window,
+            limit_per_window: AtomicU32::new(limit_per_window),
             window,
             max_keys: max_keys.max(1),
             requests: Mutex::new((HashMap::new(), Instant::now())),
         }
+    }
+
+    /// The budget this limiter currently enforces.
+    fn limit_per_window(&self) -> u32 {
+        self.limit_per_window.load(Ordering::Relaxed)
+    }
+
+    /// Adopt a new budget, keeping every recorded window.
+    fn set_limit_per_window(&self, limit_per_window: u32) {
+        self.limit_per_window.store(limit_per_window, Ordering::Relaxed);
     }
 
     fn prune_stale(requests: &mut HashMap<String, Vec<Instant>>, cutoff: Instant) {
@@ -271,7 +286,8 @@ impl SlidingWindowRateLimiter {
     }
 
     fn allow(&self, key: &str) -> bool {
-        if self.limit_per_window == 0 {
+        let limit_per_window = self.limit_per_window();
+        if limit_per_window == 0 {
             return true;
         }
 
@@ -310,7 +326,7 @@ impl SlidingWindowRateLimiter {
         let entry = requests.entry(key.to_owned()).or_default();
         entry.retain(|instant| *instant > cutoff);
 
-        if entry.len() >= self.limit_per_window as usize {
+        if entry.len() >= limit_per_window as usize {
             return false;
         }
 

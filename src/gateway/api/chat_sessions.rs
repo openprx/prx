@@ -44,6 +44,10 @@ fn refusal(status: StatusCode, detail: impl Into<String>) -> Refusal {
 fn into_refusal(error: &ChatSessionError) -> Refusal {
     let status = match error {
         ChatSessionError::UnknownSession | ChatSessionError::UnknownAssignment => StatusCode::NOT_FOUND,
+        // The assignment existed and this session held it; what changed is that
+        // somebody else ended it first. That is a conflict, not a missing row,
+        // and a client must be able to tell the two apart without reading prose.
+        ChatSessionError::AssignmentCancelled { .. } => StatusCode::CONFLICT,
         ChatSessionError::BadToken => StatusCode::UNAUTHORIZED,
         ChatSessionError::NotAuthorized { .. } => StatusCode::FORBIDDEN,
         ChatSessionError::Invalid(_) => StatusCode::BAD_REQUEST,
@@ -1256,45 +1260,27 @@ mod tests {
         server.abort();
     }
 
-    /// A store that accepts everything and keeps nothing.
+    /// Puts the process mailbox's store back when the test that borrowed it
+    /// ends, panic or not.
     ///
-    /// The process mailbox is a global, so a test that attaches a real store
-    /// under a temporary directory has to leave it attached to something that
-    /// outlives the directory; this is that something.
-    struct QuietStore;
+    /// The mailbox the gateway handlers address is a process global. A test
+    /// that attaches its own store to it and walks away leaves every test that
+    /// runs afterwards — in the same binary, under default parallelism —
+    /// writing through a store this test owns, whose temporary directory is
+    /// already gone. Restoring on drop keeps the interference to the window the
+    /// test is actually running in.
+    struct RestoreProcessStore(Option<Arc<dyn chat_sessions::MailboxStore>>);
 
-    impl chat_sessions::MailboxStore for QuietStore {
-        fn hydrate(&self) -> anyhow::Result<chat_sessions::StoredState> {
-            Ok(chat_sessions::StoredState::default())
+    impl RestoreProcessStore {
+        /// Attach `store` to the process mailbox until the guard is dropped.
+        fn attach(store: Arc<dyn chat_sessions::MailboxStore>) -> Self {
+            Self(chat_sessions::swap_store(Some(store)))
         }
-        fn insert_session(&self, _session: &chat_sessions::StoredSession) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn record_poll(&self, _session_id: &str, _polls: u64, _at_unix_ms: u64, _revision: u64) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn enqueue(&self, _assignment: &chat_sessions::StoredAssignment, _at_front: bool) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn move_to_queue(
-            &self,
-            _assignment_id: &str,
-            _queue: chat_sessions::Queue,
-            _deliveries: u32,
-            _to_front: bool,
-            _revision: u64,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn complete_assignment(
-            &self,
-            _assignment_id: &str,
-            _result: &chat_sessions::StoredResult,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn cascade_session(&self, _session_id: &str, _results: &[chat_sessions::StoredResult]) -> anyhow::Result<()> {
-            Ok(())
+    }
+
+    impl Drop for RestoreProcessStore {
+        fn drop(&mut self) {
+            let _previous = chat_sessions::swap_store(self.0.take());
         }
     }
 
@@ -1316,7 +1302,7 @@ mod tests {
         let workspace = TempDir::new().expect("test: workspace");
         let db = workspace.path().join("state").join("chat-mailbox.db");
         let store = chat_sessions::SqliteMailboxStore::open(&db).expect("test: open the mailbox store");
-        chat_sessions::attach_store(Arc::new(store));
+        let _restore = RestoreProcessStore::attach(Arc::new(store));
 
         let config = config_with(workspace.path(), vec![], &[]);
         let (base_url, server) = serve(test_app_state(config)).await;
@@ -1367,9 +1353,6 @@ mod tests {
             let _ = pull.await;
         }
         server.abort();
-        // Leave the process mailbox on a store that cannot outlive this
-        // workspace directory.
-        chat_sessions::attach_store(Arc::new(QuietStore));
 
         let (status, body) = listed.expect("an unrelated request must still be answered while the mailbox is locked");
         assert_eq!(status, 200, "test: body was {body}");

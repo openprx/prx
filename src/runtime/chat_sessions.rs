@@ -396,6 +396,11 @@ pub enum ChatSessionError {
     NotAuthorized { principal: String, session_ref: String },
     /// No such assignment is outstanding for this session.
     UnknownAssignment,
+    /// The assignment was ended from outside — an operator killed its work row
+    /// — before this report arrived. The cancellation is already in the result
+    /// feed, so the report is refused rather than recorded as a second, and
+    /// contradictory, completion.
+    AssignmentCancelled { summary: String },
     /// The request itself was malformed.
     Invalid(String),
 }
@@ -416,6 +421,7 @@ impl ChatSessionError {
             Self::BadToken => "bad_token",
             Self::NotAuthorized { .. } => "not_authorized",
             Self::UnknownAssignment => "unknown_assignment",
+            Self::AssignmentCancelled { .. } => "assignment_cancelled",
             Self::Invalid(_) => "invalid_request",
         }
     }
@@ -446,6 +452,11 @@ impl std::fmt::Display for ChatSessionError {
             Self::UnknownAssignment => write!(
                 f,
                 "that assignment is not outstanding for this session; it was already reported, killed, or never existed"
+            ),
+            Self::AssignmentCancelled { summary } => write!(
+                f,
+                "that assignment was cancelled before this report arrived ({summary}); the cancellation is already \
+                 in the result feed and this report was not recorded"
             ),
             Self::Invalid(detail) => write!(f, "{detail}"),
         }
@@ -834,6 +845,19 @@ fn bounded(value: &str, field: &str, limit: usize) -> Result<String, ChatSession
 /// memory in that case, exactly as it did before there was a store at all.
 pub fn attach_store(store: Arc<dyn MailboxStore>) {
     SESSIONS.attach_store(store);
+}
+
+/// Put a store on the process mailbox and hand back the one it had.
+///
+/// Test-only, and deliberately not a hydration: it exists so a test that has to
+/// exercise the *process* registry — the gateway handlers address it through
+/// [`SESSIONS`] and have no other registry to address — can put back exactly
+/// what it found and leave the global as it was for every other test in the
+/// binary. A test that attaches a store under a temporary directory and walks
+/// away leaves every later test writing into a file that no longer exists.
+#[cfg(test)]
+pub(crate) fn swap_store(store: Option<Arc<dyn MailboxStore>>) -> Option<Arc<dyn MailboxStore>> {
+    std::mem::replace(&mut *SESSIONS.store.write(), store)
 }
 
 /// Open the mailbox database under a workspace and attach it.
@@ -1520,13 +1544,20 @@ impl ChatSessions {
         authenticate(&session, token)?;
         let max = max.unwrap_or(DEFAULT_PULL_BATCH).clamp(1, MAX_PULL_BATCH);
 
-        let polls = session.polls.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-        let now_unix_ms = unix_ms();
         // Every write this pull owes the store, planned under the lock and
         // executed after it. See [`PendingWrite`].
         let mut pending: Vec<PendingWrite> = Vec::new();
         let pulled = {
             let mut state = session.state.lock();
+            // Counted and clocked **inside** the lock that mints the revision,
+            // because the revision is what orders the write. Sampled outside
+            // it, two overlapping pulls can pair the lower count with the
+            // higher revision — the pull that incremented first takes the lock
+            // second — and the store's revision guard then keeps the lower
+            // count, rolling the persisted liveness backwards. Value order and
+            // revision order have to be the same order.
+            let polls = session.polls.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+            let now_unix_ms = unix_ms();
             state.last_poll = Some(LastPoll::Observed(Instant::now()));
             // The evidence of liveness is persisted with the pull that produced it,
             // so a session restored after a restart is as old as its last real pull
@@ -1745,15 +1776,27 @@ impl ChatSessions {
         };
 
         let Some(assignment) = assignment else {
-            // Not outstanding. Either this session never held it — the refusal
-            // it has always been — or this *is* the report, arriving a second
-            // time because the first answer was lost in flight. A chat that is
-            // told to retry a report it already made must not be told the work
-            // is unknown, and must not mint a second completion sequence for
-            // it, so the recorded result answers the replay.
-            return self
-                .replayed_result(&session.id, assignment_id)
-                .ok_or(ChatSessionError::UnknownAssignment);
+            // Not outstanding. Three different things look identical from here,
+            // and only the recorded result tells them apart:
+            //
+            // - this *is* the report, arriving a second time because the first
+            //   answer was lost in flight. A chat that is told to retry a report
+            //   it already made must not be told the work is unknown, and must
+            //   not mint a second completion sequence for it, so the recorded
+            //   result answers the replay;
+            // - the assignment was ended from outside while the session was
+            //   still working on it. The record under this id is then a
+            //   cancellation this session never authored, and answering the
+            //   report with its sequence would call an operator's kill a
+            //   successful report and drop the session's own status and summary
+            //   on the floor;
+            // - this session never held it, which is the refusal it has always
+            //   been.
+            return match self.recorded_result(&session.id, assignment_id) {
+                Some((_, ResultStatus::Cancelled, summary)) => Err(ChatSessionError::AssignmentCancelled { summary }),
+                Some((seq, _, _)) => Ok(seq),
+                None => Err(ChatSessionError::UnknownAssignment),
+            };
         };
 
         // Retirement and result are one commit. Written separately, a failure
@@ -1767,18 +1810,25 @@ impl ChatSessions {
         Ok(self.publish_result(entry))
     }
 
-    /// The sequence a previous report of this assignment was recorded under.
+    /// The result already recorded for this assignment: its sequence, what it
+    /// says, and why.
+    ///
+    /// The status is what distinguishes a replay of the session's own report
+    /// from a cancellation recorded against the same pair of ids by an operator
+    /// kill or a deregistration cascade — [`ResultStatus::Cancelled`] is this
+    /// runtime's own verdict and [`ResultStatus::parse`] refuses it on the
+    /// wire, so no session can ever have authored one.
     ///
     /// Bounded by the feed's retention: a replay that arrives after the record
     /// has been trimmed is still refused as unknown, which is honest — the
     /// answer it is asking for no longer exists to be handed back.
-    fn replayed_result(&self, session_id: &str, assignment_id: &str) -> Option<u64> {
+    fn recorded_result(&self, session_id: &str, assignment_id: &str) -> Option<(u64, ResultStatus, String)> {
         let log = self.results.lock();
         log.entries
             .iter()
             .rev()
             .find(|entry| entry.assignment_id == assignment_id && entry.session_id == session_id)
-            .map(|entry| entry.seq)
+            .map(|entry| (entry.seq, entry.status, entry.summary.clone()))
     }
 
     /// Reserve a sequence and build the two forms of one finished assignment:
@@ -3723,5 +3773,267 @@ mod tests {
             elapsed < budget.mul_f32(1.5),
             "one pull must spend one contention budget ({budget:?}), not one per write: took {elapsed:?}"
         );
+    }
+
+    /// F-01 (R03): a report of work an operator killed is **not** a replay of
+    /// this session's own report.
+    ///
+    /// The kill records a `Cancelled` result under the same
+    /// `(assignment_id, session_id)` pair the replay path matches on, so the
+    /// late report used to be answered `Ok(seq)` — the operator's kill handed
+    /// back as the session's own receipt, with the session's real status and
+    /// summary dropped on the floor. The session is now told what actually
+    /// happened, and the feed still carries exactly one record for the
+    /// assignment.
+    ///
+    /// The second half of the test keeps R03's guarantee honest: a genuine
+    /// replay of a report the session did make still answers with the original
+    /// sequence and mints nothing new.
+    ///
+    /// MUTATION GUARD: answer the `Cancelled` arm of `report`'s
+    /// `recorded_result` match with `Ok(seq)` and the refusal assertions go
+    /// red; refuse every recorded result instead and the replay assertion does.
+    #[tokio::test]
+    async fn a_report_of_killed_work_is_refused_instead_of_replaying_the_cancellation() {
+        let sessions = Arc::new(ChatSessions::new());
+        let registration = sessions.register(LABEL, None).expect("test: registration");
+        let assign = |task: &str| {
+            sessions
+                .assign(
+                    &operator_policy(),
+                    &AssignPrincipal::operator_plane(),
+                    &registration.session_id,
+                    task,
+                    Disposition::Queue,
+                )
+                .expect("test: assignment accepted")
+        };
+        let killed = assign("inspect fixture");
+        let reported = assign("inspect the other fixture");
+
+        // Both are delivered and acknowledged: the session holds them and owes
+        // a report on each.
+        sessions
+            .pull(&registration.session_id, &registration.token, &[], Some(2))
+            .expect("test: delivery");
+        let acked = sessions
+            .pull(
+                &registration.session_id,
+                &registration.token,
+                &[killed.assignment_id.clone(), reported.assignment_id.clone()],
+                Some(2),
+            )
+            .expect("test: acknowledgement");
+        assert_eq!(acked.acked, 2);
+
+        // An operator kills the first one out from under the session.
+        let session = sessions
+            .find(&registration.session_id)
+            .expect("test: the session is registered");
+        sessions.discard(&session, &killed.assignment_id);
+
+        let error = sessions
+            .report(
+                &registration.session_id,
+                &registration.token,
+                &killed.assignment_id,
+                ResultStatus::Completed,
+                "fixture checked",
+            )
+            .expect_err("a report of work an operator killed must not be answered as a replay");
+        let ChatSessionError::AssignmentCancelled { summary } = &error else {
+            panic!("test: expected a cancellation refusal, got {error:?}");
+        };
+        assert!(
+            summary.contains("killed by an operator"),
+            "the refusal must carry why the work ended: {summary}"
+        );
+        assert_eq!(error.code(), "assignment_cancelled");
+
+        // The genuine replay path is untouched: a report the session really
+        // made answers with its original sequence, however often it is retried.
+        let first = sessions
+            .report(
+                &registration.session_id,
+                &registration.token,
+                &reported.assignment_id,
+                ResultStatus::Completed,
+                "the other fixture is fine",
+            )
+            .expect("test: the session's own report");
+        let replay = sessions
+            .report(
+                &registration.session_id,
+                &registration.token,
+                &reported.assignment_id,
+                ResultStatus::Completed,
+                "the other fixture is fine",
+            )
+            .expect("test: a replay of the session's own report");
+        assert_eq!(replay, first, "a genuine replay answers with the original sequence");
+
+        // One record per assignment: the refusal minted no second completion,
+        // and the replay minted no duplicate.
+        let feed = sessions.results_after(0, RESULT_LOG_CAPACITY).results;
+        let killed_records = feed
+            .iter()
+            .filter(|result| result.assignment_id == killed.assignment_id)
+            .map(|result| (result.status, result.summary.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            killed_records.len(),
+            1,
+            "the refused report must not add a second record: {killed_records:?}"
+        );
+        assert_eq!(
+            killed_records.first().map(|(status, _)| *status),
+            Some(ResultStatus::Cancelled),
+            "the record that stands is the operator's cancellation"
+        );
+        assert_eq!(
+            feed.iter()
+                .filter(|result| result.assignment_id == reported.assignment_id)
+                .count(),
+            1,
+            "a replayed report must not duplicate the record either"
+        );
+    }
+
+    /// F-05 (R01): a pull counts itself and reads the clock **inside** the lock
+    /// that mints the revision ordering its write.
+    ///
+    /// Sampled before the lock, two overlapping pulls can pair the lower poll
+    /// count with the higher revision — the pull that incremented first takes
+    /// the lock second — and the store's revision guard then keeps the lower
+    /// count, rolling the persisted liveness backwards.
+    ///
+    /// Two halves, because a race needs both a deterministic reproduction and
+    /// the invariant it violates. The first holds the state lock and proves the
+    /// counter cannot move without it. The second runs overlapping pulls and
+    /// pins the invariant itself: ordered by revision, the poll counts are
+    /// exactly `1..=n` and the clock never runs backwards.
+    ///
+    /// MUTATION GUARD: move the `polls.fetch_add` and the `unix_ms()` sample
+    /// back above `session.state.lock()` and the first half goes red at once.
+    #[tokio::test]
+    async fn a_pull_counts_itself_under_the_lock_that_orders_its_write() {
+        /// Records what each pull asked the store to persist about liveness.
+        struct RecordingStore {
+            polls: Mutex<Vec<(u64, u64, u64)>>,
+        }
+
+        impl MailboxStore for RecordingStore {
+            fn hydrate(&self) -> anyhow::Result<StoredState> {
+                Ok(StoredState::default())
+            }
+            fn insert_session(&self, _session: &StoredSession) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn record_poll(&self, _session_id: &str, polls: u64, at_unix_ms: u64, revision: u64) -> anyhow::Result<()> {
+                self.polls.lock().push((revision, polls, at_unix_ms));
+                Ok(())
+            }
+            fn enqueue(&self, _assignment: &StoredAssignment, _at_front: bool) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn move_to_queue(
+                &self,
+                _assignment_id: &str,
+                _queue: Queue,
+                _deliveries: u32,
+                _to_front: bool,
+                _revision: u64,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn complete_assignment(&self, _assignment_id: &str, _result: &StoredResult) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn cascade_session(&self, _session_id: &str, _results: &[StoredResult]) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let store = Arc::new(RecordingStore {
+            polls: Mutex::new(Vec::new()),
+        });
+        let sessions = Arc::new(ChatSessions::new());
+        sessions.attach_store(Arc::clone(&store) as Arc<dyn MailboxStore>);
+        let registration = sessions.register(LABEL, None).expect("test: registration");
+        let session = sessions
+            .find(&registration.session_id)
+            .expect("test: the session is registered");
+
+        // Half one, deterministic: while the state lock is held here, no pull
+        // may count itself, because the count belongs to the same critical
+        // section as the revision that orders it.
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let blocked = {
+            let guard = session.state.lock();
+            let blocked = {
+                let sessions = Arc::clone(&sessions);
+                let started = Arc::clone(&started);
+                let session_id = registration.session_id.clone();
+                let token = registration.token.clone();
+                std::thread::spawn(move || {
+                    started.store(true, Ordering::SeqCst);
+                    sessions.pull(&session_id, &token, &[], Some(1))
+                })
+            };
+            while !started.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            // Long enough that a pull sampling its counter before the lock has
+            // finished doing so many times over.
+            std::thread::sleep(Duration::from_millis(200));
+            assert_eq!(
+                session.polls.load(Ordering::Relaxed),
+                0,
+                "a pull may not count itself before it holds the lock that mints its revision"
+            );
+            drop(guard);
+            blocked
+        };
+        blocked
+            .join()
+            .expect("test: the blocked pulling thread")
+            .expect("test: the blocked pull still answers");
+
+        // Half two: the invariant itself, under real overlap.
+        let threads = (0..4)
+            .map(|_| {
+                let sessions = Arc::clone(&sessions);
+                let session_id = registration.session_id.clone();
+                let token = registration.token.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        sessions
+                            .pull(&session_id, &token, &[], Some(1))
+                            .expect("test: concurrent pull");
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().expect("test: a concurrent pulling thread");
+        }
+
+        let mut recorded = store.polls.lock().clone();
+        recorded.sort_by_key(|(revision, _, _)| *revision);
+        assert_eq!(recorded.len(), 201, "every pull records its liveness exactly once");
+        let mut previous_at_unix_ms = 0_u64;
+        for (index, (revision, polls, at_unix_ms)) in recorded.iter().enumerate() {
+            let expected = index as u64 + 1;
+            assert_eq!(
+                *polls, expected,
+                "revision {revision} carries poll count {polls} where revision order requires {expected}: \
+                 a higher revision must never carry a lower count"
+            );
+            assert!(
+                *at_unix_ms >= previous_at_unix_ms,
+                "revision {revision} carries a clock reading older than the revision before it"
+            );
+            previous_at_unix_ms = *at_unix_ms;
+        }
     }
 }

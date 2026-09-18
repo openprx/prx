@@ -43,10 +43,12 @@ const MCP_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(1);
 
 /// Process-wide per-caller budget for `POST /mcp/v1/tools/call`.
 ///
-/// Rebuilt when `mcp_server.rate_limit_rps` changes, so a config reload adopts
-/// the new budget; the in-flight window is reset by that rebuild, which can only
-/// ever admit more traffic for one window and never less.
-static MCP_RATE_LIMITER: LazyLock<RwLock<Option<(u32, Arc<super::SlidingWindowRateLimiter>)>>> =
+/// Built once and then kept: a change to `mcp_server.rate_limit_rps` is adopted
+/// **in place**, so a configuration reload cannot discard the windows callers
+/// have already spent. Rebuilding it on every change handed every caller a fresh
+/// window, which let a caller that had just been throttled burst again by doing
+/// nothing but waiting for an unrelated reload.
+static MCP_RATE_LIMITER: LazyLock<RwLock<Option<Arc<super::SlidingWindowRateLimiter>>>> =
     LazyLock::new(|| RwLock::new(None));
 
 #[derive(Debug, Serialize)]
@@ -276,21 +278,27 @@ fn mcp_idempotency_for_request(
 }
 
 /// The per-caller limiter for the currently configured budget.
-fn mcp_rate_limiter(rate_limit_rps: u32) -> Arc<super::SlidingWindowRateLimiter> {
+///
+/// The same limiter is returned for the life of the process, with the
+/// configured budget applied to it, so the windows it holds survive every
+/// configuration reload — including one that changes `rate_limit_rps` and one
+/// that changes it back.
+fn mcp_rate_limiter_in(
+    slot: &RwLock<Option<Arc<super::SlidingWindowRateLimiter>>>,
+    rate_limit_rps: u32,
+) -> Arc<super::SlidingWindowRateLimiter> {
     // The read guard is scoped explicitly: `parking_lot::RwLock` is not
     // reentrant, so it must be gone before the write lock below is taken.
     {
-        let guard = MCP_RATE_LIMITER.read();
-        if let Some((rps, limiter)) = guard.as_ref()
-            && *rps == rate_limit_rps
-        {
+        let guard = slot.read();
+        if let Some(limiter) = guard.as_ref() {
+            limiter.set_limit_per_window(rate_limit_rps);
             return Arc::clone(limiter);
         }
     }
-    let mut guard = MCP_RATE_LIMITER.write();
-    if let Some((rps, limiter)) = guard.as_ref()
-        && *rps == rate_limit_rps
-    {
+    let mut guard = slot.write();
+    if let Some(limiter) = guard.as_ref() {
+        limiter.set_limit_per_window(rate_limit_rps);
         return Arc::clone(limiter);
     }
     let limiter = Arc::new(super::SlidingWindowRateLimiter::new(
@@ -298,8 +306,13 @@ fn mcp_rate_limiter(rate_limit_rps: u32) -> Arc<super::SlidingWindowRateLimiter>
         MCP_RATE_LIMIT_WINDOW,
         super::RATE_LIMIT_MAX_KEYS_DEFAULT,
     ));
-    *guard = Some((rate_limit_rps, Arc::clone(&limiter)));
+    *guard = Some(Arc::clone(&limiter));
     limiter
+}
+
+/// The process-wide limiter, at the currently configured budget.
+fn mcp_rate_limiter(rate_limit_rps: u32) -> Arc<super::SlidingWindowRateLimiter> {
+    mcp_rate_limiter_in(&MCP_RATE_LIMITER, rate_limit_rps)
 }
 
 /// Enforce `mcp_server.rate_limit_rps` for one authenticated caller.
@@ -2957,6 +2970,74 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
         for _ in 0..8 {
             assert!(
                 mcp_rate_limit_allows(&config, first_caller),
+                "a budget of 0 disables the limit"
+            );
+        }
+    }
+
+    /// F-04 (V02-R2): a configuration reload must not hand a throttled caller a
+    /// fresh window.
+    ///
+    /// The limiter used to be keyed on the rps value, so any change to it built
+    /// a new limiter and discarded every caller's recorded requests — a caller
+    /// that had just been refused could burst again without waiting, by doing
+    /// nothing at all. The budget is now adopted in place, so the windows
+    /// survive a reload that raises it, one that lowers it, and one that
+    /// changes nothing.
+    ///
+    /// The slot is local to the test on purpose: the process-wide limiter is a
+    /// global, and a test that spends a budget on it is a test every other test
+    /// in the binary has to run around.
+    ///
+    /// MUTATION GUARD: rebuild the limiter in `mcp_rate_limiter_in` whenever the
+    /// configured rps differs from the one it was built with — the behaviour
+    /// this replaces — and the assertions after each reload go red.
+    #[test]
+    fn a_config_reload_keeps_every_callers_mcp_rate_limit_window() {
+        let slot = RwLock::new(None);
+        let caller = "owner:ws-1:agent:issuer-a.example:reload";
+        let other = "owner:ws-1:agent:issuer-b.example:reload";
+
+        assert!(mcp_rate_limiter_in(&slot, 2).allow(caller));
+        assert!(mcp_rate_limiter_in(&slot, 2).allow(caller));
+        assert!(
+            !mcp_rate_limiter_in(&slot, 2).allow(caller),
+            "the third call inside the same second exceeds a budget of 2"
+        );
+
+        // A reload that changes nothing changes nothing.
+        assert!(
+            !mcp_rate_limiter_in(&slot, 2).allow(caller),
+            "a reload at the same budget must not reset a spent window"
+        );
+
+        // A reload that raises the budget admits exactly the difference: the
+        // two requests already spent still count against the new budget.
+        assert!(
+            mcp_rate_limiter_in(&slot, 3).allow(caller),
+            "raising the budget must admit the difference"
+        );
+        assert!(
+            !mcp_rate_limiter_in(&slot, 3).allow(caller),
+            "raising the budget must not forgive what was already spent"
+        );
+
+        // And a reload back to the old value does not forgive it either.
+        assert!(
+            !mcp_rate_limiter_in(&slot, 2).allow(caller),
+            "changing the budget back must not reset a spent window"
+        );
+
+        // None of it touched anybody else's budget.
+        assert!(
+            mcp_rate_limiter_in(&slot, 2).allow(other),
+            "one caller's window must not be spent by another's"
+        );
+
+        // `0` still disables the budget, and still without a rebuild.
+        for _ in 0..8 {
+            assert!(
+                mcp_rate_limiter_in(&slot, 0).allow(caller),
                 "a budget of 0 disables the limit"
             );
         }

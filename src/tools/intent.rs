@@ -887,6 +887,26 @@ mod tests {
         ]
     }
 
+    /// The same registry with a **second** Extended-tier tool that operator
+    /// policy does not exclude.
+    ///
+    /// Discovery is only observable when the discovery surface and the routed
+    /// surface differ. With a single Extended tool, excluding it makes the two
+    /// sets identical, and an exclusion assertion written against that registry
+    /// cannot tell "discovery ran and correctly withheld the excluded tool"
+    /// from "discovery never ran at all" — it passes either way. `probe_media`
+    /// is the difference: it belongs to no category the routed turn names, so
+    /// only a discovery turn can publish it.
+    fn discovery_probe_registry() -> Vec<Box<dyn Tool>> {
+        let mut tools = probe_registry();
+        tools.push(Box::new(TieredProbe {
+            name: "probe_media",
+            tier: ToolTier::Extended,
+            categories: &[ToolCategory::Media],
+        }) as Box<dyn Tool>);
+        tools
+    }
+
     /// What a stateless entry point (channel, gateway, console, worker)
     /// publishes for this turn.
     fn selected_names(
@@ -1218,9 +1238,23 @@ mod tests {
 
     /// Discovery widens what routing may hide, never what operator policy
     /// forbids: an excluded tool stays invisible on the discovery turn too.
+    ///
+    /// The registry carries **two** Extended tools on purpose. The assertion
+    /// has to separate two outcomes that a three-tool registry renders
+    /// identical: discovery running and withholding the excluded tool, and
+    /// discovery never running at all. `probe_media` is published only if
+    /// discovery ran, `probe_web` only if the exclusion was ignored, so the two
+    /// halves of the contract are pinned by two assertions that fail for
+    /// different reasons.
+    ///
+    /// MUTATION GUARD: resolve the `PublishEverything` branch of
+    /// `resolve_tools_for_intent` with `full_tool_surface(all_tools, &[])` —
+    /// the exclusion bypassed in the discovery branch — and `probe_web` appears;
+    /// make `unrouted_turn_requests_discovery` answer `false` and `probe_media`
+    /// disappears.
     #[test]
     fn a_discovery_turn_never_exposes_an_excluded_tool() {
-        let tools = probe_registry();
+        let tools = discovery_probe_registry();
         let base = crate::config::ToolTieringConfig {
             always_exclude: vec!["probe_web".to_string()],
             ..crate::config::ToolTieringConfig::default()
@@ -1230,16 +1264,26 @@ mod tests {
         let routed = exposure.sticky_surface(&base, &tools, "commit this change");
         assert_eq!(
             session_names(&tools, "commit this change", &routed),
-            vec!["probe_core", "probe_devops"]
+            vec!["probe_core", "probe_devops"],
+            "the session must start narrower than the allowed catalog, or the discovery assertion is vacuous"
         );
 
+        assert_fixture_is_unrouted(SUBSTANTIVE_PARAPHRASE);
         let discovery = exposure.sticky_surface(&base, &tools, SUBSTANTIVE_PARAPHRASE);
         assert_eq!(
             session_names(&tools, SUBSTANTIVE_PARAPHRASE, &discovery),
-            vec!["probe_core", "probe_devops"],
-            "always_exclude outranks a discovery turn"
+            vec!["probe_core", "probe_devops", "probe_media"],
+            "a discovery turn publishes everything operator policy allows — `probe_media` proves it ran, and \
+             `probe_web` is missing because always_exclude outranks it"
         );
-        assert!(!exposure.snapshot().iter().any(|name| name == "probe_web"));
+        assert!(
+            !exposure.snapshot().iter().any(|name| name == "probe_web"),
+            "an excluded tool must never be absorbed into the session union"
+        );
+        assert!(
+            !exposure.snapshot().iter().any(|name| name == "probe_media"),
+            "discovery lasts one turn and must not be absorbed into the session union"
+        );
     }
 
     /// The discovery signal itself, at the level it is decided: structure, not
