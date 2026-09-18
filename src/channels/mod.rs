@@ -6821,6 +6821,34 @@ mod tests {
         );
     }
 
+    /// The same replay seam, one grain finer: a marker the model wrote *inside*
+    /// a sentence teaches it the same lesson as one on its own line, and the
+    /// line-level strip could not see it. A user turn quoting the marker in the
+    /// same grain must still come back byte-for-byte.
+    ///
+    /// MUTATION GUARD: point `strip_fabricated_tool_markers_from_assistant_turns`
+    /// back at the line-level `strip_fabricated_tool_markers` and the two
+    /// assistant assertions fail with the marker still in the replay copy.
+    #[test]
+    fn normalize_cached_channel_turns_strips_inline_fabricated_tool_markers() {
+        let turns = vec![
+            ChatMessage::user("what is the disk usage?"),
+            ChatMessage::assistant("Fixture checked. [Used tools: shell] Root is at 41%."),
+            ChatMessage::user("you wrote `Fixture checked. [Used tools: shell]` last time"),
+            ChatMessage::assistant("Nothing in the logs. [Used tools: shell, session_status]"),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+
+        assert_eq!(normalized.len(), 4);
+        assert_eq!(normalized[1].content, "Fixture checked. Root is at 41%.");
+        assert_eq!(normalized[3].content, "Nothing in the logs.");
+        assert_eq!(
+            normalized[2].content, "you wrote `Fixture checked. [Used tools: shell]` last time",
+            "a user turn is real conversation content and must never be rewritten"
+        );
+    }
+
     #[test]
     fn merged_history_strips_fabricated_tool_markers_without_touching_the_cache() {
         // Not every caller runs the normalizer over this union, so the strip has

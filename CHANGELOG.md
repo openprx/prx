@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.147] - 18 September 2026
+
+### Fixed
+
+- Fabricated `[Used tools: ...]` markers embedded inside a sentence are now
+  handled with the same rules as whole-line markers: an assistant response
+  carrying one without a real tool execution spends the corrective retry, and
+  the marker is removed before streaming, history, compaction summaries,
+  channel replay and TUI session resume. Fenced code blocks, inline code
+  spans, other bracketed prose, user turns, native tool-call ids and reasoning
+  boundaries are preserved.
+
 ## [0.8.146] - 18 September 2026
 
 ### Changed

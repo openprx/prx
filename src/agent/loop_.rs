@@ -159,13 +159,16 @@ pub(crate) fn contains_fabricated_tool_marker(text: &str) -> bool {
 
 /// Remove every fabricated `[Used tools: ...]` line from `text`.
 ///
-/// Borrowed (zero allocation) when there is nothing to strip, which is the
-/// overwhelmingly common case — this runs on every delivered response and on
-/// every replayed history turn. Only whole lines are dropped; a marker embedded
-/// inside a sentence and any other bracketed text are left alone, so the strip
-/// cannot mangle legitimate prose. When a line is dropped the surrounding blank
-/// space is trimmed so the delivered text does not start or end with the hole
-/// the marker left behind.
+/// Borrowed (zero allocation) when there is nothing to strip. Only whole lines
+/// are dropped; a marker embedded inside a sentence and any other bracketed text
+/// are left alone. When a line is dropped the surrounding blank space is trimmed
+/// so the text does not start or end with the hole the marker left behind.
+///
+/// This is the coarse grain only. Delivery, history and replay go through
+/// [`strip_assistant_fabricated_tool_markers`], which adds the in-line grain
+/// with code-preservation rules; quoted context goes through
+/// [`strip_quoted_fabricated_tool_markers`]. Keeping this one whole-line is what
+/// lets both of them drop a marker line without leaving a blank line behind.
 pub(crate) fn strip_fabricated_tool_markers(text: &str) -> Cow<'_, str> {
     if !contains_fabricated_tool_marker(text) {
         return Cow::Borrowed(text);
@@ -196,7 +199,7 @@ pub(crate) fn strip_fabricated_tool_markers(text: &str) -> Cow<'_, str> {
 /// prose or media markers cannot be mangled. Whitespace around the removed
 /// fragment is collapsed to a single separator so the sentence still reads.
 pub(crate) fn strip_inline_fabricated_tool_markers(text: &str) -> Cow<'_, str> {
-    const MARKER_PREFIX: &str = "[Used tools:";
+    const MARKER_PREFIX: &str = FABRICATED_TOOL_MARKER_PREFIX;
 
     if !text.contains(MARKER_PREFIX) {
         return Cow::Borrowed(text);
@@ -240,6 +243,177 @@ pub(crate) fn strip_inline_fabricated_tool_markers(text: &str) -> Cow<'_, str> {
     Cow::Owned(kept)
 }
 
+/// Prefix of the fabricated tool-use marker. Shared by every detector and
+/// cleaner below so the grains can never disagree about what a marker looks
+/// like.
+const FABRICATED_TOOL_MARKER_PREFIX: &str = "[Used tools:";
+
+/// True when `line` opens or closes a fenced code block.
+fn is_code_fence_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+/// End offset (exclusive) of the inline code span whose opening backtick run
+/// starts at `open`, or `None` when that run is never closed by a run of the
+/// same length.
+fn inline_code_span_end(line: &str, open: usize) -> Option<usize> {
+    let run = line[open..].bytes().take_while(|byte| *byte == b'`').count();
+    let mut cursor = open + run;
+    while let Some(offset) = line[cursor..].find('`') {
+        let close = cursor + offset;
+        let close_run = line[close..].bytes().take_while(|byte| *byte == b'`').count();
+        if close_run == run {
+            return Some(close + close_run);
+        }
+        cursor = close + close_run;
+    }
+    None
+}
+
+/// Remove in-line fabricated markers from one line, leaving inline code spans
+/// (`` `[Used tools: shell]` ``) byte-for-byte alone.
+///
+/// Removal and whitespace-collapsing rules are the ones
+/// [`strip_inline_fabricated_tool_markers`] documents; the only difference is
+/// that a marker delimited by backticks is documentation about the syntax — the
+/// shape this very module has to describe — not a claim about work, so it
+/// survives.
+fn strip_inline_markers_outside_code_spans(line: &str) -> Cow<'_, str> {
+    if !line.contains(FABRICATED_TOOL_MARKER_PREFIX) {
+        return Cow::Borrowed(line);
+    }
+
+    let mut kept = String::with_capacity(line.len());
+    let mut rest = line;
+    let mut stripped_any = false;
+    while let Some(marker) = rest.find(FABRICATED_TOOL_MARKER_PREFIX) {
+        // A code span opening before the candidate protects everything up to its
+        // closing run: copy it verbatim and resume scanning after it.
+        if let Some(tick) = rest.find('`')
+            && tick < marker
+            && let Some(span_end) = inline_code_span_end(rest, tick)
+        {
+            kept.push_str(&rest[..span_end]);
+            rest = &rest[span_end..];
+            continue;
+        }
+
+        let after_prefix = &rest[marker + FABRICATED_TOOL_MARKER_PREFIX.len()..];
+        let Some(close) = after_prefix.find(']') else {
+            break;
+        };
+        let tool_names = &after_prefix[..close];
+        if tool_names.trim().is_empty() || tool_names.contains(['\n', '\r']) {
+            // Not a marker (empty list, or the bracket spans a line break):
+            // keep it verbatim and resume scanning after the prefix.
+            kept.push_str(&rest[..marker + FABRICATED_TOOL_MARKER_PREFIX.len()]);
+            rest = after_prefix;
+            continue;
+        }
+        kept.push_str(&rest[..marker]);
+        while kept.ends_with([' ', '\t']) {
+            kept.pop();
+        }
+        rest = after_prefix[close + 1..].trim_start_matches([' ', '\t']);
+        stripped_any = true;
+        let needs_separator =
+            !kept.is_empty() && !rest.is_empty() && !rest.starts_with(['.', ',', ';', ':', '!', '?', ')']);
+        if needs_separator {
+            kept.push(' ');
+        }
+    }
+
+    if !stripped_any {
+        return Cow::Borrowed(line);
+    }
+    kept.push_str(rest);
+    Cow::Owned(kept)
+}
+
+/// Remove fabricated `[Used tools: ...]` markers from text the assistant itself
+/// authored — the delivered answer, the assistant history turn that accompanies
+/// real tool calls, replayed assistant turns and compaction summaries.
+///
+/// Both grains the model writes are handled here, which is what the line-level
+/// [`strip_fabricated_tool_markers`] alone could not do: a marker that owns a
+/// whole line is dropped with its line (leaving no hole behind), and a marker
+/// embedded in prose (`Fixture checked. [Used tools: shell]`) is cut out of the
+/// sentence with the surrounding whitespace collapsed to one separator.
+///
+/// Preservation rules, so the cleaner cannot mangle a legitimate answer:
+/// * fenced code blocks (opened by three backticks or three tildes) are
+///   copied verbatim, marker lines included;
+/// * inline code spans are copied verbatim, so prose *about* the marker syntax
+///   survives when it is quoted as code;
+/// * every other bracketed text is untouched — only a fragment that starts with
+///   `[Used tools:`, names at least one tool and closes on the same line is a
+///   marker;
+/// * user turns are never passed through this function (see
+///   [`strip_fabricated_tool_markers_from_assistant_turns`]), so an operator
+///   quoting a marker back keeps their own words.
+///
+/// Borrowed (zero allocation) whenever there is nothing to strip, which is the
+/// overwhelmingly common case: this runs on every delivered response and every
+/// replayed history turn.
+///
+/// Quoted context uses [`strip_quoted_fabricated_tool_markers`] instead: that
+/// content has already been flattened to a single line, so code fences no longer
+/// exist there to be recognized.
+pub(crate) fn strip_assistant_fabricated_tool_markers(text: &str) -> Cow<'_, str> {
+    if !text.contains(FABRICATED_TOOL_MARKER_PREFIX) {
+        return Cow::Borrowed(text);
+    }
+
+    let mut stripped = String::with_capacity(text.len());
+    let mut in_fenced_block = false;
+    let mut changed = false;
+    for line in text.lines() {
+        if is_code_fence_line(line) {
+            in_fenced_block = !in_fenced_block;
+        } else if !in_fenced_block {
+            if is_tool_summary_only_response(line) {
+                // A whole marker line carries nothing else: drop it outright so
+                // no blank line is left where it stood.
+                changed = true;
+                continue;
+            }
+            let cleaned = strip_inline_markers_outside_code_spans(line);
+            if let Cow::Owned(cleaned) = cleaned {
+                changed = true;
+                if !stripped.is_empty() {
+                    stripped.push('\n');
+                }
+                stripped.push_str(&cleaned);
+                continue;
+            }
+        }
+        if !stripped.is_empty() {
+            stripped.push('\n');
+        }
+        stripped.push_str(line);
+    }
+
+    if !changed {
+        return Cow::Borrowed(text);
+    }
+    let leading = stripped.len() - stripped.trim_start().len();
+    stripped.drain(..leading);
+    stripped.truncate(stripped.trim_end().len());
+    Cow::Owned(stripped)
+}
+
+/// True when `text` carries a fabricated marker in any grain the model can write
+/// it: on a line of its own, or embedded in a sentence.
+///
+/// Defined as "the assistant-surface cleaner would change this text", so the
+/// detector that spends the one corrective retry and the cleaner that runs
+/// before delivery can never disagree — including about the code-span and code
+/// fence exemptions, which must not buy a retry either.
+pub(crate) fn contains_assistant_fabricated_tool_marker(text: &str) -> bool {
+    matches!(strip_assistant_fabricated_tool_markers(text), Cow::Owned(_))
+}
+
 /// Strip fabricated tool markers from content that is about to be *quoted*
 /// back into a prompt (session/shared event preambles, document evidence,
 /// recalled cold pages).
@@ -260,9 +434,14 @@ pub(crate) fn strip_quoted_fabricated_tool_markers(text: &str) -> Cow<'_, str> {
 /// Only the copy handed to the model is touched; the persisted rows keep the
 /// bytes the model actually produced. User turns are never rewritten — an
 /// operator quoting the marker back is real conversation content.
+///
+/// Inline-aware ([`strip_assistant_fabricated_tool_markers`]): rows persisted
+/// before the delivery guard existed carry markers in both grains, and a
+/// sentence-embedded one replays into every later prompt exactly like a
+/// standalone line does.
 pub(crate) fn strip_fabricated_tool_markers_from_assistant_turns(turns: &mut [ChatMessage]) {
     for turn in turns.iter_mut().filter(|turn| turn.role == "assistant") {
-        if let Cow::Owned(stripped) = strip_fabricated_tool_markers(&turn.content) {
+        if let Cow::Owned(stripped) = strip_assistant_fabricated_tool_markers(&turn.content) {
             turn.content = stripped;
         }
     }
@@ -2546,6 +2725,12 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         }
         crate::config::AgentCompactionMode::Switch | crate::config::AgentCompactionMode::Off => return Ok(None),
     };
+    // The summarizer reads the very turns that may still carry a fabricated
+    // marker and is free to copy one into its output — the "recent turns
+    // preserved verbatim" section asks it to. A summary is replayed on every
+    // later turn and is persisted as compaction audit, so clean it in both
+    // grains before it is measured, stored or inserted.
+    let summary = strip_assistant_fabricated_tool_markers(&summary).into_owned();
     let original_source = source_history.get(start..compact_end).unwrap_or(&[]);
     let fidelity_status = compaction_summary_fidelity_status(&summary, config.mode, original_source);
     persist_compaction_audit(
@@ -7350,8 +7535,10 @@ async fn run_tool_call_loop_outcome_unguarded(
                 // response that carries real tool calls; that text goes to
                 // history untouched by the final-reply guard below (which only
                 // sees turns without tool calls), so strip it here before it can
-                // be replayed, compacted or summarized.
-                let history_text = strip_fabricated_tool_markers(&response_text);
+                // be replayed, compacted or summarized. Inline-aware: a marker
+                // this branch leaves in a sentence is replayed on every later
+                // turn, which is exactly how the shape gets imitated.
+                let history_text = strip_assistant_fabricated_tool_markers(&response_text);
                 let assistant_history_content = if resp.tool_calls.is_empty() {
                     history_text.into_owned()
                 } else {
@@ -7607,8 +7794,8 @@ async fn run_tool_call_loop_outcome_unguarded(
             // about work that did not happen; spend the one corrective retry on
             // it (the same budget the summary-only path uses, so a response that
             // is nothing but a marker still costs at most one retry).
-            let fabricated_marker =
-                contains_fabricated_tool_marker(&response_text) || contains_fabricated_tool_marker(&display_text);
+            let fabricated_marker = contains_assistant_fabricated_tool_marker(&response_text)
+                || contains_assistant_fabricated_tool_marker(&display_text);
             if fabricated_marker && !executed_any_tool_call && !tool_summary_retry_attempted {
                 tracing::warn!(
                     provider = provider_name,
@@ -7624,7 +7811,7 @@ async fn run_tool_call_loop_outcome_unguarded(
                 // actually answered and drop only the marker lines, so the
                 // fabrication never reaches the user, the history, or the next
                 // turn's prompt where it would be imitated again.
-                if let Cow::Owned(cleaned) = strip_fabricated_tool_markers(&display_text) {
+                if let Cow::Owned(cleaned) = strip_assistant_fabricated_tool_markers(&display_text) {
                     display_text = cleaned;
                 }
                 if display_text.trim().is_empty() {
@@ -16269,6 +16456,95 @@ ls -la
         }
     }
 
+    /// The assistant-surface cleaner has to see both grains a model writes the
+    /// marker in, and must leave everything else — other brackets, fenced code,
+    /// inline code spans — byte-for-byte alone.
+    #[test]
+    fn strip_assistant_fabricated_tool_markers_handles_both_grains() {
+        assert_eq!(
+            strip_assistant_fabricated_tool_markers("Fixture checked. [Used tools: shell]").as_ref(),
+            "Fixture checked."
+        );
+        assert_eq!(
+            strip_assistant_fabricated_tool_markers("Done.\n[Used tools: shell]\nMore.").as_ref(),
+            "Done.\nMore.",
+            "a whole marker line leaves no blank line behind"
+        );
+        assert_eq!(
+            strip_assistant_fabricated_tool_markers("A [Used tools: shell] B\nC [Used tools: gateway] D").as_ref(),
+            "A B\nC D"
+        );
+        assert_eq!(
+            strip_assistant_fabricated_tool_markers("Root is at 41%[Used tools: shell].").as_ref(),
+            "Root is at 41%.",
+            "punctuation after the marker must not gain a stray separator"
+        );
+        assert!(
+            strip_assistant_fabricated_tool_markers("[Used tools: shell]")
+                .as_ref()
+                .is_empty()
+        );
+    }
+
+    /// Preservation rules. A marker inside a fenced block or an inline code span
+    /// is documentation about the syntax — including this project's own docs —
+    /// not a claim of work, and legitimate bracketed prose was never a marker.
+    #[test]
+    fn strip_assistant_fabricated_tool_markers_preserves_code_and_other_brackets() {
+        for untouched in [
+            "Plain answer.",
+            "The runtime never writes `[Used tools: shell]` itself.",
+            "Example:\n```text\n[Used tools: shell]\n```\nThat shape is fabricated.",
+            "Example:\n~~~\nDone. [Used tools: shell]\n~~~",
+            "[Used tools:]",
+            "Used tools: shell",
+            "See [1] and [note: unrelated] plus [Used tools] alone.",
+            "[Used tools: shell\nstill going]",
+            "[IMAGE:/tmp/a.png] stays",
+        ] {
+            let result = strip_assistant_fabricated_tool_markers(untouched);
+            assert!(
+                matches!(result, Cow::Borrowed(_)),
+                "text with nothing to strip must not allocate: {untouched:?}"
+            );
+            assert_eq!(result.as_ref(), untouched);
+            assert!(
+                !contains_assistant_fabricated_tool_marker(untouched),
+                "an exempt marker must not buy a corrective retry either: {untouched:?}"
+            );
+        }
+
+        assert_eq!(
+            strip_assistant_fabricated_tool_markers("Checked. [Used tools: shell] See `[Used tools: x]`.").as_ref(),
+            "Checked. See `[Used tools: x]`.",
+            "the claim is cut out, the quoted syntax is kept"
+        );
+    }
+
+    /// The detector that spends the one corrective retry and the cleaner that
+    /// runs before delivery must agree on every input, or a turn can be retried
+    /// for a marker that is then not removed (or delivered with one that never
+    /// bought a retry).
+    #[test]
+    fn contains_assistant_fabricated_tool_marker_agrees_with_the_cleaner() {
+        for text in [
+            "Fixture checked. [Used tools: shell]",
+            "[Used tools: shell]",
+            "Done.\n[Used tools: shell]\nMore.",
+            "Plain answer.",
+            "The runtime never writes `[Used tools: shell]` itself.",
+            "Example:\n```\n[Used tools: shell]\n```",
+            "[Used tools:]",
+            "See [1] and [note: unrelated].",
+        ] {
+            assert_eq!(
+                contains_assistant_fabricated_tool_marker(text),
+                strip_assistant_fabricated_tool_markers(text).as_ref() != text,
+                "detector and cleaner disagree on {text:?}"
+            );
+        }
+    }
+
     #[test]
     fn compact_tool_result_for_history_emits_document_reference_for_large_output() {
         let content = format!(
@@ -18581,6 +18857,357 @@ Let me check the result."#;
                  so the fabricated marker still costs one corrective retry"
             );
             assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "The check is clean."));
+        }
+
+        /// The gap the whole-line guard left: `Fixture checked. [Used tools:
+        /// shell]` is the same claim about work that never happened as a marker
+        /// on its own line, so it must cost the one corrective retry, and once
+        /// that retry is spent the marker must be cut out of the sentence
+        /// instead of delivered.
+        ///
+        /// MUTATION GUARD: put the line-level `contains_fabricated_tool_marker`
+        /// back in the final-response guard and the second scripted response is
+        /// never consumed — the inline marker is delivered verbatim.
+        #[tokio::test]
+        async fn an_inline_fabricated_marker_without_tool_execution_retries_once_then_is_stripped() {
+            let provider = ScriptedProvider::from_text_responses(vec![
+                "Fixture checked. [Used tools: shell]",
+                "Fixture checked. [Used tools: shell] Nothing else to report.",
+            ]);
+            let remaining = Arc::clone(&provider.responses);
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("check the fixture")];
+            let tmp = TempDir::new().unwrap();
+            let (outcome, _trace) = run_tool_call_loop_outcome(
+                &provider,
+                &mut history,
+                Arc::new(Vec::new()),
+                &NoopObserver,
+                &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                None,
+                "terminal",
+                &crate::config::MultimodalConfig::default(),
+                2,
+                false,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ToolLoopMemory::none(),
+                ChatMode::default(),
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("a marker beside real text must not fail the turn");
+
+            assert_eq!(
+                remaining.lock().expect("responses lock should be valid").len(),
+                0,
+                "an in-line fabricated marker with no tool execution must cost exactly one \
+                 corrective retry (both scripted responses consumed = two provider calls)"
+            );
+            assert!(
+                matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "Fixture checked. Nothing else to report."),
+                "the retry is spent, so only the marker is cut out of the sentence: {outcome:?}"
+            );
+            assert!(
+                history.iter().all(|message| !message.content.contains("[Used tools:")),
+                "no fabricated marker may reach history in either grain: {history:?}"
+            );
+        }
+
+        /// Streaming delivery must see exactly what the returned text says. The
+        /// loop chunks `display_text` into the `on_delta` sender *after* the
+        /// marker guard, so the stream may not paint a marker the final answer
+        /// no longer contains.
+        ///
+        /// MUTATION GUARD: move the strip below the streaming block and the
+        /// reassembled stream carries `[Used tools:` while the outcome does not.
+        #[tokio::test]
+        async fn an_inline_marker_is_stripped_before_it_can_be_streamed() {
+            let provider = ScriptedProvider::from_text_responses(vec![
+                "Fixture checked. [Used tools: shell]",
+                "Fixture checked. [Used tools: shell] Nothing else to report.",
+            ]);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("check the fixture")];
+            let tmp = TempDir::new().unwrap();
+            let (outcome, _trace) = run_tool_call_loop_outcome(
+                &provider,
+                &mut history,
+                Arc::new(Vec::new()),
+                &NoopObserver,
+                &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                None,
+                "terminal",
+                &crate::config::MultimodalConfig::default(),
+                2,
+                false,
+                Vec::new(),
+                None,
+                None,
+                Some(tx),
+                None,
+                None,
+                None,
+                ToolLoopMemory::none(),
+                ChatMode::default(),
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("a marker beside real text must not fail the turn");
+
+            let mut streamed = String::new();
+            while let Ok(chunk) = rx.try_recv() {
+                streamed.push_str(&chunk);
+            }
+            assert!(
+                !streamed.contains("[Used tools:"),
+                "the streamed draft must never paint a fabricated marker: {streamed:?}"
+            );
+            assert!(
+                streamed.contains("Fixture checked."),
+                "the model's own words must still stream: {streamed:?}"
+            );
+            assert!(
+                matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "Fixture checked. Nothing else to report.")
+            );
+        }
+
+        /// A batch whose every call was refused did no work, so an in-line
+        /// marker after it is still provably fabricated and still worth the one
+        /// corrective retry — same rule the whole-line grain already enforced.
+        ///
+        /// MUTATION GUARD: restore the line-level detector and the third
+        /// scripted response is never consumed, because no retry is spent.
+        #[tokio::test]
+        async fn a_denied_only_batch_followed_by_an_inline_marker_still_retries() {
+            let provider = NativeScriptedProvider::new(vec![
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "refusing_tool".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("Fixture checked. [Used tools: refusing_tool]".to_string()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("Fixture checked; the tool refused.".to_string()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                },
+            ]);
+            let remaining = Arc::clone(&provider.responses);
+            let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RefusingTool)];
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("run the check")];
+            let tmp = TempDir::new().unwrap();
+            let (outcome, _trace) = run_tool_call_loop_outcome(
+                &provider,
+                &mut history,
+                Arc::new(tools_registry),
+                &NoopObserver,
+                &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                None,
+                "cli",
+                &crate::config::MultimodalConfig::default(),
+                3,
+                false,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ToolLoopMemory::none(),
+                ChatMode::default(),
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("the corrective retry should produce a deliverable answer");
+
+            assert_eq!(
+                remaining.lock().expect("responses lock should be valid").len(),
+                0,
+                "a batch that produced nothing but refusals must not count as tool use, so the \
+                 in-line fabricated marker still costs one corrective retry"
+            );
+            assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "Fixture checked; the tool refused."));
+        }
+
+        /// Tools really ran, so the marker buys no retry — but it is still a
+        /// fabricated shape that must not be stored where the next turn would
+        /// read it, in either grain.
+        ///
+        /// MUTATION GUARD: restore the line-level strip on
+        /// `assistant_history_content` and the history assertion fails.
+        #[tokio::test]
+        async fn an_inline_marker_beside_real_tool_calls_is_stripped_without_a_retry() {
+            let execution_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let provider = NativeScriptedProvider::new(vec![
+                ChatResponse {
+                    text: Some("Checking now. [Used tools: file_read] One moment.".to_string()),
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "file_read".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("Fixture checked. [Used tools: file_read]".to_string()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                },
+            ]);
+            let remaining = Arc::clone(&provider.responses);
+            let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingTool {
+                name: "file_read".to_string(),
+                execution_order: Arc::clone(&execution_order),
+            })];
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("run the check")];
+            let tmp = TempDir::new().unwrap();
+            let (outcome, _trace) = run_tool_call_loop_outcome(
+                &provider,
+                &mut history,
+                Arc::new(tools_registry),
+                &NoopObserver,
+                &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                None,
+                "cli",
+                &crate::config::MultimodalConfig::default(),
+                2,
+                false,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ToolLoopMemory::none(),
+                ChatMode::default(),
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("a turn that really used a tool must complete");
+
+            assert_eq!(
+                execution_order
+                    .lock()
+                    .expect("execution order lock should be valid")
+                    .as_slice(),
+                ["file_read".to_string()],
+                "the premise is a tool that really ran"
+            );
+            assert_eq!(
+                remaining.lock().expect("responses lock should be valid").len(),
+                0,
+                "a marker backed by a real tool run must not spend a corrective retry"
+            );
+            assert!(
+                history.iter().all(|message| !message.content.contains("[Used tools:")),
+                "neither grain of the marker may be stored: {history:?}"
+            );
+            assert!(
+                history
+                    .iter()
+                    .any(|message| message.content.contains("Checking now. One moment.")),
+                "only the marker is cut out; the model's own words stay: {history:?}"
+            );
+            assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "Fixture checked."));
+        }
+
+        /// The summarizer reads the turns it is compacting and is explicitly
+        /// asked to preserve recent exchanges verbatim, so a marker in those
+        /// turns comes back inside the summary — which is then replayed on every
+        /// later turn and persisted as compaction audit.
+        ///
+        /// MUTATION GUARD: drop the strip applied to `summary` in
+        /// `build_configurable_compaction_patch_with_source_history` and the
+        /// replacement message carries `[Used tools:`.
+        #[tokio::test]
+        async fn a_compaction_summary_carrying_a_marker_is_stripped_in_both_grains() {
+            let provider = SystemSummaryProvider {
+                response: "## Decisions\n- keep the fixture\n## Open TODOs\n- none\n\
+                           ## Critical Context\n- Fixture checked. [Used tools: shell]\n\
+                           ## Progress\n[Used tools: shell, file_read]"
+                    .to_string(),
+            };
+            let mut history = vec![ChatMessage::system("sys")];
+            for idx in 0..10 {
+                history.push(ChatMessage::user(format!("turn-{idx} {}", "bulk-token ".repeat(80))));
+            }
+            let config = crate::config::AgentCompactionConfig {
+                mode: crate::config::AgentCompactionMode::Safeguard,
+                reserve_tokens: 10,
+                keep_recent_messages: 2,
+                memory_flush: false,
+                max_context_tokens: 120,
+                max_context_tokens_explicit: true,
+                os_paging: crate::config::OsPagingConfig::default(),
+            };
+
+            let patch = build_configurable_compaction_patch(
+                &history,
+                &provider,
+                "model",
+                &config,
+                None,
+                "test_inline_marker_compaction",
+            )
+            .await
+            .expect("compaction must not fail")
+            .expect("an over-budget history must produce a compaction patch");
+
+            assert!(
+                patch
+                    .replacement
+                    .iter()
+                    .all(|message| !message.content.contains("[Used tools:")),
+                "a compaction summary is replayed on every later turn: {:?}",
+                patch.replacement
+            );
+            assert!(
+                patch
+                    .replacement
+                    .iter()
+                    .any(|message| message.content.contains("Fixture checked.")),
+                "only the marker is removed; the summary itself survives: {:?}",
+                patch.replacement
+            );
         }
 
         async fn run_with_response(response: &str, expose: bool) -> (ToolLoopOutcome, Vec<ChatMessage>) {

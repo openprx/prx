@@ -2632,6 +2632,13 @@ impl ChatState {
                 content: t.content.clone(),
             })
             .collect();
+        // A session saved before the delivery guard existed still holds
+        // fabricated `[Used tools: ...]` claims in its assistant turns. This is
+        // the replay seam that hands those turns back to the model, so strip
+        // them from the context copy here, in both grains. The persisted turns
+        // and the rendered transcript keep the bytes that were actually
+        // produced; only what the model is told it once did is corrected.
+        crate::agent::loop_::strip_fabricated_tool_markers_from_assistant_turns(&mut self.session.history);
         self.ui.conversation_lines = conversation_lines_from_turns(&self.session.turns);
         self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
         #[cfg(feature = "terminal-tui")]
@@ -6616,6 +6623,45 @@ mod tests {
                 state.session.history.first().map(|m| m.role.as_str()),
                 Some("user"),
                 "history[0] must have the user role"
+            );
+        }
+
+        /// A session saved before the delivery guard existed still holds
+        /// fabricated `[Used tools: ...]` claims — in both grains. Resuming it
+        /// is a replay seam: the context copy handed back to the model must not
+        /// re-teach it the shape, while the persisted turns (and therefore the
+        /// rendered transcript) keep what was actually produced, and a user turn
+        /// quoting the marker is never rewritten.
+        ///
+        /// MUTATION GUARD: drop the strip in `reduce_session_loaded` and the
+        /// assistant-history assertions fail with the marker still in context.
+        #[test]
+        fn test_redux_session_loaded_strips_fabricated_tool_markers_from_assistant_history() {
+            use crate::chat::session::ChatSession;
+            let mut state = s();
+            let mut loaded = ChatSession::new("p", "m");
+            loaded.add_user_turn("you wrote [Used tools: shell] last time");
+            loaded.add_assistant_turn("Fixture checked. [Used tools: shell]", vec![]);
+            loaded.add_user_turn("and now?");
+            loaded.add_assistant_turn("Nothing new.\n[Used tools: shell]", vec![]);
+
+            let _ = state.reduce(Action::SessionLoaded(loaded));
+
+            let history: Vec<&str> = state.session.history.iter().map(|m| m.content.as_str()).collect();
+            assert_eq!(
+                history,
+                vec![
+                    "you wrote [Used tools: shell] last time",
+                    "Fixture checked.",
+                    "and now?",
+                    "Nothing new."
+                ],
+                "assistant turns are cleaned in both grains; the user turn is real content"
+            );
+            assert_eq!(
+                state.session.turns.get(1).map(|t| t.content.as_str()),
+                Some("Fixture checked. [Used tools: shell]"),
+                "the persisted turn keeps the bytes the model actually produced"
             );
         }
 
