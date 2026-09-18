@@ -6849,6 +6849,40 @@ mod tests {
         );
     }
 
+    /// The same replay seam, on the two CommonMark fence shapes a single
+    /// `in_fenced_block` boolean gets wrong (2026-09-19 cross-audit probe).
+    ///
+    /// A prose marker after a `~~~` block whose body holds a ```` ```example ````
+    /// line is a fabricated claim and must not be replayed; a marker inside a
+    /// ```` ````text ```` block whose body holds a bare ```` ``` ```` line is the
+    /// model's own code example and must be replayed byte-for-byte, because
+    /// rewriting it is how the replay copy stops matching what the user saw.
+    ///
+    /// MUTATION GUARD: accept any fence line as a closer again and the first
+    /// assistant turn keeps its marker while the second loses part of its code.
+    #[test]
+    fn normalize_cached_channel_turns_walks_fences_the_way_commonmark_does() {
+        const CODE_EXAMPLE: &str = "````text\n```\nDocumented [Used tools: shell]\n````";
+        let turns = vec![
+            ChatMessage::user("what is the disk usage?"),
+            ChatMessage::assistant("~~~text\n```example\n~~~\nFixture checked. [Used tools: shell]"),
+            ChatMessage::user("show me the marker syntax"),
+            ChatMessage::assistant(CODE_EXAMPLE),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+
+        assert_eq!(normalized.len(), 4);
+        assert_eq!(
+            normalized[1].content, "~~~text\n```example\n~~~\nFixture checked.",
+            "prose after a mixed-fence block is not code: the fabricated marker must be stripped"
+        );
+        assert_eq!(
+            normalized[3].content, CODE_EXAMPLE,
+            "a marker inside a genuine long-fence block is the model's own example and must be replayed verbatim"
+        );
+    }
+
     #[test]
     fn merged_history_strips_fabricated_tool_markers_without_touching_the_cache() {
         // Not every caller runs the normalizer over this union, so the strip has

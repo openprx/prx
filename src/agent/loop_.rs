@@ -248,10 +248,95 @@ pub(crate) fn strip_inline_fabricated_tool_markers(text: &str) -> Cow<'_, str> {
 /// like.
 const FABRICATED_TOOL_MARKER_PREFIX: &str = "[Used tools:";
 
-/// True when `line` opens or closes a fenced code block.
-fn is_code_fence_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+/// The opening delimiter of a CommonMark fenced code block: which character
+/// opened it and how long the run was.
+///
+/// A single `in_fenced_block` boolean cannot represent this, and getting it
+/// wrong is user-visible in both directions. It treats every fence-looking line
+/// as a toggle, so a `~~~text` block whose body contains the line
+/// ```` ```example ```` is "closed" by that body line and reopened by its real
+/// `~~~` closer: prose after the block is then mistaken for code and a
+/// fabricated marker in it survives both the cleaner and the detector. The
+/// mirror image is a ```` ````text ```` block containing a bare ```` ``` ````
+/// line: the short run is mistaken for a closer and the model's own code is
+/// edited. Both inputs are valid CommonMark and pulldown-cmark parses them the
+/// way this type does.
+#[derive(Clone, Copy)]
+struct CodeFence {
+    /// The fence character, `` ` `` or `~`.
+    marker: u8,
+    /// Length of the opening run. A closer must be at least this long.
+    length: usize,
+}
+
+impl CodeFence {
+    /// `line` with its fence indentation removed, or `None` when the line is
+    /// indented too far to be a fence at all: CommonMark allows a fence up to
+    /// three leading spaces, and four turn the line into indented content.
+    fn undented(line: &str) -> Option<&str> {
+        let body = line.trim_start_matches(' ');
+        (line.len() - body.len() <= 3).then_some(body)
+    }
+
+    /// Parse `line` as the opening fence of a code block.
+    fn open(line: &str) -> Option<Self> {
+        let body = Self::undented(line)?;
+        let marker = match body.as_bytes().first()? {
+            b'`' => b'`',
+            b'~' => b'~',
+            _ => return None,
+        };
+        let length = body.bytes().take_while(|byte| *byte == marker).count();
+        if length < 3 {
+            return None;
+        }
+        // A backtick fence's info string may not contain a backtick; such a
+        // line is ordinary paragraph text, not a fence.
+        if marker == b'`' && body[length..].contains('`') {
+            return None;
+        }
+        Some(Self { marker, length })
+    }
+
+    /// True when `line` closes this block: the same fence character, a run at
+    /// least as long as the opener's, and nothing after the run but whitespace.
+    fn closes(self, line: &str) -> bool {
+        let Some(body) = Self::undented(line) else {
+            return false;
+        };
+        let length = body.bytes().take_while(|byte| *byte == self.marker).count();
+        length >= self.length && body[length..].trim().is_empty()
+    }
+}
+
+/// Walk `text` line by line, reporting for each line whether it belongs to a
+/// fenced code block. The fence delimiters themselves count as code because
+/// they too must be copied out verbatim.
+///
+/// Single source of truth for the fence model. The cleaner
+/// [`strip_assistant_fabricated_tool_markers`] walks the text with this
+/// function and the detector [`contains_assistant_fabricated_tool_marker`] is
+/// defined in terms of the cleaner, so the retry decision and the delivered
+/// text can never disagree about where code starts and ends. An unterminated
+/// fence runs to the end of the text, and `str::lines` gives CRLF input exactly
+/// the lines LF input gets.
+fn walk_markdown_lines(text: &str) -> impl Iterator<Item = (&str, bool)> {
+    let mut fence: Option<CodeFence> = None;
+    text.lines().map(move |line| {
+        let in_code = match fence {
+            Some(open) => {
+                if open.closes(line) {
+                    fence = None;
+                }
+                true
+            }
+            None => {
+                fence = CodeFence::open(line);
+                fence.is_some()
+            }
+        };
+        (line, in_code)
+    })
 }
 
 /// End offset (exclusive) of the inline code span whose opening backtick run
@@ -342,8 +427,10 @@ fn strip_inline_markers_outside_code_spans(line: &str) -> Cow<'_, str> {
 /// sentence with the surrounding whitespace collapsed to one separator.
 ///
 /// Preservation rules, so the cleaner cannot mangle a legitimate answer:
-/// * fenced code blocks (opened by three backticks or three tildes) are
-///   copied verbatim, marker lines included;
+/// * fenced code blocks are copied verbatim, marker lines included; the block
+///   runs from its opening fence to the first line that closes it under
+///   [`CodeFence`] (same character, at least as long, nothing but trailing
+///   whitespace after it) or, when there is none, to the end of the text;
 /// * inline code spans are copied verbatim, so prose *about* the marker syntax
 ///   survives when it is quoted as code;
 /// * every other bracketed text is untouched — only a fragment that starts with
@@ -366,12 +453,9 @@ pub(crate) fn strip_assistant_fabricated_tool_markers(text: &str) -> Cow<'_, str
     }
 
     let mut stripped = String::with_capacity(text.len());
-    let mut in_fenced_block = false;
     let mut changed = false;
-    for line in text.lines() {
-        if is_code_fence_line(line) {
-            in_fenced_block = !in_fenced_block;
-        } else if !in_fenced_block {
+    for (line, in_fenced_block) in walk_markdown_lines(text) {
+        if !in_fenced_block {
             if is_tool_summary_only_response(line) {
                 // A whole marker line carries nothing else: drop it outright so
                 // no blank line is left where it stood.
@@ -16545,6 +16629,100 @@ ls -la
         }
     }
 
+    /// The CommonMark fence model the cleaner and the detector share, on the
+    /// shapes a single `in_fenced_block` boolean gets wrong.
+    ///
+    /// Each fixture is `(name, input, expected)`; `expected == input` means the
+    /// text must come back byte-for-byte and must therefore not buy a
+    /// corrective retry either. The first two inputs are the 2026-09-19
+    /// cross-audit probe's own cases, replayed verbatim, and pulldown-cmark
+    /// parses both the way these expectations describe.
+    ///
+    /// MUTATION GUARD: drop the character/length check in `CodeFence::closes`
+    /// (accept any fence line as a closer again) and the mixed-fence, long-fence,
+    /// longer-closer, info-string-closer and CRLF fixtures all fail.
+    #[test]
+    fn the_shared_fence_model_follows_commonmark_closing_rules() {
+        let fixtures: &[(&str, &str, &str)] = &[
+            (
+                "plain control",
+                "Fixture checked. [Used tools: shell]",
+                "Fixture checked.",
+            ),
+            (
+                "mixed fence: a backtick line inside a tilde block is not a closer",
+                "~~~text\n```example\n~~~\nFixture checked. [Used tools: shell]",
+                "~~~text\n```example\n~~~\nFixture checked.",
+            ),
+            (
+                "long fence: a shorter run inside a longer block is not a closer",
+                "````text\n```\nDocumented [Used tools: shell]\n````",
+                "````text\n```\nDocumented [Used tools: shell]\n````",
+            ),
+            (
+                "fence-looking content inside a longer tilde fence",
+                "~~~~\n~~~\n[Used tools: shell]\n~~~~",
+                "~~~~\n~~~\n[Used tools: shell]\n~~~~",
+            ),
+            (
+                "a closer may be longer than its opener",
+                "```text\n[Used tools: shell]\n`````\nDone. [Used tools: shell]",
+                "```text\n[Used tools: shell]\n`````\nDone.",
+            ),
+            (
+                "a closing fence may not carry an info string",
+                "```\n[Used tools: shell]\n```rust\nStill code. [Used tools: shell]\n```",
+                "```\n[Used tools: shell]\n```rust\nStill code. [Used tools: shell]\n```",
+            ),
+            (
+                "an opening backtick fence's info string may not contain a backtick",
+                "```rust `x`\nNot code. [Used tools: shell]",
+                "```rust `x`\nNot code.",
+            ),
+            (
+                "inline code spans still document the syntax",
+                "Checked. [Used tools: shell] See `[Used tools: x]`.",
+                "Checked. See `[Used tools: x]`.",
+            ),
+            (
+                "a backslash-escaped fence does not open a block",
+                "\\```text\n[Used tools: shell]\nDone.",
+                "\\```text\nDone.",
+            ),
+            (
+                "three spaces of indent still open and close a fence",
+                "   ```text\n   [Used tools: shell]\n   ```\nDone.",
+                "   ```text\n   [Used tools: shell]\n   ```\nDone.",
+            ),
+            (
+                "an unterminated fence runs to the end of the text",
+                "```text\n[Used tools: shell]\nDocumented [Used tools: shell]",
+                "```text\n[Used tools: shell]\nDocumented [Used tools: shell]",
+            ),
+            (
+                "CRLF input walks the same fences LF input does",
+                "~~~text\r\n```example\r\n~~~\r\nFixture checked. [Used tools: shell]",
+                "~~~text\n```example\n~~~\nFixture checked.",
+            ),
+        ];
+
+        for (name, input, expected) in fixtures {
+            let cleaned = strip_assistant_fabricated_tool_markers(input);
+            assert_eq!(cleaned.as_ref(), *expected, "cleaner disagrees on {name}");
+            assert_eq!(
+                contains_assistant_fabricated_tool_marker(input),
+                cleaned.as_ref() != *input,
+                "detector and cleaner disagree on {name}"
+            );
+            if cleaned.as_ref() == *input {
+                assert!(
+                    matches!(cleaned, Cow::Borrowed(_)),
+                    "text that is not stripped must stay borrowed on {name}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn compact_tool_result_for_history_emits_document_reference_for_large_output() {
         let content = format!(
@@ -19207,6 +19385,153 @@ Let me check the result."#;
                     .any(|message| message.content.contains("Fixture checked.")),
                 "only the marker is removed; the summary itself survives: {:?}",
                 patch.replacement
+            );
+        }
+
+        /// Case 1 of the 2026-09-19 cross-audit fence probe, replayed verbatim
+        /// through the delivery path: a `~~~text` block whose body holds the
+        /// line ```` ```example ````, closed by `~~~`, and then a prose marker.
+        /// The toggle model counted that body line as the closer and the real
+        /// closer as a new opener, so the prose was mistaken for code: no
+        /// corrective retry was spent and the fabricated claim shipped to the
+        /// user and into history.
+        ///
+        /// MUTATION GUARD: accept any fence line as a closer again (drop the
+        /// character/length check in `CodeFence::closes`) and the second
+        /// scripted response is never consumed, the outcome carries
+        /// `[Used tools: shell]`, and history stores it for the next turn to
+        /// imitate.
+        #[tokio::test]
+        async fn a_marker_after_a_mixed_fence_block_retries_once_then_is_stripped() {
+            let provider = ScriptedProvider::from_text_responses(vec![
+                "~~~text\n```example\n~~~\nFixture checked. [Used tools: shell]",
+                "~~~text\n```example\n~~~\nFixture checked. [Used tools: shell] Nothing else to report.",
+            ]);
+            let remaining = Arc::clone(&provider.responses);
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("check the fixture")];
+            let tmp = TempDir::new().unwrap();
+            let (outcome, _trace) = run_tool_call_loop_outcome(
+                &provider,
+                &mut history,
+                Arc::new(Vec::new()),
+                &NoopObserver,
+                &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                None,
+                "terminal",
+                &crate::config::MultimodalConfig::default(),
+                2,
+                false,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ToolLoopMemory::none(),
+                ChatMode::default(),
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("a marker beside real text must not fail the turn");
+
+            assert_eq!(
+                remaining.lock().expect("responses lock should be valid").len(),
+                0,
+                "prose after a mixed-fence block is not code, so the fabricated marker must \
+                 cost exactly one corrective retry (both scripted responses consumed)"
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    ToolLoopOutcome::Text(ref text)
+                        if text == "~~~text\n```example\n~~~\nFixture checked. Nothing else to report."
+                ),
+                "the fenced example must survive byte-for-byte and only the prose marker is cut: {outcome:?}"
+            );
+            assert!(
+                history.iter().all(|message| !message.content.contains("[Used tools:")),
+                "no fabricated marker may reach history: {history:?}"
+            );
+            assert!(
+                history.iter().any(|message| message.content.contains("```example")),
+                "the model's own fenced example must still be stored: {history:?}"
+            );
+        }
+
+        /// Case 2 of the same probe, the mirror image: a ```` ````text ````
+        /// block whose body holds a bare ```` ``` ```` line is code all the way
+        /// to its four-backtick closer. The marker inside is the model's own
+        /// example of the syntax, so it must neither buy the corrective retry
+        /// nor be edited out of the answer or out of history.
+        ///
+        /// MUTATION GUARD: accept any fence line as a closer again and the bare
+        /// ```` ``` ```` line ends the block, so the loop spends the retry on a
+        /// genuine code example and then delivers the example with a hole in it.
+        #[tokio::test]
+        async fn a_marker_inside_a_long_fence_block_is_neither_retried_nor_edited() {
+            const ANSWER: &str = "````text\n```\nDocumented [Used tools: shell]\n````";
+            let provider = ScriptedProvider::from_text_responses(vec![
+                ANSWER,
+                "a genuine code example must not spend the corrective retry",
+            ]);
+            let remaining = Arc::clone(&provider.responses);
+            let mut history = vec![
+                ChatMessage::system("sys"),
+                ChatMessage::user("show me the marker syntax"),
+            ];
+            let tmp = TempDir::new().unwrap();
+            let (outcome, _trace) = run_tool_call_loop_outcome(
+                &provider,
+                &mut history,
+                Arc::new(Vec::new()),
+                &NoopObserver,
+                &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                None,
+                "terminal",
+                &crate::config::MultimodalConfig::default(),
+                2,
+                false,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ToolLoopMemory::none(),
+                ChatMode::default(),
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("a fenced code example must not fail the turn");
+
+            assert_eq!(
+                remaining.lock().expect("responses lock should be valid").len(),
+                1,
+                "a marker inside a genuine fenced block is code, not a claim about work: \
+                 the second scripted response must stay unconsumed"
+            );
+            assert!(
+                matches!(outcome, ToolLoopOutcome::Text(ref text) if text == ANSWER),
+                "a fenced code example must be delivered byte-for-byte: {outcome:?}"
+            );
+            assert_eq!(
+                history.last().map(|message| message.content.as_str()),
+                Some(ANSWER),
+                "the history copy of a fenced code example must not be edited either: {history:?}"
             );
         }
 

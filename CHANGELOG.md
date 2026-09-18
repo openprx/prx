@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.156] - 19 September 2026
+
+### Fixed
+
+- The fabricated `[Used tools: ...]` marker cleaner and its corrective-retry
+  detector now follow CommonMark fenced-code rules through one shared fence
+  walker: a closing fence must use the opening fence's character, be at least
+  as long and carry only trailing whitespace; a fence may be indented up to
+  three spaces; a backtick fence's info string may not contain a backtick; an
+  unterminated fence runs to the end of the text. Prose after a mixed fence is
+  no longer mistaken for code (the marker is detected and stripped again), and a
+  marker inside a longer fence is no longer deleted out of a code example.
+
 ## [0.8.155] - 18 September 2026
 
 ### Fixed
