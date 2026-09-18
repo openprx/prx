@@ -128,25 +128,30 @@ impl Spec {
             Err(error) => return Err(error),
         };
         super::files::commit_mutation_atomically(plan).await?;
-        write_managed_defaults(target_dir, &managed_defaults)?;
 
-        // 5. Create the non-config workspace structure only after the complete
-        // configuration generation has committed.
-        std::fs::create_dir_all(&workspace_dir)
-            .with_context(|| format!("Failed to create workspace in {}", target_dir.display()))?;
-        for subdir in &["sessions", "memory", "state", "cron", "skills"] {
-            std::fs::create_dir_all(workspace_dir.join(subdir))
-                .with_context(|| format!("Failed to create workspace/{subdir} in {}", target_dir.display()))?;
+        // 5. The mutation is on disk from here on. A failure in the steps that
+        // follow is still a failure, but it must not take the report with it:
+        // returning `Err` here used to discard the reset warning and the
+        // archive path, leaving the operator with defaults, an exit code and
+        // an empty stdout. The failure is carried in the report instead, so
+        // `print` still shows what committed and `into_result` still exits
+        // non-zero — now naming both the mutation and the error that stopped
+        // the run.
+        if let Err(error) = finish_after_commit(target_dir, &workspace_dir, &managed_defaults) {
+            report
+                .notices
+                .insert(0, format!("PRX configuration committed ({spec})", spec = self.name()));
+            report
+                .notices
+                .insert(1, format!("  Config dir: {}", target_dir.display()));
+            report
+                .notices
+                .push("  Config files: config.toml + 13 managed fragments".to_string());
+            report.record_post_commit_failure(&error);
+            return Ok(report);
         }
 
-        // 6. Scaffold workspace .md files (default persona, skip existing)
-        scaffold_workspace_defaults(&workspace_dir)?;
-
-        // 7. Set directory permissions (Unix only)
-        #[cfg(unix)]
-        set_directory_permissions(target_dir)?;
-
-        // 8. Summary
+        // 6. Summary
         report
             .notices
             .insert(0, format!("PRX configuration initialized ({spec})", spec = self.name()));
@@ -185,6 +190,10 @@ pub struct InitReport {
     /// a scalar where the previous tree held a table (or the reverse). Same
     /// class of loss as `unpreserved`, different cause.
     dropped: Vec<String>,
+    /// Rendered failure of a step that ran after the configuration mutation
+    /// committed. The tree on disk already changed, so this is reported next to
+    /// the mutation rather than in place of it.
+    post_commit_failure: Option<String>,
 }
 
 impl InitReport {
@@ -204,6 +213,13 @@ impl InitReport {
     #[must_use]
     pub const fn was_reset_to_templates(&self) -> bool {
         self.reset.is_some()
+    }
+
+    /// The failure that stopped the run after the configuration mutation had
+    /// already committed, if there was one.
+    #[must_use]
+    pub fn post_commit_failure(&self) -> Option<&str> {
+        self.post_commit_failure.as_deref()
     }
 
     /// Write the report where `prx init` can actually be read: stdout for the
@@ -240,6 +256,18 @@ impl InitReport {
     /// Keys this build can no longer represent are lost just as completely, so
     /// they end the command non-zero too, listed under their own heading.
     pub fn into_result(self) -> Result<()> {
+        // A step that ran after the mutation committed failed: the operator
+        // needs the failure *and* whatever the mutation did to their settings,
+        // so both are named in the same error.
+        if let Some(failure) = self.post_commit_failure {
+            return Err(match self.reset {
+                Some(_) => anyhow::anyhow!(
+                    "the configuration was reset to this build's templates (see the warning above) \
+                     and the run then failed: {failure}"
+                ),
+                None => anyhow::anyhow!(failure),
+            });
+        }
         if let Some(reason) = self.reset {
             return Err(anyhow::anyhow!(reason));
         }
@@ -329,6 +357,17 @@ impl InitReport {
         );
         self.warnings.push(message.clone());
         self.reset = Some(message);
+    }
+
+    /// Record a failure of a step that ran after the configuration mutation
+    /// committed, keeping everything already recorded about that mutation.
+    fn record_post_commit_failure(&mut self, error: &anyhow::Error) {
+        let rendered = format!("{error:#}");
+        self.warnings.push(format!(
+            "ERROR: the configuration above is already written, but this run then failed: {rendered}. \
+             Fix the reported cause and run `prx init --force` again; the archive named above is kept."
+        ));
+        self.post_commit_failure = Some(rendered);
     }
 }
 
@@ -946,6 +985,26 @@ fn leftover_label(table: &[String], key: &str) -> String {
 }
 
 // ── File I/O helpers ────────────────────────────────────────────
+
+/// Everything `prx init` does after the configuration mutation has committed:
+/// the defaults sidecar, the workspace tree, the scaffolded persona files and
+/// the directory permissions.
+///
+/// Kept in one place so the caller can treat a failure here as "committed, then
+/// failed" rather than as a failed run with nothing to report.
+fn finish_after_commit(target_dir: &Path, workspace_dir: &Path, managed_defaults: &str) -> Result<()> {
+    write_managed_defaults(target_dir, managed_defaults)?;
+    std::fs::create_dir_all(workspace_dir)
+        .with_context(|| format!("Failed to create workspace in {}", target_dir.display()))?;
+    for subdir in &["sessions", "memory", "state", "cron", "skills"] {
+        std::fs::create_dir_all(workspace_dir.join(subdir))
+            .with_context(|| format!("Failed to create workspace/{subdir} in {}", target_dir.display()))?;
+    }
+    scaffold_workspace_defaults(workspace_dir)?;
+    #[cfg(unix)]
+    set_directory_permissions(target_dir)?;
+    Ok(())
+}
 
 fn write_config_file(path: &Path, content: &str) -> Result<()> {
     // Backup existing file before overwriting
@@ -2502,6 +2561,78 @@ mod tests {
         report.record_preservation(&outcome, None);
         assert!(report.dropped_keys().is_empty());
         report.into_result().expect("test: a lossless fold must exit zero");
+    }
+
+    /// A step that runs after the mutation commits must not take the report
+    /// with it: the operator's settings are already off the live tree, so the
+    /// reset warning, the archive that holds them and the failure itself all
+    /// have to reach the caller, and the run still ends non-zero.
+    #[tokio::test]
+    async fn a_failure_after_the_commit_keeps_the_committed_report() {
+        let tmp = tempfile::tempdir().expect("test: create tempdir");
+        let dir = tmp.path();
+        Spec::Full.generate(dir, false).await.expect("test: generate full");
+
+        // `allowed_users` is required, so the preserved settings cannot validate
+        // and `--force` falls back to the shipped templates.
+        fs::write(
+            dir.join("config.d/channels.toml"),
+            "[channels_config]\ncli = true\n\n[channels_config.telegram]\nbot_token = \"unit-operator-token\"\n",
+        )
+        .expect("test: write a fragment this build cannot load");
+        // Obstruct a workspace subdirectory so the scaffolding after the commit fails.
+        let sessions = dir.join("workspace").join("sessions");
+        fs::remove_dir_all(&sessions).expect("test: clear workspace/sessions");
+        fs::write(&sessions, "not a directory").expect("test: obstruct workspace/sessions");
+
+        let report = Spec::Full
+            .generate_reported(dir, true)
+            .await
+            .expect("test: a failure after the commit must still return the report");
+
+        assert!(
+            report.was_reset_to_templates(),
+            "the fixture must reproduce the reset: {:?}",
+            report.warnings()
+        );
+        let failure = report
+            .post_commit_failure()
+            .expect("test: the failure that stopped the run must be reported");
+        assert!(
+            failure.contains("workspace/sessions"),
+            "the failure must name what it could not create: {failure}"
+        );
+
+        let archives = archive_dirs(dir);
+        assert_eq!(archives.len(), 1, "exactly one archive: {archives:?}");
+        let archive = archives.first().expect("test: the archive must exist");
+        let archive_path = archive.display().to_string();
+        assert!(
+            report.warnings().iter().any(|line| line.contains(&archive_path)),
+            "the archive path must be printed: {:?}",
+            report.warnings()
+        );
+        assert!(
+            fs::read_to_string(archive.join("channels.toml"))
+                .expect("test: read the archived fragment")
+                .contains("unit-operator-token"),
+            "the archive must hold the operator's original value"
+        );
+        assert!(
+            !fs::read_to_string(dir.join("config.d/channels.toml"))
+                .expect("test: read the regenerated fragment")
+                .contains("unit-operator-token"),
+            "the reset the report describes must actually have committed"
+        );
+
+        let error = report
+            .into_result()
+            .expect_err("test: a failure after the commit must exit non-zero");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("workspace/sessions") && rendered.contains("reset"),
+            "the error must name both the failure and the mutation: {rendered}"
+        );
     }
 
     // ── Archive directories ──────────────────────────────────────

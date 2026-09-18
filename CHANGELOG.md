@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.150] - 18 September 2026
+
+### Fixed
+
+- `prx init --force` no longer hides a committed configuration reset when a
+  later step fails. Post-commit work (defaults sidecar, workspace tree,
+  scaffolding, permissions) is grouped after the commit; a failure there is
+  recorded on the report, so the reset warning, the exact unique archive path
+  and the preserved settings are still printed together with an `ERROR:` line,
+  and the command exits non-zero naming both the reset and the failing step.
+  A real CLI integration test covers the obstructed-workspace case.
+
 ## [0.8.149] - 18 September 2026
 
 ### Fixed
