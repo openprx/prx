@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.160] - 19 September 2026
+
+### Changed
+
+- The channel test that proves a two-hour turn is never cut off by a wall clock
+  now keeps that turn observably progressing while it waits, so it no longer
+  contradicts the idle (no-progress) detector once turn silence is measured on
+  the runtime clock. A silent two-hour turn is still terminated, as documented.
+
 ## [0.8.159] - 19 September 2026
 
 ### Fixed

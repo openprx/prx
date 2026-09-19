@@ -8601,10 +8601,35 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     /// Answers only after a stretch of wall clock far beyond the deleted per-turn
-    /// budget, then replies normally.
+    /// budget, and — like any provider that is genuinely working — keeps the turn
+    /// visibly alive while it does.
     struct GlacialProvider {
         delay: Duration,
         calls: Arc<AtomicUsize>,
+    }
+
+    impl GlacialProvider {
+        /// Longest the provider stays quiet between signs of life.
+        ///
+        /// A slow provider is not a *silent* one: it streams tokens, or reports
+        /// a retry, or at minimum keeps a connection producing something. This
+        /// models that at the coarsest end of plausible — one signal every ten
+        /// minutes — which is comfortably inside
+        /// [`crate::agent::idle::DEFAULT_IDLE_HANG_SECS`] (1800s), so the turn
+        /// below is long without ever being silent.
+        const PROGRESS_SLICE: Duration = Duration::from_mins(10);
+
+        async fn answer_slowly(&self) -> String {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut remaining = self.delay;
+            while !remaining.is_zero() {
+                let slice = remaining.min(Self::PROGRESS_SLICE);
+                tokio::time::sleep(slice).await;
+                remaining = remaining.saturating_sub(slice);
+                crate::agent::idle::beat(crate::agent::idle::ProgressKind::ProviderStream);
+            }
+            "here is the slow answer".to_string()
+        }
     }
 
     #[async_trait::async_trait]
@@ -8616,9 +8641,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _model: &str,
             _temperature: f64,
         ) -> anyhow::Result<String> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            tokio::time::sleep(self.delay).await;
-            Ok("here is the slow answer".to_string())
+            Ok(self.answer_slowly().await)
         }
 
         async fn chat_with_history(
@@ -8627,9 +8650,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _model: &str,
             _temperature: f64,
         ) -> anyhow::Result<String> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            tokio::time::sleep(self.delay).await;
-            Ok("here is the slow answer".to_string())
+            Ok(self.answer_slowly().await)
         }
     }
 
@@ -8642,6 +8663,15 @@ BTC is currently around $65,000 based on latest tool output."#
     /// nothing on the channel path measures them any more. Before this change
     /// the turn was aborted at 1200s, the whole turn was replayed once, and the
     /// user was sent "⚠️ Request timed out. Please try again shortly."
+    ///
+    /// The turn is long *and progressing*: the provider signals every ten
+    /// virtual minutes, the way one that is genuinely working does. That
+    /// distinction is the whole contract, and it is the only one left — duration
+    /// is not a fault, silence is, and with the wall clock deleted the idle
+    /// (no-progress) detector is the sole mechanism that can still end a turn.
+    /// A fixture that instead sat mute for two hours would not be testing the
+    /// absence of a wall clock; it would be a stall, and evidence 2 below is
+    /// what a stall is supposed to look like.
     ///
     /// MUTATION: wrapping the tool loop in `process_channel_message` in a
     /// `tokio::time::timeout` again turns this test red.
