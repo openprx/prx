@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.161] - 19 September 2026
+
+### Changed
+
+- The architecture guard decides tool-execution exemptions by binding and call
+  count, never by name: a field or accessor receiver (`self.conn`,
+  `checkout.client_mut()?`) carries no binding and must be listed as a reviewed
+  site; a producer expression is matched by its canonical shape and receiver
+  rather than by substring; and every allowlisted direct invocation carries an
+  exact occurrence count, so a second direct tool call added inside an
+  allowlisted function, a stale entry, or a shadowed handle fails the guard.
+
 ## [0.8.160] - 19 September 2026
 
 ### Changed

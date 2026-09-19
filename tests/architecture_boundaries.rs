@@ -6,7 +6,7 @@
 
 #![allow(clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::unwrap_used)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -1082,55 +1082,81 @@ const NON_TOOL_RECEIVER_TYPES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Chain methods that only attach context to an error and cannot change the
+/// type of the value a producer expression yields.
+const PRODUCER_INERT_TAIL_METHODS: &[&str] = &[".context(", ".with_context(", ".map_err("];
+
 /// Initialiser expressions that produce one of [`NON_TOOL_RECEIVER_TYPES`].
 ///
 /// A `let` binding with no type annotation carries its type in the expression
-/// that built it. Each pattern here is matched against the whole initialiser of
-/// the receiver's own binding in the enclosing function, and names the type it
-/// yields; nothing matches a plain move of an existing value, so
-/// `let conn = some_tool;` stays a reviewable tool execution.
+/// that built it. Each entry is the *whole* initialiser in canonical form
+/// ([`producer_shape`]: whitespace removed, argument lists that carry no nested
+/// call reduced to `..`, the inert error-context tail and `?` stripped), and it
+/// is compared for equality, never as a substring. The receiver is part of the
+/// entry for that reason: `.transaction()` on its own would have exempted
+/// `let handle = self.transaction();` whatever `self.transaction()` returns,
+/// which is the same defect as exempting a receiver by its name. Nothing here
+/// matches a plain move of an existing value, so `let conn = some_tool;` stays
+/// a reviewable tool execution.
+///
+/// Associated functions of a declared non-tool type - `Connection::open(..)` -
+/// are recognised by [`constructor_producer_type`] instead and are not listed.
 const NON_TOOL_RECEIVER_PRODUCERS: &[(&str, &str)] = &[
     (
-        ".build_transaction()",
-        "tokio-postgres transaction builder -> Transaction",
+        "checkout.client_mut()?.transaction()",
+        "the webhook store's pooled tokio-postgres checkout -> Transaction",
     ),
     (
-        ".transaction()",
-        "rusqlite / tokio-postgres `transaction()` -> Transaction",
+        "client.build_transaction().read_only(..).start()",
+        "the memory Postgres read-only transaction builder -> Transaction",
     ),
     (
-        ".transaction_with_behavior(",
+        "client.transaction()",
+        "tokio-postgres `Client::transaction()` -> Transaction",
+    ),
+    (
+        "conn.transaction()",
+        "rusqlite `Connection::transaction()` -> Transaction",
+    ),
+    (
+        "conn.transaction_with_behavior(..)",
         "rusqlite `transaction_with_behavior()` -> Transaction",
     ),
     (
-        ".unchecked_transaction()",
+        "conn.unchecked_transaction()",
         "rusqlite `unchecked_transaction()` -> Transaction",
     ),
-    ("Connection::open(", "rusqlite `Connection::open()` -> Connection"),
     (
-        "self.client.clone()",
-        "the memory Postgres pool's own tokio-postgres Client handle",
-    ),
-    ("self.conn()", "the store's rusqlite connection accessor -> Connection"),
-    (
-        "self.conn.lock()",
-        "the webhook store's `parking_lot` guard over its rusqlite Connection",
-    ),
-    (
-        "open_approval_ledger(",
+        "open_approval_ledger(..)",
         "the approval ledger opener -> rusqlite Connection",
-    ),
-    (
-        "ToolExecutionService::from_shared_boxed_registry(",
-        "the gateway MCP compatibility layer building the approved execution service",
     ),
     (
         "pool.write()",
         "the `parking_lot` write guard over the shared rusqlite Connection",
     ),
     (
+        "self.client.clone()",
+        "the memory Postgres pool's own tokio-postgres Client handle",
+    ),
+    (
+        "self.conn()",
+        "the xin and cron store's rusqlite connection accessor -> Connection",
+    ),
+    (
+        "self.conn.lock()",
+        "the webhook store's `parking_lot` guard over its rusqlite Connection",
+    ),
+    (
+        "self.conn.transaction()",
+        "the store's own rusqlite Connection field -> Transaction",
+    ),
+    (
         "reader.connection()",
-        "the snapshot reader's rusqlite Connection accessor",
+        "the memory SQLite snapshot reader's rusqlite Connection accessor",
+    ),
+    (
+        "to_store_err!(conn.transaction())",
+        "the WhatsApp store's error-mapping macro around `Connection::transaction()`",
     ),
 ];
 
@@ -1185,125 +1211,159 @@ const NON_TOOL_CLOSURE_PROVIDERS: &[(&str, &str, &str)] = &[
 /// A new entry needs a reason next to it, and any new entry under `src/gateway/`
 /// that is not in `GATEWAY_DIRECT_TOOL_INVOCATION_GATES` is a regression of the
 /// 0.8.126 fix by construction.
-const ALLOWED_DIRECT_TOOL_INVOCATIONS: &[(&str, &str)] = &[
+///
+/// Each entry carries how many direct `Tool` executions that function contains.
+/// The guard compares `(entry, count)`, not the set of entries: a *second*
+/// direct call added to a function that is already listed used to disappear into
+/// the deduplicated entry name, which is the same blind spot as exempting a
+/// receiver by its name.
+const ALLOWED_DIRECT_TOOL_INVOCATIONS: &[(&str, usize, &str)] = &[
     (
         "src/agent/agent.rs::spawn_delegate_task",
+        1,
         "fire-and-forget delegate spawn from the legacy `Agent::run_single` shell; \
          `Agent::execute_tool_call` — the shell's actual tool path — was routed through the \
          service in 0.8.128 and must not come back here",
     ),
     (
         "src/chat/mod.rs::enrich_file_mentions_for_prompt",
+        1,
         "operator-typed `@file` mention expansion; the argument document is built by this code, \
          not by a model",
     ),
     (
         "src/chat/mod.rs::kill_local_session",
+        1,
         "operator-typed `/kill`; the human at the keyboard is the authority",
     ),
     (
         "src/chat/mod.rs::run",
+        4,
         "operator-typed `/spawn`, `/steer` and `!command`; the human at the keyboard is the \
          authority",
     ),
     (
         "src/gateway/api/channels.rs::post_channel_send",
+        1,
         "operator-plane send with its own gate chain — see GATEWAY_DIRECT_TOOL_INVOCATION_GATES",
     ),
     (
         "src/gateway/api/config.rs::post_config_reload",
+        1,
         "operator-plane config reload with its own gate chain — see \
          GATEWAY_DIRECT_TOOL_INVOCATION_GATES",
     ),
     (
         "src/plugins/runtime.rs::dispatch_alias",
+        1,
         "decorator: the WASM plugin runtime dispatches a plugin alias onto the plugin tool it \
          already resolved",
     ),
     (
         "src/plugins/runtime.rs::execute_named",
+        1,
         "decorator: the WASM plugin tool forwards its named entry to the resolved plugin tool",
     ),
     (
         "src/tools/delegate.rs::execute",
+        2,
         "decorator: the delegate/capability alias forwards to the inner tool",
     ),
     (
         "src/tools/delegate.rs::execute_named",
+        1,
         "decorator: the delegate/capability alias forwards to the inner tool",
     ),
     (
         "src/tools/delegate.rs::execute_named_with_cancellation",
+        1,
         "decorator: the delegate/capability alias forwards to the inner tool",
     ),
     (
         "src/tools/delegate.rs::execute_with_cancellation",
+        2,
         "decorator: the delegate/capability alias forwards to the inner tool",
     ),
     (
         "src/tools/execution.rs::invoke",
+        2,
         "the service's own legacy per-call adapter — this is `ToolExecutionService` reaching its \
          backend after every gate has run",
     ),
     (
         "src/tools/mcp.rs::execute",
+        1,
         "decorator: the `mcp_call` root alias forwards to its own named entry",
     ),
     (
         "src/tools/mod.rs::execute",
+        1,
         "decorator: the tiering wrapper forwards to the wrapped tool",
     ),
     (
         "src/tools/mod.rs::execute_named",
+        1,
         "decorator: the tiering wrapper forwards to the wrapped tool",
     ),
     (
         "src/tools/mod.rs::execute_named_with_cancellation",
+        1,
         "decorator: the tiering wrapper forwards to the wrapped tool",
     ),
     (
         "src/tools/mod.rs::execute_with_cancellation",
+        1,
         "decorator: the tiering wrapper forwards to the wrapped tool",
     ),
     (
         "src/tools/sessions_spawn.rs::execute",
+        1,
         "decorator: session-scoped aliases rewrite arguments then forward",
     ),
     (
         "src/tools/sessions_spawn.rs::execute_named",
+        1,
         "decorator: session-scoped aliases rewrite arguments then forward",
     ),
     (
         "src/tools/sessions_spawn.rs::execute_named_with_cancellation",
+        1,
         "decorator: session-scoped aliases rewrite arguments then forward",
     ),
     (
         "src/tools/sessions_spawn.rs::execute_with_cancellation",
+        1,
         "decorator: session-scoped aliases rewrite arguments then forward",
     ),
     (
         "src/tools/skills.rs::execute",
+        1,
         "decorator: skill aliases forward to the skill runner",
     ),
     (
         "src/tools/skills.rs::execute_named",
+        1,
         "decorator: skill aliases forward to the skill runner",
     ),
     (
         "src/tools/skills.rs::execute_resolved",
+        1,
         "decorator: an `http` skill is run by handing the request this code built to the \
          `HttpRequestTool` the skill tool owns; the service already gated the outer `skill_execute`",
     ),
     (
         "src/tools/traits.rs::execute_named",
+        1,
         "the `Tool` trait's own default bodies: `execute_named` falls back to `execute`",
     ),
     (
         "src/tools/traits.rs::execute_named_with_cancellation",
+        3,
         "the `Tool` trait's own default bodies: the cancellation twin routes to the named entry",
     ),
     (
         "src/tools/traits.rs::execute_with_cancellation",
+        2,
         "the `Tool` trait's own default body: the cancellation twin races `execute`",
     ),
 ];
@@ -1566,6 +1626,42 @@ fn receiver_expression(characters: &[char], dot: usize) -> String {
     }
     segments.reverse();
     segments.join(".")
+}
+
+/// Whether the receiver of the call at `dot` is a plain local name - something
+/// a `let`, a parameter or a closure parameter in this function could have
+/// bound - rather than a field, an index or the result of another call.
+///
+/// `conn.execute(..)` is a local name. `self.conn.execute(..)`,
+/// `state.tool.execute(..)` and `checkout.client_mut()?.execute(..)` are not:
+/// their type lives on a struct or on another function's return type, so the
+/// binding rule has nothing to say about them and they fall through to the
+/// reviewed site exceptions.
+fn receiver_is_local_binding(characters: &[char], dot: usize) -> bool {
+    let mut index = dot;
+    while index > 0 && characters[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    if index == 0 || !is_ident_char(characters[index - 1]) {
+        return false;
+    }
+    let mut start = index - 1;
+    while start > 0 && is_ident_char(characters[start - 1]) {
+        start -= 1;
+    }
+    let mut before = start;
+    while before > 0 && characters[before - 1].is_whitespace() {
+        before -= 1;
+    }
+    if before == 0 {
+        return true;
+    }
+    if matches!(characters[before - 1], '.' | ')' | ']' | '?') {
+        return false;
+    }
+    // A path segment (`crate::THING.execute(..)`), not a local. A single colon
+    // is a macro label or a struct field and says nothing either way.
+    !(characters[before - 1] == ':' && before >= 2 && characters[before - 2] == ':')
 }
 
 /// The type or trait a UFCS call names: `Tool::execute`, `MessageSendTool::execute`
@@ -1888,6 +1984,132 @@ fn base_type_identifier(annotation: &str) -> String {
     head.rsplit("::").next().unwrap_or(&head).to_string()
 }
 
+/// One `let` initialiser in canonical form.
+///
+/// Whitespace is removed so a multi-line chain reads like a single-line one, and
+/// every argument list is reduced to `..` unless it contains another call, in
+/// which case the nested call is kept and canonicalised too. The result is the
+/// *shape* of the expression: which receiver, which methods, in which order -
+/// everything that decides the type, and nothing that does not.
+fn producer_shape(initialiser: &str) -> String {
+    let characters: Vec<char> = initialiser.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut shape = String::new();
+    let mut index = 0usize;
+    while index < characters.len() {
+        if characters[index] != '(' {
+            shape.push(characters[index]);
+            index += 1;
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut end = index;
+        let mut closed = false;
+        while end < characters.len() {
+            match characters[end] {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        closed = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            end += 1;
+        }
+        if !closed {
+            // Truncated or unbalanced: nothing can match it, which is the safe
+            // direction.
+            shape.push_str("(<unbalanced>");
+            return shape;
+        }
+        let inner: String = characters[index + 1..end].iter().collect();
+        shape.push('(');
+        if inner.contains('(') {
+            shape.push_str(&producer_shape(&inner));
+        } else if !inner.is_empty() {
+            shape.push_str("..");
+        }
+        shape.push(')');
+        index = end + 1;
+    }
+    shape
+}
+
+/// Whether `text` opens with `(` and closes on the matching `)` at its end.
+fn is_one_balanced_group(text: &str) -> bool {
+    let characters: Vec<char> = text.chars().collect();
+    if characters.first() != Some(&'(') {
+        return false;
+    }
+    let mut depth = 0usize;
+    for (offset, character) in characters.iter().enumerate() {
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return offset + 1 == characters.len();
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Strip the part of a producer shape that cannot change its type: trailing `?`
+/// and trailing error-context combinators.
+fn strip_inert_producer_tail(shape: &str) -> String {
+    let mut text = shape;
+    loop {
+        if let Some(trimmed) = text.strip_suffix('?') {
+            text = trimmed;
+            continue;
+        }
+        let mut cut = None;
+        for method in PRODUCER_INERT_TAIL_METHODS {
+            let Some(position) = text.rfind(method) else {
+                continue;
+            };
+            let arguments = &text[position + method.len() - 1..];
+            if is_one_balanced_group(arguments) {
+                cut = Some(cut.map_or(position, |current: usize| current.min(position)));
+            }
+        }
+        match cut {
+            Some(position) => text = &text[..position],
+            None => break,
+        }
+    }
+    text.to_string()
+}
+
+/// The non-tool type a producer shape names when it is an associated function
+/// of one: `Connection::open(..)`,
+/// `crate::tools::ToolExecutionService::from_shared_boxed_registry(..)`.
+///
+/// The shape has to be that one call and nothing else, so
+/// `MessageSendTool::new(..).with_channels(..)` and a chain that turns the
+/// result into something else both fall through to review.
+fn constructor_producer_type(shape: &str) -> Option<&'static str> {
+    let (head, arguments) = shape.split_once('(')?;
+    if head.contains('.') || !head.contains("::") {
+        return None;
+    }
+    if !is_one_balanced_group(&format!("({arguments}")) {
+        return None;
+    }
+    let mut segments: Vec<&str> = head.split("::").collect();
+    segments.pop()?;
+    let owner = segments.pop()?;
+    NON_TOOL_RECEIVER_TYPES
+        .iter()
+        .find(|(name, _)| *name == owner)
+        .map(|(name, _)| *name)
+}
+
 /// The non-`Tool` type one binding proves, if any.
 fn non_tool_binding_type(binding: &str) -> Option<&'static str> {
     if let Some(annotation) = binding
@@ -1910,9 +2132,13 @@ fn non_tool_binding_type(binding: &str) -> Option<&'static str> {
             .map(|(_, parameter, _)| *parameter);
     }
     if let Some(value) = binding.strip_prefix("let value: ") {
+        let shape = strip_inert_producer_tail(&producer_shape(value));
+        if let Some(owner) = constructor_producer_type(&shape) {
+            return Some(owner);
+        }
         return NON_TOOL_RECEIVER_PRODUCERS
             .iter()
-            .find(|(pattern, _)| value.contains(pattern))
+            .find(|(pattern, _)| *pattern == shape)
             .map(|(pattern, _)| *pattern);
     }
     None
@@ -2013,8 +2239,18 @@ fn scan_tool_executions(relative: &str, source: &str) -> ToolExecutionScan {
             before -= 1;
         }
         let (receiver, receiver_path, form) = if before > 0 && characters[before - 1] == '.' {
-            let receiver = receiver_identifier(&characters, before - 1);
             let path = receiver_expression(&characters, before - 1);
+            // Only a receiver that *is* a local binding may be looked up among
+            // the function's bindings. `self.conn` and `state.tool` are fields
+            // and `checkout.client_mut()?` is a call: a same-named local in the
+            // same function says nothing about them, and consulting one is how
+            // an audit probe got a `Tool` on `self.conn` waved through by a
+            // `conn: &Connection` parameter sitting beside it.
+            let receiver = if receiver_is_local_binding(&characters, before - 1) {
+                receiver_identifier(&characters, before - 1)
+            } else {
+                String::new()
+            };
             let form = format!("{path}.{name}(...)");
             (receiver, path, form)
         } else if before > 1 && characters[before - 1] == ':' && characters[before - 2] == ':' {
@@ -2267,6 +2503,22 @@ fn scan_repository_tool_executions() -> ToolExecutionScan {
     combined
 }
 
+/// One inventory line per enclosing function: `<file>::<function> xN`.
+///
+/// The count is what stops a *second* direct tool execution inside a function
+/// that is already allowlisted from disappearing into the deduplicated entry
+/// name.
+fn direct_tool_execution_inventory(sites: &[&ToolExecutionSite]) -> Vec<String> {
+    let mut counted: BTreeMap<&str, usize> = BTreeMap::new();
+    for site in sites {
+        *counted.entry(site.entry.as_str()).or_default() += 1;
+    }
+    counted
+        .into_iter()
+        .map(|(entry, count)| format!("{entry} x{count}"))
+        .collect()
+}
+
 /// The autonomy policy, the approval gate, the published-schema check and the
 /// audit record all live in `ToolExecutionService::execute`. Anything that calls
 /// a `Tool` directly gets none of them, so the set of direct callers is pinned —
@@ -2302,16 +2554,15 @@ fn direct_tool_invocations_outside_the_execution_service_are_allowlisted() {
         );
     }
 
-    let mut found: Vec<String> = direct.iter().map(|site| site.entry.clone()).collect();
-    found.sort();
-    found.dedup();
+    let found = direct_tool_execution_inventory(&direct);
 
-    let expected: Vec<&str> = ALLOWED_DIRECT_TOOL_INVOCATIONS
+    let expected: Vec<String> = ALLOWED_DIRECT_TOOL_INVOCATIONS
         .iter()
-        .map(|(entry, _)| *entry)
+        .map(|(entry, count, _)| format!("{entry} x{count}"))
         .collect();
+    let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
     assert_inventory(
-        "direct Tool execution call sites outside ToolExecutionService",
+        "direct Tool execution call sites outside ToolExecutionService (entry and call count)",
         found,
         &expected,
     );
@@ -2359,10 +2610,15 @@ fn every_gateway_tool_execution_documents_its_alternative_gate() {
 #[test]
 fn direct_tool_invocation_allowlist_entries_carry_a_reason() {
     let mut seen = BTreeSet::new();
-    for (entry, reason) in ALLOWED_DIRECT_TOOL_INVOCATIONS {
+    for (entry, occurrences, reason) in ALLOWED_DIRECT_TOOL_INVOCATIONS {
         assert!(
             seen.insert(*entry),
             "{entry} is listed twice in ALLOWED_DIRECT_TOOL_INVOCATIONS"
+        );
+        assert!(
+            *occurrences > 0,
+            "{entry} declares zero direct tool executions; delete the entry instead of leaving a \
+             standing exemption"
         );
         assert!(
             reason.len() > 20,
@@ -2544,7 +2800,7 @@ fn the_binding_rule_proves_only_the_declared_non_tool_types() {
         (
             "declared producer expression",
             "pub fn f() {\n    let tx = conn.transaction()?;\n    tx.execute(sql, params)?;\n}\n",
-            Some(".transaction()"),
+            Some("conn.transaction()"),
         ),
         (
             "plain move of an existing value",
@@ -2570,6 +2826,140 @@ fn the_binding_rule_proves_only_the_declared_non_tool_types() {
             *expected,
             "{label} resolved to the wrong binding: {:?}",
             scan.sites[0]
+        );
+    }
+}
+
+/// Independent audit B01-M3: a `Tool` reached through a field is not excused by
+/// a same-named local of a proven type sitting beside it.
+///
+/// `self.conn.execute(args).await` reduces to the identifier `conn`, and the
+/// function also takes `conn: &Connection`. A field has no binding in the
+/// function, so its type is not the local's type and the call must fall through
+/// to the reviewed site exceptions, which is where `self.tool_execution`,
+/// `self.process` and `self.shell` already are.
+#[test]
+fn a_tool_on_a_non_local_receiver_is_not_excused_by_a_same_named_local() {
+    let cases: &[(&str, &str, &str)] = &[
+        ("field of self", "self.conn", "let _ = self.conn.execute(args).await;"),
+        (
+            "field of a local",
+            "state.conn",
+            "let _ = state.conn.execute(args).await;",
+        ),
+        ("accessor call", "conn", "let _ = checkout.conn()?.execute(args).await;"),
+        (
+            "indexed element",
+            "conn",
+            "let _ = registry.conn[0].execute(args).await;",
+        ),
+    ];
+    for (label, expected_receiver, call) in cases {
+        let source = format!(
+            "pub async fn probe_field_receiver(&self, conn: &Connection) {{\n    \
+             conn.execute(sql, params)?;\n    \
+             {call}\n}}\n"
+        );
+        let scan = scan_tool_executions("src/memory/sqlite.rs", &source);
+        assert_eq!(scan.sites.len(), 2, "{label}: {:?}", scan.sites);
+        let direct = direct_tool_execution_sites(&scan.sites, NON_TOOL_EXECUTE_CALL_SITES);
+        let receivers: Vec<&str> = direct.iter().map(|site| site.receiver_path.as_str()).collect();
+        assert_eq!(
+            receivers,
+            vec![*expected_receiver],
+            "{label}: the local `conn: &Connection` call must stay proven and the non-local \
+             receiver must be inventoried; scan was {:?}",
+            scan.sites
+        );
+    }
+}
+
+/// Independent audit B01-M4: a producer is matched against the whole
+/// initialiser, so a method that merely shares a name with one proves nothing.
+#[test]
+fn a_producer_match_is_anchored_to_the_whole_initialiser() {
+    let cases: &[(&str, &str, bool)] = &[
+        ("the declared receiver", "conn.transaction()?", true),
+        ("a different receiver", "self.transaction()", false),
+        ("an undeclared receiver", "factory.transaction()?", false),
+        ("a chained conversion", "conn.transaction()?.into_tool()", false),
+        ("an error-context tail", "conn.transaction().context(reason)?", true),
+        ("a declared constructor", "Connection::open(path)?", true),
+        (
+            "a constructor of some other type",
+            "MessageSendTool::new(policy)",
+            false,
+        ),
+        (
+            "a constructor turned into something else",
+            "Connection::open(path)?.into_tool()",
+            false,
+        ),
+    ];
+    for (label, initialiser, proven) in cases {
+        let source = format!(
+            "pub fn probe_producer() {{\n    let handle = {initialiser};\n    let _ = handle.execute(args);\n}}\n"
+        );
+        let scan = scan_tool_executions("src/memory/sqlite.rs", &source);
+        assert_eq!(scan.sites.len(), 1, "{label}: {:?}", scan.sites);
+        assert_eq!(
+            scan.sites[0].non_tool_binding.is_some(),
+            *proven,
+            "{label}: `let handle = {initialiser};` resolved to {:?}",
+            scan.sites[0]
+        );
+    }
+}
+
+/// The direct-invocation inventory counts calls, not functions, so a second
+/// direct tool execution inside an already allowlisted function changes the
+/// value the allowlist is compared against.
+#[test]
+fn the_direct_invocation_inventory_counts_calls_not_functions() {
+    let one = scan_tool_executions(
+        "src/example.rs",
+        "pub async fn handler() {\n    let _ = tool.execute(args).await;\n}\n",
+    );
+    assert_eq!(
+        direct_tool_execution_inventory(&direct_tool_execution_sites(&one.sites, NON_TOOL_EXECUTE_CALL_SITES)),
+        vec!["src/example.rs::handler x1".to_string()]
+    );
+
+    let two = scan_tool_executions(
+        "src/example.rs",
+        "pub async fn handler() {\n    let _ = tool.execute(args).await;\n    let _ = other.execute_with_cancellation(args, None).await;\n}\n",
+    );
+    assert_eq!(
+        direct_tool_execution_inventory(&direct_tool_execution_sites(&two.sites, NON_TOOL_EXECUTE_CALL_SITES)),
+        vec!["src/example.rs::handler x2".to_string()],
+        "a second direct tool execution in the same function must change the inventory line"
+    );
+
+    let none = scan_tool_executions("src/example.rs", "pub async fn handler() {\n    let _ = 1;\n}\n");
+    assert!(
+        direct_tool_execution_inventory(&direct_tool_execution_sites(&none.sites, NON_TOOL_EXECUTE_CALL_SITES))
+            .is_empty(),
+        "a removed call must drop its inventory line so a stale allowlist entry fails"
+    );
+}
+
+/// Every allowlist entry declares how many direct tool executions its function
+/// makes, and the count is what the guard compares.
+#[test]
+fn direct_tool_invocation_allowlist_counts_match_the_tree() {
+    let scan = scan_repository_tool_executions();
+    let direct = direct_tool_execution_sites(&scan.sites, NON_TOOL_EXECUTE_CALL_SITES);
+    let mut counted: BTreeMap<&str, usize> = BTreeMap::new();
+    for site in &direct {
+        *counted.entry(site.entry.as_str()).or_default() += 1;
+    }
+    for (entry, occurrences, _) in ALLOWED_DIRECT_TOOL_INVOCATIONS {
+        let actual = counted.get(entry).copied().unwrap_or_default();
+        assert_eq!(
+            actual, *occurrences,
+            "{entry} is allowlisted for {occurrences} direct tool execution(s) but the tree has \
+             {actual}. Every direct call is reviewed one at a time: raise the count only with the \
+             reason that justifies the new call, and remove the entry when the last call goes"
         );
     }
 }
@@ -2759,8 +3149,19 @@ fn the_non_tool_receiver_tables_are_reviewable() {
             "{pattern} needs a reason naming the type it yields, not {reason:?}"
         );
         assert!(
-            pattern.contains('(') || pattern.contains("::"),
+            pattern.contains('('),
             "{pattern} must be a call expression, not a bare name that any variable could carry"
+        );
+        assert_eq!(
+            strip_inert_producer_tail(&producer_shape(pattern)),
+            *pattern,
+            "{pattern} is not in canonical producer form and can therefore never match an \
+             initialiser; write it as the whole expression with argument lists reduced to `..`"
+        );
+        assert!(
+            constructor_producer_type(pattern).is_none(),
+            "{pattern} is an associated function of a declared non-tool type, which \
+             constructor_producer_type already recognises; a table entry would only rot"
         );
     }
 }
