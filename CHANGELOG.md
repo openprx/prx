@@ -23,10 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same owner isolation as the other reads: an owner-isolated caller sees a
   chunk only when its owner id matches, an unattributed chunk is hidden from
   such a caller, and non-isolated callers are unchanged.
-- The memory-draft lifecycle and document-ingest memory events now record
-  their owner in both adapters, so rows created at session or private
-  visibility are attributed from birth instead of being invisible to their
-  own owner-isolated author.
+- The memory-draft lifecycle memory events now record their owner in both
+  adapters, so draft rows created at session or private visibility are
+  attributed from birth instead of being invisible to their own
+  owner-isolated author. Document-ingest events record the owner as well;
+  they still carry no session key, so a session- or private-visibility
+  ingest event remains unreadable through the session arms (tracked
+  separately).
 
 ## [0.8.161] - 19 September 2026
 
@@ -66,8 +69,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `owner_id` column through an idempotent migration (SQLite schema v16,
   Postgres v22); existing rows are preserved, stay readable by non-isolated
   principals, and unattributed rows can be assigned to an owner with the
-  bounded statements documented in `docs/tools.md`. Issuer and subject
-  components of the owner id percent-encode `:` and `%` so they cannot collide.
+  bounded statements documented in `docs/tools.md`. (This entry originally
+  also percent-encoded `:` and `%` in the issuer and subject components of
+  the owner id; that change is withdrawn in 0.8.162 before any release.)
 
 ## [0.8.158] - 19 September 2026
 
