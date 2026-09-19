@@ -4968,12 +4968,15 @@ impl Memory for PostgresMemory {
                 "
             );
             let outbox_stmt = format!(
+                // C03: the draft's own owner is recorded in the column, not only
+                // inside `payload_json`, so a `session`/`private` row born here
+                // is attributed and stays readable by its owner-isolated owner.
                 "
                 INSERT INTO {qualified_memory_events_table} (
-                    event_id, workspace_id, event_type, subject_table, subject_id, session_key,
+                    event_id, workspace_id, owner_id, event_type, subject_table, subject_id, session_key,
                     agent_id, persona_id, visibility, payload_json, created_at
                 )
-                VALUES ($1, $2, 'memory.draft.created', 'memory_drafts', $3, $4, $5, $6, $7, $8, $9)
+                VALUES ($1, $2, $3, 'memory.draft.created', 'memory_drafts', $4, $5, $6, $7, $8, $9, $10)
                 "
             );
             let row = client.with_client(|client| {
@@ -5012,6 +5015,7 @@ impl Memory for PostgresMemory {
                     &[
                         &Uuid::new_v4().to_string(),
                         &draft.workspace_id,
+                        &draft.owner_id,
                         &draft.draft_id,
                         &draft.session_key,
                         &draft.agent_id,
@@ -5161,12 +5165,13 @@ impl Memory for PostgresMemory {
                 "
             );
             let outbox_stmt = format!(
+                // C03: see `create_memory_draft` - the owner goes in the column.
                 "
                 INSERT INTO {qualified_memory_events_table} (
-                    event_id, workspace_id, event_type, subject_table, subject_id, session_key,
+                    event_id, workspace_id, owner_id, event_type, subject_table, subject_id, session_key,
                     agent_id, persona_id, visibility, payload_json, created_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                 "
             );
             let row = client.with_client(|client| {
@@ -5207,6 +5212,7 @@ impl Memory for PostgresMemory {
                         &[
                             &Uuid::new_v4().to_string(),
                             &merged.workspace_id,
+                            &merged.owner_id,
                             &event_type,
                             &subject_table,
                             &subject_id,
@@ -5281,12 +5287,13 @@ impl Memory for PostgresMemory {
                 "
             );
             let outbox_stmt = format!(
+                // C03: see `create_memory_draft` - the owner goes in the column.
                 "
                 INSERT INTO {qualified_memory_events_table} (
-                    event_id, workspace_id, event_type, subject_table, subject_id, session_key,
+                    event_id, workspace_id, owner_id, event_type, subject_table, subject_id, session_key,
                     agent_id, persona_id, visibility, payload_json, created_at
                 )
-                VALUES ($1, $2, 'memory.draft.rejected', 'memory_drafts', $3, $4, $5, $6, $7, $8, $9)
+                VALUES ($1, $2, $3, 'memory.draft.rejected', 'memory_drafts', $4, $5, $6, $7, $8, $9, $10)
                 "
             );
             let row = client.with_client(|client| {
@@ -5308,6 +5315,7 @@ impl Memory for PostgresMemory {
                         &[
                             &Uuid::new_v4().to_string(),
                             &draft.workspace_id,
+                            &draft.owner_id,
                             &draft.draft_id,
                             &draft.session_key,
                             &draft.agent_id,
@@ -5423,12 +5431,14 @@ impl Memory for PostgresMemory {
                 "
             );
             let insert_event_stmt = format!(
+                // C03: the ingested document's own owner is recorded in the
+                // column, so a `session`/`private` ingest event is attributed.
                 "
                 INSERT INTO {qualified_memory_events_table} (
-                    event_id, workspace_id, event_type, subject_table, subject_id,
+                    event_id, workspace_id, owner_id, event_type, subject_table, subject_id,
                     session_key, agent_id, persona_id, visibility, payload_json, created_at
                 )
-                VALUES ($1, $2, 'document.ingested', 'documents', $3, NULL, NULL, NULL, $4, $5, $6)
+                VALUES ($1, $2, $3, 'document.ingested', 'documents', $4, NULL, NULL, NULL, $5, $6, $7)
                 "
             );
             let select_document_stmt = format!(
@@ -5527,6 +5537,7 @@ impl Memory for PostgresMemory {
                     &[
                         &Uuid::new_v4().to_string(),
                         &input.workspace_id,
+                        &input.owner_id,
                         &document_id,
                         &visibility,
                         &payload_json,
@@ -7788,6 +7799,116 @@ mod tests {
             unisolated.iter().any(|content| content == "a-session")
                 && unisolated.iter().any(|content| content == "a-private"),
             "a non-isolated principal keeps the pre-C03 semantics: {unisolated:?}"
+        );
+    }
+
+    /// C03 (P2-4), Postgres twin: the draft-lifecycle and document-ingest
+    /// inserts must record the owner in the `memory_events.owner_id` column.
+    /// The draft rows are written at `session` visibility, the arm the owner
+    /// predicate guards, so they exercise attribution and isolation; the
+    /// `document.ingested` row has no `session_key`, so it is workspace-visible
+    /// and its attribution is asserted on the column the read path returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_c03_draft_lifecycle_and_ingest_events_carry_the_owner() {
+        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let schema = format!("prx_c03_lifecycle_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).unwrap();
+        let owner_a = c03_owner("issuer-a");
+        let owner_b = c03_owner("issuer-b");
+
+        for (owner, draft_id, key) in [(&owner_a, "draft-a", "key-a"), (&owner_b, "draft-b", "key-b")] {
+            mem.create_memory_draft(MemoryDraftInput {
+                draft_id: Some(draft_id.to_string()),
+                workspace_id: C03_WORKSPACE.to_string(),
+                owner_id: Some(owner.clone()),
+                worker_run_id: format!("run-{draft_id}"),
+                parent_run_id: None,
+                session_key: Some(C03_SESSION_KEY.to_string()),
+                agent_id: None,
+                persona_id: None,
+                key: key.to_string(),
+                content: "draft body".to_string(),
+                category: MemoryCategory::Core,
+                source_event_id: None,
+                visibility: MemoryVisibility::Session,
+                payload_json: None,
+            })
+            .await
+            .unwrap();
+        }
+        mem.merge_memory_draft(&c03_principal(Some(&owner_b), false), "draft-b")
+            .await
+            .unwrap();
+        mem.reject_memory_draft(&c03_principal(Some(&owner_a), false), "draft-a", Some("not wanted"))
+            .await
+            .unwrap();
+
+        for (owner, document_id, body) in [
+            (&owner_a, "doc-a", "issuer-a document"),
+            (&owner_b, "doc-b", "issuer-b document"),
+        ] {
+            mem.ingest_document(DocumentIngestInput {
+                document_id: Some(document_id.to_string()),
+                workspace_id: C03_WORKSPACE.to_string(),
+                owner_id: Some(owner.clone()),
+                topic_id: None,
+                task_id: None,
+                source_message_event_id: None,
+                source_kind: "test".to_string(),
+                source_uri: None,
+                title: None,
+                content: body.to_string(),
+                mime_type: Some("text/plain".to_string()),
+                visibility: MemoryVisibility::Workspace,
+                metadata_json: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let events = mem
+            .list_memory_events_recent(&c03_principal(Some(&owner_a), false), 200)
+            .await
+            .unwrap();
+        for (event_type, subject_id, expected_owner) in [
+            ("memory.draft.created", "draft-a", &owner_a),
+            ("memory.draft.created", "draft-b", &owner_b),
+            ("memory.draft.merged", "draft-b", &owner_b),
+            ("memory.stored", "key-b", &owner_b),
+            ("memory.draft.rejected", "draft-a", &owner_a),
+            ("document.ingested", "doc-a", &owner_a),
+            ("document.ingested", "doc-b", &owner_b),
+        ] {
+            let event = events
+                .iter()
+                .find(|event| event.event_type == event_type && event.subject_id == subject_id)
+                .unwrap_or_else(|| panic!("no `{event_type}` row for `{subject_id}`"));
+            assert_eq!(
+                event.owner_id.as_deref(),
+                Some(expected_owner.as_str()),
+                "`{event_type}` for `{subject_id}` must carry its own owner"
+            );
+        }
+
+        let seen_by_b = mem
+            .list_memory_events_recent(&c03_principal(Some(&owner_b), true), 200)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|event| (event.event_type, event.subject_id))
+            .collect::<Vec<_>>();
+        assert!(
+            seen_by_b.contains(&("memory.draft.created".to_string(), "draft-b".to_string()))
+                && seen_by_b.contains(&("memory.draft.merged".to_string(), "draft-b".to_string())),
+            "issuer B must read its own draft lifecycle: {seen_by_b:?}"
+        );
+        assert!(
+            !seen_by_b
+                .iter()
+                .any(|(_, subject)| subject == "draft-a" || subject == "key-a"),
+            "issuer B must not read issuer A's draft lifecycle: {seen_by_b:?}"
         );
     }
 

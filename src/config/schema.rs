@@ -6745,6 +6745,28 @@ impl Config {
         // Chat's link to the daemon it borrows channels from.
         self.chat.validate()?;
 
+        // The MCP caller identity is `agent:{issuer}:{subject}` and the owner id
+        // wraps it, and that string is an authorization boundary. The issuer
+        // component is only ever one of the fixed origin names or this single
+        // configured value, and the components are joined with `:` without
+        // escaping (escaping them would move every real caller's owner id).
+        // Two distinct callers can therefore only compose to the same id if the
+        // configured issuer collides with a fixed origin name, so refuse that
+        // here rather than letting the ambiguity exist at runtime.
+        if let Some(jwt_issuer) = self.mcp_server.jwt_issuer.as_deref().map(str::trim) {
+            for fixed in crate::gateway::FIXED_EXTERNAL_ISSUERS {
+                if jwt_issuer == fixed || jwt_issuer.starts_with(&format!("{fixed}:")) {
+                    anyhow::bail!(
+                        "mcp_server.jwt_issuer must not be '{fixed}' or start with '{fixed}:' \
+                         (configured: '{jwt_issuer}'): the MCP caller identity is \
+                         agent:{{issuer}}:{{subject}} and '{fixed}' is the reserved issuer of a \
+                         built-in origin, so such a value would let a bearer caller and a {fixed} \
+                         caller resolve to the same owner id"
+                    );
+                }
+            }
+        }
+
         // MCP discovery advertises what `exposed_tools` names. A side-effecting
         // entry is allowed but must be a visible choice, not a silent one.
         let side_effecting = self.mcp_server.side_effecting_exposed_tools();

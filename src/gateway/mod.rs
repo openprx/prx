@@ -26,6 +26,13 @@
 mod api;
 mod compat;
 mod jobs;
+
+/// The reserved issuer component of every built-in (non-bearer) MCP origin.
+///
+/// Re-exported so `Config::validate` can refuse a `mcp_server.jwt_issuer` that
+/// would collide with one of them inside the `:`-composed caller identity.
+pub use compat::FIXED_EXTERNAL_ISSUERS;
+
 mod ui;
 mod webhook_dedup;
 

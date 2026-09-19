@@ -310,11 +310,23 @@ from the request body at the gateway and again in the execution service before
 the authoritative block is written from the authenticated envelope, so a forged
 scope can neither widen a read nor clear the isolation mark.
 
-The issuer and subject components of the owner id are percent-encoded for `:`
-and `%`, so an issuer of `a:b` with subject `c` cannot compose to the same owner
-id as an issuer of `a` with subject `b:c`. Components containing neither
-character are byte-identical to the pre-encoding format, so no existing binding,
-owner id or idempotency scope moves.
+The owner id is `owner:{workspace}:agent:{issuer}:{subject}`, composed verbatim.
+Its components are deliberately **not** escaped: real issuers and subjects
+contain `:` routinely — JWT `iss` URLs, `spiffe://` subjects, the literal
+`anonymous:mcp` — so escaping them would change every real caller's owner id,
+which is also its idempotency scope and, now, its read boundary. Every owner id
+is therefore byte-identical to what the same caller had before owner isolation
+existed, and no stored binding, owner id or idempotency scope moves.
+
+Ambiguity is excluded by construction rather than by escaping. The issuer
+component is only ever one of the fixed origin names `spiffe`, `mtls` or
+`anonymous`, or the single configured `mcp_server.jwt_issuer` — the JWT `iss`
+claim is validated against exactly that value before an identity is derived from
+it. The three fixed names share no prefix with one another, so two different
+callers can only compose to the same owner id if the configured issuer is one of
+those names or begins with one of them followed by `:`. Config load refuses such
+a value, naming `mcp_server.jwt_issuer` in the error, so the ambiguity cannot
+exist at runtime.
 
 ### Recovering unattributed rows
 
@@ -325,9 +337,13 @@ by every principal that is not owner-isolated, and it is never deleted, but an
 owner-isolated caller does not see it. That is deliberate — the store cannot
 prove such a row belongs to the caller.
 
-If an MCP caller needs its pre-upgrade history back, attribute it explicitly,
-one session key at a time. Always run the dry run first and read the count; the
-statements are parameterized and deliberately refuse to take a wildcard.
+No row is ever re-keyed by the upgrade itself: owner ids do not move, so a row
+that already carried its caller's owner id stays readable by that caller. The
+only rows an owner-isolated caller loses sight of are the ones that never had an
+owner at all. If a caller needs that pre-upgrade history back, attribute it
+explicitly, one session key at a time. Always run the dry run first and read the
+count; the statements are parameterized and deliberately refuse to take a
+wildcard.
 
 SQLite (`<workspace>/memory/brain.db`):
 

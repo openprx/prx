@@ -19,7 +19,6 @@ use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, LazyLock, OnceLock};
@@ -1009,33 +1008,25 @@ fn peer_issuer_allowed(headers: &HeaderMap, config: &crate::config::A2aConfig) -
     allow.contains(issuer.as_str())
 }
 
-/// Percent-encode the two characters that would otherwise let one
-/// issuer/subject pair impersonate another inside a `:`-composed id.
+/// The fixed issuer component every non-bearer MCP origin identifies itself by.
 ///
 /// `prx_principal_id` is `agent:{issuer}:{subject}` and `prx_owner_id` wraps it
-/// again, so an issuer of `a:b` with subject `c` and an issuer of `a` with
-/// subject `b:c` would compose to the same string — and after C03 that string
-/// is an authorization boundary, not just a label. `%` is escaped too, so the
-/// encoding stays unambiguous.
+/// again, and after C03 that string is an authorization boundary rather than
+/// just a label. The components are joined with `:` and are NOT escaped, because
+/// real issuers and subjects contain `:` routinely — JWT `iss` URLs, `spiffe://`
+/// subjects, the literal `anonymous:mcp` — and escaping them would move every
+/// real caller's owner id, orphaning its history under the owner predicate and
+/// resetting its idempotency scope.
 ///
-/// Encoding is applied only when one of those characters is actually present,
-/// so every existing well-formed id stays byte-identical: no stored binding,
-/// owner id or idempotency scope changes for a caller whose issuer and subject
-/// contain neither `:` nor `%`.
-fn encode_identity_component(value: &str) -> Cow<'_, str> {
-    if !value.contains(':') && !value.contains('%') {
-        return Cow::Borrowed(value);
-    }
-    let mut encoded = String::with_capacity(value.len() + 8);
-    for ch in value.chars() {
-        match ch {
-            '%' => encoded.push_str("%25"),
-            ':' => encoded.push_str("%3A"),
-            other => encoded.push(other),
-        }
-    }
-    Cow::Owned(encoded)
-}
+/// Ambiguity is excluded by construction instead. The issuer component is only
+/// ever one of these three fixed names or the single configured
+/// `mcp_server.jwt_issuer` (the JWT `iss` claim is validated against exactly
+/// that value before it reaches here), and the three fixed names share no
+/// prefix with one another. Two different `(issuer, subject)` pairs can
+/// therefore only compose to the same principal id if the configured issuer is
+/// one of these names or begins with one of them followed by `:`, which
+/// [`crate::config::Config::validate`] refuses at config load.
+pub const FIXED_EXTERNAL_ISSUERS: [&str; 3] = ["spiffe", "mtls", "anonymous"];
 
 fn external_identity_for(
     external_issuer: &str,
@@ -1043,11 +1034,7 @@ fn external_identity_for(
     external_subject: &str,
     workspace_id: &str,
 ) -> ExternalAgentIdentity {
-    let principal_id = format!(
-        "agent:{}:{}",
-        encode_identity_component(external_issuer),
-        encode_identity_component(external_subject)
-    );
+    let principal_id = format!("agent:{external_issuer}:{external_subject}");
     ExternalAgentIdentity {
         external_subject: external_subject.to_string(),
         external_issuer: external_issuer.to_string(),
@@ -3366,34 +3353,105 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
         );
     }
 
-    /// Delimiter safety: `prx_owner_id` is `:`-composed, and after C03 it is an
-    /// authorization boundary. An issuer of `a:b` with subject `c` must not
-    /// compose to the same id as an issuer of `a` with subject `b:c`.
+    /// The owner id is composed verbatim, so every caller's id is byte-identical
+    /// to the pre-C03 format — including the `:`-containing components that
+    /// actually occur in this codebase (JWT `iss` URLs, `spiffe://` subjects,
+    /// the literal `anonymous:mcp`). Escaping them would move every real
+    /// caller's owner id across the upgrade, orphan its history under the owner
+    /// predicate and reset its MCP idempotency scope.
     #[test]
-    fn external_identity_components_containing_the_delimiter_cannot_collide() {
-        let left = external_identity_for("a:b", "bearer", "c", "ws-1");
-        let right = external_identity_for("a", "bearer", "b:c", "ws-1");
-        assert_ne!(
-            left.prx_principal_id, right.prx_principal_id,
-            "a colon in a component must not merge two distinct identities"
+    fn external_identity_components_are_composed_verbatim() {
+        for (issuer, subject, expected) in [
+            ("issuer.example", "subject-1", "agent:issuer.example:subject-1"),
+            (
+                "https://auth.example.com",
+                "subject-1",
+                "agent:https://auth.example.com:subject-1",
+            ),
+            (
+                "spiffe",
+                "spiffe://issuer/agent/a",
+                "agent:spiffe:spiffe://issuer/agent/a",
+            ),
+            ("anonymous", "anonymous:mcp", "agent:anonymous:anonymous:mcp"),
+        ] {
+            let identity = external_identity_for(issuer, "bearer", subject, "ws-1");
+            assert_eq!(
+                identity.prx_principal_id, expected,
+                "the principal id must not be re-encoded for issuer {issuer} / subject {subject}"
+            );
+            assert_eq!(identity.prx_owner_id, format!("owner:ws-1:{expected}"));
+            assert_eq!(identity.external_issuer, issuer);
+            assert_eq!(identity.external_subject, subject);
+        }
+    }
+
+    /// Delimiter safety, closed by construction rather than by escaping.
+    ///
+    /// The issuer component is only ever one of [`FIXED_EXTERNAL_ISSUERS`] or
+    /// the single configured `mcp_server.jwt_issuer`, so the former collision
+    /// fixture (issuer `a:b` + subject `c` versus issuer `a` + subject `b:c`)
+    /// is not reachable: `a:b` can only be the issuer component if it is the
+    /// configured issuer, and `a` can only be one too — there is exactly one
+    /// configured value. The one residual shape, a configured issuer that
+    /// collides with a built-in origin name, is refused at config load.
+    #[test]
+    fn a_jwt_issuer_that_could_collide_with_a_built_in_origin_is_refused_at_config_load() {
+        let mut accepted = crate::config::Config::default();
+        accepted.mcp_server.jwt_issuer = Some("https://auth.example.com".to_string());
+        accepted.validate().expect("a normal issuer URL must still be accepted");
+
+        for hostile in [
+            // Equal to a fixed name: a bearer caller and a SPIFFE caller with the
+            // same subject would compose to one owner id.
+            "spiffe",
+            "mtls",
+            "anonymous",
+            // Prefixed by a fixed name plus the delimiter: this is the
+            // `a:b` + `c` versus `a` + `b:c` collision, in the only shape the
+            // production identity paths can actually produce.
+            "spiffe://issuer",
+            "mtls:client",
+            "anonymous:mcp",
+        ] {
+            let mut config = crate::config::Config::default();
+            config.mcp_server.jwt_issuer = Some(hostile.to_string());
+            let error = config
+                .validate()
+                .expect_err("a colliding issuer must be refused at config load")
+                .to_string();
+            assert!(
+                error.contains("mcp_server.jwt_issuer"),
+                "the rejection must name the offending key: {error}"
+            );
+        }
+
+        // Whitespace is trimmed before the comparison, so padding is not an escape.
+        let mut padded = crate::config::Config::default();
+        padded.mcp_server.jwt_issuer = Some("  spiffe://issuer  ".to_string());
+        assert!(
+            padded.validate().is_err(),
+            "a padded colliding issuer must be refused too"
         );
-        assert_ne!(left.prx_owner_id, right.prx_owner_id);
+    }
 
-        // The escape character itself is escaped, so the encoding stays
-        // unambiguous against a literal "%3A" in a component.
-        let literal_escape = external_identity_for("a%3Ab", "bearer", "c", "ws-1");
-        assert_ne!(literal_escape.prx_principal_id, left.prx_principal_id);
-
-        // Every id whose components carry neither ':' nor '%' is byte-identical
-        // to the pre-C03 format, so no stored binding or owner id moves.
-        let plain = external_identity_for("issuer.example", "bearer", "subject-1", "ws-1");
-        assert_eq!(plain.prx_principal_id, "agent:issuer.example:subject-1");
-        assert_eq!(plain.prx_owner_id, "owner:ws-1:agent:issuer.example:subject-1");
-
-        // The un-encoded issuer and subject are still reported verbatim, which
-        // is what the envelope's session key and sender are built from.
-        assert_eq!(left.external_issuer, "a:b");
-        assert_eq!(right.external_subject, "b:c");
+    /// The identities the collision rule protects: with the configured issuer
+    /// constrained, a bearer caller and each built-in origin stay distinct even
+    /// when they present the same subject.
+    #[test]
+    fn a_bearer_caller_and_a_built_in_origin_never_share_an_owner_id() {
+        const SUBJECT: &str = "spiffe://issuer/agent/a";
+        let bearer = external_identity_for("https://auth.example.com", "bearer-jwt", SUBJECT, "ws-1");
+        let mut seen = vec![bearer.prx_owner_id];
+        for fixed in FIXED_EXTERNAL_ISSUERS {
+            let identity = external_identity_for(fixed, fixed, SUBJECT, "ws-1");
+            assert!(
+                !seen.contains(&identity.prx_owner_id),
+                "origin {fixed} must not share an owner id with another origin"
+            );
+            seen.push(identity.prx_owner_id);
+        }
+        assert_eq!(seen.len(), 1 + FIXED_EXTERNAL_ISSUERS.len());
     }
 
     /// The MCP envelope must actually carry the owner-isolation marker; without

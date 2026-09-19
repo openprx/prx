@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.162] - 19 September 2026
+
+### Fixed
+
+- The MCP owner id is composed verbatim from issuer and subject, so every
+  owner id, identity binding, idempotency scope and rate-budget key is
+  byte-identical to earlier releases for every input (the 0.8.159 encoding
+  of `:` and `%`, which would have moved the id of any issuer URL or SPIFFE
+  subject and orphaned that caller's history, is withdrawn before release).
+  The delimiter-collision class is closed at configuration load instead:
+  `mcp_server.jwt_issuer` may not equal, or start with, a built-in origin
+  name (`spiffe`, `mtls`, `anonymous`) followed by `:`.
+- `document_get_chunk`, which is exposed over MCP by default, applies the
+  same owner isolation as the other reads: an owner-isolated caller sees a
+  chunk only when its owner id matches, an unattributed chunk is hidden from
+  such a caller, and non-isolated callers are unchanged.
+- The memory-draft lifecycle and document-ingest memory events now record
+  their owner in both adapters, so rows created at session or private
+  visibility are attributed from birth instead of being invisible to their
+  own owner-isolated author.
+
 ## [0.8.161] - 19 September 2026
 
 ### Changed

@@ -189,9 +189,38 @@ impl Tool for DocumentGetChunkTool {
     }
 }
 
+/// Whether `principal` may read a chunk owned by `owner_id`.
+///
+/// Three cases, matching [`crate::memory::owner_predicate::owner_match_suffix`]
+/// so this default-exposed MCP tool and the event read paths cannot drift:
+///
+/// - **owner-isolated principal, chunk owner equals the authenticated owner id**
+///   → visible;
+/// - **owner-isolated principal, anything else** (a different owner, *and* a
+///   chunk with no owner at all) → hidden. An isolated principal's channel and
+///   sender are the caller-chosen external subject alone, so the subject-derived
+///   `OwnerPrincipal` below would admit a chunk belonging to a different issuer;
+///   and an unattributed chunk cannot be proved to be the caller's. Both fail
+///   closed, and a principal with no owner id reaches no owned chunk at all.
+/// - **not owner-isolated** → the historical behaviour, unchanged: an
+///   unattributed chunk is workspace-visible and the owner may be matched either
+///   directly or through the channel/sender pair.
 fn chunk_visible_to_principal(workspace_id: &str, owner_id: Option<&str>, principal: &MemoryPrincipal) -> bool {
     if workspace_id != principal.workspace_id {
         return false;
+    }
+    if principal.require_owner_match {
+        let (Some(chunk_owner), Some(caller_owner)) = (
+            owner_id,
+            principal
+                .owner_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|owner| !owner.is_empty()),
+        ) else {
+            return false;
+        };
+        return chunk_owner == caller_owner;
     }
     let Some(owner_id) = owner_id else {
         return true;
@@ -294,6 +323,213 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("\"content\": \"private owner chunk content\""));
         assert!(result.output.contains("\"trace_id\":"));
+    }
+
+    /// C03 / V02-R4 (P2-2): `document_get_chunk` is default-exposed over MCP.
+    /// An owner-isolated caller's channel/sender pair is the external subject
+    /// alone, so resolving the chunk owner from it hands a private chunk owned
+    /// by one issuer to a different issuer presenting the same subject.
+    #[tokio::test]
+    async fn c03_document_get_chunk_does_not_leak_a_subject_derived_chunk_to_another_issuer() {
+        let tmp = TempDir::new().unwrap();
+        let workspace_id = tmp.path().to_string_lossy().to_string();
+        // The owner an MCP ingest would derive from channel + sender: subject
+        // only, no issuer.
+        let subject_derived_owner = OwnerPrincipal::new(
+            workspace_id.clone(),
+            "mcp",
+            "shared-subject",
+            "mcp:shared-subject",
+            vec![Role::Anonymous],
+        )
+        .owner_id;
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        memory
+            .ingest_document(DocumentIngestInput {
+                document_id: Some("doc-mcp-1".into()),
+                workspace_id: workspace_id.clone(),
+                owner_id: Some(subject_derived_owner),
+                topic_id: None,
+                task_id: None,
+                source_message_event_id: None,
+                source_kind: "test".into(),
+                source_uri: None,
+                title: None,
+                content: "subject-derived-secret marker body".into(),
+                mime_type: Some("text/plain".into()),
+                visibility: MemoryVisibility::Private,
+                metadata_json: None,
+            })
+            .await
+            .unwrap();
+        // A second document with no owner at all: unattributed, and therefore
+        // equally unprovable as the caller's.
+        memory
+            .ingest_document(DocumentIngestInput {
+                document_id: Some("doc-unowned-1".into()),
+                workspace_id,
+                owner_id: None,
+                topic_id: None,
+                task_id: None,
+                source_message_event_id: None,
+                source_kind: "test".into(),
+                source_uri: None,
+                title: None,
+                content: "unattributed-secret marker body".into(),
+                mime_type: Some("text/plain".into()),
+                visibility: MemoryVisibility::Private,
+                metadata_json: None,
+            })
+            .await
+            .unwrap();
+
+        let tool = DocumentGetChunkTool::new(tmp.path().to_path_buf(), memory);
+        let isolated_scope = json!({
+            "channel": "mcp",
+            "chat_id": "mcp:shared-subject",
+            "sender": "shared-subject",
+            "owner_id": "owner:ws:agent:issuer-b:shared-subject",
+            "owner_isolated": true,
+        });
+
+        for (chunk_id, secret) in [
+            ("doc-mcp-1:chunk:0", "subject-derived-secret"),
+            ("doc-unowned-1:chunk:0", "unattributed-secret"),
+        ] {
+            let result = tool
+                .execute(json!({
+                    "chunk_id": chunk_id,
+                    "_zc_scope_trusted": true,
+                    "_zc_scope": isolated_scope,
+                }))
+                .await
+                .unwrap();
+            assert!(
+                !result.output.contains(secret),
+                "`{chunk_id}` must not reach an owner-isolated caller of another issuer: {}",
+                result.output
+            );
+            assert!(
+                result.output.contains("\"found\": false"),
+                "`{chunk_id}` must be reported as not found: {}",
+                result.output
+            );
+        }
+    }
+
+    /// The complement: the owner-isolated caller that actually owns the chunk
+    /// still reads it, so the rule is isolation and not a blanket denial.
+    #[tokio::test]
+    async fn c03_document_get_chunk_still_serves_the_owner_isolated_caller_its_own_chunk() {
+        let tmp = TempDir::new().unwrap();
+        let workspace_id = tmp.path().to_string_lossy().to_string();
+        const ISSUER_B_OWNER: &str = "owner:ws:agent:issuer-b:shared-subject";
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        memory
+            .ingest_document(DocumentIngestInput {
+                document_id: Some("doc-owned-by-b".into()),
+                workspace_id,
+                owner_id: Some(ISSUER_B_OWNER.to_string()),
+                topic_id: None,
+                task_id: None,
+                source_message_event_id: None,
+                source_kind: "test".into(),
+                source_uri: None,
+                title: None,
+                content: "issuer-b own chunk body".into(),
+                mime_type: Some("text/plain".into()),
+                visibility: MemoryVisibility::Private,
+                metadata_json: None,
+            })
+            .await
+            .unwrap();
+
+        let tool = DocumentGetChunkTool::new(tmp.path().to_path_buf(), memory);
+        let result = tool
+            .execute(json!({
+                "chunk_id": "doc-owned-by-b:chunk:0",
+                "_zc_scope_trusted": true,
+                "_zc_scope": {
+                    "channel": "mcp",
+                    "chat_id": "mcp:shared-subject",
+                    "sender": "shared-subject",
+                    "owner_id": ISSUER_B_OWNER,
+                    "owner_isolated": true,
+                },
+            }))
+            .await
+            .unwrap();
+        assert!(
+            result.output.contains("issuer-b own chunk body"),
+            "the owner must still read its own chunk: {}",
+            result.output
+        );
+    }
+
+    /// Fail closed: an owner-isolated caller with no usable owner id reaches no
+    /// owner-scoped chunk, rather than falling back to the channel/sender pair.
+    #[tokio::test]
+    async fn c03_document_get_chunk_denies_an_owner_isolated_caller_without_an_owner_id() {
+        let tmp = TempDir::new().unwrap();
+        let workspace_id = tmp.path().to_string_lossy().to_string();
+        let subject_derived_owner = OwnerPrincipal::new(
+            workspace_id.clone(),
+            "mcp",
+            "shared-subject",
+            "mcp:shared-subject",
+            vec![Role::Anonymous],
+        )
+        .owner_id;
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        memory
+            .ingest_document(DocumentIngestInput {
+                document_id: Some("doc-no-owner-caller".into()),
+                workspace_id,
+                owner_id: Some(subject_derived_owner),
+                topic_id: None,
+                task_id: None,
+                source_message_event_id: None,
+                source_kind: "test".into(),
+                source_uri: None,
+                title: None,
+                content: "no-owner-caller-secret body".into(),
+                mime_type: Some("text/plain".into()),
+                visibility: MemoryVisibility::Private,
+                metadata_json: None,
+            })
+            .await
+            .unwrap();
+
+        let tool = DocumentGetChunkTool::new(tmp.path().to_path_buf(), memory);
+        for scope in [
+            json!({
+                "channel": "mcp",
+                "chat_id": "mcp:shared-subject",
+                "sender": "shared-subject",
+                "owner_isolated": true,
+            }),
+            json!({
+                "channel": "mcp",
+                "chat_id": "mcp:shared-subject",
+                "sender": "shared-subject",
+                "owner_id": "   ",
+                "owner_isolated": true,
+            }),
+        ] {
+            let result = tool
+                .execute(json!({
+                    "chunk_id": "doc-no-owner-caller:chunk:0",
+                    "_zc_scope_trusted": true,
+                    "_zc_scope": scope,
+                }))
+                .await
+                .unwrap();
+            assert!(
+                !result.output.contains("no-owner-caller-secret"),
+                "an isolated caller with no owner id must reach no owner-scoped chunk: {}",
+                result.output
+            );
+        }
     }
 
     #[tokio::test]
