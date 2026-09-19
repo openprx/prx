@@ -98,7 +98,15 @@ impl Tool for SessionStatusTool {
         let uptime_secs = self.started_at.elapsed().as_secs();
         let uptime_str = Self::format_uptime(uptime_secs);
 
-        let runs = self.active_runs.read().await;
+        // C03 / V02-R4: see `sessions_list` — an externally authenticated caller
+        // only counts the registry entries its own owner registered, so the
+        // numbers in this card cannot report another owner's fan-out.
+        let owner_scope = sessions_read_model::RunOwnerScope::from_args(&args);
+        let all_runs = self.active_runs.read().await;
+        let runs = all_runs
+            .iter()
+            .filter(|run| owner_scope.admits(run.owner_id.as_deref()))
+            .collect::<Vec<_>>();
         let active_ids = runs.iter().map(|run| run.id.clone()).collect::<HashSet<_>>();
         let running_count = runs
             .iter()
@@ -114,6 +122,7 @@ impl Tool for SessionStatusTool {
             .count();
         let runtime_count = runs.len();
         drop(runs);
+        drop(all_runs);
 
         let recovered = sessions_read_model::recover_task_runs(self.memory.as_ref(), self.workspace_id(), &args, 100)
             .await?
@@ -224,6 +233,97 @@ mod tests {
         assert!(result.output.contains("0 total"));
     }
 
+    fn owned_running_run(id: &str, owner_id: Option<&str>) -> SubAgentRun {
+        SubAgentRun {
+            progress: crate::agent::idle::child_beat(),
+            batch_id: None,
+            id: id.into(),
+            task: format!("task for {id}"),
+            owner_id: owner_id.map(str::to_string),
+            topic_id: None,
+            source_message_event_id: None,
+            started_at: Utc::now(),
+            finished_at: None,
+            status: SubAgentStatus::Running,
+            recipient: None,
+            channel_name: None,
+            abort_handle: None,
+            process_control: None,
+            history: Arc::new(RwLock::new(vec![])),
+            steer_tx: None,
+            parent_run_id: None,
+            session_scope_key: "test-session".to_string(),
+            spawn_depth: 0,
+            token_usage_records: Vec::new(),
+        }
+    }
+
+    /// C03 / V02-R4: the status card counts the shared registry. An externally
+    /// authenticated caller must not learn another owner's fan-out from it.
+    #[tokio::test]
+    async fn c03_an_owner_isolated_caller_only_counts_its_own_registry_runs() {
+        let tool = make_tool_with_runs(vec![
+            owned_running_run("run-a", Some("owner:ws:agent:issuer-a:subject")),
+            owned_running_run("run-b", Some("owner:ws:agent:issuer-b:subject")),
+            owned_running_run("run-unowned", None),
+        ]);
+
+        let scoped = tool
+            .execute(json!({
+                "_zc_scope": {
+                    "owner_id": "owner:ws:agent:issuer-b:subject",
+                    "owner_isolated": true,
+                },
+                "_zc_scope_trusted": true,
+            }))
+            .await
+            .expect("test: scoped status");
+        assert!(
+            scoped.output.contains("1 total"),
+            "only the caller's own run may be counted: {}",
+            scoped.output
+        );
+
+        let unscoped = tool.execute(json!({})).await.expect("test: unscoped status");
+        assert!(
+            unscoped.output.contains("3 total"),
+            "an in-process caller still counts the whole registry: {}",
+            unscoped.output
+        );
+    }
+
+    /// C03 / V02-R4, fail-closed half: an owner-isolated caller with no usable
+    /// owner id must count nothing from the shared registry, so the status card
+    /// cannot report another owner's fan-out as its own.
+    #[tokio::test]
+    async fn c03_an_owner_isolated_caller_without_an_owner_id_counts_no_registry_run() {
+        let tool = make_tool_with_runs(vec![
+            owned_running_run("run-a", Some("owner:ws:agent:issuer-a:subject")),
+            owned_running_run("run-b", Some("owner:ws:agent:issuer-b:subject")),
+            owned_running_run("run-unowned", None),
+        ]);
+
+        for (label, scope) in [
+            ("absent owner id", json!({ "owner_isolated": true })),
+            ("blank owner id", json!({ "owner_isolated": true, "owner_id": "   " })),
+        ] {
+            let result = tool
+                .execute(json!({ "_zc_scope": scope, "_zc_scope_trusted": true }))
+                .await
+                .expect("test: scoped status");
+            assert!(
+                result.output.contains("0 total"),
+                "{label}: an isolated caller with no owner id must count nothing: {}",
+                result.output
+            );
+            assert!(
+                !result.output.contains("run-a") && !result.output.contains("run-b"),
+                "{label}: no run id may appear: {}",
+                result.output
+            );
+        }
+    }
+
     #[tokio::test]
     async fn counts_runs_by_status() {
         let runs = vec![
@@ -309,6 +409,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         memory
             .append_memory_event(MemoryEventInput {
+                owner_id: None,
                 event_id: None,
                 workspace_id: "/tmp".to_string(),
                 event_type: "task.spawned".to_string(),
@@ -326,6 +427,7 @@ mod tests {
             .unwrap();
         memory
             .append_memory_event(MemoryEventInput {
+                owner_id: None,
                 event_id: None,
                 workspace_id: "/tmp".to_string(),
                 event_type: "task.failed".to_string(),
@@ -356,6 +458,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         memory
             .append_memory_event(MemoryEventInput {
+                owner_id: None,
                 event_id: None,
                 workspace_id: "/tmp".to_string(),
                 event_type: "cron.job.created".to_string(),

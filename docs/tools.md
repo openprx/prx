@@ -279,6 +279,97 @@ disables it. `GET /mcp/v1/tools/list` reports each exposed tool's real effect
 (`readonly` or `act`) rather than assuming the list is read-only, and a
 side-effecting entry in `mcp_server.exposed_tools` is warned about at config
 load.
+
+### Owner-isolated reads for external MCP callers
+
+The execution envelope an authenticated MCP caller runs under is keyed on the
+external *subject*: the session key is `mcp:{subject}` and the sender and
+recipient are the subject itself. The issuer appears in exactly one place, the
+owner id `owner:{workspace}:agent:{issuer}:{subject}`. Two identities that
+present the same subject under different issuers therefore share a session key
+and a sender, and a read that admits `session`-visibility rows by session key
+and `private`-visibility rows by sender would hand each of them the other's
+history through the default-exposed `sessions_list` and `sessions_history`
+tools.
+
+An externally authenticated envelope is therefore marked owner-isolated, and
+that mark travels to every tool through the `_zc_scope` block the execution
+service re-authors from the envelope. Under it, the `session` and `private`
+arms of every principal-scoped read in both the SQLite and Postgres adapters
+additionally require `owner_id` equality — the legacy-key read merge included —
+and a principal that is owner-isolated but carries no owner id admits no
+`session` or `private` row at all rather than falling back to sender matching.
+`workspace` and `global` visibility keep their documented shared contract, and
+the shared in-process sub-agent run registry is filtered by the same rule.
+Nothing changes for chat, channel, agent, cron, xin or sub-agent principals:
+they are never owner-isolated and their statements are unchanged.
+
+Caller-supplied `_zc_scope`, `_zc_scope_trusted`, owner id, run id or session id
+arguments cannot influence any of this. Every `_zc_*` / `_prx_*` key is dropped
+from the request body at the gateway and again in the execution service before
+the authoritative block is written from the authenticated envelope, so a forged
+scope can neither widen a read nor clear the isolation mark.
+
+The issuer and subject components of the owner id are percent-encoded for `:`
+and `%`, so an issuer of `a:b` with subject `c` cannot compose to the same owner
+id as an issuer of `a` with subject `b:c`. Components containing neither
+character are byte-identical to the pre-encoding format, so no existing binding,
+owner id or idempotency scope moves.
+
+### Recovering unattributed rows
+
+`message_events.owner_id` already existed; `memory_events.owner_id` is added by
+an idempotent migration (SQLite schema v16, Postgres v22). Every existing row is
+preserved. A row whose `owner_id` is NULL is *unattributed*: it stays readable
+by every principal that is not owner-isolated, and it is never deleted, but an
+owner-isolated caller does not see it. That is deliberate — the store cannot
+prove such a row belongs to the caller.
+
+If an MCP caller needs its pre-upgrade history back, attribute it explicitly,
+one session key at a time. Always run the dry run first and read the count; the
+statements are parameterized and deliberately refuse to take a wildcard.
+
+SQLite (`<workspace>/memory/brain.db`):
+
+```sql
+-- Dry run: how many rows would be attributed, and to what.
+SELECT COUNT(*) FROM message_events
+ WHERE workspace_id = ?1 AND session_key = ?2 AND owner_id IS NULL;
+SELECT COUNT(*) FROM memory_events
+ WHERE workspace_id = ?1 AND session_key = ?2 AND owner_id IS NULL;
+
+-- Apply, with ?3 bound to the exact owner id
+-- (owner:{workspace}:agent:{issuer}:{subject}).
+UPDATE message_events SET owner_id = ?3
+ WHERE workspace_id = ?1 AND session_key = ?2 AND owner_id IS NULL;
+UPDATE memory_events SET owner_id = ?3
+ WHERE workspace_id = ?1 AND session_key = ?2 AND owner_id IS NULL;
+```
+
+Postgres (inside the configured schema; the tables are the configured memory
+table name with the `_message_events` / `_memory_events` suffix):
+
+```sql
+-- Dry run.
+SELECT COUNT(*) FROM <schema>.<table>_message_events
+ WHERE workspace_id = $1 AND session_key = $2 AND owner_id IS NULL;
+SELECT COUNT(*) FROM <schema>.<table>_memory_events
+ WHERE workspace_id = $1 AND session_key = $2 AND owner_id IS NULL;
+
+-- Apply, with $3 bound to the exact owner id.
+UPDATE <schema>.<table>_message_events SET owner_id = $3
+ WHERE workspace_id = $1 AND session_key = $2 AND owner_id IS NULL;
+UPDATE <schema>.<table>_memory_events SET owner_id = $3
+ WHERE workspace_id = $1 AND session_key = $2 AND owner_id IS NULL;
+```
+
+Both statements are bounded by one workspace and one session key and only touch
+rows that are still unattributed, so re-running them is a no-op and an already
+attributed row is never reassigned. There is no CLI wrapper: assigning an
+authorization boundary is a deliberate operator action, and the shape that
+matters — one stated session key, one stated owner id, no wildcard — is the SQL
+above.
+
 The `Agent::run_single` shell runs through the same service as of 0.8.128;
 approval there is fail-closed for the same reason.
 `tests/architecture_boundaries.rs` pins the inventory of production call sites

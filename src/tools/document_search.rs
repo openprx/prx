@@ -76,6 +76,10 @@ pub(crate) fn parse_scope_principal(args: &serde_json::Value, workspace_id: Stri
         channel: read_scope("channel"),
         sender: read_scope("sender"),
         owner_id: read_scope("owner_id"),
+        // C03 / V02-R4: an owner-isolated origin resolves its document owner
+        // from the authenticated owner id instead of the channel/sender pair,
+        // which for MCP is the caller-chosen subject alone.
+        require_owner_match: crate::tools::execution::scope_requires_owner_match(args),
         legacy_session_key: None,
     }
 }

@@ -286,6 +286,7 @@ mod tests {
 
     fn workspace_principal(workspace_id: &str, session_key: &str) -> MemoryPrincipal {
         MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: workspace_id.to_string(),
             agent_id: None,
             persona_id: None,
@@ -655,6 +656,7 @@ mod tests {
         );
         assert_eq!(first.cost_settlement, Some(CostSettlement::UnknownPricing));
         let principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "workspace-a".to_string(),
             agent_id: None,
             persona_id: None,
@@ -753,6 +755,7 @@ mod tests {
             assert_eq!(first.usage_settlement.is_some(), status == TurnTerminalStatus::Silent);
 
             let principal = MemoryPrincipal {
+                require_owner_match: false,
                 workspace_id: "workspace-a".to_string(),
                 agent_id: None,
                 persona_id: None,
@@ -843,6 +846,7 @@ mod tests {
             );
 
             let principal = MemoryPrincipal {
+                require_owner_match: false,
                 workspace_id: "workspace-a".to_string(),
                 agent_id: None,
                 persona_id: None,

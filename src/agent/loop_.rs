@@ -956,6 +956,8 @@ impl DocumentIngestRuntime {
             channel: self.channel.clone(),
             sender: self.sender.clone(),
             owner_id: self.owner_id.clone(),
+            // In-process agent turn: the historical sender/session semantics apply.
+            require_owner_match: false,
             legacy_session_key: self.legacy_session_key.clone(),
         }
     }
@@ -3219,6 +3221,8 @@ async fn recall_context_pages(
         channel: runtime.channel.clone(),
         sender: runtime.sender.clone(),
         owner_id: runtime.owner_id.clone(),
+        // In-process agent turn: the historical sender/session semantics apply.
+        require_owner_match: false,
         legacy_session_key: None,
     };
     // Over-fetch then filter to context pages, since search spans all docs in
@@ -10998,6 +11002,7 @@ mod tests {
         assert_eq!(result, "done");
 
         let principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "workspace-request-context".to_string(),
             agent_id: None,
             persona_id: None,
@@ -11126,6 +11131,7 @@ mod tests {
         assert_eq!(result, "done");
 
         let principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "workspace-render-cache".to_string(),
             agent_id: None,
             persona_id: None,
@@ -11432,6 +11438,7 @@ mod tests {
         let context = build_context_with_shared_events_and_scope(
             &mem,
             MemoryPrincipal {
+                require_owner_match: false,
                 workspace_id: "workspace-a".to_string(),
                 agent_id: None,
                 persona_id: None,
@@ -15989,6 +15996,7 @@ ls -la
         let context = build_context_with_shared_events(
             &mem,
             MemoryPrincipal {
+                require_owner_match: false,
                 workspace_id: "workspace-a".to_string(),
                 agent_id: None,
                 persona_id: None,
@@ -16141,6 +16149,7 @@ ls -la
         let bundle = build_agent_context(
             &mem,
             MemoryPrincipal {
+                require_owner_match: false,
                 workspace_id: "workspace-a".to_string(),
                 agent_id: None,
                 persona_id: None,
@@ -16207,6 +16216,7 @@ ls -la
         let isolated = build_agent_context(
             &mem,
             MemoryPrincipal {
+                require_owner_match: false,
                 workspace_id: tmp.path().to_string_lossy().to_string(),
                 agent_id: None,
                 persona_id: None,
@@ -16231,6 +16241,7 @@ ls -la
         let merged = build_agent_context(
             &mem,
             MemoryPrincipal {
+                require_owner_match: false,
                 workspace_id: tmp.path().to_string_lossy().to_string(),
                 agent_id: None,
                 persona_id: None,
@@ -16277,6 +16288,7 @@ ls -la
         let bundle = build_agent_context(
             &mem,
             MemoryPrincipal {
+                require_owner_match: false,
                 workspace_id: "workspace-a".to_string(),
                 agent_id: None,
                 persona_id: None,
@@ -16387,6 +16399,7 @@ ls -la
         let bundle = build_agent_context(
             &mem,
             MemoryPrincipal {
+                require_owner_match: false,
                 workspace_id: "workspace-a".to_string(),
                 agent_id: None,
                 persona_id: None,
@@ -16453,6 +16466,7 @@ ls -la
         // by the full candidate key set (canonical + legacy), matching the
         // read-merge already done in the memory store layer.
         let principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "workspace-a".to_string(),
             agent_id: None,
             persona_id: None,
@@ -16519,6 +16533,7 @@ ls -la
     #[test]
     fn a_persisted_fabricated_marker_never_reaches_the_prompt_through_a_preamble() {
         let principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "workspace-a".to_string(),
             agent_id: None,
             persona_id: None,
@@ -18131,6 +18146,7 @@ Let me check the result."#;
 
     fn untrusted_search_principal() -> MemoryPrincipal {
         MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "workspace-untrusted".to_string(),
             agent_id: None,
             persona_id: None,

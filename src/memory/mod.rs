@@ -9,6 +9,7 @@ pub mod hygiene;
 pub mod lucid;
 pub mod markdown;
 pub mod none;
+pub mod owner_predicate;
 pub mod postgres;
 pub mod principal;
 pub mod retrieval;

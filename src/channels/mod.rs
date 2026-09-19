@@ -1539,6 +1539,8 @@ async fn load_persisted_histories(
         channel: None,
         sender: None,
         owner_id: Some("system:*".to_string()),
+        // Local history hydration under the system owner; not an external origin.
+        require_owner_match: false,
         legacy_session_key: None,
     };
     match memory
@@ -7209,6 +7211,7 @@ mod tests {
         let events = memory
             .list_message_events_since(
                 &MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: tmp.path().to_string_lossy().to_string(),
                     agent_id: None,
                     persona_id: None,
@@ -10297,6 +10300,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let events = memory
             .list_message_events_since(
                 &MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: tmp.path().to_string_lossy().to_string(),
                     agent_id: None,
                     persona_id: None,
@@ -10931,6 +10935,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let events = memory
             .list_message_events_since(
                 &MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: tmp.path().to_string_lossy().to_string(),
                     agent_id: None,
                     persona_id: None,
@@ -10953,6 +10958,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let outbound_events = memory
             .list_message_events_since(
                 &MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: tmp.path().to_string_lossy().to_string(),
                     agent_id: None,
                     persona_id: None,
@@ -11705,6 +11711,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let events = memory
             .list_message_events_since(
                 &MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: tmp.path().to_string_lossy().to_string(),
                     agent_id: None,
                     persona_id: None,

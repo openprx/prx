@@ -126,7 +126,60 @@ pub(crate) fn principal_from_args(args: &Value, workspace_id: &str) -> MemoryPri
         channel,
         sender,
         owner_id: read_scope("owner_id"),
+        // C03 / V02-R4: for an externally authenticated origin the session key
+        // (`mcp:{subject}`) and the sender are the caller-chosen subject alone,
+        // so `session`/`private` admission must also match the owner. The marker
+        // comes from the service-authored scope, never from caller arguments.
+        require_owner_match: crate::tools::execution::scope_requires_owner_match(args),
         legacy_session_key: None,
+    }
+}
+
+/// C03 / V02-R4: the confinement an externally authenticated caller runs under
+/// when it reads the *shared in-process* run registry.
+///
+/// Persisted rows are owner-qualified in SQL; the registry is a process-global
+/// `Vec<SubAgentRun>` with no query layer, so the same rule is applied here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RunOwnerScope {
+    /// Historical behaviour: the caller sees every run in the registry. This is
+    /// every in-process origin (chat, channel, agent, cron, xin, sub-agent).
+    Unrestricted,
+    /// Owner-isolated caller: only runs registered under exactly this owner.
+    /// `None` means the caller carries no owner id, so nothing is admitted.
+    Owner(Option<String>),
+}
+
+impl RunOwnerScope {
+    /// Derive the confinement from the service-authored scope. The marker and
+    /// the owner id are both read from `_zc_scope`, which the execution service
+    /// rewrites from the authenticated envelope, so caller-supplied arguments
+    /// cannot widen (or narrow) this.
+    pub(crate) fn from_args(args: &Value) -> Self {
+        if !crate::tools::execution::scope_requires_owner_match(args) {
+            return Self::Unrestricted;
+        }
+        Self::Owner(
+            args.get("_zc_scope")
+                .and_then(Value::as_object)
+                .and_then(|scope| scope.get("owner_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|owner| !owner.is_empty())
+                .map(str::to_string),
+        )
+    }
+
+    /// Whether a registry entry owned by `run_owner_id` is visible.
+    ///
+    /// An owner-isolated caller never sees an unowned run: the registry cannot
+    /// prove such a run is the caller's, so it fails closed.
+    pub(crate) fn admits(&self, run_owner_id: Option<&str>) -> bool {
+        match self {
+            Self::Unrestricted => true,
+            Self::Owner(Some(caller)) => run_owner_id.is_some_and(|owner| owner == caller),
+            Self::Owner(None) => false,
+        }
     }
 }
 
@@ -411,6 +464,7 @@ mod tests {
 
     fn task_event(workspace_id: &str, event_type: &str, subject_id: &str, task: &str) -> MemoryEventInput {
         MemoryEventInput {
+            owner_id: None,
             event_id: None,
             workspace_id: workspace_id.to_string(),
             event_type: event_type.to_string(),

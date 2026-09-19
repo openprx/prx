@@ -201,6 +201,30 @@ pub struct MemoryPrincipal {
     pub sender: Option<String>,
     #[serde(default)]
     pub owner_id: Option<String>,
+    /// Require `owner_id` equality before admitting `session`- and
+    /// `private`-visibility rows (C03 / V02-R4).
+    ///
+    /// `false` (the default) is the historical contract: `session` rows are
+    /// admitted by `session_key` and `private` rows by `sender` / `agent_id` /
+    /// `persona_id`. That is correct for channel, chat, cron, xin and sub-agent
+    /// principals, whose `session_key` and `sender` already encode one trust
+    /// domain.
+    ///
+    /// `true` is set ONLY by trusted internal context for an externally
+    /// authenticated origin — today the MCP execution context, whose session key
+    /// (`mcp:{subject}`) and sender are the *external subject only*, so two
+    /// identities presenting the same subject under different issuers would
+    /// otherwise share both. With this set, those two arms additionally require
+    /// `owner_id = principal.owner_id`; a principal that requires the match but
+    /// carries no `owner_id` admits no `session`/`private` row at all (fail
+    /// closed), and a stored row with a NULL `owner_id` is never admitted.
+    /// `workspace` and `global` visibility keep their documented shared
+    /// contract.
+    ///
+    /// This is never read from caller-supplied tool arguments: the execution
+    /// service re-authors `_zc_scope` from the authenticated envelope.
+    #[serde(default)]
+    pub require_owner_match: bool,
     /// Optional pre-cutover (legacy) `session_key` candidate for read-merge.
     ///
     /// When a durable `session_key` is migrated to a canonical format (D4),
@@ -222,6 +246,7 @@ impl Default for MemoryPrincipal {
             channel: None,
             sender: None,
             owner_id: None,
+            require_owner_match: false,
             legacy_session_key: None,
         }
     }
@@ -672,6 +697,13 @@ pub struct SessionContextQuery {
 pub struct MemoryEventInput {
     pub event_id: Option<String>,
     pub workspace_id: String,
+    /// Owning principal of this event, mirroring `message_events.owner_id`.
+    ///
+    /// `None` means unattributed: the row is preserved and stays readable by
+    /// every non-owner-isolated principal, but an owner-isolated principal
+    /// (see [`MemoryPrincipal::require_owner_match`]) never admits it.
+    #[serde(default)]
+    pub owner_id: Option<String>,
     pub event_type: String,
     pub subject_table: String,
     pub subject_id: String,
@@ -692,6 +724,10 @@ pub struct MemoryEvent {
     pub id: i64,
     pub event_id: String,
     pub workspace_id: String,
+    /// Owning principal of this event. `None` for rows written before the
+    /// column existed, and for writers that have no owner in scope.
+    #[serde(default)]
+    pub owner_id: Option<String>,
     pub event_type: String,
     pub subject_table: String,
     pub subject_id: String,

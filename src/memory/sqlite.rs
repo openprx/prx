@@ -132,6 +132,7 @@ pub fn append_task_event_mirror_idempotent(
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             event_id      TEXT NOT NULL UNIQUE,
             workspace_id  TEXT NOT NULL,
+            owner_id      TEXT,
             event_type    TEXT NOT NULL,
             subject_table TEXT NOT NULL,
             subject_id    TEXT NOT NULL,
@@ -654,6 +655,16 @@ impl SqliteMemory {
         }
     }
 
+    /// C03 owner isolation: 1-based placeholder index for the owner parameter.
+    ///
+    /// The owner id always binds *after* the D4 legacy session keys, so the
+    /// index is the first free trailing slot once those are accounted for.
+    /// `legacy_start` is the same first-trailing-placeholder index the legacy
+    /// keys were laid out from.
+    const fn owner_index(legacy_start: usize, legacy_key_count: usize) -> usize {
+        legacy_start + legacy_key_count
+    }
+
     /// D4 read-merge: placeholder indices for the `session_key` predicate.
     ///
     /// `canonical_index` is the existing placeholder bound to
@@ -997,6 +1008,7 @@ impl SqliteMemory {
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id      TEXT NOT NULL UNIQUE,
                 workspace_id  TEXT NOT NULL,
+                owner_id      TEXT,
                 event_type    TEXT NOT NULL,
                 subject_table TEXT NOT NULL,
                 subject_id    TEXT NOT NULL,
@@ -1693,6 +1705,11 @@ impl SqliteMemory {
                 "parent_run_id",
                 "ALTER TABLE memory_events ADD COLUMN parent_run_id TEXT",
             ),
+            // Schema v16 (C03 / V02-R4): owner attribution for memory events, so
+            // an owner-isolated principal can be denied another owner's
+            // `session`/`private` rows. Existing rows keep a NULL owner and are
+            // never rewritten; NULL means unattributed.
+            ("owner_id", "ALTER TABLE memory_events ADD COLUMN owner_id TEXT"),
         ];
         for (name, alter_sql) in missing_event_columns {
             if !event_names.contains(name) {
@@ -1713,7 +1730,9 @@ impl SqliteMemory {
             "CREATE INDEX IF NOT EXISTS idx_memory_events_run
                  ON memory_events(workspace_id, run_id, id);
              CREATE INDEX IF NOT EXISTS idx_memory_events_parent_run
-                 ON memory_events(workspace_id, parent_run_id, id);",
+                 ON memory_events(workspace_id, parent_run_id, id);
+             CREATE INDEX IF NOT EXISTS idx_memory_events_owner
+                 ON memory_events(workspace_id, owner_id, id);",
         )?;
 
         conn.execute_batch(
@@ -2109,6 +2128,15 @@ impl SqliteMemory {
                 "message_event_execution_metadata",
                 "message_events + source_ref_json + subject_ref_json + goal_id + causation_event_id + correlation_id + attempt_id + lease_epoch",
             ),
+            (
+                16,
+                "memory_event_owner_isolation",
+                // C03 / V02-R4: `memory_events` gains `owner_id` so an
+                // externally authenticated (owner-isolated) principal can be
+                // refused another owner's `session`/`private` rows. Added by an
+                // idempotent ALTER; legacy rows keep NULL (unattributed).
+                "memory_events + owner_id + idx_memory_events_owner",
+            ),
         ]
     }
 
@@ -2255,22 +2283,23 @@ impl SqliteMemory {
     }
 
     fn memory_event_from_row(row: &Row<'_>) -> rusqlite::Result<MemoryEvent> {
-        let visibility_raw: String = row.get(11)?;
+        let visibility_raw: String = row.get(12)?;
         Ok(MemoryEvent {
             id: row.get(0)?,
             event_id: row.get(1)?,
             workspace_id: row.get(2)?,
-            event_type: row.get(3)?,
-            subject_table: row.get(4)?,
-            subject_id: row.get(5)?,
-            session_key: row.get(6)?,
-            run_id: row.get(7)?,
-            parent_run_id: row.get(8)?,
-            agent_id: row.get(9)?,
-            persona_id: row.get(10)?,
+            owner_id: row.get(3)?,
+            event_type: row.get(4)?,
+            subject_table: row.get(5)?,
+            subject_id: row.get(6)?,
+            session_key: row.get(7)?,
+            run_id: row.get(8)?,
+            parent_run_id: row.get(9)?,
+            agent_id: row.get(10)?,
+            persona_id: row.get(11)?,
             visibility: visibility_raw.parse().unwrap_or(MemoryVisibility::Workspace),
-            payload_json: row.get(12)?,
-            created_at: row.get(13)?,
+            payload_json: row.get(13)?,
+            created_at: row.get(14)?,
         })
     }
 
@@ -2824,6 +2853,16 @@ impl SqliteMemory {
     }
 
     fn document_owner_for_principal(principal: &MemoryPrincipal) -> Option<String> {
+        // C03 / V02-R4: an owner-isolated principal's channel/sender pair is the
+        // caller-chosen external subject alone, so deriving the document owner
+        // from it would let two issuers sharing a subject read each other's
+        // private documents. Use the authenticated owner id instead; when it is
+        // absent the principal admits no owner-scoped document at all.
+        if principal.require_owner_match {
+            return crate::memory::owner_predicate::has_owner_id(principal)
+                .then(|| principal.owner_id.clone())
+                .flatten();
+        }
         let channel = principal.channel.as_deref()?.trim();
         let sender = principal.sender.as_deref()?.trim();
         if channel.is_empty() || sender.is_empty() {
@@ -4876,13 +4915,14 @@ impl Memory for SqliteMemory {
             if inserted > 0 {
                 tx.execute(
                     "INSERT INTO memory_events (
-                        event_id, workspace_id, event_type, subject_table, subject_id, session_key,
+                        event_id, workspace_id, owner_id, event_type, subject_table, subject_id, session_key,
                         agent_id, persona_id, visibility, payload_json, created_at
                      )
-                     VALUES (?1, ?2, ?3, 'message_events', ?4, ?5, ?6, ?7, ?8, NULL, ?9)",
+                     VALUES (?1, ?2, ?3, ?4, 'message_events', ?5, ?6, ?7, ?8, ?9, NULL, ?10)",
                     params![
                         Uuid::new_v4().to_string(),
                         event.workspace_id,
+                        event.owner_id,
                         event.event_type,
                         event.event_id,
                         event.session_key,
@@ -4946,6 +4986,12 @@ impl Memory for SqliteMemory {
         let session_indices = Self::session_indices(5, 9, &principal, &legacy_session_keys);
         let session_fragment =
             crate::memory::session_predicate::session_visibility_or_fragment(SQLITE_DIALECT, &session_indices);
+        let owner_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            SQLITE_DIALECT,
+            Self::owner_index(9, legacy_session_keys.len()),
+            principal.require_owner_match,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let reader = pool.read()?;
@@ -4968,12 +5014,12 @@ impl Memory for SqliteMemory {
                                    (?3 IS NOT NULL AND agent_id = ?3)
                                    OR (?4 IS NOT NULL AND persona_id = ?4)
                                ))
-                               OR (visibility = 'session' AND {session_fragment})
+                               OR (visibility = 'session' AND {session_fragment}{owner_fragment})
                                OR (visibility = 'private' AND (
                                    (?3 IS NOT NULL AND agent_id = ?3)
                                    OR (?4 IS NOT NULL AND persona_id = ?4)
                                    OR (?6 IS NOT NULL AND sender = ?6)
-                               ))
+                               ){owner_fragment})
                                OR (visibility = 'system' AND ?7)
                            )
                        )
@@ -4981,6 +5027,7 @@ impl Memory for SqliteMemory {
                  ORDER BY id ASC
                  LIMIT ?8",
                 session_fragment = session_fragment.sql,
+                owner_fragment = owner_fragment.sql,
             ))?;
             let mut bind: Vec<&dyn rusqlite::types::ToSql> = vec![
                 &after_id,
@@ -4994,6 +5041,9 @@ impl Memory for SqliteMemory {
             ];
             for key in &legacy_session_keys {
                 bind.push(key);
+            }
+            if owner_fragment.bound_owner {
+                bind.push(&principal.owner_id);
             }
             let rows = stmt.query_map(bind.as_slice(), Self::message_event_from_row)?;
 
@@ -5018,6 +5068,12 @@ impl Memory for SqliteMemory {
         let session_indices = Self::session_indices(4, 8, &principal, &legacy_session_keys);
         let session_fragment =
             crate::memory::session_predicate::session_visibility_or_fragment(SQLITE_DIALECT, &session_indices);
+        let owner_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            SQLITE_DIALECT,
+            Self::owner_index(8, legacy_session_keys.len()),
+            principal.require_owner_match,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let reader = pool.read()?;
@@ -5039,12 +5095,12 @@ impl Memory for SqliteMemory {
                                    (?2 IS NOT NULL AND agent_id = ?2)
                                    OR (?3 IS NOT NULL AND persona_id = ?3)
                                ))
-                               OR (visibility = 'session' AND {session_fragment})
+                               OR (visibility = 'session' AND {session_fragment}{owner_fragment})
                                OR (visibility = 'private' AND (
                                    (?2 IS NOT NULL AND agent_id = ?2)
                                    OR (?3 IS NOT NULL AND persona_id = ?3)
                                    OR (?5 IS NOT NULL AND sender = ?5)
-                               ))
+                               ){owner_fragment})
                                OR (visibility = 'system' AND ?6)
                            )
                        )
@@ -5052,6 +5108,7 @@ impl Memory for SqliteMemory {
                  ORDER BY id DESC
                  LIMIT ?7",
                 session_fragment = session_fragment.sql,
+                owner_fragment = owner_fragment.sql,
             ))?;
             let mut bind: Vec<&dyn rusqlite::types::ToSql> = vec![
                 &principal.workspace_id,
@@ -5064,6 +5121,9 @@ impl Memory for SqliteMemory {
             ];
             for key in &legacy_session_keys {
                 bind.push(key);
+            }
+            if owner_fragment.bound_owner {
+                bind.push(&principal.owner_id);
             }
             let rows = stmt.query_map(bind.as_slice(), Self::message_event_from_row)?;
 
@@ -5099,6 +5159,12 @@ impl Memory for SqliteMemory {
         let session_indices = Self::session_indices(4, 12, &principal, &legacy_session_keys);
         let session_fragment =
             crate::memory::session_predicate::session_visibility_or_fragment(SQLITE_DIALECT, &session_indices);
+        let owner_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            SQLITE_DIALECT,
+            Self::owner_index(12, legacy_session_keys.len()),
+            principal.require_owner_match,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let reader = pool.read()?;
@@ -5127,12 +5193,12 @@ impl Memory for SqliteMemory {
                                    (?2 IS NOT NULL AND agent_id = ?2)
                                    OR (?3 IS NOT NULL AND persona_id = ?3)
                                ))
-                               OR (visibility = 'session' AND {session_fragment})
+                               OR (visibility = 'session' AND {session_fragment}{owner_fragment})
                                OR (visibility = 'private' AND (
                                    (?2 IS NOT NULL AND agent_id = ?2)
                                    OR (?3 IS NOT NULL AND persona_id = ?3)
                                    OR (?5 IS NOT NULL AND sender = ?5)
-                               ))
+                               ){owner_fragment})
                                OR (visibility = 'system' AND ?6)
                            )
                        )
@@ -5140,6 +5206,7 @@ impl Memory for SqliteMemory {
                  ORDER BY created_at ASC, id ASC
                  LIMIT ?11",
                 session_fragment = session_fragment.sql,
+                owner_fragment = owner_fragment.sql,
             ))?;
             let mut bind: Vec<&dyn rusqlite::types::ToSql> = vec![
                 &principal.workspace_id,
@@ -5156,6 +5223,9 @@ impl Memory for SqliteMemory {
             ];
             for key in &legacy_session_keys {
                 bind.push(key);
+            }
+            if owner_fragment.bound_owner {
+                bind.push(&principal.owner_id);
             }
             let rows = stmt.query_map(bind.as_slice(), Self::message_event_from_row)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -5182,6 +5252,12 @@ impl Memory for SqliteMemory {
         let session_indices = Self::session_indices(5, 9, &principal, &legacy_session_keys);
         let session_fragment =
             crate::memory::session_predicate::session_visibility_or_fragment(SQLITE_DIALECT, &session_indices);
+        let owner_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            SQLITE_DIALECT,
+            Self::owner_index(9, legacy_session_keys.len()),
+            principal.require_owner_match,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let reader = pool.read()?;
@@ -5204,12 +5280,12 @@ impl Memory for SqliteMemory {
                                    (?3 IS NOT NULL AND agent_id = ?3)
                                    OR (?4 IS NOT NULL AND persona_id = ?4)
                                ))
-                               OR (visibility = 'session' AND {session_fragment})
+                               OR (visibility = 'session' AND {session_fragment}{owner_fragment})
                                OR (visibility = 'private' AND (
                                    (?3 IS NOT NULL AND agent_id = ?3)
                                    OR (?4 IS NOT NULL AND persona_id = ?4)
                                    OR (?6 IS NOT NULL AND sender = ?6)
-                               ))
+                               ){owner_fragment})
                                OR (visibility = 'system' AND ?7)
                            )
                        )
@@ -5217,6 +5293,7 @@ impl Memory for SqliteMemory {
                  ORDER BY id DESC
                  LIMIT ?8",
                 session_fragment = session_fragment.sql,
+                owner_fragment = owner_fragment.sql,
             ))?;
             let mut bind: Vec<&dyn rusqlite::types::ToSql> = vec![
                 &after_id,
@@ -5230,6 +5307,9 @@ impl Memory for SqliteMemory {
             ];
             for key in &legacy_session_keys {
                 bind.push(key);
+            }
+            if owner_fragment.bound_owner {
+                bind.push(&principal.owner_id);
             }
             let rows = stmt.query_map(bind.as_slice(), Self::message_event_from_row)?;
 
@@ -5272,6 +5352,12 @@ impl Memory for SqliteMemory {
         }
         let session_fragment =
             crate::memory::session_predicate::session_key_match_fragment(SQLITE_DIALECT, &session_indices);
+        let owner_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            SQLITE_DIALECT,
+            Self::owner_index(9, legacy_session_keys.len()),
+            principal.require_owner_match,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let reader = pool.read()?;
@@ -5292,17 +5378,18 @@ impl Memory for SqliteMemory {
                            (?4 IS NOT NULL AND agent_id = ?4)
                            OR (?5 IS NOT NULL AND persona_id = ?5)
                        ))
-                       OR visibility = 'session'
+                       OR (visibility = 'session'{owner_fragment})
                        OR (visibility = 'private' AND (
                            (?4 IS NOT NULL AND agent_id = ?4)
                            OR (?5 IS NOT NULL AND persona_id = ?5)
                            OR (?6 IS NOT NULL AND sender = ?6)
-                       ))
+                       ){owner_fragment})
                        OR (visibility = 'system' AND ?7)
                    )
                  ORDER BY id DESC
                  LIMIT ?8",
                 session_fragment = session_fragment.sql,
+                owner_fragment = owner_fragment.sql,
             ))?;
             let mut bind: Vec<&dyn rusqlite::types::ToSql> = vec![
                 &after_id,
@@ -5316,6 +5403,9 @@ impl Memory for SqliteMemory {
             ];
             for key in &legacy_session_keys {
                 bind.push(key);
+            }
+            if owner_fragment.bound_owner {
+                bind.push(&principal.owner_id);
             }
             let rows = stmt.query_map(bind.as_slice(), Self::message_event_from_row)?;
 
@@ -5341,13 +5431,14 @@ impl Memory for SqliteMemory {
             let event_id = input.event_id.unwrap_or_else(|| Uuid::new_v4().to_string());
             conn.execute(
                 "INSERT OR IGNORE INTO memory_events (
-                    event_id, workspace_id, event_type, subject_table, subject_id,
+                    event_id, workspace_id, owner_id, event_type, subject_table, subject_id,
                     session_key, run_id, parent_run_id, agent_id, persona_id, visibility, payload_json, created_at
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     event_id,
                     input.workspace_id,
+                    input.owner_id,
                     input.event_type,
                     input.subject_table,
                     input.subject_id,
@@ -5363,7 +5454,7 @@ impl Memory for SqliteMemory {
             )?;
 
             let event = conn.query_row(
-                "SELECT id, event_id, workspace_id, event_type, subject_table, subject_id,
+                "SELECT id, event_id, workspace_id, owner_id, event_type, subject_table, subject_id,
                         session_key, run_id, parent_run_id, agent_id, persona_id, visibility, payload_json, created_at
                  FROM memory_events
                  WHERE event_id = ?1
@@ -5386,13 +5477,21 @@ impl Memory for SqliteMemory {
         let principal = principal.clone();
         let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
 
+        // C03: the owner parameter binds at the first free trailing slot (`?8`).
+        let owner_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            SQLITE_DIALECT,
+            8,
+            principal.require_owner_match,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
+
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEvent>> {
             let reader = pool.read()?;
             let conn = reader.connection()?;
             let system_allowed =
                 principal.agent_id.as_deref() == Some("system") || principal.persona_id.as_deref() == Some("system");
-            let mut stmt = conn.prepare(
-                "SELECT id, event_id, workspace_id, event_type, subject_table, subject_id,
+            let mut stmt = conn.prepare(&format!(
+                "SELECT id, event_id, workspace_id, owner_id, event_type, subject_table, subject_id,
                         session_key, run_id, parent_run_id, agent_id, persona_id, visibility, payload_json, created_at
                    FROM memory_events
                   WHERE id > ?1
@@ -5406,30 +5505,32 @@ impl Memory for SqliteMemory {
                                     (?3 IS NOT NULL AND agent_id = ?3)
                                     OR (?4 IS NOT NULL AND persona_id = ?4)
                                 ))
-                                OR (visibility = 'session' AND ?5 IS NOT NULL AND session_key = ?5)
+                                OR (visibility = 'session' AND ?5 IS NOT NULL AND session_key = ?5{owner_fragment})
                                 OR (visibility = 'private' AND (
                                     (?3 IS NOT NULL AND agent_id = ?3)
                                     OR (?4 IS NOT NULL AND persona_id = ?4)
-                                ))
+                                ){owner_fragment})
                                 OR (visibility = 'system' AND ?6)
                             )
                         )
                     )
                   ORDER BY id ASC
                   LIMIT ?7",
-            )?;
-            let rows = stmt.query_map(
-                params![
-                    after_id,
-                    principal.workspace_id,
-                    principal.agent_id,
-                    principal.persona_id,
-                    principal.session_key,
-                    system_allowed,
-                    limit
-                ],
-                Self::memory_event_from_row,
-            )?;
+                owner_fragment = owner_fragment.sql,
+            ))?;
+            let mut bind: Vec<&dyn rusqlite::types::ToSql> = vec![
+                &after_id,
+                &principal.workspace_id,
+                &principal.agent_id,
+                &principal.persona_id,
+                &principal.session_key,
+                &system_allowed,
+                &limit,
+            ];
+            if owner_fragment.bound_owner {
+                bind.push(&principal.owner_id);
+            }
+            let rows = stmt.query_map(bind.as_slice(), Self::memory_event_from_row)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         })
         .await?
@@ -5444,13 +5545,21 @@ impl Memory for SqliteMemory {
         let principal = principal.clone();
         let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
 
+        // C03: the owner parameter binds at the first free trailing slot (`?7`).
+        let owner_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            SQLITE_DIALECT,
+            7,
+            principal.require_owner_match,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
+
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEvent>> {
             let reader = pool.read()?;
             let conn = reader.connection()?;
             let system_allowed =
                 principal.agent_id.as_deref() == Some("system") || principal.persona_id.as_deref() == Some("system");
-            let mut stmt = conn.prepare(
-                "SELECT id, event_id, workspace_id, event_type, subject_table, subject_id,
+            let mut stmt = conn.prepare(&format!(
+                "SELECT id, event_id, workspace_id, owner_id, event_type, subject_table, subject_id,
                         session_key, run_id, parent_run_id, agent_id, persona_id, visibility, payload_json, created_at
                    FROM memory_events
                   WHERE (
@@ -5463,29 +5572,31 @@ impl Memory for SqliteMemory {
                                     (?2 IS NOT NULL AND agent_id = ?2)
                                     OR (?3 IS NOT NULL AND persona_id = ?3)
                                 ))
-                                OR (visibility = 'session' AND ?4 IS NOT NULL AND session_key = ?4)
+                                OR (visibility = 'session' AND ?4 IS NOT NULL AND session_key = ?4{owner_fragment})
                                 OR (visibility = 'private' AND (
                                     (?2 IS NOT NULL AND agent_id = ?2)
                                     OR (?3 IS NOT NULL AND persona_id = ?3)
-                                ))
+                                ){owner_fragment})
                                 OR (visibility = 'system' AND ?5)
                             )
                         )
                     )
                   ORDER BY id DESC
                   LIMIT ?6",
-            )?;
-            let rows = stmt.query_map(
-                params![
-                    principal.workspace_id,
-                    principal.agent_id,
-                    principal.persona_id,
-                    principal.session_key,
-                    system_allowed,
-                    limit
-                ],
-                Self::memory_event_from_row,
-            )?;
+                owner_fragment = owner_fragment.sql,
+            ))?;
+            let mut bind: Vec<&dyn rusqlite::types::ToSql> = vec![
+                &principal.workspace_id,
+                &principal.agent_id,
+                &principal.persona_id,
+                &principal.session_key,
+                &system_allowed,
+                &limit,
+            ];
+            if owner_fragment.bound_owner {
+                bind.push(&principal.owner_id);
+            }
+            let rows = stmt.query_map(bind.as_slice(), Self::memory_event_from_row)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         })
         .await?
@@ -6441,6 +6552,7 @@ mod tests {
 
     fn test_conversation_principal(session_key: &str, owner_id: Option<&str>) -> MemoryPrincipal {
         MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "/tmp/test-workspace".to_string(),
             agent_id: None,
             persona_id: None,
@@ -6499,6 +6611,7 @@ mod tests {
         session_key: Option<&str>,
     ) -> MemoryEventInput {
         MemoryEventInput {
+            owner_id: None,
             event_id: None,
             workspace_id: workspace_id.to_string(),
             event_type: event_type.to_string(),
@@ -6818,6 +6931,7 @@ mod tests {
         let events = mem
             .list_message_events_since(
                 &MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: "workspace-a".to_string(),
                     agent_id: None,
                     persona_id: None,
@@ -7248,6 +7362,7 @@ source: tool_output\n\
         assert_eq!(document.content_sha256.len(), 64);
 
         let principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "workspace-a".to_string(),
             agent_id: None,
             persona_id: None,
@@ -7329,6 +7444,7 @@ source: tool_output\n\
         .unwrap();
 
         let principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "workspace-a".to_string(),
             agent_id: None,
             persona_id: None,
@@ -7427,6 +7543,7 @@ source: tool_output\n\
         assert_eq!(reindexed, 1);
 
         let principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "workspace-a".to_string(),
             agent_id: None,
             persona_id: None,
@@ -7484,6 +7601,7 @@ source: tool_output\n\
         assert_eq!(draft.owner_id.as_deref(), Some("owner-a"));
 
         let test_principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "workspace".to_string(),
             agent_id: Some("system".to_string()),
             persona_id: None,
@@ -7764,6 +7882,7 @@ source: tool_output\n\
         let outbox = mem
             .list_memory_events_since(
                 &MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: "workspace-a".to_string(),
                     agent_id: Some("agent-a".to_string()),
                     persona_id: None,
@@ -7842,6 +7961,7 @@ source: tool_output\n\
         }
 
         let principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "workspace-a".to_string(),
             agent_id: Some("agent-a".to_string()),
             persona_id: None,
@@ -7892,6 +8012,7 @@ source: tool_output\n\
         let visible = mem
             .list_message_events_since(
                 &MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: "workspace-b".to_string(),
                     agent_id: None,
                     persona_id: None,
@@ -8015,6 +8136,7 @@ source: tool_output\n\
         let events = mem
             .load_recent_session_context(SessionContextQuery {
                 principal: MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: "workspace-a".to_string(),
                     agent_id: None,
                     persona_id: None,
@@ -8066,6 +8188,7 @@ source: tool_output\n\
         .unwrap();
 
         let principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "workspace-a".to_string(),
             agent_id: None,
             persona_id: None,
@@ -8136,6 +8259,7 @@ source: tool_output\n\
         .unwrap();
 
         let principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "workspace-a".to_string(),
             agent_id: None,
             persona_id: None,
@@ -8292,6 +8416,7 @@ source: tool_output\n\
         }
 
         let principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "workspace-a".to_string(),
             agent_id: Some("agent-a".to_string()),
             persona_id: None,
@@ -8338,6 +8463,7 @@ source: tool_output\n\
         let visible = mem
             .list_memory_events_since(
                 &MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: "workspace-b".to_string(),
                     agent_id: None,
                     persona_id: None,
@@ -8394,6 +8520,7 @@ source: tool_output\n\
         let events = mem
             .load_recent_shared_context(SharedContextQuery {
                 principal: MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: "workspace-a".to_string(),
                     agent_id: None,
                     persona_id: None,
@@ -10083,6 +10210,7 @@ source: tool_output\n\
 
     fn g1_owner_principal(owner: &str) -> MemoryPrincipal {
         MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "ws".to_string(),
             agent_id: None,
             persona_id: None,
@@ -10161,6 +10289,455 @@ source: tool_output\n\
         .optional()
         .expect("query index")
         .is_some()
+    }
+
+    // ---------------------------------------------------------------------
+    // C03 / V02-R4: owner-qualified identity isolation.
+    //
+    // An externally authenticated MCP caller's `session_key` (`mcp:{subject}`)
+    // and `sender` are the external subject only, so two issuers that accept
+    // the same subject would share every `session`- and `private`-visibility
+    // row. These tests replay the audit counterexample against the production
+    // `SqliteMemory`.
+    // ---------------------------------------------------------------------
+
+    const C03_WORKSPACE: &str = "ws-c03";
+    const C03_SESSION_KEY: &str = "mcp:shared-subject";
+
+    fn c03_owner(issuer: &str) -> String {
+        format!("owner:{C03_WORKSPACE}:agent:{issuer}:shared-subject")
+    }
+
+    /// One row written exactly as the MCP envelope writes it: keyed on the
+    /// subject, attributed to the issuer-qualified owner.
+    fn c03_message_input(
+        workspace_id: &str,
+        owner_id: Option<&str>,
+        session_key: &str,
+        visibility: MemoryVisibility,
+        content: &str,
+    ) -> MessageEventInput {
+        MessageEventInput {
+            event_id: None,
+            idempotency_key: None,
+            workspace_id: workspace_id.to_string(),
+            owner_id: owner_id.map(str::to_string),
+            source: "gateway".into(),
+            channel: Some("mcp".to_string()),
+            session_key: Some(session_key.to_string()),
+            parent_session_key: None,
+            run_id: None,
+            parent_run_id: None,
+            agent_id: None,
+            persona_id: None,
+            sender: Some("shared-subject".to_string()),
+            recipient: Some("shared-subject".to_string()),
+            role: "assistant".to_string(),
+            event_type: "message.assistant".to_string(),
+            subject: None,
+            goal_id: None,
+            causation_event_id: None,
+            correlation_id: None,
+            attempt_id: None,
+            lease_epoch: None,
+            config_generation_id: None,
+            config_source_revision: None,
+            content: content.to_string(),
+            raw_payload_json: None,
+            visibility,
+        }
+    }
+
+    fn c03_principal(workspace_id: &str, owner_id: Option<&str>, isolated: bool) -> MemoryPrincipal {
+        MemoryPrincipal {
+            workspace_id: workspace_id.to_string(),
+            agent_id: None,
+            persona_id: None,
+            session_key: Some(C03_SESSION_KEY.to_string()),
+            channel: Some("mcp".to_string()),
+            sender: Some("shared-subject".to_string()),
+            owner_id: owner_id.map(str::to_string),
+            require_owner_match: isolated,
+            legacy_session_key: None,
+        }
+    }
+
+    async fn c03_contents(mem: &SqliteMemory, principal: &MemoryPrincipal) -> Vec<String> {
+        mem.list_message_events_recent(principal, 50)
+            .await
+            .expect("test: recent message events")
+            .into_iter()
+            .map(|event| event.content)
+            .collect()
+    }
+
+    /// The audit counterexample plus its complement: isolation must deny the
+    /// other issuer without denying the owner itself, without leaking across
+    /// workspaces, and without changing the documented `workspace` contract.
+    #[tokio::test]
+    async fn c03_owner_isolation_matrix_for_session_and_private_rows() {
+        let (_tmp, mem) = temp_sqlite();
+        let owner_a = c03_owner("issuer-a");
+        let owner_b = c03_owner("issuer-b");
+
+        for (visibility, content) in [
+            (MemoryVisibility::Session, "a-session"),
+            (MemoryVisibility::Private, "a-private"),
+        ] {
+            mem.append_message_event(c03_message_input(
+                C03_WORKSPACE,
+                Some(&owner_a),
+                C03_SESSION_KEY,
+                visibility,
+                content,
+            ))
+            .await
+            .expect("test: append issuer-a row");
+        }
+        mem.append_message_event(c03_message_input(
+            C03_WORKSPACE,
+            Some(&owner_b),
+            C03_SESSION_KEY,
+            MemoryVisibility::Session,
+            "b-session",
+        ))
+        .await
+        .expect("test: append issuer-b row");
+        mem.append_message_event(c03_message_input(
+            C03_WORKSPACE,
+            Some(&owner_a),
+            C03_SESSION_KEY,
+            MemoryVisibility::Workspace,
+            "a-workspace",
+        ))
+        .await
+        .expect("test: append workspace row");
+        mem.append_message_event(c03_message_input(
+            "ws-other",
+            Some(&owner_a),
+            C03_SESSION_KEY,
+            MemoryVisibility::Session,
+            "other-workspace",
+        ))
+        .await
+        .expect("test: append foreign workspace row");
+
+        let seen_by_b = c03_contents(&mem, &c03_principal(C03_WORKSPACE, Some(&owner_b), true)).await;
+        assert!(
+            !seen_by_b.iter().any(|content| content == "a-session"),
+            "issuer B must not read issuer A's session row: {seen_by_b:?}"
+        );
+        assert!(
+            !seen_by_b.iter().any(|content| content == "a-private"),
+            "issuer B must not read issuer A's private row: {seen_by_b:?}"
+        );
+        assert!(
+            seen_by_b.iter().any(|content| content == "b-session"),
+            "issuer B must still read its own session row: {seen_by_b:?}"
+        );
+        assert!(
+            seen_by_b.iter().any(|content| content == "a-workspace"),
+            "workspace visibility stays shared by contract: {seen_by_b:?}"
+        );
+        assert!(
+            !seen_by_b.iter().any(|content| content == "other-workspace"),
+            "a different workspace stays isolated: {seen_by_b:?}"
+        );
+
+        let seen_by_a = c03_contents(&mem, &c03_principal(C03_WORKSPACE, Some(&owner_a), true)).await;
+        assert!(
+            seen_by_a.iter().any(|content| content == "a-session") && seen_by_a.iter().any(|c| c == "a-private"),
+            "issuer A must still read its own rows: {seen_by_a:?}"
+        );
+        assert!(
+            !seen_by_a.iter().any(|content| content == "b-session"),
+            "isolation is symmetric: {seen_by_a:?}"
+        );
+
+        // The historical contract is untouched for principals that do not ask
+        // for isolation: the same subject-keyed principal still sees both.
+        let unisolated = c03_contents(&mem, &c03_principal(C03_WORKSPACE, Some(&owner_b), false)).await;
+        assert!(
+            unisolated.iter().any(|content| content == "a-session")
+                && unisolated.iter().any(|content| content == "a-private"),
+            "a non-isolated principal keeps the pre-C03 session/sender semantics: {unisolated:?}"
+        );
+    }
+
+    /// Fail closed: isolation with no owner id must never degrade to
+    /// sender-only matching.
+    #[tokio::test]
+    async fn c03_owner_isolated_principal_without_an_owner_id_reads_nothing_private() {
+        let (_tmp, mem) = temp_sqlite();
+        let owner_a = c03_owner("issuer-a");
+        for (visibility, content) in [
+            (MemoryVisibility::Session, "a-session"),
+            (MemoryVisibility::Private, "a-private"),
+            (MemoryVisibility::Workspace, "a-workspace"),
+        ] {
+            mem.append_message_event(c03_message_input(
+                C03_WORKSPACE,
+                Some(&owner_a),
+                C03_SESSION_KEY,
+                visibility,
+                content,
+            ))
+            .await
+            .expect("test: append row");
+        }
+
+        let seen = c03_contents(&mem, &c03_principal(C03_WORKSPACE, None, true)).await;
+        assert_eq!(
+            seen,
+            vec!["a-workspace".to_string()],
+            "an isolated principal with no owner id admits only the shared contract: {seen:?}"
+        );
+    }
+
+    /// Legacy rows written before the owner column carried a value stay in the
+    /// database, are invisible to an isolated principal, and come back after the
+    /// documented recovery statement attributes them.
+    #[tokio::test]
+    async fn c03_unattributed_rows_are_invisible_until_the_documented_recovery_sql_runs() {
+        let (tmp, mem) = temp_sqlite();
+        let owner_a = c03_owner("issuer-a");
+        mem.append_message_event(c03_message_input(
+            C03_WORKSPACE,
+            None,
+            C03_SESSION_KEY,
+            MemoryVisibility::Session,
+            "legacy-unowned",
+        ))
+        .await
+        .expect("test: append legacy row");
+
+        let principal = c03_principal(C03_WORKSPACE, Some(&owner_a), true);
+        let before = c03_contents(&mem, &principal).await;
+        assert!(
+            before.is_empty(),
+            "an unattributed row must not reach an isolated principal: {before:?}"
+        );
+
+        // The recovery procedure documented in docs/tools.md, applied
+        // exactly as written: a dry-run count, then a bounded parameterized
+        // UPDATE for one stated session key.
+        let db_path = tmp.path().join("memory").join("brain.db");
+        let conn = Connection::open(&db_path).expect("test: open brain.db");
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM message_events
+                 WHERE workspace_id = ?1 AND session_key = ?2 AND owner_id IS NULL",
+                params![C03_WORKSPACE, C03_SESSION_KEY],
+                |row| row.get(0),
+            )
+            .expect("test: dry-run count");
+        assert_eq!(pending, 1, "the dry run must find exactly the legacy row");
+        let updated = conn
+            .execute(
+                "UPDATE message_events SET owner_id = ?3
+                 WHERE workspace_id = ?1 AND session_key = ?2 AND owner_id IS NULL",
+                params![C03_WORKSPACE, C03_SESSION_KEY, owner_a],
+            )
+            .expect("test: recovery update");
+        assert_eq!(updated, 1);
+        drop(conn);
+
+        let after = c03_contents(&mem, &principal).await;
+        assert_eq!(
+            after,
+            vec!["legacy-unowned".to_string()],
+            "the recovered row must be readable by the owner it was assigned to: {after:?}"
+        );
+    }
+
+    /// The D4 legacy-key read merge must not become an isolation bypass: a
+    /// foreign owner's row under the *legacy* key is still refused.
+    #[tokio::test]
+    async fn c03_legacy_session_key_read_merge_is_owner_qualified() {
+        let (_tmp, mem) = temp_sqlite();
+        let owner_a = c03_owner("issuer-a");
+        let owner_b = c03_owner("issuer-b");
+        const LEGACY_KEY: &str = "mcp-legacy:shared-subject";
+
+        mem.append_message_event(c03_message_input(
+            C03_WORKSPACE,
+            Some(&owner_a),
+            LEGACY_KEY,
+            MemoryVisibility::Session,
+            "a-legacy",
+        ))
+        .await
+        .expect("test: append issuer-a legacy row");
+        mem.append_message_event(c03_message_input(
+            C03_WORKSPACE,
+            Some(&owner_b),
+            LEGACY_KEY,
+            MemoryVisibility::Session,
+            "b-legacy",
+        ))
+        .await
+        .expect("test: append issuer-b legacy row");
+
+        let mut principal = c03_principal(C03_WORKSPACE, Some(&owner_b), true);
+        principal.legacy_session_key = Some(LEGACY_KEY.to_string());
+        let seen = c03_contents(&mem, &principal).await;
+        assert_eq!(
+            seen,
+            vec!["b-legacy".to_string()],
+            "the read merge must return only the caller's own legacy history: {seen:?}"
+        );
+    }
+
+    /// The `memory_events` outbox is the second read the sessions read model
+    /// makes; its `session`/`private` arms are owner-qualified too.
+    #[tokio::test]
+    async fn c03_memory_events_are_owner_qualified() {
+        let (_tmp, mem) = temp_sqlite();
+        let owner_a = c03_owner("issuer-a");
+        let owner_b = c03_owner("issuer-b");
+
+        for (owner, subject) in [(&owner_a, "run-a"), (&owner_b, "run-b")] {
+            mem.append_memory_event(MemoryEventInput {
+                event_id: None,
+                workspace_id: C03_WORKSPACE.to_string(),
+                owner_id: Some(owner.clone()),
+                event_type: "task.spawned".to_string(),
+                subject_table: "tasks".to_string(),
+                subject_id: subject.to_string(),
+                session_key: Some(C03_SESSION_KEY.to_string()),
+                run_id: Some(subject.to_string()),
+                parent_run_id: None,
+                agent_id: None,
+                persona_id: None,
+                visibility: MemoryVisibility::Session,
+                payload_json: None,
+            })
+            .await
+            .expect("test: append memory event");
+        }
+
+        let seen = mem
+            .list_memory_events_recent(&c03_principal(C03_WORKSPACE, Some(&owner_b), true), 50)
+            .await
+            .expect("test: recent memory events")
+            .into_iter()
+            .map(|event| event.subject_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            seen,
+            vec!["run-b".to_string()],
+            "an isolated principal must only see its own task events: {seen:?}"
+        );
+    }
+
+    /// A database created before schema v16 has no `memory_events.owner_id`.
+    /// `init_schema` must add it idempotently and the new read path must work on
+    /// the reopened file (mirrors the v7 run-lineage regression above).
+    #[test]
+    fn legacy_memory_events_gets_owner_id_column_on_init() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("legacy-owner.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memory_events (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id      TEXT NOT NULL UNIQUE,
+                workspace_id  TEXT NOT NULL,
+                event_type    TEXT NOT NULL,
+                subject_table TEXT NOT NULL,
+                subject_id    TEXT NOT NULL,
+                session_key   TEXT,
+                run_id        TEXT,
+                parent_run_id TEXT,
+                agent_id      TEXT,
+                persona_id    TEXT,
+                visibility    TEXT NOT NULL DEFAULT 'workspace',
+                payload_json  TEXT,
+                created_at    TEXT NOT NULL
+            );
+             INSERT INTO memory_events
+                 (event_id, workspace_id, event_type, subject_table, subject_id, visibility, created_at)
+             VALUES ('evt-legacy', 'ws-c03', 'task.spawned', 'tasks', 'run-legacy', 'session', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        let before = legacy_table_columns(&conn, "memory_events");
+        assert!(
+            !before.contains("owner_id"),
+            "precondition: the legacy table lacks owner_id"
+        );
+
+        SqliteMemory::init_schema(&conn).expect("init_schema upgrades a pre-v16 memory_events");
+        let after = legacy_table_columns(&conn, "memory_events");
+        assert!(after.contains("owner_id"), "owner_id column must be added");
+        assert!(
+            legacy_index_exists(&conn, "idx_memory_events_owner"),
+            "idx_memory_events_owner must be created"
+        );
+        SqliteMemory::init_schema(&conn).expect("init_schema is idempotent on re-run");
+
+        let unattributed: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_events WHERE owner_id IS NULL", [], |row| {
+                row.get(0)
+            })
+            .expect("query owner_id must not fail with `no such column`");
+        assert_eq!(unattributed, 1, "the preserved legacy row is unattributed");
+    }
+
+    /// Rollback: a binary from before schema v16 must still work against a
+    /// migrated database. It never issues `SELECT *` and never names `owner_id`,
+    /// so the added nullable column is invisible to it; and the migration ledger
+    /// row it does not know about is simply never inspected, because the runner
+    /// only walks its own registry.
+    #[test]
+    fn a_pre_v16_binary_still_reads_and_writes_a_migrated_memory_events_table() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("migrated.db");
+        let conn = Connection::open(&db_path).unwrap();
+        SqliteMemory::init_schema(&conn).expect("init_schema creates the v16 schema");
+        SqliteMemory::run_memory_schema_migrations(&conn).expect("ledger records v16");
+
+        // The pre-v16 write path: an explicit column list without owner_id.
+        conn.execute(
+            "INSERT INTO memory_events (
+                event_id, workspace_id, event_type, subject_table, subject_id,
+                session_key, agent_id, persona_id, visibility, payload_json, created_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                "evt-old-binary",
+                "ws-c03",
+                "task.spawned",
+                "tasks",
+                "run-old",
+                "mcp:shared-subject",
+                None::<String>,
+                None::<String>,
+                "session",
+                None::<String>,
+                "2026-01-01T00:00:00Z",
+            ],
+        )
+        .expect("a pre-v16 insert must still be accepted");
+
+        // The pre-v16 read path: the old explicit column list.
+        let subject: String = conn
+            .query_row(
+                "SELECT subject_id FROM memory_events WHERE event_id = ?1",
+                params!["evt-old-binary"],
+                |row| row.get(0),
+            )
+            .expect("a pre-v16 select must still work");
+        assert_eq!(subject, "run-old");
+
+        // The ledger carries a version the old registry does not know about, and
+        // the old registry's own entries still verify.
+        let recorded: i64 = conn
+            .query_row("SELECT MAX(version) FROM memory_schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("ledger is readable");
+        assert!(recorded >= 16, "the new version is recorded: {recorded}");
+        SqliteMemory::run_memory_schema_migrations(&conn).expect("re-running the ledger is a no-op");
     }
 
     /// Regression guard for the deployment bug: a legacy `memory_events` table
@@ -10317,6 +10894,7 @@ source: tool_output\n\
 
         let (_tmp, mem) = temp_sqlite();
         let system_principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "/ws".to_string(),
             agent_id: Some("self_system".to_string()),
             persona_id: None,
@@ -10387,6 +10965,7 @@ source: tool_output\n\
         assert_eq!(listed.len(), 1);
 
         let other_principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "/ws".to_string(),
             agent_id: None,
             persona_id: None,
@@ -10527,6 +11106,7 @@ source: tool_output\n\
     async fn memory_event_records_and_queries_parent_run_id() {
         let (_tmp, mem) = temp_sqlite();
         mem.append_memory_event(MemoryEventInput {
+            owner_id: None,
             event_id: None,
             workspace_id: "/ws".to_string(),
             event_type: "task.spawned".to_string(),
@@ -10544,6 +11124,7 @@ source: tool_output\n\
         .expect("append child event");
 
         let principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "/ws".to_string(),
             agent_id: Some("system".to_string()),
             persona_id: None,

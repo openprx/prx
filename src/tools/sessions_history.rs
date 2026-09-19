@@ -96,8 +96,15 @@ impl Tool for SessionsHistoryTool {
             .and_then(|v| v.as_u64())
             .map_or(DEFAULT_LIMIT, |v| usize::try_from(v).unwrap_or(DEFAULT_LIMIT));
 
+        // C03 / V02-R4: see `sessions_list` — an externally authenticated caller
+        // only reaches the registry entries its own owner registered. Anything
+        // else falls through to the owner-qualified memory read model.
+        let owner_scope = sessions_read_model::RunOwnerScope::from_args(&args);
         let runs = self.active_runs.read().await;
-        let Some(run) = runs.iter().find(|r| r.id == run_id) else {
+        let Some(run) = runs
+            .iter()
+            .find(|r| r.id == run_id && owner_scope.admits(r.owner_id.as_deref()))
+        else {
             drop(runs);
             if let Some(history) = sessions_read_model::recover_run_history(
                 self.memory.as_ref(),
@@ -257,6 +264,50 @@ mod tests {
         }
     }
 
+    fn owned_run(id: &str, owner_id: Option<&str>, entries: Vec<HistoryEntry>) -> SubAgentRun {
+        let mut run = make_run(id, SubAgentStatus::Running, entries);
+        run.owner_id = owner_id.map(str::to_string);
+        run
+    }
+
+    /// C03 / V02-R4, fail-closed half: an owner-isolated caller with no usable
+    /// owner id must not reach any registry run, even when it names the run id
+    /// exactly, and must not learn its transcript.
+    #[tokio::test]
+    async fn c03_an_owner_isolated_caller_without_an_owner_id_finds_no_registry_run() {
+        let runs = Arc::new(RwLock::new(vec![
+            owned_run(
+                "run-a",
+                Some("owner:ws:agent:issuer-a:subject"),
+                vec![make_entry("user", "issuer-a-secret")],
+            ),
+            owned_run("run-unowned", None, vec![make_entry("user", "unowned-secret")]),
+        ]));
+        let tool = SessionsHistoryTool::new(runs);
+
+        for (label, scope) in [
+            ("absent owner id", json!({ "owner_isolated": true })),
+            ("blank owner id", json!({ "owner_isolated": true, "owner_id": "   " })),
+        ] {
+            for (run_id, secret) in [("run-a", "issuer-a-secret"), ("run-unowned", "unowned-secret")] {
+                let result = tool
+                    .execute(json!({
+                        "run_id": run_id,
+                        "_zc_scope": scope,
+                        "_zc_scope_trusted": true,
+                    }))
+                    .await
+                    .expect("test: scoped history");
+                assert!(!result.success, "{label}: `{run_id}` must not be reachable: {result:?}");
+                assert!(
+                    !result.output.contains(secret),
+                    "{label}: `{run_id}` transcript must not leak: {}",
+                    result.output
+                );
+            }
+        }
+    }
+
     #[test]
     fn name_and_description() {
         let runs = Arc::new(RwLock::new(Vec::new()));
@@ -341,6 +392,7 @@ mod tests {
             .unwrap();
         memory
             .append_memory_event(MemoryEventInput {
+                owner_id: None,
                 event_id: None,
                 workspace_id: "/tmp".to_string(),
                 event_type: "task.spawned".to_string(),
@@ -358,6 +410,7 @@ mod tests {
             .unwrap();
         memory
             .append_memory_event(MemoryEventInput {
+                owner_id: None,
                 event_id: None,
                 workspace_id: "/tmp".to_string(),
                 event_type: "task.completed".to_string(),

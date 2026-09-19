@@ -152,9 +152,16 @@ impl Tool for SessionsSendTool {
         // send: the message channel is bounded, so a send can park until the
         // session drains it, and parking while holding this guard would deadlock
         // against the receiving loop's own registry writes.
+        // C03 / V02-R4: the registry is shared by every origin in this process,
+        // and steering another owner's run is a control action, not just a read.
+        // An externally authenticated caller only reaches its own runs.
+        let owner_scope = super::sessions_read_model::RunOwnerScope::from_args(&args);
         let (steer_tx, steered_run) = {
             let runs = self.active_runs.read().await;
-            let Some(run) = runs.iter().find(|r| r.id == run_id) else {
+            let Some(run) = runs
+                .iter()
+                .find(|r| r.id == run_id && owner_scope.admits(r.owner_id.as_deref()))
+            else {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -257,6 +264,78 @@ mod tests {
         (run, rx)
     }
 
+    /// C03 / V02-R4: steering a run is a control action on the shared registry.
+    /// An externally authenticated caller must not reach another owner's run,
+    /// even when it names the run id exactly.
+    #[tokio::test]
+    async fn c03_an_owner_isolated_caller_cannot_steer_another_owners_run() {
+        let (mut run_a, mut rx_a) = make_running_run("run-a");
+        run_a.owner_id = Some("owner:ws:agent:issuer-a:subject".to_string());
+        let (mut run_b, mut rx_b) = make_running_run("run-b");
+        run_b.owner_id = Some("owner:ws:agent:issuer-b:subject".to_string());
+        let tool = SessionsSendTool::new(Arc::new(RwLock::new(vec![run_a, run_b])));
+
+        let scoped_call = |run_id: &str, message: &str| {
+            json!({
+                "run_id": run_id,
+                "message": message,
+                "_zc_scope": {
+                    "owner_id": "owner:ws:agent:issuer-b:subject",
+                    "owner_isolated": true,
+                },
+                "_zc_scope_trusted": true,
+            })
+        };
+
+        let result = tool
+            .execute(scoped_call("run-a", "steer issuer A"))
+            .await
+            .expect("test: denied send");
+        assert!(!result.success, "another owner's run must not be steerable");
+        assert!(rx_a.try_recv().is_err(), "nothing may reach issuer A's channel");
+
+        let result = tool
+            .execute(scoped_call("run-b", "steer my own"))
+            .await
+            .expect("test: allowed send");
+        assert!(result.success, "the caller's own run stays steerable: {result:?}");
+        assert_eq!(rx_b.try_recv().ok().as_deref(), Some("steer my own"));
+    }
+
+    /// C03 / V02-R4, fail-closed half: an owner-isolated caller with no usable
+    /// owner id must not steer any registry run, its own included, rather than
+    /// falling through to "every run is mine".
+    #[tokio::test]
+    async fn c03_an_owner_isolated_caller_without_an_owner_id_cannot_steer_any_run() {
+        let (mut run_a, mut rx_a) = make_running_run("run-a");
+        run_a.owner_id = Some("owner:ws:agent:issuer-a:subject".to_string());
+        let (run_unowned, mut rx_unowned) = make_running_run("run-unowned");
+        let tool = SessionsSendTool::new(Arc::new(RwLock::new(vec![run_a, run_unowned])));
+
+        for (label, scope) in [
+            ("absent owner id", json!({ "owner_isolated": true })),
+            ("blank owner id", json!({ "owner_isolated": true, "owner_id": "   " })),
+        ] {
+            for run_id in ["run-a", "run-unowned"] {
+                let result = tool
+                    .execute(json!({
+                        "run_id": run_id,
+                        "message": "steer without an owner",
+                        "_zc_scope": scope,
+                        "_zc_scope_trusted": true,
+                    }))
+                    .await
+                    .expect("test: scoped send");
+                assert!(!result.success, "{label}: `{run_id}` must not be steerable: {result:?}");
+            }
+        }
+        assert!(rx_a.try_recv().is_err(), "nothing may reach the owned run's channel");
+        assert!(
+            rx_unowned.try_recv().is_err(),
+            "nothing may reach the unattributed run's channel"
+        );
+    }
+
     #[test]
     fn name_and_description() {
         let runs = Arc::new(RwLock::new(Vec::new()));
@@ -342,6 +421,7 @@ mod tests {
         let events = memory
             .list_memory_events_since(
                 &MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: tmp.path().to_string_lossy().to_string(),
                     agent_id: None,
                     persona_id: None,

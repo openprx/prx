@@ -129,6 +129,7 @@ mod tests {
 
         let err = memory
             .append_memory_event(MemoryEventInput {
+                owner_id: None,
                 event_id: None,
                 workspace_id: "workspace".to_string(),
                 event_type: "memory.test".to_string(),
@@ -167,6 +168,7 @@ mod tests {
         assert!(err.to_string().contains("document::ingest_document"));
 
         let principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "workspace".to_string(),
             agent_id: None,
             persona_id: None,

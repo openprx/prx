@@ -14908,6 +14908,7 @@ mod session_runtime_binding_tests {
         let events = memory
             .list_message_events_since(
                 &MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: tmp.path().to_string_lossy().to_string(),
                     agent_id: None,
                     persona_id: None,
@@ -15701,6 +15702,7 @@ mod legacy_chat_compaction_audit_tests {
         let events = memory
             .list_message_events_since(
                 &MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: tmp.path().to_string_lossy().to_string(),
                     agent_id: None,
                     persona_id: None,

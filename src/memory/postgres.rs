@@ -1191,6 +1191,7 @@ impl PostgresMemory {
                 id BIGSERIAL PRIMARY KEY,
                 event_id TEXT UNIQUE NOT NULL,
                 workspace_id TEXT NOT NULL,
+                owner_id TEXT,
                 event_type TEXT NOT NULL,
                 subject_table TEXT NOT NULL,
                 subject_id TEXT NOT NULL,
@@ -1205,6 +1206,10 @@ impl PostgresMemory {
             );
             ALTER TABLE {qualified_memory_events_table} ADD COLUMN IF NOT EXISTS run_id TEXT;
             ALTER TABLE {qualified_memory_events_table} ADD COLUMN IF NOT EXISTS parent_run_id TEXT;
+            -- Schema v16 (C03 / V02-R4): owner attribution for memory events.
+            -- Existing rows keep a NULL owner (unattributed) and are never
+            -- rewritten; an owner-isolated principal does not admit them.
+            ALTER TABLE {qualified_memory_events_table} ADD COLUMN IF NOT EXISTS owner_id TEXT;
 
             CREATE INDEX IF NOT EXISTS idx_memory_events_workspace_id
                 ON {qualified_memory_events_table}(workspace_id, id);
@@ -1216,6 +1221,8 @@ impl PostgresMemory {
                 ON {qualified_memory_events_table}(workspace_id, run_id, id);
             CREATE INDEX IF NOT EXISTS idx_memory_events_parent_run
                 ON {qualified_memory_events_table}(workspace_id, parent_run_id, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_events_owner
+                ON {qualified_memory_events_table}(workspace_id, owner_id, id);
 
             CREATE TABLE IF NOT EXISTS {qualified_drafts_table} (
                 id BIGSERIAL PRIMARY KEY,
@@ -1686,6 +1693,16 @@ impl PostgresMemory {
                 21,
                 "vector_owner_workspace_row_level_security",
                 "memories + document_chunks + embedding_cache scoped by workspace_id/owner_id and ENABLE+FORCE ROW LEVEL SECURITY; transaction-local workspace required; private/cache owner exact; shared reads tenant-scoped; writes owner exact; missing context denies",
+            ),
+            (
+                22,
+                "memory_event_owner_isolation",
+                // C03 / V02-R4, parity with SQLite v16: `memory_events` gains
+                // `owner_id` so an externally authenticated (owner-isolated)
+                // principal can be refused another owner's `session`/`private`
+                // rows. Added by `ADD COLUMN IF NOT EXISTS`; legacy rows keep
+                // NULL (unattributed).
+                "memory_events + owner_id + idx_memory_events_owner",
             ),
         ]
     }
@@ -2244,6 +2261,16 @@ impl PostgresMemory {
     }
 
     fn document_owner_for_principal(principal: &MemoryPrincipal) -> Option<String> {
+        // C03 / V02-R4: an owner-isolated principal's channel/sender pair is the
+        // caller-chosen external subject alone, so deriving the document owner
+        // from it would let two issuers sharing a subject read each other's
+        // private documents. Use the authenticated owner id instead; when it is
+        // absent the principal admits no owner-scoped document at all.
+        if principal.require_owner_match {
+            return crate::memory::owner_predicate::has_owner_id(principal)
+                .then(|| principal.owner_id.clone())
+                .flatten();
+        }
         let channel = principal.channel.as_deref()?.trim();
         let sender = principal.sender.as_deref()?.trim();
         if channel.is_empty() || sender.is_empty() {
@@ -2286,6 +2313,14 @@ impl PostgresMemory {
 
     /// D4 read-merge: placeholder indices for the canonical key plus trailing
     /// legacy key(s). Mirrors `SqliteMemory::session_indices`.
+    /// C03 owner isolation: 1-based placeholder index for the owner parameter.
+    ///
+    /// The owner id always binds *after* the D4 legacy session keys, so the
+    /// index is the first free trailing slot once those are accounted for.
+    const fn owner_index(legacy_start: usize, legacy_key_count: usize) -> usize {
+        legacy_start + legacy_key_count
+    }
+
     fn session_indices(
         canonical_index: usize,
         legacy_start: usize,
@@ -2638,9 +2673,9 @@ impl PostgresMemory {
     }
 
     fn row_to_memory_event(row: &Row) -> Result<MemoryEvent> {
-        let created_at: DateTime<Utc> = row.get(13);
+        let created_at: DateTime<Utc> = row.get(14);
         let visibility = row
-            .get::<_, String>(11)
+            .get::<_, String>(12)
             .parse::<MemoryVisibility>()
             .unwrap_or(MemoryVisibility::Workspace);
 
@@ -2648,16 +2683,17 @@ impl PostgresMemory {
             id: row.get(0),
             event_id: row.get(1),
             workspace_id: row.get(2),
-            event_type: row.get(3),
-            subject_table: row.get(4),
-            subject_id: row.get(5),
-            session_key: row.get(6),
-            run_id: row.get(7),
-            parent_run_id: row.get(8),
-            agent_id: row.get(9),
-            persona_id: row.get(10),
+            owner_id: row.get(3),
+            event_type: row.get(4),
+            subject_table: row.get(5),
+            subject_id: row.get(6),
+            session_key: row.get(7),
+            run_id: row.get(8),
+            parent_run_id: row.get(9),
+            agent_id: row.get(10),
+            persona_id: row.get(11),
             visibility,
-            payload_json: row.get(12),
+            payload_json: row.get(13),
             created_at: created_at.to_rfc3339(),
         })
     }
@@ -4121,10 +4157,10 @@ impl Memory for PostgresMemory {
             let outbox_stmt = format!(
                 "
                 INSERT INTO {qualified_memory_events_table} (
-                    event_id, workspace_id, event_type, subject_table, subject_id, session_key,
+                    event_id, workspace_id, owner_id, event_type, subject_table, subject_id, session_key,
                     agent_id, persona_id, visibility, payload_json, created_at
                 )
-                VALUES ($1, $2, $3, 'message_events', $4, $5, $6, $7, $8, NULL, $9)
+                VALUES ($1, $2, $3, $4, 'message_events', $5, $6, $7, $8, $9, NULL, $10)
                 ON CONFLICT (event_id) DO NOTHING
                 "
             );
@@ -4175,6 +4211,7 @@ impl Memory for PostgresMemory {
                         &[
                             &Uuid::new_v4().to_string(),
                             &event.workspace_id,
+                            &event.owner_id,
                             &event.event_type,
                             &event.event_id,
                             &event.session_key,
@@ -4240,6 +4277,12 @@ impl Memory for PostgresMemory {
         let session_indices = Self::session_indices(5, 9, &principal, &legacy_session_keys);
         let session_fragment =
             crate::memory::session_predicate::session_visibility_or_fragment(PG_DIALECT, &session_indices);
+        let owner_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            PG_DIALECT,
+            Self::owner_index(9, legacy_session_keys.len()),
+            principal.require_owner_match,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
 
         tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
             let stmt = format!(
@@ -4261,12 +4304,12 @@ impl Memory for PostgresMemory {
                                   ($3::TEXT IS NOT NULL AND agent_id = $3)
                                   OR ($4::TEXT IS NOT NULL AND persona_id = $4)
                               ))
-                              OR (visibility = 'session' AND {session_fragment})
+                              OR (visibility = 'session' AND {session_fragment}{owner_fragment})
                               OR (visibility = 'private' AND (
                                   ($3::TEXT IS NOT NULL AND agent_id = $3)
                                   OR ($4::TEXT IS NOT NULL AND persona_id = $4)
                                   OR ($6::TEXT IS NOT NULL AND sender = $6)
-                              ))
+                              ){owner_fragment})
                               OR (visibility = 'system' AND $7::BOOLEAN)
                           )
                       )
@@ -4275,6 +4318,7 @@ impl Memory for PostgresMemory {
                 LIMIT $8
                 ",
                 session_fragment = session_fragment.sql,
+                owner_fragment = owner_fragment.sql,
             );
             let rows = client.with_client(|client| {
                 let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
@@ -4289,6 +4333,9 @@ impl Memory for PostgresMemory {
                 ];
                 for key in &legacy_session_keys {
                     bind.push(key);
+                }
+                if owner_fragment.bound_owner {
+                    bind.push(&principal.owner_id);
                 }
                 Ok(client.query(&stmt, &bind)?)
             })?;
@@ -4312,6 +4359,12 @@ impl Memory for PostgresMemory {
         let session_indices = Self::session_indices(4, 8, &principal, &legacy_session_keys);
         let session_fragment =
             crate::memory::session_predicate::session_visibility_or_fragment(PG_DIALECT, &session_indices);
+        let owner_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            PG_DIALECT,
+            Self::owner_index(8, legacy_session_keys.len()),
+            principal.require_owner_match,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
 
         tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
             let stmt = format!(
@@ -4332,12 +4385,12 @@ impl Memory for PostgresMemory {
                                   ($2::TEXT IS NOT NULL AND agent_id = $2)
                                   OR ($3::TEXT IS NOT NULL AND persona_id = $3)
                               ))
-                              OR (visibility = 'session' AND {session_fragment})
+                              OR (visibility = 'session' AND {session_fragment}{owner_fragment})
                               OR (visibility = 'private' AND (
                                   ($2::TEXT IS NOT NULL AND agent_id = $2)
                                   OR ($3::TEXT IS NOT NULL AND persona_id = $3)
                                   OR ($5::TEXT IS NOT NULL AND sender = $5)
-                              ))
+                              ){owner_fragment})
                               OR (visibility = 'system' AND $6::BOOLEAN)
                           )
                       )
@@ -4346,6 +4399,7 @@ impl Memory for PostgresMemory {
                 LIMIT $7
                 ",
                 session_fragment = session_fragment.sql,
+                owner_fragment = owner_fragment.sql,
             );
             let rows = client.with_client(|client| {
                 let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
@@ -4359,6 +4413,9 @@ impl Memory for PostgresMemory {
                 ];
                 for key in &legacy_session_keys {
                     bind.push(key);
+                }
+                if owner_fragment.bound_owner {
+                    bind.push(&principal.owner_id);
                 }
                 Ok(client.query(&stmt, &bind)?)
             })?;
@@ -4402,6 +4459,12 @@ impl Memory for PostgresMemory {
         }
         let session_fragment =
             crate::memory::session_predicate::session_visibility_or_fragment(PG_DIALECT, &session_indices);
+        let owner_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            PG_DIALECT,
+            Self::owner_index(12, legacy_session_keys.len()),
+            principal.require_owner_match,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
 
         tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
             let stmt = format!(
@@ -4429,12 +4492,12 @@ impl Memory for PostgresMemory {
                                   ($2::TEXT IS NOT NULL AND agent_id = $2)
                                   OR ($3::TEXT IS NOT NULL AND persona_id = $3)
                               ))
-                              OR (visibility = 'session' AND {session_fragment})
+                              OR (visibility = 'session' AND {session_fragment}{owner_fragment})
                               OR (visibility = 'private' AND (
                                   ($2::TEXT IS NOT NULL AND agent_id = $2)
                                   OR ($3::TEXT IS NOT NULL AND persona_id = $3)
                                   OR ($5::TEXT IS NOT NULL AND sender = $5)
-                              ))
+                              ){owner_fragment})
                               OR (visibility = 'system' AND $6::BOOLEAN)
                           )
                       )
@@ -4443,6 +4506,7 @@ impl Memory for PostgresMemory {
                 LIMIT $11
                 ",
                 session_fragment = session_fragment.sql,
+                owner_fragment = owner_fragment.sql,
             );
             let rows = client.with_client(|client| {
                 let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
@@ -4460,6 +4524,9 @@ impl Memory for PostgresMemory {
                 ];
                 for key in &legacy_session_keys {
                     bind.push(key);
+                }
+                if owner_fragment.bound_owner {
+                    bind.push(&principal.owner_id);
                 }
                 Ok(client.query(&stmt, &bind)?)
             })?;
@@ -4488,6 +4555,12 @@ impl Memory for PostgresMemory {
         let session_indices = Self::session_indices(5, 9, &principal, &legacy_session_keys);
         let session_fragment =
             crate::memory::session_predicate::session_visibility_or_fragment(PG_DIALECT, &session_indices);
+        let owner_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            PG_DIALECT,
+            Self::owner_index(9, legacy_session_keys.len()),
+            principal.require_owner_match,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
 
         tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
             let stmt = format!(
@@ -4509,12 +4582,12 @@ impl Memory for PostgresMemory {
                                   ($3::TEXT IS NOT NULL AND agent_id = $3)
                                   OR ($4::TEXT IS NOT NULL AND persona_id = $4)
                               ))
-                              OR (visibility = 'session' AND {session_fragment})
+                              OR (visibility = 'session' AND {session_fragment}{owner_fragment})
                               OR (visibility = 'private' AND (
                                   ($3::TEXT IS NOT NULL AND agent_id = $3)
                                   OR ($4::TEXT IS NOT NULL AND persona_id = $4)
                                   OR ($6::TEXT IS NOT NULL AND sender = $6)
-                              ))
+                              ){owner_fragment})
                               OR (visibility = 'system' AND $7::BOOLEAN)
                           )
                       )
@@ -4523,6 +4596,7 @@ impl Memory for PostgresMemory {
                 LIMIT $8
                 ",
                 session_fragment = session_fragment.sql,
+                owner_fragment = owner_fragment.sql,
             );
             let rows = client.with_client(|client| {
                 let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
@@ -4537,6 +4611,9 @@ impl Memory for PostgresMemory {
                 ];
                 for key in &legacy_session_keys {
                     bind.push(key);
+                }
+                if owner_fragment.bound_owner {
+                    bind.push(&principal.owner_id);
                 }
                 Ok(client.query(&stmt, &bind)?)
             })?;
@@ -4583,6 +4660,12 @@ impl Memory for PostgresMemory {
         }
         let session_fragment =
             crate::memory::session_predicate::session_key_match_fragment(PG_DIALECT, &session_indices);
+        let owner_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            PG_DIALECT,
+            Self::owner_index(9, legacy_session_keys.len()),
+            principal.require_owner_match,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
 
         tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
             let stmt = format!(
@@ -4602,18 +4685,19 @@ impl Memory for PostgresMemory {
                           ($4::TEXT IS NOT NULL AND agent_id = $4)
                           OR ($5::TEXT IS NOT NULL AND persona_id = $5)
                       ))
-                      OR visibility = 'session'
+                      OR (visibility = 'session'{owner_fragment})
                       OR (visibility = 'private' AND (
                           ($4::TEXT IS NOT NULL AND agent_id = $4)
                           OR ($5::TEXT IS NOT NULL AND persona_id = $5)
                           OR ($6::TEXT IS NOT NULL AND sender = $6)
-                      ))
+                      ){owner_fragment})
                       OR (visibility = 'system' AND $7::BOOLEAN)
                   )
                 ORDER BY id DESC
                 LIMIT $8
                 ",
                 session_fragment = session_fragment.sql,
+                owner_fragment = owner_fragment.sql,
             );
             let rows = client.with_client(|client| {
                 let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
@@ -4628,6 +4712,9 @@ impl Memory for PostgresMemory {
                 ];
                 for key in &legacy_session_keys {
                     bind.push(key);
+                }
+                if owner_fragment.bound_owner {
+                    bind.push(&principal.owner_id);
                 }
                 Ok(client.query(&stmt, &bind)?)
             })?;
@@ -4657,16 +4744,16 @@ impl Memory for PostgresMemory {
             let insert_stmt = format!(
                 "
                 INSERT INTO {qualified_memory_events_table} (
-                    event_id, workspace_id, event_type, subject_table, subject_id,
+                    event_id, workspace_id, owner_id, event_type, subject_table, subject_id,
                     session_key, run_id, parent_run_id, agent_id, persona_id, visibility, payload_json, created_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                 ON CONFLICT (event_id) DO NOTHING
                 "
             );
             let select_stmt = format!(
                 "
-                SELECT id, event_id, workspace_id, event_type, subject_table, subject_id,
+                SELECT id, event_id, workspace_id, owner_id, event_type, subject_table, subject_id,
                        session_key, run_id, parent_run_id, agent_id, persona_id, visibility, payload_json, created_at
                 FROM {qualified_memory_events_table}
                 WHERE event_id = $1
@@ -4679,6 +4766,7 @@ impl Memory for PostgresMemory {
                     &[
                         &event_id,
                         &input.workspace_id,
+                        &input.owner_id,
                         &input.event_type,
                         &input.subject_table,
                         &input.subject_id,
@@ -4711,10 +4799,18 @@ impl Memory for PostgresMemory {
         let limit_i64 = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
         let system_allowed = Self::is_system_principal(&principal);
 
+        // C03: the owner parameter binds at the first free trailing slot (`$8`).
+        let owner_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            PG_DIALECT,
+            8,
+            principal.require_owner_match,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
+
         tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEvent>> {
             let stmt = format!(
                 "
-                SELECT id, event_id, workspace_id, event_type, subject_table, subject_id,
+                SELECT id, event_id, workspace_id, owner_id, event_type, subject_table, subject_id,
                        session_key, run_id, parent_run_id, agent_id, persona_id, visibility, payload_json, created_at
                 FROM {qualified_memory_events_table}
                 WHERE id > $1
@@ -4728,32 +4824,34 @@ impl Memory for PostgresMemory {
                                   ($3::TEXT IS NOT NULL AND agent_id = $3)
                                   OR ($4::TEXT IS NOT NULL AND persona_id = $4)
                               ))
-                              OR (visibility = 'session' AND $5::TEXT IS NOT NULL AND session_key = $5)
+                              OR (visibility = 'session' AND $5::TEXT IS NOT NULL AND session_key = $5{owner_fragment})
                               OR (visibility = 'private' AND (
                                   ($3::TEXT IS NOT NULL AND agent_id = $3)
                                   OR ($4::TEXT IS NOT NULL AND persona_id = $4)
-                              ))
+                              ){owner_fragment})
                               OR (visibility = 'system' AND $6::BOOLEAN)
                           )
                       )
                   )
                 ORDER BY id ASC
                 LIMIT $7
-                "
+                ",
+                owner_fragment = owner_fragment.sql,
             );
             let rows = client.with_client(|client| {
-                Ok(client.query(
-                    &stmt,
-                    &[
-                        &after_id,
-                        &principal.workspace_id,
-                        &principal.agent_id,
-                        &principal.persona_id,
-                        &principal.session_key,
-                        &system_allowed,
-                        &limit_i64,
-                    ],
-                )?)
+                let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
+                    &after_id,
+                    &principal.workspace_id,
+                    &principal.agent_id,
+                    &principal.persona_id,
+                    &principal.session_key,
+                    &system_allowed,
+                    &limit_i64,
+                ];
+                if owner_fragment.bound_owner {
+                    bind.push(&principal.owner_id);
+                }
+                Ok(client.query(&stmt, &bind)?)
             })?;
             rows.iter()
                 .map(Self::row_to_memory_event)
@@ -4769,10 +4867,18 @@ impl Memory for PostgresMemory {
         let limit_i64 = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
         let system_allowed = Self::is_system_principal(&principal);
 
+        // C03: the owner parameter binds at the first free trailing slot (`$7`).
+        let owner_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            PG_DIALECT,
+            7,
+            principal.require_owner_match,
+            crate::memory::owner_predicate::has_owner_id(&principal),
+        );
+
         tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEvent>> {
             let stmt = format!(
                 "
-                SELECT id, event_id, workspace_id, event_type, subject_table, subject_id,
+                SELECT id, event_id, workspace_id, owner_id, event_type, subject_table, subject_id,
                        session_key, run_id, parent_run_id, agent_id, persona_id, visibility, payload_json, created_at
                 FROM {qualified_memory_events_table}
                 WHERE (
@@ -4785,31 +4891,33 @@ impl Memory for PostgresMemory {
                                   ($2::TEXT IS NOT NULL AND agent_id = $2)
                                   OR ($3::TEXT IS NOT NULL AND persona_id = $3)
                               ))
-                              OR (visibility = 'session' AND $4::TEXT IS NOT NULL AND session_key = $4)
+                              OR (visibility = 'session' AND $4::TEXT IS NOT NULL AND session_key = $4{owner_fragment})
                               OR (visibility = 'private' AND (
                                   ($2::TEXT IS NOT NULL AND agent_id = $2)
                                   OR ($3::TEXT IS NOT NULL AND persona_id = $3)
-                              ))
+                              ){owner_fragment})
                               OR (visibility = 'system' AND $5::BOOLEAN)
                           )
                       )
                   )
                 ORDER BY id DESC
                 LIMIT $6
-                "
+                ",
+                owner_fragment = owner_fragment.sql,
             );
             let rows = client.with_client(|client| {
-                Ok(client.query(
-                    &stmt,
-                    &[
-                        &principal.workspace_id,
-                        &principal.agent_id,
-                        &principal.persona_id,
-                        &principal.session_key,
-                        &system_allowed,
-                        &limit_i64,
-                    ],
-                )?)
+                let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
+                    &principal.workspace_id,
+                    &principal.agent_id,
+                    &principal.persona_id,
+                    &principal.session_key,
+                    &system_allowed,
+                    &limit_i64,
+                ];
+                if owner_fragment.bound_owner {
+                    bind.push(&principal.owner_id);
+                }
+                Ok(client.query(&stmt, &bind)?)
             })?;
             rows.iter()
                 .map(Self::row_to_memory_event)
@@ -6646,6 +6754,7 @@ mod tests {
             .unwrap();
 
         let principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "workspace-a".to_string(),
             agent_id: Some("agent-a".to_string()),
             persona_id: Some("persona-a".to_string()),
@@ -6713,6 +6822,7 @@ mod tests {
 
         let custom_event = mem
             .append_memory_event(MemoryEventInput {
+                owner_id: None,
                 event_id: Some("memory-event-1".to_string()),
                 workspace_id: "workspace-a".to_string(),
                 event_type: "memory.custom".to_string(),
@@ -6756,6 +6866,7 @@ mod tests {
             .unwrap();
         assert_eq!(draft.status, "pending");
         let test_principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "workspace".to_string(),
             agent_id: Some("system".to_string()),
             persona_id: None,
@@ -7041,6 +7152,7 @@ mod tests {
             "Postgres should cache repeated document chunk embeddings"
         );
         let principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "workspace-a".to_string(),
             agent_id: None,
             persona_id: None,
@@ -7507,5 +7619,234 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    // ---------------------------------------------------------------------
+    // C03 / V02-R4: Postgres parity for owner-qualified identity isolation.
+    //
+    // Requires a reachable instance: set `OPENPRX_TEST_POSTGRES_URL`. Without
+    // it these return early, exactly like every other Postgres test here.
+    // ---------------------------------------------------------------------
+
+    const C03_WORKSPACE: &str = "ws-c03";
+    const C03_SESSION_KEY: &str = "mcp:shared-subject";
+
+    fn c03_owner(issuer: &str) -> String {
+        format!("owner:{C03_WORKSPACE}:agent:{issuer}:shared-subject")
+    }
+
+    fn c03_message_input(
+        workspace_id: &str,
+        owner_id: Option<&str>,
+        session_key: &str,
+        visibility: MemoryVisibility,
+        content: &str,
+    ) -> MessageEventInput {
+        MessageEventInput {
+            event_id: None,
+            idempotency_key: None,
+            workspace_id: workspace_id.to_string(),
+            owner_id: owner_id.map(str::to_string),
+            source: "gateway".into(),
+            channel: Some("mcp".to_string()),
+            session_key: Some(session_key.to_string()),
+            parent_session_key: None,
+            run_id: None,
+            parent_run_id: None,
+            agent_id: None,
+            persona_id: None,
+            sender: Some("shared-subject".to_string()),
+            recipient: Some("shared-subject".to_string()),
+            role: "assistant".to_string(),
+            event_type: "message.assistant".to_string(),
+            subject: None,
+            goal_id: None,
+            causation_event_id: None,
+            correlation_id: None,
+            attempt_id: None,
+            lease_epoch: None,
+            config_generation_id: None,
+            config_source_revision: None,
+            content: content.to_string(),
+            raw_payload_json: None,
+            visibility,
+        }
+    }
+
+    fn c03_principal(owner_id: Option<&str>, isolated: bool) -> MemoryPrincipal {
+        MemoryPrincipal {
+            workspace_id: C03_WORKSPACE.to_string(),
+            agent_id: None,
+            persona_id: None,
+            session_key: Some(C03_SESSION_KEY.to_string()),
+            channel: Some("mcp".to_string()),
+            sender: Some("shared-subject".to_string()),
+            owner_id: owner_id.map(str::to_string),
+            require_owner_match: isolated,
+            legacy_session_key: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_c03_owner_isolation_matrix_for_session_and_private_rows() {
+        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let schema = format!("prx_c03_isolation_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).unwrap();
+        let owner_a = c03_owner("issuer-a");
+        let owner_b = c03_owner("issuer-b");
+
+        for (owner, visibility, content) in [
+            (&owner_a, MemoryVisibility::Session, "a-session"),
+            (&owner_a, MemoryVisibility::Private, "a-private"),
+            (&owner_b, MemoryVisibility::Session, "b-session"),
+            (&owner_a, MemoryVisibility::Workspace, "a-workspace"),
+        ] {
+            mem.append_message_event(c03_message_input(
+                C03_WORKSPACE,
+                Some(owner),
+                C03_SESSION_KEY,
+                visibility,
+                content,
+            ))
+            .await
+            .unwrap();
+        }
+        mem.append_message_event(c03_message_input(
+            "ws-other",
+            Some(&owner_a),
+            C03_SESSION_KEY,
+            MemoryVisibility::Session,
+            "other-workspace",
+        ))
+        .await
+        .unwrap();
+        mem.append_message_event(c03_message_input(
+            C03_WORKSPACE,
+            None,
+            C03_SESSION_KEY,
+            MemoryVisibility::Session,
+            "legacy-unowned",
+        ))
+        .await
+        .unwrap();
+
+        let seen_by_b = mem
+            .list_message_events_recent(&c03_principal(Some(&owner_b), true), 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|event| event.content)
+            .collect::<Vec<_>>();
+        assert!(
+            !seen_by_b.iter().any(|content| content == "a-session"),
+            "issuer B must not read issuer A's session row: {seen_by_b:?}"
+        );
+        assert!(
+            !seen_by_b.iter().any(|content| content == "a-private"),
+            "issuer B must not read issuer A's private row: {seen_by_b:?}"
+        );
+        assert!(
+            !seen_by_b.iter().any(|content| content == "legacy-unowned"),
+            "an unattributed row must not reach an isolated principal: {seen_by_b:?}"
+        );
+        assert!(
+            seen_by_b.iter().any(|content| content == "b-session"),
+            "issuer B must still read its own row: {seen_by_b:?}"
+        );
+        assert!(
+            seen_by_b.iter().any(|content| content == "a-workspace"),
+            "workspace visibility stays shared by contract: {seen_by_b:?}"
+        );
+        assert!(
+            !seen_by_b.iter().any(|content| content == "other-workspace"),
+            "a different workspace stays isolated: {seen_by_b:?}"
+        );
+
+        let no_owner = mem
+            .list_message_events_recent(&c03_principal(None, true), 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|event| event.content)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            no_owner,
+            vec!["a-workspace".to_string()],
+            "an isolated principal with no owner id admits only the shared contract: {no_owner:?}"
+        );
+
+        let unisolated = mem
+            .list_message_events_recent(&c03_principal(Some(&owner_b), false), 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|event| event.content)
+            .collect::<Vec<_>>();
+        assert!(
+            unisolated.iter().any(|content| content == "a-session")
+                && unisolated.iter().any(|content| content == "a-private"),
+            "a non-isolated principal keeps the pre-C03 semantics: {unisolated:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_c03_memory_events_are_owner_qualified() {
+        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let schema = format!("prx_c03_events_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::new(&db_url, &schema, "memories", Some(5)).unwrap();
+        let owner_a = c03_owner("issuer-a");
+        let owner_b = c03_owner("issuer-b");
+
+        for (owner, subject) in [
+            (Some(&owner_a), "run-a"),
+            (Some(&owner_b), "run-b"),
+            (None, "run-legacy"),
+        ] {
+            mem.append_memory_event(MemoryEventInput {
+                event_id: None,
+                workspace_id: C03_WORKSPACE.to_string(),
+                owner_id: owner.cloned(),
+                event_type: "task.spawned".to_string(),
+                subject_table: "tasks".to_string(),
+                subject_id: subject.to_string(),
+                session_key: Some(C03_SESSION_KEY.to_string()),
+                run_id: Some(subject.to_string()),
+                parent_run_id: None,
+                agent_id: None,
+                persona_id: None,
+                visibility: MemoryVisibility::Session,
+                payload_json: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let seen = mem
+            .list_memory_events_recent(&c03_principal(Some(&owner_b), true), 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|event| event.subject_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            seen,
+            vec!["run-b".to_string()],
+            "an isolated principal must only see its own task events: {seen:?}"
+        );
+
+        let all = mem
+            .list_memory_events_recent(&c03_principal(Some(&owner_b), false), 50)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3, "the non-isolated read is unchanged");
+        assert!(
+            all.iter()
+                .any(|event| event.owner_id.as_deref() == Some(owner_a.as_str())),
+            "the owner column must round-trip through Postgres"
+        );
     }
 }

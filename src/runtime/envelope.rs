@@ -17,6 +17,17 @@ pub struct RuntimeEnvelope {
     /// `None` preserves single-key behaviour. Always read-only.
     pub legacy_session_key: Option<String>,
     pub owner_id: Option<String>,
+    /// Require `owner_id` equality on `session`/`private` memory reads made
+    /// under this envelope (C03 / V02-R4).
+    ///
+    /// Set only by trusted internal context for an externally authenticated
+    /// origin whose `session_key` and `sender` are derived from a caller-chosen
+    /// identifier alone — today the MCP execution context, whose key is
+    /// `mcp:{external_subject}`. Every in-process origin (chat, channel, agent,
+    /// cron, xin, sub-agent) leaves this `false` and keeps its historical
+    /// semantics. Flows into [`MemoryPrincipal::require_owner_match`] and, via
+    /// the service-authored `_zc_scope`, into tools that rebuild a principal.
+    pub owner_isolated: bool,
     pub topic_id: Option<String>,
     pub task_id: Option<String>,
     pub source_message_event_id: Option<String>,
@@ -85,6 +96,7 @@ impl RuntimeEnvelope {
             session_key: session_key.into(),
             legacy_session_key: None,
             owner_id: None,
+            owner_isolated: false,
             topic_id: None,
             task_id: None,
             source_message_event_id: None,
@@ -485,6 +497,17 @@ impl RuntimeEnvelope {
         self
     }
 
+    /// Mark this envelope as owner-isolated (C03 / V02-R4).
+    ///
+    /// Only a trusted internal construction site for an externally
+    /// authenticated origin may call this; see
+    /// [`RuntimeEnvelope::owner_isolated`].
+    #[must_use]
+    pub const fn with_owner_isolation(mut self) -> Self {
+        self.owner_isolated = true;
+        self
+    }
+
     #[must_use]
     pub fn with_topic_id(mut self, topic_id: impl Into<String>) -> Self {
         self.topic_id = Some(topic_id.into());
@@ -625,6 +648,7 @@ impl RuntimeEnvelope {
             channel: self.channel.clone(),
             sender: self.sender.clone(),
             owner_id: Some(self.resolved_owner_id()),
+            require_owner_match: self.owner_isolated,
             // D4: carry the pre-cutover legacy key so `session`-visibility recall
             // read-merges canonical + legacy. `None` preserves single-key recall.
             legacy_session_key: self.legacy_session_key.clone(),

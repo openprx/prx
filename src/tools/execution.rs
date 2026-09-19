@@ -1965,6 +1965,34 @@ fn tool_execution_event_input(
 /// untrusted call instead of an authorization bypass.
 pub const RUNTIME_ONLY_ARG_PREFIXES: [&str; 2] = ["_zc_", "_prx_"];
 
+/// Key inside the service-authored `_zc_scope` that marks the turn's origin as
+/// owner-isolated (C03 / V02-R4).
+///
+/// Written only when [`crate::runtime::envelope::RuntimeEnvelope::owner_isolated`]
+/// is set, which today means an externally authenticated MCP caller. Tools that
+/// rebuild a [`crate::memory::MemoryPrincipal`] from the scope read it back with
+/// [`scope_requires_owner_match`].
+pub const SCOPE_OWNER_ISOLATED_KEY: &str = "owner_isolated";
+
+/// Read the owner-isolation marker back out of tool arguments.
+///
+/// Honoured only when `_zc_scope_trusted` is set, and that whole block is
+/// re-authored by [`normalize_arguments`] from the authenticated execution
+/// context after [`strip_runtime_only_args`] has dropped everything the caller
+/// supplied — so a caller can neither forge the marker nor clear it.
+#[must_use]
+pub fn scope_requires_owner_match(args: &serde_json::Value) -> bool {
+    args.get("_zc_scope_trusted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        && args
+            .get("_zc_scope")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|scope| scope.get(SCOPE_OWNER_ISOLATED_KEY))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+}
+
 /// Whether `key` names a runtime-only tool argument (see
 /// [`RUNTIME_ONLY_ARG_PREFIXES`]).
 #[must_use]
@@ -2071,6 +2099,11 @@ fn normalize_arguments(
     });
     if let Some(scope) = scope.as_object_mut() {
         insert_optional(scope, "owner_id", context.envelope.owner_id.as_deref());
+        // C03: only written when the origin is owner-isolated, so every other
+        // turn's authored scope stays byte-identical to the pre-C03 one.
+        if context.envelope.owner_isolated {
+            scope.insert(SCOPE_OWNER_ISOLATED_KEY.to_string(), serde_json::Value::Bool(true));
+        }
         insert_optional(scope, "topic_id", context.envelope.topic_id.as_deref());
         insert_optional(scope, "task_id", context.envelope.task_id.as_deref());
         insert_optional(scope, "run_id", context.envelope.run_id.as_deref());

@@ -83,9 +83,14 @@ impl Tool for SessionsListTool {
         let status_filter = args.get("status").and_then(|v| v.as_str()).unwrap_or("all");
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
 
+        // C03 / V02-R4: the run registry is shared by every origin in this
+        // process. An externally authenticated caller may only see the runs its
+        // own owner registered; persisted rows are qualified in SQL instead.
+        let owner_scope = sessions_read_model::RunOwnerScope::from_args(&args);
         let runs = self.active_runs.read().await;
         let filtered: Vec<&SubAgentRun> = runs
             .iter()
+            .filter(|r| owner_scope.admits(r.owner_id.as_deref()))
             .filter(|r| match status_filter {
                 "running" => matches!(r.status, SubAgentStatus::Running),
                 "completed" => matches!(r.status, SubAgentStatus::Completed(_)),
@@ -378,6 +383,101 @@ mod tests {
         }
     }
 
+    fn owned_run(id: &str, owner_id: &str, task: &str) -> SubAgentRun {
+        let mut run = make_run(id, SubAgentStatus::Running, task);
+        run.owner_id = Some(owner_id.to_string());
+        run
+    }
+
+    /// C03 / V02-R4: the run registry is one process-wide `Vec`, shared by every
+    /// origin. An externally authenticated caller must only see the entries its
+    /// own owner registered — an unowned entry included, because the registry
+    /// cannot prove it is the caller's.
+    #[tokio::test]
+    async fn c03_an_owner_isolated_caller_only_lists_its_own_registry_runs() {
+        let runs = Arc::new(RwLock::new(vec![
+            owned_run("run-a", "owner:ws:agent:issuer-a:subject", "issuer-a task"),
+            owned_run("run-b", "owner:ws:agent:issuer-b:subject", "issuer-b task"),
+            make_run("run-unowned", SubAgentStatus::Running, "unattributed task"),
+        ]));
+        let tool = SessionsListTool::new(runs);
+
+        let scoped = tool
+            .execute(json!({
+                "_zc_scope": {
+                    "owner_id": "owner:ws:agent:issuer-b:subject",
+                    "owner_isolated": true,
+                },
+                "_zc_scope_trusted": true,
+            }))
+            .await
+            .expect("test: scoped listing");
+        assert!(
+            scoped.output.contains("run-b") && scoped.output.contains("issuer-b task"),
+            "the caller's own run must still be listed: {}",
+            scoped.output
+        );
+        assert!(
+            !scoped.output.contains("run-a") && !scoped.output.contains("issuer-a task"),
+            "another owner's run must not be listed: {}",
+            scoped.output
+        );
+        assert!(
+            !scoped.output.contains("run-unowned"),
+            "an unattributed run must not be listed to an isolated caller: {}",
+            scoped.output
+        );
+        assert!(
+            scoped.output.contains("(1 shown"),
+            "the reported count must match what is visible: {}",
+            scoped.output
+        );
+
+        // Without the marker the registry keeps its historical shared view.
+        let unscoped = tool.execute(json!({})).await.expect("test: unscoped listing");
+        assert!(
+            unscoped.output.contains("run-a") && unscoped.output.contains("run-b"),
+            "an in-process caller still sees the whole registry: {}",
+            unscoped.output
+        );
+    }
+
+    /// C03 / V02-R4, fail-closed half: an owner-isolated caller that carries no
+    /// usable owner id must list nothing from the shared registry. Without this
+    /// the absent-owner branch degrades to "admit everything", which is the
+    /// original defect with an extra step.
+    #[tokio::test]
+    async fn c03_an_owner_isolated_caller_without_an_owner_id_lists_no_registry_run() {
+        let runs = Arc::new(RwLock::new(vec![
+            owned_run("run-a", "owner:ws:agent:issuer-a:subject", "issuer-a task"),
+            owned_run("run-b", "owner:ws:agent:issuer-b:subject", "issuer-b task"),
+            make_run("run-unowned", SubAgentStatus::Running, "unattributed task"),
+        ]));
+        let tool = SessionsListTool::new(runs);
+
+        for (label, scope) in [
+            ("absent owner id", json!({ "owner_isolated": true })),
+            ("blank owner id", json!({ "owner_isolated": true, "owner_id": "   " })),
+        ] {
+            let result = tool
+                .execute(json!({ "_zc_scope": scope, "_zc_scope_trusted": true }))
+                .await
+                .expect("test: scoped listing");
+            assert!(
+                result.output.contains("No sessions found"),
+                "{label}: an isolated caller with no owner id must list nothing: {}",
+                result.output
+            );
+            for forbidden in ["run-a", "run-b", "run-unowned", "issuer-a task", "issuer-b task"] {
+                assert!(
+                    !result.output.contains(forbidden),
+                    "{label}: `{forbidden}` must not be listed: {}",
+                    result.output
+                );
+            }
+        }
+    }
+
     #[test]
     fn name_and_description() {
         let runs = Arc::new(RwLock::new(Vec::new()));
@@ -604,6 +704,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         memory
             .append_memory_event(MemoryEventInput {
+                owner_id: None,
                 event_id: None,
                 workspace_id: "/tmp".to_string(),
                 event_type: "task.spawned".to_string(),
@@ -628,6 +729,7 @@ mod tests {
             .unwrap();
         memory
             .append_memory_event(MemoryEventInput {
+                owner_id: None,
                 event_id: None,
                 workspace_id: "/tmp".to_string(),
                 event_type: "task.completed".to_string(),
@@ -666,6 +768,7 @@ mod tests {
         let visible = memory
             .list_memory_events_since(
                 &MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: "/tmp".to_string(),
                     agent_id: None,
                     persona_id: None,

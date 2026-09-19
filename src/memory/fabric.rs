@@ -382,6 +382,9 @@ impl MemoryFabric {
             .append_memory_event(MemoryEventInput {
                 event_id: None,
                 workspace_id: self.workspace_id.clone(),
+                // C03: task lifecycle events inherit the writing scope's owner so
+                // an owner-isolated reader can be told them apart.
+                owner_id: scope.owner_id.clone(),
                 event_type: event_type.into(),
                 subject_table: "tasks".to_string(),
                 subject_id: task_id.into(),
@@ -463,6 +466,9 @@ impl MemoryFabric {
             .append_memory_event(MemoryEventInput {
                 event_id: None,
                 workspace_id: self.workspace_id.clone(),
+                // Semantic promotion has no caller scope in hand; the event is
+                // workspace-visible, so it needs no owner attribution.
+                owner_id: None,
                 event_type: "memory.stored".to_string(),
                 subject_table: "memories".to_string(),
                 subject_id: key.to_string(),
@@ -555,6 +561,7 @@ impl MemoryFabric {
             .append_memory_event(MemoryEventInput {
                 event_id: None,
                 workspace_id: target_workspace_id.unwrap_or_else(|| self.workspace_id()).to_string(),
+                owner_id: draft.owner_id.clone(),
                 event_type: "memory.draft.merge_requested".to_string(),
                 subject_table: "memory_drafts".to_string(),
                 subject_id: draft.draft_id.clone(),
@@ -793,6 +800,7 @@ mod tests {
         let visible = memory
             .list_message_events_since(
                 &crate::memory::MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: "workspace-a".to_string(),
                     agent_id: None,
                     persona_id: None,
@@ -835,6 +843,7 @@ mod tests {
         let events = memory
             .list_memory_events_since(
                 &crate::memory::MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: "workspace-a".to_string(),
                     agent_id: None,
                     persona_id: None,
@@ -879,6 +888,7 @@ mod tests {
         let events = memory
             .list_memory_events_since(
                 &crate::memory::MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: "workspace-a".to_string(),
                     agent_id: Some("agent-a".to_string()),
                     persona_id: Some("persona-a".to_string()),
@@ -939,6 +949,7 @@ mod tests {
         let events = memory
             .list_memory_events_since(
                 &crate::memory::MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: "workspace-a".to_string(),
                     agent_id: Some("agent-a".to_string()),
                     persona_id: Some("persona-a".to_string()),
@@ -974,6 +985,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         let fabric = MemoryFabric::new(memory.clone(), "workspace-a");
         let principal = crate::memory::MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: "workspace-a".to_string(),
             agent_id: None,
             persona_id: None,
@@ -1039,6 +1051,7 @@ mod tests {
         let visible = memory
             .list_message_events_since(
                 &crate::memory::MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: "workspace-a".to_string(),
                     agent_id: None,
                     persona_id: None,

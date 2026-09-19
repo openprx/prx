@@ -3742,6 +3742,7 @@ mod tests {
         .unwrap();
 
         let principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id,
             agent_id: Some("config-generation-manager".to_string()),
             persona_id: None,
@@ -5227,6 +5228,7 @@ mod tests {
         // the production envelope reads) returns the request, shared terminal
         // projections, and provider telemetry for the turn.
         let canonical_principal = MemoryPrincipal {
+            require_owner_match: false,
             workspace_id: tmp.path().to_string_lossy().to_string(),
             agent_id: None,
             persona_id: None,

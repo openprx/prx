@@ -2652,6 +2652,7 @@ mod tests {
         let drafts = worker_memory
             .list_memory_drafts_for_run(
                 &crate::memory::traits::MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: "workspace".to_string(),
                     agent_id: Some("system".to_string()),
                     persona_id: None,
@@ -2679,6 +2680,7 @@ mod tests {
         let parent_events = parent_memory
             .list_memory_events_since(
                 &crate::memory::MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: parent.path().to_string_lossy().to_string(),
                     agent_id: Some("agent-a".to_string()),
                     persona_id: Some("persona-a".to_string()),
@@ -2787,6 +2789,7 @@ mod tests {
         let drafts = worker_memory
             .list_memory_drafts_for_run(
                 &crate::memory::traits::MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: "workspace".to_string(),
                     agent_id: Some("system".to_string()),
                     persona_id: None,

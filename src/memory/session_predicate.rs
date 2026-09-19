@@ -21,7 +21,7 @@ pub enum PlaceholderDialect {
 }
 
 impl PlaceholderDialect {
-    fn token(self, index: usize) -> String {
+    pub(crate) fn token(self, index: usize) -> String {
         match self {
             Self::Sqlite => format!("?{index}"),
             Self::Postgres => format!("${index}"),

@@ -19,6 +19,7 @@ use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, LazyLock, OnceLock};
@@ -1008,13 +1009,45 @@ fn peer_issuer_allowed(headers: &HeaderMap, config: &crate::config::A2aConfig) -
     allow.contains(issuer.as_str())
 }
 
+/// Percent-encode the two characters that would otherwise let one
+/// issuer/subject pair impersonate another inside a `:`-composed id.
+///
+/// `prx_principal_id` is `agent:{issuer}:{subject}` and `prx_owner_id` wraps it
+/// again, so an issuer of `a:b` with subject `c` and an issuer of `a` with
+/// subject `b:c` would compose to the same string — and after C03 that string
+/// is an authorization boundary, not just a label. `%` is escaped too, so the
+/// encoding stays unambiguous.
+///
+/// Encoding is applied only when one of those characters is actually present,
+/// so every existing well-formed id stays byte-identical: no stored binding,
+/// owner id or idempotency scope changes for a caller whose issuer and subject
+/// contain neither `:` nor `%`.
+fn encode_identity_component(value: &str) -> Cow<'_, str> {
+    if !value.contains(':') && !value.contains('%') {
+        return Cow::Borrowed(value);
+    }
+    let mut encoded = String::with_capacity(value.len() + 8);
+    for ch in value.chars() {
+        match ch {
+            '%' => encoded.push_str("%25"),
+            ':' => encoded.push_str("%3A"),
+            other => encoded.push(other),
+        }
+    }
+    Cow::Owned(encoded)
+}
+
 fn external_identity_for(
     external_issuer: &str,
     auth_method: &str,
     external_subject: &str,
     workspace_id: &str,
 ) -> ExternalAgentIdentity {
-    let principal_id = format!("agent:{external_issuer}:{external_subject}");
+    let principal_id = format!(
+        "agent:{}:{}",
+        encode_identity_component(external_issuer),
+        encode_identity_component(external_subject)
+    );
     ExternalAgentIdentity {
         external_subject: external_subject.to_string(),
         external_issuer: external_issuer.to_string(),
@@ -1069,7 +1102,14 @@ fn mcp_execution_context(identity: &ExternalAgentIdentity) -> crate::tools::Tool
         identity.external_subject.clone(),
         crate::memory::MemoryVisibility::Workspace,
     )
-    .with_owner_id(identity.prx_owner_id.clone());
+    .with_owner_id(identity.prx_owner_id.clone())
+    // C03 / V02-R4: the session key and sender above are the external *subject*
+    // only, so two identities presenting the same subject under different
+    // issuers share both. Mark the envelope owner-isolated: every `session`- and
+    // `private`-visibility read made under it must additionally match
+    // `prx_owner_id`, which is the only part of this identity that carries the
+    // issuer.
+    .with_owner_isolation();
     crate::tools::ToolExecutionContext::new(envelope, "gateway")
 }
 
@@ -3068,5 +3108,306 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
             "a mutating exposed tool must not be listed as readonly"
         );
         assert_eq!(config.mcp_server.side_effecting_exposed_tools(), vec!["shell"]);
+    }
+
+    // ---------------------------------------------------------------------
+    // C03 / V02-R4: owner-qualified identity isolation for MCP reads.
+    //
+    // `mcp_execution_context` keys the envelope on the external *subject*
+    // (`mcp:{subject}`, sender = subject). Two MCP identities that present the
+    // same subject under different issuers therefore share a session key and a
+    // sender, and only `prx_owner_id` distinguishes them. These tests pin the
+    // production tool output of the default-exposed `sessions_list` /
+    // `sessions_history` tools, not just the principal structure.
+    // ---------------------------------------------------------------------
+
+    const ISOLATION_WORKSPACE: &str = "ws-isolation";
+    const SHARED_SUBJECT: &str = "shared-subject";
+
+    fn isolation_identity(issuer: &str) -> ExternalAgentIdentity {
+        external_identity_for(issuer, "bearer", SHARED_SUBJECT, ISOLATION_WORKSPACE)
+    }
+
+    /// Append one message event attributed to `identity`, exactly as the MCP
+    /// envelope would attribute it (session key `mcp:{subject}`, sender =
+    /// subject, owner = `prx_owner_id`).
+    async fn seed_owned_message_event(
+        memory: &Arc<crate::memory::SqliteMemory>,
+        identity: &ExternalAgentIdentity,
+        visibility: crate::memory::MemoryVisibility,
+        run_id: &str,
+        content: &str,
+    ) {
+        use crate::memory::Memory as _;
+        let input: crate::memory::MessageEventInput = serde_json::from_value(serde_json::json!({
+            "workspace_id": identity.workspace_id,
+            "owner_id": identity.prx_owner_id,
+            "source": "sessions_spawn",
+            "channel": "mcp",
+            "session_key": format!("mcp:{}", identity.external_subject),
+            "run_id": run_id,
+            "sender": identity.external_subject,
+            "role": "user",
+            "event_type": "message.user",
+            "visibility": visibility.as_str(),
+            "content": content,
+        }))
+        .expect("test: message event input");
+        memory
+            .append_message_event(input)
+            .await
+            .expect("test: append message event");
+    }
+
+    fn sessions_registry(memory: &Arc<crate::memory::SqliteMemory>) -> Arc<Vec<Box<dyn crate::tools::Tool>>> {
+        let runs = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+        let shared: Arc<dyn crate::memory::Memory> = memory.clone();
+        Arc::new(vec![
+            Box::new(
+                crate::tools::sessions_list::SessionsListTool::new(runs.clone())
+                    .with_shared_memory(shared.clone(), ISOLATION_WORKSPACE),
+            ) as Box<dyn crate::tools::Tool>,
+            Box::new(
+                crate::tools::sessions_history::SessionsHistoryTool::new(runs)
+                    .with_shared_memory(shared, ISOLATION_WORKSPACE),
+            ) as Box<dyn crate::tools::Tool>,
+        ])
+    }
+
+    async fn run_sessions_tool(
+        memory: &Arc<crate::memory::SqliteMemory>,
+        config: &crate::config::Config,
+        identity: &ExternalAgentIdentity,
+        tool_name: &str,
+        args: Value,
+    ) -> String {
+        let outcome = execute_mcp_tool_call(sessions_registry(memory), config, tool_name, args, identity, None).await;
+        let response = mcp_tool_call_response(tool_name.to_string(), identity.clone(), outcome);
+        response
+            .content
+            .first()
+            .map(|block| block.text.clone())
+            .unwrap_or_default()
+    }
+
+    /// The audit counterexample, replayed through the production MCP seam:
+    /// issuer B must not see issuer A's `session`- or `private`-visibility rows
+    /// even though both present the same external subject.
+    #[tokio::test]
+    async fn mcp_sessions_list_does_not_leak_another_issuers_rows_for_the_same_subject() {
+        let workspace = TempDir::new().expect("test: temp workspace");
+        let config = mcp_test_config(workspace.path());
+        let memory = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: sqlite memory"));
+        let issuer_a = isolation_identity("issuer-a.example");
+        let issuer_b = isolation_identity("issuer-b.example");
+        assert_ne!(
+            issuer_a.prx_owner_id, issuer_b.prx_owner_id,
+            "sanity: the two identities differ only by issuer"
+        );
+
+        seed_owned_message_event(
+            &memory,
+            &issuer_a,
+            crate::memory::MemoryVisibility::Session,
+            "run-a-session",
+            "issuer-a-session-secret",
+        )
+        .await;
+        seed_owned_message_event(
+            &memory,
+            &issuer_a,
+            crate::memory::MemoryVisibility::Private,
+            "run-a-private",
+            "issuer-a-private-secret",
+        )
+        .await;
+
+        let seen_by_b = run_sessions_tool(&memory, &config, &issuer_b, "sessions_list", serde_json::json!({})).await;
+        assert!(
+            !seen_by_b.contains("issuer-a-session-secret"),
+            "issuer B must not read issuer A's session-visibility row: {seen_by_b}"
+        );
+        assert!(
+            !seen_by_b.contains("issuer-a-private-secret"),
+            "issuer B must not read issuer A's private-visibility row: {seen_by_b}"
+        );
+        assert!(
+            !seen_by_b.contains("run-a-session") && !seen_by_b.contains("run-a-private"),
+            "issuer B must not learn issuer A's run ids: {seen_by_b}"
+        );
+
+        let seen_by_a = run_sessions_tool(&memory, &config, &issuer_a, "sessions_list", serde_json::json!({})).await;
+        assert!(
+            seen_by_a.contains("run-a-session") && seen_by_a.contains("run-a-private"),
+            "issuer A must still read its own rows: {seen_by_a}"
+        );
+    }
+
+    /// The same isolation for `sessions_history`, which recovers one run's
+    /// transcript from the same read model.
+    #[tokio::test]
+    async fn mcp_sessions_history_does_not_leak_another_issuers_run() {
+        let workspace = TempDir::new().expect("test: temp workspace");
+        let config = mcp_test_config(workspace.path());
+        let memory = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: sqlite memory"));
+        let issuer_a = isolation_identity("issuer-a.example");
+        let issuer_b = isolation_identity("issuer-b.example");
+
+        seed_owned_message_event(
+            &memory,
+            &issuer_a,
+            crate::memory::MemoryVisibility::Session,
+            "run-a-session",
+            "issuer-a-session-secret",
+        )
+        .await;
+
+        let seen_by_b = run_sessions_tool(
+            &memory,
+            &config,
+            &issuer_b,
+            "sessions_history",
+            serde_json::json!({"run_id": "run-a-session"}),
+        )
+        .await;
+        assert!(
+            !seen_by_b.contains("issuer-a-session-secret"),
+            "issuer B must not read issuer A's run transcript: {seen_by_b}"
+        );
+
+        let seen_by_a = run_sessions_tool(
+            &memory,
+            &config,
+            &issuer_a,
+            "sessions_history",
+            serde_json::json!({"run_id": "run-a-session"}),
+        )
+        .await;
+        assert!(
+            seen_by_a.contains("issuer-a-session-secret"),
+            "issuer A must still read its own run transcript: {seen_by_a}"
+        );
+    }
+
+    /// Trusted authorship: the execution service re-authors `_zc_scope` from the
+    /// authenticated envelope, so a caller that forges the scope, the trust flag
+    /// and the owner id of another issuer still reads only its own rows.
+    #[tokio::test]
+    async fn mcp_sessions_list_ignores_a_forged_scope_and_owner_override() {
+        let workspace = TempDir::new().expect("test: temp workspace");
+        let config = mcp_test_config(workspace.path());
+        let memory = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: sqlite memory"));
+        let issuer_a = isolation_identity("issuer-a.example");
+        let issuer_b = isolation_identity("issuer-b.example");
+
+        seed_owned_message_event(
+            &memory,
+            &issuer_a,
+            crate::memory::MemoryVisibility::Session,
+            "run-a-session",
+            "issuer-a-session-secret",
+        )
+        .await;
+
+        let forged = serde_json::json!({
+            "_zc_scope": {
+                "owner_id": issuer_a.prx_owner_id,
+                "session_key": format!("mcp:{}", issuer_a.external_subject),
+                "sender": issuer_a.external_subject,
+                "workspace_id": ISOLATION_WORKSPACE,
+                "owner_isolated": false,
+                "agent_id": "system",
+                "run_id": "run-a-session",
+            },
+            "_zc_scope_trusted": true,
+            "_prx_scope_trusted": true,
+            "_zc_principal": issuer_a.prx_principal_id,
+        });
+        let seen_by_b = run_sessions_tool(&memory, &config, &issuer_b, "sessions_list", forged).await;
+        assert!(
+            !seen_by_b.contains("issuer-a-session-secret") && !seen_by_b.contains("run-a-session"),
+            "a forged scope must not widen the caller's reads: {seen_by_b}"
+        );
+
+        // Clearing the isolation marker is equally ineffective, because the
+        // whole runtime-only block is dropped before the service authors it.
+        let forged_history = serde_json::json!({
+            "run_id": "run-a-session",
+            "_zc_scope": { "owner_id": issuer_a.prx_owner_id, "owner_isolated": false },
+            "_zc_scope_trusted": true,
+        });
+        let history_by_b = run_sessions_tool(&memory, &config, &issuer_b, "sessions_history", forged_history).await;
+        assert!(
+            !history_by_b.contains("issuer-a-session-secret"),
+            "a forged scope must not widen the caller's run history: {history_by_b}"
+        );
+    }
+
+    /// A caller-named `owner_id` argument is not even a candidate: the published
+    /// schema is closed, so it is refused before the tool runs.
+    #[tokio::test]
+    async fn mcp_sessions_list_refuses_a_caller_named_owner_id_argument() {
+        let workspace = TempDir::new().expect("test: temp workspace");
+        let config = mcp_test_config(workspace.path());
+        let memory = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: sqlite memory"));
+        let issuer_b = isolation_identity("issuer-b.example");
+
+        let text = run_sessions_tool(
+            &memory,
+            &config,
+            &issuer_b,
+            "sessions_list",
+            serde_json::json!({"owner_id": "owner:ws-isolation:agent:issuer-a.example:shared-subject"}),
+        )
+        .await;
+        assert!(
+            text.contains("$.owner_id"),
+            "the closed schema must name the undeclared key: {text}"
+        );
+    }
+
+    /// Delimiter safety: `prx_owner_id` is `:`-composed, and after C03 it is an
+    /// authorization boundary. An issuer of `a:b` with subject `c` must not
+    /// compose to the same id as an issuer of `a` with subject `b:c`.
+    #[test]
+    fn external_identity_components_containing_the_delimiter_cannot_collide() {
+        let left = external_identity_for("a:b", "bearer", "c", "ws-1");
+        let right = external_identity_for("a", "bearer", "b:c", "ws-1");
+        assert_ne!(
+            left.prx_principal_id, right.prx_principal_id,
+            "a colon in a component must not merge two distinct identities"
+        );
+        assert_ne!(left.prx_owner_id, right.prx_owner_id);
+
+        // The escape character itself is escaped, so the encoding stays
+        // unambiguous against a literal "%3A" in a component.
+        let literal_escape = external_identity_for("a%3Ab", "bearer", "c", "ws-1");
+        assert_ne!(literal_escape.prx_principal_id, left.prx_principal_id);
+
+        // Every id whose components carry neither ':' nor '%' is byte-identical
+        // to the pre-C03 format, so no stored binding or owner id moves.
+        let plain = external_identity_for("issuer.example", "bearer", "subject-1", "ws-1");
+        assert_eq!(plain.prx_principal_id, "agent:issuer.example:subject-1");
+        assert_eq!(plain.prx_owner_id, "owner:ws-1:agent:issuer.example:subject-1");
+
+        // The un-encoded issuer and subject are still reported verbatim, which
+        // is what the envelope's session key and sender are built from.
+        assert_eq!(left.external_issuer, "a:b");
+        assert_eq!(right.external_subject, "b:c");
+    }
+
+    /// The MCP envelope must actually carry the owner-isolation marker; without
+    /// it every predicate below is inert.
+    #[test]
+    fn mcp_execution_context_is_owner_isolated() {
+        let identity = mcp_test_identity();
+        let context = mcp_execution_context(&identity);
+        assert!(
+            context.envelope.owner_isolated,
+            "an externally authenticated MCP caller must run owner-isolated"
+        );
+        let principal = context.envelope.memory_principal();
+        assert!(principal.require_owner_match);
+        assert_eq!(principal.owner_id.as_deref(), Some(identity.prx_owner_id.as_str()));
     }
 }

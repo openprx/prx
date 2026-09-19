@@ -156,6 +156,11 @@ const ALLOWED_PERSISTED_EVENT_TABLES: &[&str] = &[
     "src/memory/sqlite.rs::memory_events",
     "src/memory/sqlite.rs::memory_events",
     "src/memory/sqlite.rs::memory_events",
+    // Fourth occurrence: the pre-v16 `memory_events` fixture in
+    // `legacy_memory_events_gets_owner_id_column_on_init`, which proves the
+    // C03 owner_id migration upgrades a database created before the column
+    // existed. A test fixture, not a second production ledger.
+    "src/memory/sqlite.rs::memory_events",
     "src/memory/sqlite.rs::message_events",
     "src/memory/sqlite.rs::message_events",
     "src/memory/sqlite.rs::message_events",

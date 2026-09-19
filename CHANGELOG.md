@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.159] - 19 September 2026
+
+### Fixed
+
+- MCP session and private reads are isolated by owner. Two authenticated MCP
+  identities that present the same subject under different issuers no longer
+  share `session`- or `private`-visibility history through `sessions_list`,
+  `sessions_history`, `session_status`, `sessions_send` or `document_search`.
+  Externally authenticated envelopes are marked owner-isolated; under that mark
+  the `session` and `private` arms of every principal-scoped read in the SQLite
+  and Postgres adapters, the legacy-key read merge included, additionally
+  require `owner_id` equality, and an isolated principal without an owner id
+  reads no such row. `workspace` and `global` visibility keep their shared
+  contract and in-process callers are unaffected. `memory_events` gains an
+  `owner_id` column through an idempotent migration (SQLite schema v16,
+  Postgres v22); existing rows are preserved, stay readable by non-isolated
+  principals, and unattributed rows can be assigned to an owner with the
+  bounded statements documented in `docs/tools.md`. Issuer and subject
+  components of the owner id percent-encode `:` and `%` so they cannot collide.
+
 ## [0.8.158] - 19 September 2026
 
 ### Fixed

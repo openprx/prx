@@ -8228,6 +8228,7 @@ mod tests {
         let events = memory
             .list_message_events_since(
                 &MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: "/tmp".to_string(),
                     agent_id: None,
                     persona_id: None,
@@ -8280,6 +8281,7 @@ mod tests {
         let memory_events = memory
             .list_memory_events_since(
                 &MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: "/tmp".to_string(),
                     agent_id: None,
                     persona_id: None,
@@ -8777,6 +8779,7 @@ mod tests {
         let events = memory
             .list_memory_events_since(
                 &MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: "/tmp".to_string(),
                     agent_id: None,
                     persona_id: None,
@@ -8953,6 +8956,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         memory
             .append_memory_event(MemoryEventInput {
+                owner_id: None,
                 event_id: None,
                 workspace_id: "/tmp".to_string(),
                 event_type: "task.spawned".to_string(),
@@ -9330,6 +9334,7 @@ mod tests {
         let events = memory
             .list_memory_events_since(
                 &MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: "/tmp".to_string(),
                     agent_id: None,
                     persona_id: None,
@@ -9688,6 +9693,7 @@ mod tests {
         let events = memory
             .list_memory_events_since(
                 &MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: "/tmp".to_string(),
                     agent_id: None,
                     persona_id: None,
@@ -10351,6 +10357,7 @@ mod tests {
         let events = memory
             .list_memory_events_since(
                 &MemoryPrincipal {
+                    require_owner_match: false,
                     workspace_id: "/tmp".to_string(),
                     agent_id: None,
                     persona_id: None,
