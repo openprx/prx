@@ -3063,7 +3063,25 @@ fn fabric_channel_label(body: &WebhookBody) -> &str {
 ///
 /// Owns the idempotency claim for the whole run: the claim is only resolved by
 /// code that knows how the run ended, never by the request future going away.
-async fn run_webhook_job(
+fn run_webhook_job(
+    state: AppState,
+    webhook_body: WebhookBody,
+    credential: String,
+    idempotency_digest: Option<String>,
+    idempotency_claim: Option<IdempotencyClaim>,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<jobs::JobOutput, String>> + Send>> {
+    // Keep owned webhook work out of the generic job submitter's future.
+    // Construction does not poll it; the same idempotency claim moves with it.
+    Box::pin(run_webhook_job_work(
+        state,
+        webhook_body,
+        credential,
+        idempotency_digest,
+        idempotency_claim,
+    ))
+}
+
+async fn run_webhook_job_work(
     state: AppState,
     webhook_body: WebhookBody,
     credential: String,
