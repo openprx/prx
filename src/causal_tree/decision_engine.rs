@@ -31,11 +31,10 @@ use super::state::{
     CausalState, DerivedCandidate, DerivedState, DuplicateCandidate, ObservedArtifactKind, SideEffectMode, TrustedParts,
 };
 use crate::capability::CapabilityAvailabilityLevel;
-#[cfg(test)]
 use crate::decision::DecisionError;
 #[cfg(test)]
-use crate::decision::factory::BuiltinFailure;
-use crate::decision::factory::{DecisionBackendFactory, PredictionResult};
+use crate::decision::factory::DecisionBackendFactory;
+use crate::decision::factory::PredictionResult;
 use crate::decision::telemetry::CausalLineage;
 use crate::decision::{DecisionAnswer, DecisionKey, GlobalQuestion, RequestLimits, ValidatedDecision};
 use crate::security::{AutonomyLevel, SecurityPolicy};
@@ -44,8 +43,24 @@ use crate::tools::capability::child::{CapabilityConstraints, ChildCapabilityMani
 use crate::tools::capability::search::CatalogSearch;
 use crate::tools::execution::{ToolExecutionDecision, decide_tool_execution};
 
+/// Borrowed prediction port owned by the engine domain. Its producer keeps
+/// physical accounting and transport outside the engine; no boxed future is
+/// introduced on builtin/cache or physical paths by this contract.
+pub(crate) mod prediction_sealed {
+    pub(crate) trait Producer {}
+}
+
+pub(crate) trait PredictionPort: prediction_sealed::Producer + Clone + Send + Sync {
+    fn remaining_budget(&self) -> Option<(u64, u64)>;
+    fn predict<'a>(
+        &'a self,
+        request: &'a crate::decision::DecisionRequest,
+        lineage: &'a CausalLineage,
+    ) -> impl std::future::Future<Output = Result<PredictionResult, DecisionError>> + Send + 'a;
+}
+
 #[derive(Clone)]
-pub(crate) struct EngineInputs<'a, 'catalog> {
+pub(crate) struct EngineInputs<'a, 'catalog, P: PredictionPort> {
     pub state: &'a CausalState,
     pub catalog: &'a CatalogView<'catalog>,
     pub config: &'a CausalTreeConfig,
@@ -61,8 +76,7 @@ pub(crate) struct EngineInputs<'a, 'catalog> {
     pub delegation: Option<(&'a CapabilityConstraints, &'a [CapabilityRef])>,
     /// Runtime's pinned delegation depth limit for this turn.
     pub delegation_max_depth: u8,
-    pub backend: &'a DecisionBackendFactory,
-    pub accounting: Option<&'a dyn crate::decision::budget::DecisionAttemptAccounting>,
+    pub prediction: P,
     pub rehearsal_ports: &'a RehearsalPorts<'a>,
     pub request_limits: RequestLimits,
     pub model: Option<&'a str>,
@@ -218,9 +232,9 @@ impl PredictionAuditTrace {
 /// A candidate set and derived state bound to the exact inputs of one hop.
 /// The runtime can compare its evidence before allowing another backend call,
 /// then consume the same preparation without regenerating candidates.
-pub(crate) struct PreparedHop<'a, 'catalog> {
+pub(crate) struct PreparedHop<'a, 'catalog, P: PredictionPort> {
     started_at: Instant,
-    inputs: EngineInputs<'a, 'catalog>,
+    inputs: EngineInputs<'a, 'catalog, P>,
     state: CausalState,
     candidates: CandidateSet,
     all: Vec<CausalCandidate>,
@@ -229,7 +243,7 @@ pub(crate) struct PreparedHop<'a, 'catalog> {
     resume_target: Option<&'a CapabilityRef>,
 }
 
-impl PreparedHop<'_, '_> {
+impl<P: PredictionPort> PreparedHop<'_, '_, P> {
     pub(crate) const fn candidate_count(&self) -> usize {
         self.all.len()
     }
@@ -245,7 +259,7 @@ impl PreparedHop<'_, '_> {
         self.state.derived.candidates() != prior.derived.candidates()
     }
 
-    pub(crate) fn candidate_bodies_changed_from_prepared(&self, prior: &PreparedHop<'_, '_>) -> bool {
+    pub(crate) fn candidate_bodies_changed_from_prepared(&self, prior: &PreparedHop<'_, '_, P>) -> bool {
         self.candidate_bodies_changed_from(&prior.state)
     }
 }
@@ -350,7 +364,11 @@ impl EngineDecision {
             || !is_retrieval_source(entry)
             || (entry.family == super::branch::CapabilityTarget::Session
                 && self.state.trusted.parts().source_event_id.is_none())
-            || self.state.trusted.parts().excludes_entry(catalog, entry)
+            || self
+                .state
+                .trusted
+                .parts()
+                .excludes_entry(catalog.model_admission_entry(entry))
         {
             return Err(RetrievalIssueError);
         }
@@ -425,7 +443,7 @@ impl EngineDecision {
         let refs = CatalogSearch::find(catalog, &query, &families, limit)
             .into_iter()
             .filter(|hit| matches!(hit.entry.exposure, Exposure::Searchable))
-            .filter(|hit| !trusted.excludes_entry(catalog, hit.entry))
+            .filter(|hit| !trusted.excludes_entry(catalog.model_admission_entry(hit.entry)))
             .map(|hit| CapabilityRef {
                 id: hit.entry.id.clone(),
                 fingerprint: hit.entry.fingerprint,
@@ -480,22 +498,24 @@ pub(crate) struct CausalDecisionEngine;
 
 impl CausalDecisionEngine {
     #[cfg(test)]
-    pub(crate) async fn decide_once(inputs: &EngineInputs<'_, '_>) -> Result<EngineDecision, EngineError> {
+    pub(crate) async fn decide_once<P: PredictionPort>(
+        inputs: &EngineInputs<'_, '_, P>,
+    ) -> Result<EngineDecision, EngineError> {
         Self::decide_prepared(Self::prepare_hop(inputs)?).await
     }
 
-    pub(crate) fn prepare_hop<'a, 'catalog>(
-        inputs: &EngineInputs<'a, 'catalog>,
-    ) -> Result<PreparedHop<'a, 'catalog>, EngineError> {
+    pub(crate) fn prepare_hop<'a, 'catalog, P: PredictionPort>(
+        inputs: &EngineInputs<'a, 'catalog, P>,
+    ) -> Result<PreparedHop<'a, 'catalog, P>, EngineError> {
         Self::prepare_hop_with_resume_target(inputs, None)
     }
 
     /// Only a caller with authenticated, current-snapshot resume evidence may
     /// restore this exact candidate. All normal preparation and gates remain.
-    pub(crate) fn prepare_hop_with_resume_target<'a, 'catalog>(
-        inputs: &EngineInputs<'a, 'catalog>,
+    pub(crate) fn prepare_hop_with_resume_target<'a, 'catalog, P: PredictionPort>(
+        inputs: &EngineInputs<'a, 'catalog, P>,
         resume_target: Option<&'a crate::causal_tree::branch::CapabilityRef>,
-    ) -> Result<PreparedHop<'a, 'catalog>, EngineError> {
+    ) -> Result<PreparedHop<'a, 'catalog, P>, EngineError> {
         let started_at = Instant::now();
         let trusted = inputs.state.trusted.parts();
         if trusted.catalog_generation != inputs.catalog.generation() {
@@ -571,7 +591,9 @@ impl CausalDecisionEngine {
 
     /// Select a freshly gated terminal after a read hop stops. This path
     /// consumes a terminal-only preparation and never calls a backend.
-    pub(crate) fn decide_terminal_prepared(prepared: PreparedHop<'_, '_>) -> Result<EngineDecision, EngineError> {
+    pub(crate) fn decide_terminal_prepared<P: PredictionPort>(
+        prepared: PreparedHop<'_, '_, P>,
+    ) -> Result<EngineDecision, EngineError> {
         let PreparedHop {
             started_at,
             inputs,
@@ -672,8 +694,8 @@ impl CausalDecisionEngine {
 
     /// Source eligibility is supplied by the verified service's sealed ingress proof.
     /// No backend sees this result and no executable capability is selected.
-    pub(crate) async fn decide_prepared_with_collection(
-        mut prepared: PreparedHop<'_, '_>,
+    pub(crate) async fn decide_prepared_with_collection<P: PredictionPort>(
+        mut prepared: PreparedHop<'_, '_, P>,
         adapter: Option<super::approval_collection::ApprovalReviewAdapter>,
     ) -> Result<EngineDecision, EngineError> {
         let inputs = &prepared.inputs;
@@ -772,7 +794,9 @@ impl CausalDecisionEngine {
         })
     }
 
-    pub(crate) async fn decide_prepared(prepared: PreparedHop<'_, '_>) -> Result<EngineDecision, EngineError> {
+    pub(crate) async fn decide_prepared<P: PredictionPort>(
+        prepared: PreparedHop<'_, '_, P>,
+    ) -> Result<EngineDecision, EngineError> {
         let PreparedHop {
             started_at,
             inputs,
@@ -806,22 +830,18 @@ impl CausalDecisionEngine {
             request_compiled = true;
             #[cfg(test)]
             let outcome = if inputs.inject_builtin_failure {
-                Ok(Err(BuiltinFailure(DecisionError::Unavailable)))
+                Ok(Err(DecisionError::Unavailable))
             } else {
                 tokio::time::timeout_at(
                     tokio::time::Instant::from_std(inputs.deadline),
-                    inputs
-                        .backend
-                        .decide_with_accounting(compiled.request(), &lineage(trusted), inputs.accounting),
+                    inputs.prediction.predict(compiled.request(), &lineage(trusted)),
                 )
                 .await
             };
             #[cfg(not(test))]
             let outcome = tokio::time::timeout_at(
                 tokio::time::Instant::from_std(inputs.deadline),
-                inputs
-                    .backend
-                    .decide_with_accounting(compiled.request(), &lineage(trusted), inputs.accounting),
+                inputs.prediction.predict(compiled.request(), &lineage(trusted)),
             )
             .await;
             match outcome {
@@ -1031,13 +1051,15 @@ impl CausalDecisionEngine {
     }
 }
 
-fn remaining_budget(inputs: &EngineInputs<'_, '_>, state: &CausalState) -> super::state::TurnBudgets {
+fn remaining_budget<P: PredictionPort>(
+    inputs: &EngineInputs<'_, '_, P>,
+    state: &CausalState,
+) -> super::state::TurnBudgets {
     let mut remaining = state.trusted.parts().budgets;
     remaining.latency_ms = remaining
         .latency_ms
         .min(u64::try_from(inputs.deadline.saturating_duration_since(Instant::now()).as_millis()).unwrap_or(u64::MAX));
-    if let Some(accounting) = inputs.accounting {
-        let (tokens, micro_usd) = accounting.remaining_budget();
+    if let Some((tokens, micro_usd)) = inputs.prediction.remaining_budget() {
         remaining.tokens = remaining.tokens.min(tokens);
         remaining.micro_usd = remaining.micro_usd.min(micro_usd);
     }
@@ -1114,7 +1136,7 @@ fn validate_delegation_refs(
             || reference.fingerprint != entry.fingerprint
             || matches!(entry.exposure, Exposure::Unavailable { .. })
             || entry.availability.level < CapabilityAvailabilityLevel::Configured
-            || trusted.excludes_entry(catalog, entry)
+            || trusted.excludes_entry(catalog.model_admission_entry(entry))
             || (trusted.channel.is_some() && !entry.channel_eligible)
             || decide_tool_execution(policy, &entry.public_name, sender, policy_channel, chat_type)
                 == ToolExecutionDecision::Deny
@@ -2288,8 +2310,7 @@ mod tests {
             gates: &gates,
             delegation: None,
             delegation_max_depth: 2,
-            backend: &backend,
-            accounting: None,
+            prediction: backend.prediction_port(None),
             rehearsal_ports: &ports,
             request_limits: RequestLimits::default(),
             model: Some("mock-model"),
@@ -2399,7 +2420,7 @@ mod tests {
             OutboundSecrets::default(),
             SlotLimits::default(),
         );
-        inputs.backend = &builtin;
+        inputs.prediction = builtin.prediction_port(None);
         inputs.cost_model = &cost;
         inputs.inject_builtin_failure = true;
         inputs.deadline = Instant::now() + Duration::from_secs(1);
@@ -2435,7 +2456,7 @@ mod tests {
         inputs.allow_terminal_answer = true;
         inputs.after_prediction_pause = None;
         inputs.deadline = Instant::now() + Duration::from_secs(1);
-        inputs.backend = &backend;
+        inputs.prediction = backend.prediction_port(None);
         let before_terminal = calls.load(Ordering::SeqCst);
         let prepared = CausalDecisionEngine::prepare_hop(&inputs).expect("fresh terminal candidates");
         let terminal = CausalDecisionEngine::decide_terminal_prepared(prepared).expect("fresh terminal gate pass");

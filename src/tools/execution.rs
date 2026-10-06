@@ -3118,7 +3118,7 @@ pub const RUNTIME_ONLY_ARG_PREFIXES: [&str; 2] = ["_zc_", "_prx_"];
 /// but the gateway does not register them, so they stay off the list until it
 /// does: an exposed entry is then refused with 403 before any identity binding
 /// is written, instead of passing this gate and answering 404 afterwards.
-pub use super::capability::policy::OWNER_ISOLATION_AWARE_TOOLS;
+pub use crate::causal_tree::capability_policy::OWNER_ISOLATION_AWARE_TOOLS;
 
 /// Whether `name` is on [`OWNER_ISOLATION_AWARE_TOOLS`].
 #[must_use]
@@ -3133,7 +3133,10 @@ pub fn is_owner_isolation_aware_tool(name: &str) -> bool {
 /// listed name from another backend is refused: it is not the audited tool.
 #[must_use]
 pub fn admits_owner_isolated_origin(descriptor: &ToolDescriptor) -> bool {
-    super::capability::policy::admits_owner_isolated_identity(&descriptor.public_name, &descriptor.backend_name)
+    crate::causal_tree::capability_policy::admits_owner_isolated_identity(
+        &descriptor.public_name,
+        &descriptor.backend_name,
+    )
 }
 
 /// The refusal given to an owner-isolated caller for a tool that does not

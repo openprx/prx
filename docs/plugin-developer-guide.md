@@ -423,6 +423,7 @@ interface tool-exports {
 ```
 
 **Pattern:**
+
 - `get-spec` is called **once** at load time. Return your tool's name, description, and JSON Schema for parameters.
 - `execute` is called each time the LLM invokes the tool. `args` is a JSON string matching your schema.
 
@@ -441,6 +442,7 @@ interface tool-exports {
 A trapped call is never retried for you: it may already have made an HTTP request. `wasm_plugins_status` lists each tool under `tool_adapters` with `plugin`, `tool` and the health fields described under 4.3, and a quarantine publishes `prx.plugin.tool_quarantined`.
 
 **`plugin.toml`:**
+
 ```toml
 [[capabilities]]
 type = "tool"
@@ -449,6 +451,7 @@ description = "What my tool does"
 ```
 
 **Example (Rust):**
+
 ```rust
 pub fn get_spec_impl() -> ToolSpec {
     ToolSpec {
@@ -493,6 +496,7 @@ interface hook-exports {
 ```
 
 **`plugin.toml`:**
+
 ```toml
 [[capabilities]]
 type = "hook"
@@ -510,6 +514,7 @@ description = "Tool invocations only"
 **When a delivery fails.** A hook adapter recovers from a trap exactly like middleware (see *Trap recovery, restart budget and quarantine* under 4.3). Hooks are observe-only, so every failure fails open: a hook that traps, times out, is being rebuilt or is quarantined simply does not see that event, and a payload larger than the payload cap is skipped (`skipped_oversize`). Your `on-event` result is recorded, never acted on. Counters you keep through `kv` — as the audit example does — survive a rebuild; anything kept in guest memory does not. Event subscriptions survive a rebuild, and `subscribe` is idempotent per pattern: calling it again after a rebuild returns the existing subscription instead of adding a second delivery. `wasm_plugins_status` lists each hook under `hook_adapters` with `invocation_count` and `last_event` (deliveries that reached your guest; one refused while the hook is quarantined or awaiting a rebuild is not counted), `last_error` (the most recent failure, kept after later successes) and the health fields; a quarantine publishes `prx.plugin.hook_quarantined`.
 
 **Event patterns:**
+
 - Exact: `"tool.call"` — matches only that event
 - Wildcard: `"prx.lifecycle.*"` — matches all events under `prx.lifecycle.`
 - All: `"*"` — matches every event (use sparingly)
@@ -534,6 +539,7 @@ description = "Tool invocations only"
 | `error` | Error occurred | `message`, `context` |
 
 **Example (Rust):**
+
 ```rust
 pub fn on_event_impl(event: &str, payload_json: &str) -> Result<(), String> {
     log::info(&format!("Event: {event}"));
@@ -615,6 +621,7 @@ redacted string off those screens.
 > whether a response is final.
 
 **`plugin.toml`:**
+
 ```toml
 [[capabilities]]
 type = "middleware"
@@ -622,6 +629,7 @@ priority = 10   # lower number = runs first
 ```
 
 **Example — content filter (Rust):**
+
 ```rust
 pub fn process_impl(stage: &str, data_json: &str) -> Result<String, String> {
     if stage != "inbound" {
@@ -665,7 +673,7 @@ A middleware adapter owns one wasmtime `Store`. Wasmtime poisons the whole store
 
 **A rebuilt instance loses guest state.** Anything a plugin kept in its own linear memory — a counter, a cache, a compiled regex — starts empty after a rebuild. Data written through the `kv` host functions lives in host state and survives. Keep anything that has to outlive a trap in `kv`.
 
-`wasm_plugins_status` reports per middleware adapter: `state` (`live`, `restarting`, `quarantined`), `restart_count`, `failure_count`, `cancelled_count`, `skipped_oversize`, `skipped_quarantined`, `consecutive_timeouts`, `last_error`, `last_error_at`, and `quarantined_for_ms` and `quarantine_rule` (`restart_window` or `timeout_streak`) while quarantined. `restart_count` counts rebuild attempts, successful or not, including the uncharged ones that follow a cancellation. `last_error` may contain the error string your guest returned, so it is truncated to 512 characters, followed by a ` ... (truncated)` marker.
+`wasm_plugins_status` reports per middleware adapter: `state` (`live`, `restarting`, `quarantined`), `restart_count`, `failure_count`, `cancelled_count`, `skipped_oversize`, `skipped_quarantined`, `consecutive_timeouts`, `last_error`, `last_error_at`, and `quarantined_for_ms` and `quarantine_rule` (`restart_window` or `timeout_streak`) while quarantined. `restart_count` counts rebuild attempts, successful or not, including the uncharged ones that follow a cancellation. `last_error` may contain the error string your guest returned, so it is truncated to 512 characters, followed by a `" ... (truncated)"` marker (quotes delimit the string and are not appended).
 
 #### Payload size
 
@@ -689,6 +697,7 @@ interface cron-exports {
 ```
 
 **`plugin.toml`:**
+
 ```toml
 [[capabilities]]
 type = "cron"
@@ -717,6 +726,7 @@ schedule = "0 * * * *"   # every hour at :00
 | `0 0 1 * *` | First of every month at midnight |
 
 **Example (Rust):**
+
 ```rust
 pub fn run_impl() -> Result<String, String> {
     log::info("Cron job starting");
@@ -769,6 +779,7 @@ interface provider-exports {
 ```
 
 **`plugin.toml`:**
+
 ```toml
 [[capabilities]]
 type = "provider"
@@ -783,6 +794,7 @@ http_allowlist = ["https://my-api.com"]
 ```
 
 **Example (Rust) — proxy to a custom API:**
+
 ```rust
 pub fn name_impl() -> String {
     "my-llm".to_string()
@@ -849,6 +861,7 @@ interface storage-exports {
 ```
 
 **`plugin.toml`:**
+
 ```toml
 [[capabilities]]
 type = "storage"
@@ -978,6 +991,7 @@ count = host.kv.increment("counter", delta=1)
 ```
 
 **Key design guidelines:**
+
 - Use namespaced keys: `"user:{id}:prefs"`, `"count:tool_calls"`, etc.
 - `list-keys("")` returns all keys for the plugin.
 - Values are raw bytes; use PDK helpers for strings and JSON.
@@ -1025,6 +1039,7 @@ resp = host.http.request("PUT", url, headers=[("X-Token", "abc")], body=b"...")
 ```
 
 **`plugin.toml` — declare allowed origins:**
+
 ```toml
 [permissions]
 required = ["http-outbound"]
@@ -1096,6 +1111,7 @@ host.events.unsubscribe(sub_id)
 ```
 
 **Rules:**
+
 - Payload must be valid JSON, max 64 KB.
 - Publishing is fire-and-forget (no delivery confirmation).
 - Recursion is protected: a plugin's `on-event` handler cannot trigger itself via event publish.
@@ -1188,6 +1204,7 @@ When fuel is exhausted, the plugin call returns an error: `"plugin ran out of fu
 ### Memory Guide
 
 Python and JavaScript plugins embed their runtime interpreter:
+
 - Rust plugins: typically 1–4 MB
 - Go/TinyGo plugins: typically 1–3 MB
 - Python plugins: typically 8–15 MB (embeds Python interpreter)
@@ -1329,6 +1346,7 @@ prx-plugin validate my.wasm     # validates specific file
 ```
 
 Checks performed:
+
 - Valid WASM magic bytes
 - WASM component (not plain module) detection
 - `plugin.toml` parse and schema validation
@@ -1361,6 +1379,7 @@ prx-plugin pack --output dist/my-plugin-v1.0.prxplugin
 ```
 
 Archive contents:
+
 ```
 my-plugin-0.1.0.prxplugin
 ├── plugin.wasm
@@ -1490,6 +1509,7 @@ The plugin tried to make an HTTP request without the `http-outbound` permission,
 
 1. Add `"http-outbound"` to `permissions.required`.
 2. Add the target origin to `http_allowlist`:
+
    ```toml
    http_allowlist = ["https://api.target.com"]
    ```
@@ -1499,6 +1519,7 @@ The plugin tried to make an HTTP request without the `http-outbound` permission,
 ### "URL not in allowlist"
 
 The URL matches the permission declaration but not the allowlist pattern. Check that:
+
 - The scheme matches (`https://` vs `http://`).
 - The host matches exactly (no wildcard support; sub-paths are prefix-matched).
 - There are no trailing slashes mismatches.
@@ -1523,6 +1544,7 @@ also visible in `wasm_plugins_status`.
 ### "invalid plugin.toml"
 
 Parse error in the manifest. Common mistakes:
+
 - Missing `[[capabilities]]` section.
 - `type` is not one of `tool|hook|middleware|cron|provider|storage`.
 - `schedule` missing for a `cron` capability.

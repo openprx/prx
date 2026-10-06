@@ -20,7 +20,7 @@ use uuid::Uuid;
 /// surface "[plan mode] would call X" than accidentally execute an opaque
 /// MCP/composio tool whose side-effects we can't classify.
 pub(super) fn is_write_tool(name: &str) -> bool {
-    crate::tools::capability::policy::plan_intercepts_tool(name)
+    crate::causal_tree::capability_policy::plan_intercepts_tool(name)
 }
 
 /// Truncate a JSON value to a short preview string suitable for synthesized

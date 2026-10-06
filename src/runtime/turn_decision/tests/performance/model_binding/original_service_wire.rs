@@ -61,6 +61,7 @@ async fn run_witness(slow: bool) {
     assert!(output.is_absolute() && output.is_dir());
     let output = output.join(if slow { "slow" } else { "ok" });
     std::fs::create_dir(&output).expect("fresh leg; never overwrite evidence");
+    let diagnostic_timing = crate::runtime::decision_accounting::timing::Capture::new();
     let workspace = output.join("workspace");
     std::fs::create_dir(&workspace).expect("fresh retained SQLite workspace");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -122,7 +123,7 @@ async fn run_witness(slow: bool) {
         let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(&generation,Arc::clone(&memory),"Hello PRX, reply with a brief greeting.","prx_original_wire_run").await;
         let cancellation = CancellationToken::new();
         let started=Instant::now();
-        let (context, observed)=crate::causal_tree::decision_engine::original_observation::capture("actual-compatible-service-wire",service.decide_agent_initial(&proof,AgentTurnKind::Repl,&cancellation)).await.expect("actual original observer");
+        let (context, observed)=diagnostic_timing.scope(Box::pin(crate::causal_tree::decision_engine::original_observation::capture("actual-compatible-service-wire",service.decide_agent_initial(&proof,AgentTurnKind::Repl,&cancellation)))).await.expect("actual original observer");
         let elapsed=started.elapsed();
         let context=context.expect("actual configured decision or bounded builtin fallback");
         let hops=context.audit_hops().collect::<Vec<_>>();
@@ -199,6 +200,9 @@ async fn run_witness(slow: bool) {
         "cleanup_completed":work.is_ok(),"cleanup_error":work.as_ref().err().map(|error|format!("{error:#}")),
         "business_panicked":business_panic.is_some(),"business_error":business_error.as_ref().map(|error|format!("{error:#}")),
     })).expect("cleanup result JSON")).expect("retain cleanup result");
+    diagnostic_timing
+        .write(&output.join("accounting-timing.json"))
+        .expect("retain numeric actual-stage timings");
     work.expect("whole source-owned cleanup completed before propagating business failure");
     if let Some(panic) = business_panic {
         std::panic::resume_unwind(panic);

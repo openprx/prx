@@ -1,3 +1,4 @@
+pub(crate) mod model_admission;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroU8;
@@ -127,7 +128,7 @@ pub(crate) struct TrustedParts {
     /// Explicit excluded capability names (global, channel, child manifest).
     /// Exact-model policy has a separate compact commitment below.
     pub(crate) exclusions: Vec<Arc<str>>,
-    pub(crate) model_admission: Option<Arc<crate::tools::capability::model_policy::ModelAdmission>>,
+    pub(crate) model_admission: Option<Arc<dyn crate::causal_tree::state::model_admission::ModelAdmissionView>>,
     /// Explicit structural user restrictions, as codes.
     pub(crate) constraints: Vec<ConstraintCode>,
     pub(crate) approval_pending: bool,
@@ -146,8 +147,7 @@ impl TrustedParts {
     }
     pub(crate) fn excludes_entry(
         &self,
-        catalog: &crate::tools::capability::catalog::CatalogView<'_>,
-        entry: &crate::tools::capability::catalog::CapabilityEntry,
+        entry: crate::causal_tree::state::model_admission::ModelAdmissionEntry<'_>,
     ) -> bool {
         self.exclusions
             .iter()
@@ -155,7 +155,7 @@ impl TrustedParts {
             || self
                 .model_admission
                 .as_ref()
-                .is_some_and(|policy| policy.excludes(catalog, entry))
+                .is_some_and(|policy| policy.excludes(entry))
     }
 }
 

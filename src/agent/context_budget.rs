@@ -365,23 +365,41 @@ pub fn count_tokens(text: &str) -> usize {
     count_tokens_with_source(text).tokens
 }
 
+#[cfg(test)]
+pub(crate) mod token_timing;
+
 pub(crate) fn count_tokens_with_source(text: &str) -> TokenMeasurement {
+    #[cfg(test)]
+    let _whole_timing = token_timing::Span::start(token_timing::Kind::Whole);
     #[cfg(feature = "llm-router")]
     {
         use std::sync::LazyLock;
         use tiktoken_rs::CoreBPE;
 
-        static ENCODER: LazyLock<Option<CoreBPE>> = LazyLock::new(|| match tiktoken_rs::cl100k_base() {
-            Ok(bpe) => Some(bpe),
-            Err(err) => {
-                tracing::warn!("tiktoken cl100k_base init failed, falling back to char heuristic: {err}");
-                None
+        static ENCODER: LazyLock<Option<CoreBPE>> = LazyLock::new(|| {
+            #[cfg(test)]
+            let _init_timing = token_timing::Span::start(token_timing::Kind::Init);
+            match tiktoken_rs::cl100k_base() {
+                Ok(bpe) => Some(bpe),
+                Err(err) => {
+                    tracing::warn!("tiktoken cl100k_base init failed, falling back to char heuristic: {err}");
+                    None
+                }
             }
         });
 
-        if let Some(bpe) = ENCODER.as_ref() {
+        #[cfg(test)]
+        let lookup_timing = token_timing::Span::start(token_timing::Kind::Lookup);
+        let encoder = ENCODER.as_ref();
+        #[cfg(test)]
+        drop(lookup_timing);
+        if let Some(bpe) = encoder {
             return TokenMeasurement {
-                tokens: bpe.encode_with_special_tokens(text).len(),
+                tokens: {
+                    #[cfg(test)]
+                    let _encode_timing = token_timing::Span::start(token_timing::Kind::Encode);
+                    bpe.encode_with_special_tokens(text).len()
+                },
                 source: TokenMeasurementSource::Cl100kProxy,
             };
         }

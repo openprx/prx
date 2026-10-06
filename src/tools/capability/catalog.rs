@@ -65,6 +65,20 @@ pub(crate) struct CapabilityEntry {
     pub availability: CapabilityAvailability,
 }
 
+impl CapabilityEntry {
+    /// Project the actual execution target into the domain's Plan policy.
+    /// Aliases/effect labels never substitute for the registered root.
+    pub(crate) fn plan_intercepted(&self) -> bool {
+        match &self.target {
+            ExecutionTarget::Tool(name) => crate::causal_tree::capability_policy::plan_intercepts_tool(name),
+            ExecutionTarget::Skill { root, .. } | ExecutionTarget::Node { root, .. } => {
+                crate::causal_tree::capability_policy::plan_intercepts_tool(root)
+            }
+            ExecutionTarget::Hook => true,
+        }
+    }
+}
+
 /// Inputs outside the finalized executable registry. Callers take these as
 /// read-only snapshots of the same runtime generation.
 #[derive(Debug, Clone, Default)]
@@ -673,6 +687,24 @@ fn verify_child_descriptor(entry: &CapabilityEntry, current: &ToolDescriptor) ->
 }
 
 impl<'a> CatalogView<'a> {
+    pub(crate) const fn model_admission_layout(&self) -> &[u8; 32] {
+        &self.model_layout
+    }
+
+    pub(crate) fn model_admission_entry<'b>(
+        &'b self,
+        entry: &'b CapabilityEntry,
+    ) -> crate::causal_tree::state::model_admission::ModelAdmissionEntry<'b> {
+        crate::causal_tree::state::model_admission::ModelAdmissionEntry {
+            public_name: &entry.public_name,
+            root: &entry.root,
+            generation: self.generation().0,
+            layout: &self.model_layout,
+            public_slot: self.model_names.get(entry.public_name.as_str()).copied(),
+            root_slot: self.model_names.get(entry.root.as_str()).copied(),
+        }
+    }
+
     /// Narrow a view without copying entries, schemas, bindings or the search index.
     #[cfg(not(test))]
     pub(crate) const fn with_surface(mut self, surface: &'a SurfacePolicy) -> Self {

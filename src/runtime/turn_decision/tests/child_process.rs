@@ -782,7 +782,22 @@ async fn actual_parent_process_case(non_root_route: bool) -> anyhow::Result<()> 
         );
     }
     match outcome {
-        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Ok(()))) => {
+            let retained = scratch.keep();
+            let subscriber = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_ansi(false)
+                .without_time()
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(
+                    "C28 AUT succeeded after confirmed process cleanup; retained scratch {}",
+                    retained.display()
+                );
+            });
+            Ok(())
+        }
         Ok(Ok(Err(error))) => {
             let retained = scratch.keep();
             Err(error.context(format!(

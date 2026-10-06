@@ -202,7 +202,7 @@ impl TurnDecisionService {
                 && entry.generation == trusted.catalog_generation
                 && entry.availability.level >= CapabilityAvailabilityLevel::Configured
                 && !matches!(entry.exposure, Exposure::Unavailable { .. })
-                && !trusted.excludes_entry(catalog, entry)
+                && !trusted.excludes_entry(catalog.model_admission_entry(entry))
                 && (trusted.channel.is_none() || entry.channel_eligible)
                 && crate::tools::execution::decide_tool_execution(
                     &self.security,

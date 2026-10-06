@@ -341,6 +341,30 @@ impl Slot {
     }
 }
 
+/// Engine-facing borrowed adapter. The original sealed accounting owner and
+/// physical attempt construction stay in the decision/runtime boundary.
+#[derive(Clone, Copy)]
+pub(crate) struct AccountedPrediction<'a> {
+    factory: &'a DecisionBackendFactory,
+    accounting: Option<&'a dyn super::budget::DecisionAttemptAccounting>,
+}
+impl crate::causal_tree::decision_engine::prediction_sealed::Producer for AccountedPrediction<'_> {}
+impl crate::causal_tree::decision_engine::PredictionPort for AccountedPrediction<'_> {
+    fn remaining_budget(&self) -> Option<(u64, u64)> {
+        self.accounting.map(|owner| owner.remaining_budget())
+    }
+    async fn predict<'a>(
+        &'a self,
+        request: &'a crate::decision::DecisionRequest,
+        lineage: &'a CausalLineage,
+    ) -> Result<PredictionResult, crate::decision::DecisionError> {
+        self.factory
+            .decide_with_accounting(request, lineage, self.accounting)
+            .await
+            .map_err(|BuiltinFailure(error)| error)
+    }
+}
+
 /// A configured backend's status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotStatus {
@@ -604,6 +628,16 @@ impl Emitter<'_> {
 }
 
 impl DecisionBackendFactory {
+    pub(crate) fn prediction_port<'a>(
+        &'a self,
+        accounting: Option<&'a dyn super::budget::DecisionAttemptAccounting>,
+    ) -> AccountedPrediction<'a> {
+        AccountedPrediction {
+            factory: self,
+            accounting,
+        }
+    }
+
     /// The backend order for `section` (SP-CDP-A 5.6 under D-040). Pure:
     /// the same configuration and health always give the same order. The
     /// builtin is always the last included slot.

@@ -148,7 +148,7 @@ since the guest last returned), `last_error`, `last_error_at` and, while quarant
 `quarantined_for_ms` and `quarantine_rule` (`restart_window` or `timeout_streak`: which rule
 fired), alongside `plugin` and `priority`.
 `last_error` can carry text the guest itself authored, so it is truncated to
-512 characters when it is recorded, followed by a ` ... (truncated)` marker. The
+512 characters when it is recorded, followed by a `" ... (truncated)"` marker (quotes delimit the string and are not appended). The
 `wasm_plugins_status` capability reports `Ready` instead of `Healthy` while any
 middleware adapter is quarantined.
 

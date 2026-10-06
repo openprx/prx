@@ -21,6 +21,9 @@ use crate::decision::protocol::DecisionUsage;
 use crate::decision::{DecisionError, DecisionKey, KeyDomain};
 use crate::llm::route_decision::{MeteredTokenUsageRecord, TokenUsageSource, UsagePrice, usage_cost_resolution};
 
+#[cfg(test)]
+pub(crate) mod timing;
+
 /// Pinned configuration and a real cleanup owner are borrowed through Arc;
 /// builtin/cache-only calls never initialize the token owner or cost storage.
 pub(crate) struct AccountingScope {
@@ -150,6 +153,12 @@ impl AccountingScope {
         );
         let owner_deadline = self.deadline;
         let deadline = owner_deadline.min(attempt.deadline);
+        #[cfg(test)]
+        let mut diagnostic_timing = timing::Span::current(deadline);
+        #[cfg(test)]
+        if let Some(timing) = &mut diagnostic_timing {
+            timing.mark("accounting_entered");
+        }
         if Instant::now() >= deadline {
             return Err(DecisionError::BudgetExceeded);
         }
@@ -221,7 +230,15 @@ impl AccountingScope {
         let model = attempt.model.to_owned();
         // The ticket moves into the blocking operation before the first await.
         // A dropped caller cannot abandon a ledger transition in progress.
+        #[cfg(test)]
+        if let Some(timing) = &mut diagnostic_timing {
+            timing.mark("spawn_submitted");
+        }
         let work = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(timing) = &mut diagnostic_timing {
+                timing.mark("blocking_entered");
+            }
             let mut ticket = Some(ticket);
             let mut confirmed = true;
             let mut restore_tokens = true;
@@ -232,7 +249,14 @@ impl AccountingScope {
                 #[cfg(test)]
                 {
                     diagnostic_stage = "input_fit";
+                    if let Some(timing) = &mut diagnostic_timing {
+                        timing.mark("input_fit");
+                    }
                 }
+                #[cfg(test)]
+                let token_timing = diagnostic_timing
+                    .as_ref()
+                    .map(|_| crate::agent::context_budget::token_timing::Scope::new());
                 let input_fits = input_token_preflight(text, tokens, auxiliary, || {
                     let measured = crate::agent::context_budget::count_tokens_with_source(text);
                     let estimate = crate::agent::context_budget::estimate_request_tokens(
@@ -256,6 +280,13 @@ impl AccountingScope {
                     }
                     estimate
                 })?;
+                #[cfg(test)]
+                if let Some(scope) = token_timing {
+                    if let Some(timing) = &mut diagnostic_timing {
+                        timing.tokenizer(scope.finish());
+                        timing.mark("input_fit_finished");
+                    }
+                }
                 anyhow::ensure!(
                     input_fits,
                     "physical request exceeds estimated decision token allowance"
@@ -263,6 +294,9 @@ impl AccountingScope {
                 #[cfg(test)]
                 {
                     diagnostic_stage = "deadline_after_estimation";
+                    if let Some(timing) = &mut diagnostic_timing {
+                        timing.mark("deadline_after_estimation");
+                    }
                 }
                 anyhow::ensure!(
                     !cancel.is_cancelled() && Instant::now() < deadline,
@@ -271,11 +305,17 @@ impl AccountingScope {
                 #[cfg(test)]
                 {
                     diagnostic_stage = "tracker_open";
+                    if let Some(timing) = &mut diagnostic_timing {
+                        timing.mark("tracker_open");
+                    }
                 }
                 let tracker = CostTracker::new(config.cost.clone(), &config.workspace_dir)?;
                 #[cfg(test)]
                 {
                     diagnostic_stage = "reserve";
+                    if let Some(timing) = &mut diagnostic_timing {
+                        timing.mark("reserve");
+                    }
                 }
                 let receipt = match tracker.reserve_estimated_attempt(request) {
                     Ok(receipt) => receipt,
@@ -293,6 +333,9 @@ impl AccountingScope {
                 #[cfg(test)]
                 {
                     diagnostic_stage = "deadline_before_dispatch";
+                    if let Some(timing) = &mut diagnostic_timing {
+                        timing.mark("deadline_before_dispatch");
+                    }
                 }
                 if cancel.is_cancelled() || Instant::now() >= deadline {
                     if let Err(error) = tracker.release_unsent_attempt(&receipt) {
@@ -305,6 +348,9 @@ impl AccountingScope {
                 #[cfg(test)]
                 {
                     diagnostic_stage = "mark_dispatched";
+                    if let Some(timing) = &mut diagnostic_timing {
+                        timing.mark("mark_dispatched");
+                    }
                 }
                 if let Err(error) = tracker.mark_attempt_dispatched(&receipt) {
                     if error.is::<crate::cost::reservation::ReservationWriteUnconfirmed>() {
@@ -329,6 +375,16 @@ impl AccountingScope {
                     deadline: owner_deadline,
                 })
             })();
+            #[cfg(test)]
+            if let Some(timing) = &mut diagnostic_timing {
+                timing.mark(if result.is_ok() {
+                    "operation_ok"
+                } else {
+                    "operation_error"
+                });
+            }
+            #[cfg(test)]
+            drop(diagnostic_timing);
             if restore_tokens {
                 remaining.tokens.fetch_add(tokens, Ordering::AcqRel);
                 remaining.micro_usd.fetch_add(maximum, Ordering::AcqRel);

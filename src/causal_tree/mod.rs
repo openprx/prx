@@ -15,6 +15,7 @@ pub mod admin;
 pub(crate) mod approval_collection;
 pub mod branch;
 pub(crate) mod candidate_generator;
+pub(crate) mod capability_policy;
 pub mod config;
 pub(crate) mod decision_engine;
 pub(crate) mod decision_rehearsal;

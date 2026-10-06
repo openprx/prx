@@ -596,7 +596,7 @@ impl TurnDecisionService {
         anyhow::ensure!(
             entry.generation == trusted.catalog_generation
                 && !self.catalog_view().surface_excludes(entry)
-                && !trusted.excludes_entry(&self.catalog_view(), entry)
+                && !trusted.excludes_entry(self.catalog_view().model_admission_entry(entry))
                 && (trusted.channel.is_none() || entry.channel_eligible)
                 && crate::tools::execution::decide_tool_execution(
                     &self.security,

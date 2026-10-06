@@ -503,7 +503,7 @@ fn model_admission_canonical_commits_only_digest_and_none_keeps_legacy_bytes() {
     let mut state = canonical_fixture(&key, 3);
     assert_oracle(&state, &key);
     let mut parts = state.trusted.parts().clone();
-    parts.model_admission = Some(Arc::clone(&policy));
+    parts.model_admission = Some(Arc::clone(&policy) as Arc<dyn super::model_admission::ModelAdmissionView>);
     state.trusted = TrustedState::from_runtime(parts);
     for record in [false, true] {
         let mut expected: serde_json::Value =

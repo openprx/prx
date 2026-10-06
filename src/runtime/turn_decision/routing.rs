@@ -383,8 +383,7 @@ impl TurnDecisionService {
             gates: &gates,
             delegation: None,
             delegation_max_depth: 0,
-            backend: &self.factory,
-            accounting: Some(accounting),
+            prediction: self.factory.prediction_port(Some(accounting)),
             rehearsal_ports: &rehearsal,
             request_limits: RequestLimits {
                 max_request_bytes: config.causal_tree.backend.max_request_bytes,

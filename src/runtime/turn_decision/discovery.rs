@@ -71,7 +71,7 @@ impl TurnDecisionService {
             .context("discoverable turn lacks the capability search backend")?;
         let trusted = context.engine.state.trusted.parts();
         if self.catalog_view().surface_excludes(entry)
-            || trusted.excludes_entry(&self.catalog_view(), entry)
+            || trusted.excludes_entry(self.catalog_view().model_admission_entry(entry))
             || (trusted.channel.is_some() && !entry.channel_eligible)
             || matches!(entry.exposure, Exposure::Unavailable { .. })
             || entry.availability.level < CapabilityAvailabilityLevel::Configured
@@ -155,7 +155,7 @@ impl CapabilitySearchAuthority {
                 "capability_search" | "stay_silent" | "transcript_history_lookup" | "delegate" | "sessions_spawn"
             ) && matches!(entry.exposure, Exposure::Searchable)
                 && entry.availability.level >= CapabilityAvailabilityLevel::Configured
-                && !trusted.excludes_entry(&view, entry)
+                && !trusted.excludes_entry(view.model_admission_entry(entry))
                 && (trusted.channel.is_none() || entry.channel_eligible)
                 && self.proof.child_scope().is_none_or(|scope| {
                     scope.gate_inputs().0.allowed.iter().any(|reference| {

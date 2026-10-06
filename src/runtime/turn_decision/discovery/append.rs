@@ -162,8 +162,7 @@ impl TurnDecisionService {
         anyhow::ensure!(
             !(trusted.constraints.iter().any(|code| {
                 matches!(code.as_str(), "resume_exact_call" | "tools_off")
-                    || code.as_str() == "intercepts_writes"
-                        && crate::tools::capability::policy::plan_intercepts_entry(entry)
+                    || code.as_str() == "intercepts_writes" && entry.plan_intercepted()
             }) || trusted.side_effect_mode == SideEffectMode::ReadOnly && entry.effect > SideEffectClass::ReadOnly),
             "discovered capability conflicts with turn restrictions"
         );

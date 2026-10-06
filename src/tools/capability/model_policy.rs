@@ -1,5 +1,23 @@
 //! Fresh model policy snapshot; no backend output can construct this authority.
-use super::catalog::{CapabilityEntry, CatalogView};
+use super::catalog::CatalogView;
+impl crate::causal_tree::state::model_admission::model_admission_sealed::Producer for ModelAdmission {}
+impl crate::causal_tree::state::model_admission::ModelAdmissionView for ModelAdmission {
+    fn denied_words(&self) -> &[u64] {
+        &self.denied
+    }
+    fn generation(&self) -> [u8; 32] {
+        self.generation.0
+    }
+    fn layout(&self) -> &[u8; 32] {
+        &self.layout
+    }
+    fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+}
+
+#[cfg(test)]
+use super::catalog::CapabilityEntry;
 use crate::causal_tree::branch::CatalogGeneration;
 use crate::tools::Tool;
 use std::sync::Arc;
@@ -73,27 +91,17 @@ impl ModelAdmission {
         })
     }
 
+    #[cfg(test)]
     pub(crate) const fn digest(&self) -> &[u8; 32] {
         &self.digest
     }
 
-    pub(crate) fn matches_catalog(&self, catalog: &CatalogView<'_>) -> bool {
-        self.generation == catalog.generation() && self.layout == catalog.model_layout
-    }
-
+    #[cfg(test)]
     pub(crate) fn excludes(&self, catalog: &CatalogView<'_>, entry: &CapabilityEntry) -> bool {
-        // Fail closed outside the pinned slot layout. G3 explicitly checks this
-        // binding; G2 only queries it when the layout matches.
-        if !self.matches_catalog(catalog) {
-            return true;
-        }
-        [&entry.public_name, &entry.root].iter().any(|name| {
-            catalog.model_names.get(name.as_str()).is_some_and(|&slot| {
-                self.denied
-                    .get(slot / 64)
-                    .is_none_or(|word| word & (1_u64 << (slot % 64)) != 0)
-            })
-        })
+        crate::causal_tree::state::model_admission::ModelAdmissionView::excludes(
+            self,
+            catalog.model_admission_entry(entry),
+        )
     }
 }
 

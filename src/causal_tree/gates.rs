@@ -227,13 +227,15 @@ impl HardGates {
         // Check before G4, including the argument-collection candidate path.
         if trusted.owner_isolated()
             && entries.iter().flatten().any(|entry| {
-                !(crate::tools::capability::policy::admits_owner_isolated_identity(&entry.public_name, &entry.root)
-                    || (trusted
-                        .constraints
-                        .iter()
-                        .any(|code| code.as_str() == "owner_private_filesystem_v1")
-                        && entry.public_name == entry.root
-                        && matches!(entry.public_name.as_str(), "file_read" | "file_write" | "file_edit")))
+                !(crate::causal_tree::capability_policy::admits_owner_isolated_identity(
+                    &entry.public_name,
+                    &entry.root,
+                ) || (trusted
+                    .constraints
+                    .iter()
+                    .any(|code| code.as_str() == "owner_private_filesystem_v1")
+                    && entry.public_name == entry.root
+                    && matches!(entry.public_name.as_str(), "file_read" | "file_write" | "file_edit")))
             })
         {
             return blocked(1, "owner_isolation");
@@ -270,10 +272,10 @@ impl HardGates {
                     .exclusions
                     .iter()
                     .any(|name| name.as_ref() == entry.public_name || name.as_ref() == entry.root)
-                    || trusted
-                        .model_admission
-                        .as_ref()
-                        .is_some_and(|policy| policy.matches_catalog(catalog) && policy.excludes(catalog, entry)))
+                    || trusted.model_admission.as_ref().is_some_and(|policy| {
+                        policy.matches_layout(catalog.generation().0, catalog.model_admission_layout())
+                            && policy.excludes(catalog.model_admission_entry(entry))
+                    }))
                 || trusted.channel.is_some() && !entry.channel_eligible
         }) {
             return blocked(2, "excluded");
@@ -284,7 +286,7 @@ impl HardGates {
             || trusted
                 .model_admission
                 .as_ref()
-                .is_some_and(|policy| !policy.matches_catalog(catalog))
+                .is_some_and(|policy| !policy.matches_layout(catalog.generation().0, catalog.model_admission_layout()))
             || candidate
                 .required_capabilities()
                 .iter()
@@ -414,10 +416,7 @@ impl HardGates {
                 .constraints
                 .iter()
                 .any(|code| code.as_str() == "intercepts_writes")
-                && (entries
-                    .iter()
-                    .flatten()
-                    .any(|entry| crate::tools::capability::policy::plan_intercepts_entry(entry))
+                && (entries.iter().flatten().any(|entry| entry.plan_intercepted())
                     || entries.is_empty() && candidate.side_effect() > SideEffectClass::ReadOnly))
             || (trusted.side_effect_mode == SideEffectMode::ReadOnly
                 && effective_effect(candidate, entries) > SideEffectClass::ReadOnly)

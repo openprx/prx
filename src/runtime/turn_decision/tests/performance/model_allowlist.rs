@@ -117,8 +117,8 @@ async fn owned_model_allowlist_catalog_growth_profile() {
         .catalog
         .entry_for_public_name("image_info")
         .expect("denied root");
-    assert!(!trusted.excludes_entry(&view, allowed));
-    assert!(trusted.excludes_entry(&view, denied));
+    assert!(!trusted.excludes_entry(view.model_admission_entry(allowed)));
+    assert!(trusted.excludes_entry(view.model_admission_entry(denied)));
     let semantics = semantic_context(&service, &proof, &context);
     assert_eq!(transports.0.load(Ordering::SeqCst), 0);
     assert_eq!(dispatches.load(Ordering::SeqCst), 0);

@@ -433,11 +433,11 @@ The same person is reachable under more than one string. `send_deny` therefore
 matches the recipient after folding the spellings that are **derivable from the
 identifier itself**:
 
-* a JID's `:device` suffix, in either position (`1234@s.whatsapp.net`,
+- a JID's `:device` suffix, in either position (`1234@s.whatsapp.net`,
   `1234:2@s.whatsapp.net` and `1234@lid:2`), and the server's letter case;
-* one leading `+` — the WhatsApp Cloud API strips it before sending, so
+- one leading `+` — the WhatsApp Cloud API strips it before sending, so
   `+15550001111` and `15550001111` are one account;
-* a UUID's letter case and hyphenation, both of which Signal accepts.
+- a UUID's letter case and hyphenation, both of which Signal accepts.
 
 A colon in a recipient that is *not* a JID is left alone, because it is part of
 the identifier: a Telegram forum topic is `{chat_id}:{thread_id}` and denying it

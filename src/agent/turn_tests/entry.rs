@@ -367,10 +367,69 @@ async fn scheduled_agent_creator_read_only_denies_wire_file_write() {
     let mut config = cli_agent_probe_config(tmp.path(), &probe);
     config.autonomy.level = crate::security::AutonomyLevel::Full;
     config.tool_tiering.always_include.push("file_write".to_string());
-    let envelope = RuntimeEnvelope::cron(config.workspace_dir.to_string_lossy(), "prx_job", "attempt")
-        .with_sender("creator")
-        .with_channel("telegram");
-    let context = crate::tools::ToolExecutionContext::new(envelope.clone(), "private").with_chat_id("creator_chat");
+    // Persist the job through the real tool service: it owns the trusted
+    // creator projection. The model arguments contain no scope or origin.
+    const PROMPT: &str = "write scheduled-denied.txt";
+    let creator_envelope = RuntimeEnvelope::chat_terminal(
+        config.workspace_dir.to_string_lossy(),
+        "prx_creator_chat",
+        crate::memory::MemoryVisibility::Workspace,
+    )
+    .with_sender("creator")
+    .with_channel("telegram");
+    let creator_context =
+        crate::tools::ToolExecutionContext::new(creator_envelope, "private").with_chat_id("prx_creator_chat");
+    let created = crate::cron::origin_test_support::execute_as(
+        Box::new(crate::tools::CronTool::new(
+            crate::config::new_shared(config.clone()),
+            Arc::new(crate::security::SecurityPolicy::from_config(
+                &config.autonomy,
+                &config.workspace_dir,
+            )),
+        )),
+        creator_context,
+        serde_json::json!({
+            "action": "add",
+            "schedule": {"kind": "at", "at": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()},
+            "job_type": "agent",
+            "prompt": PROMPT,
+        }),
+    )
+    .await;
+    assert!(created.success, "real creator job must be stored: {created:?}");
+    let jobs = crate::cron::list_jobs(&config).expect("stored creator jobs");
+    assert_eq!(jobs.len(), 1);
+    let job = crate::cron::get_job(&config, &jobs.first().expect("one stored creator job").id)
+        .expect("reload actual stored creator origin");
+    assert_eq!(job.prompt.as_deref(), Some(PROMPT));
+    assert!(matches!(
+        &job.origin,
+        crate::tools::execution::JobOrigin::Principal { channel, sender, chat_type, .. }
+            if channel == "telegram" && sender == "creator" && chat_type == "private"
+    ));
+    // Same no-lease immediate invocation identity as the production scheduler.
+    let origin = crate::agent::scheduled_source::ScheduledAgentOrigin::from_cron(&job, None);
+    let mut envelope = RuntimeEnvelope::cron(
+        config.workspace_dir.to_string_lossy(),
+        job.id.clone(),
+        format!("immediate-{}", uuid::Uuid::new_v4()),
+    );
+    if let Some(owner) = job.owner_id.as_deref() {
+        envelope = envelope.with_owner_id(owner);
+    }
+    if let Some(topic) = job.topic_id.as_deref() {
+        envelope = envelope.with_topic_id(topic);
+    }
+    if let Some(source) = job.source_message_event_id.as_deref() {
+        envelope = envelope.with_source_message_event_id(source);
+    }
+    if job.origin.is_owner_isolated() {
+        envelope = envelope.with_owner_isolation();
+    }
+    let context = job
+        .origin
+        .scheduled_tool_context(envelope.clone())
+        .expect("stored non-operator creator context");
     let mut creator_policy = crate::security::SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
     creator_policy.autonomy = crate::security::AutonomyLevel::ReadOnly;
     let scope = crate::tools::execution::ScheduledToolScope {
@@ -378,18 +437,19 @@ async fn scheduled_agent_creator_read_only_denies_wire_file_write() {
         policy: Arc::new(creator_policy),
     };
 
-    let reply = run_with_runtime_envelope(
-        config.clone(),
-        Some("write scheduled-denied.txt".to_string()),
-        None,
-        None,
-        0.0,
-        CancellationToken::new(),
-        Some(envelope),
-        Some(scope),
-    )
-    .await
-    .expect("test: scheduled denied tool does not fail the agent turn");
+    let reply = origin
+        .scope(run_with_runtime_envelope(
+            config.clone(),
+            Some("write scheduled-denied.txt".to_string()),
+            None,
+            None,
+            0.0,
+            CancellationToken::new(),
+            Some(envelope),
+            Some(scope),
+        ))
+        .await
+        .expect("test: scheduled denied tool does not fail the agent turn");
 
     assert!(reply.contains(crate::providers::credential_probe::PROBE_REPLY));
     let requests = probe.requests();

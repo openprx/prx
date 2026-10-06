@@ -198,3 +198,172 @@ fn model_policy_digest_binds_presence_across_catalog_sizes() -> anyhow::Result<(
     assert_eq!(lengths, [32, 32, 32]);
     Ok(())
 }
+
+#[test]
+fn model_admission_dyn_equality_compares_each_original_field() -> anyhow::Result<()> {
+    use crate::causal_tree::state::model_admission::ModelAdmissionView;
+    let registry: Vec<Box<dyn Tool>> = vec![Box::new(AliasTool {
+        root: "prx_eq_root".into(),
+        enabled: Arc::new(AtomicBool::new(true)),
+        root_spec: true,
+    })];
+    let catalog = CapabilityCatalog::build(&registry, &CatalogSources::default(), &SurfacePolicy::default())?;
+    let view = catalog.view(&CatalogScope::default());
+    let key = crate::causal_tree::state::fixtures::key();
+    let issued = ModelAdmission::fresh(&registry, &view, "prx-model", &[], "prx-policy", &key);
+    let same = ModelAdmission::fresh(&registry, &view, "prx-model", &[], "prx-policy", &key);
+    let left: &dyn ModelAdmissionView = issued.as_ref();
+    let equal: &dyn ModelAdmissionView = same.as_ref();
+    assert!(left.eq(equal));
+    assert!(equal.eq(left));
+    assert!(left.eq(left));
+    // Constructed negative values remain private to this test module. They are
+    // never published as runtime authority: mutate exactly one original field
+    // while holding the other three fixed, including the keyed digest.
+    for field in 0..4 {
+        let mut changed = ModelAdmission {
+            denied: issued.denied.clone(),
+            generation: issued.generation,
+            layout: issued.layout,
+            digest: issued.digest,
+        };
+        match field {
+            0 => {
+                *changed
+                    .denied
+                    .first_mut()
+                    .ok_or_else(|| anyhow::anyhow!("real nonempty catalog bitmap"))? ^= 1
+            }
+            1 => {
+                *changed
+                    .generation
+                    .0
+                    .first_mut()
+                    .ok_or_else(|| anyhow::anyhow!("fixed digest byte missing"))? ^= 1
+            }
+            2 => {
+                *changed
+                    .layout
+                    .first_mut()
+                    .ok_or_else(|| anyhow::anyhow!("fixed digest byte missing"))? ^= 1
+            }
+            3 => {
+                *changed
+                    .digest
+                    .first_mut()
+                    .ok_or_else(|| anyhow::anyhow!("fixed digest byte missing"))? ^= 1
+            }
+            _ => anyhow::bail!("unexpected equality field"),
+        }
+        let differences = [
+            changed.denied != issued.denied,
+            changed.generation != issued.generation,
+            changed.layout != issued.layout,
+            changed.digest != issued.digest,
+        ];
+        assert_eq!(differences.iter().filter(|different| **different).count(), 1);
+        assert_eq!(differences.get(field).copied(), Some(true));
+        let right: &dyn ModelAdmissionView = &changed;
+        assert!(!left.eq(right), "field {field} must participate in dyn equality");
+        assert!(!right.eq(left), "field {field} inequality must be symmetric");
+        assert!(!issued.as_ref().eq(&changed), "original concrete equality agrees");
+    }
+    Ok(())
+}
+
+#[test]
+fn model_admission_absent_slots_and_invalid_present_slots_remain_distinct() -> anyhow::Result<()> {
+    use crate::causal_tree::state::model_admission::{ModelAdmissionEntry, ModelAdmissionView};
+    let registry: Vec<Box<dyn Tool>> = (0..33)
+        .map(|index| {
+            Box::new(AliasTool {
+                root: format!("prx_slot_{index}"),
+                enabled: Arc::new(AtomicBool::new(true)),
+                root_spec: true,
+            }) as Box<dyn Tool>
+        })
+        .collect();
+    let catalog = CapabilityCatalog::build(&registry, &CatalogSources::default(), &SurfacePolicy::default())?;
+    let view = catalog.view(&CatalogScope::default());
+    let key = crate::causal_tree::state::fixtures::key();
+    let allowed = ModelAdmission::fresh(
+        &registry,
+        &view,
+        "prx-model",
+        &["prx_shared".into()],
+        "prx-policy",
+        &key,
+    );
+    let denied = ModelAdmission::fresh(&registry, &view, "prx-model", &[], "prx-policy", &key);
+    let port: &dyn ModelAdmissionView = allowed.as_ref();
+    let mut crosses_word_boundary = false;
+    for entry in view.iter_entries() {
+        let actual = view.model_admission_entry(entry);
+        crosses_word_boundary |= actual.public_slot.is_some_and(|slot| slot >= 64);
+        assert!(!port.excludes(actual), "actual published allowed entry");
+        assert!(
+            ModelAdmissionView::excludes(denied.as_ref(), actual),
+            "actual published denied entry"
+        );
+    }
+    assert!(crosses_word_boundary, "fixture exercises a real second bitmap word");
+    let actual = view.model_admission_entry(
+        view.iter_entries()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("real catalog entry missing"))?,
+    );
+    assert!(actual.public_slot.is_some());
+    assert!(actual.root_slot.is_some());
+    // These projections are constructed negative facts, never published or
+    // used to execute tools. The concrete policy above is genuinely fresh.
+    let absent = ModelAdmissionEntry {
+        public_slot: None,
+        root_slot: None,
+        ..actual
+    };
+    assert!(!port.excludes(absent));
+    assert!(!port.excludes(ModelAdmissionEntry {
+        public_slot: None,
+        ..actual
+    }));
+    assert!(!port.excludes(ModelAdmissionEntry {
+        root_slot: None,
+        ..actual
+    }));
+    let first_missing_word = allowed.denied.len() * 64;
+    for invalid in [first_missing_word, usize::MAX] {
+        assert!(port.excludes(ModelAdmissionEntry {
+            public_slot: Some(invalid),
+            ..actual
+        }));
+        assert!(port.excludes(ModelAdmissionEntry {
+            root_slot: Some(invalid),
+            ..actual
+        }));
+        assert!(port.excludes(ModelAdmissionEntry {
+            public_slot: Some(invalid),
+            ..absent
+        }));
+        assert!(port.excludes(ModelAdmissionEntry {
+            root_slot: Some(invalid),
+            ..absent
+        }));
+    }
+    let mut wrong_generation = absent.generation;
+    *wrong_generation
+        .first_mut()
+        .ok_or_else(|| anyhow::anyhow!("fixed digest byte missing"))? ^= 1;
+    assert!(port.excludes(ModelAdmissionEntry {
+        generation: wrong_generation,
+        ..absent
+    }));
+    let mut wrong_layout = *absent.layout;
+    *wrong_layout
+        .first_mut()
+        .ok_or_else(|| anyhow::anyhow!("fixed digest byte missing"))? ^= 1;
+    assert!(port.excludes(ModelAdmissionEntry {
+        layout: &wrong_layout,
+        ..absent
+    }));
+    Ok(())
+}

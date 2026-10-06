@@ -69,6 +69,7 @@ Emit a log message at the specified severity level.
 ### PDK Usage
 
 **Rust:**
+
 ```rust
 use prx_pdk::prelude::*;
 
@@ -80,6 +81,7 @@ log::error(&format!("fatal: {e}"));
 ```
 
 **Python:**
+
 ```python
 from prx_pdk import host
 host.log.trace("entering hot path")
@@ -90,6 +92,7 @@ host.log.error(f"fatal: {e}")
 ```
 
 **TypeScript:**
+
 ```typescript
 import { log } from "@prx/pdk";
 log.trace("entering hot path");
@@ -100,6 +103,7 @@ log.error(`fatal: ${e}`);
 ```
 
 **Go:**
+
 ```go
 import "github.com/openprx/prx-pdk-go/host/log"
 log.Trace("entering hot path")
@@ -151,6 +155,7 @@ Get all configuration key-value pairs.
 ### PDK Usage
 
 **Rust:**
+
 ```rust
 use prx_pdk::prelude::*;
 
@@ -168,6 +173,7 @@ for (k, v) in &all {
 ```
 
 **Python:**
+
 ```python
 from prx_pdk import host
 value = host.config.get("api_key")               # Optional[str]
@@ -176,6 +182,7 @@ pairs = host.config.get_all()                    # list[tuple[str, str]]
 ```
 
 **TypeScript:**
+
 ```typescript
 import { config } from "@prx/pdk";
 const apiKey = config.get("api_key");              // string | undefined
@@ -184,6 +191,7 @@ const all = config.getAll();                       // [string, string][]
 ```
 
 **Go:**
+
 ```go
 import "github.com/openprx/prx-pdk-go/host/config"
 val, ok := config.Get("api_key")
@@ -284,6 +292,7 @@ List all keys matching a prefix.
 The PDK adds `has`, `increment`, `get_str`/`set_str`, and `get_json`/`set_json` on top of the core WIT functions:
 
 **Rust:**
+
 ```rust
 use prx_pdk::prelude::*;
 
@@ -309,6 +318,7 @@ let exists = kv::has("my_key");
 ```
 
 **Python:**
+
 ```python
 from prx_pdk import host
 
@@ -327,6 +337,7 @@ count = host.kv.increment("calls", delta=1)  # int (new value)
 ```
 
 **TypeScript:**
+
 ```typescript
 import { kv } from "@prx/pdk";
 
@@ -345,6 +356,7 @@ kv.increment("calls", 1);          // number (new value)
 ```
 
 **Go:**
+
 ```go
 import "github.com/openprx/prx-pdk-go/host/kv"
 
@@ -433,6 +445,7 @@ Make an HTTP request.
 **Returns:** `result<http-response, string>` — the response on success, or an error message on failure
 
 **Failure reasons:**
+
 - URL not in `http_allowlist`
 - Network error (DNS failure, connection refused, timeout)
 - Request count limit reached (`max_http_requests`)
@@ -454,6 +467,7 @@ http_allowlist = [
 ### PDK Usage
 
 **Rust:**
+
 ```rust
 use prx_pdk::prelude::*;
 
@@ -493,6 +507,7 @@ let resp = http::request(
 ```
 
 **Python:**
+
 ```python
 from prx_pdk import host
 
@@ -519,6 +534,7 @@ resp = host.http.request(
 ```
 
 **TypeScript:**
+
 ```typescript
 import { http } from "@prx/pdk";
 
@@ -544,6 +560,7 @@ const resp3 = http.request(
 ```
 
 **Go:**
+
 ```go
 import "github.com/openprx/prx-pdk-go/host/http"
 
@@ -655,6 +672,7 @@ Search memories by semantic similarity.
 ### PDK Usage
 
 **Rust:**
+
 ```rust
 use prx_pdk::prelude::*;
 
@@ -681,6 +699,7 @@ if let Some(top) = entries.first() {
 ```
 
 **Python:**
+
 ```python
 from prx_pdk import host
 
@@ -694,6 +713,7 @@ for e in entries:
 ```
 
 **TypeScript:**
+
 ```typescript
 import { memory } from "@prx/pdk";
 import type { MemoryEntry } from "@prx/pdk";
@@ -707,6 +727,7 @@ entries.forEach(e => console.log(`[${e.importance.toFixed(2)}] ${e.text}`));
 ```
 
 **Go:**
+
 ```go
 import "github.com/openprx/prx-pdk-go/host/memory"
 
@@ -754,6 +775,7 @@ Publish an event to a topic.
 **Returns:** `result<_, string>` — `ok(())` on success, `err(message)` on failure
 
 **Failure reasons:**
+
 - Payload exceeds 64 KB
 - Recursion limit reached (plugin publishing to itself)
 
@@ -807,6 +829,7 @@ Cancel one of your own subscriptions. A plugin can cancel only subscriptions it 
 ### PDK Usage
 
 **Rust:**
+
 ```rust
 use prx_pdk::prelude::*;
 
@@ -826,6 +849,7 @@ events::unsubscribe(sub_id).unwrap();
 ```
 
 **Python:**
+
 ```python
 from prx_pdk import host
 
@@ -840,6 +864,7 @@ host.events.unsubscribe(sub_id)
 ```
 
 **TypeScript:**
+
 ```typescript
 import { events } from "@prx/pdk";
 
@@ -854,6 +879,7 @@ events.unsubscribe(subId);
 ```
 
 **Go:**
+
 ```go
 import "github.com/openprx/prx-pdk-go/host/events"
 
@@ -906,7 +932,7 @@ pub fn on_event_impl(event: &str, payload_json: &str) -> Result<(), String> {
 ## Appendix: Permission Quick Reference
 
 | Permission | Interface | Worlds available in | Default |
-|------------|-----------|--------------------|---------| 
+|------------|-----------|--------------------|---------|
 | (none) | `prx:host/log` | all | ✅ always granted |
 | `config` | `prx:host/config` | all | ✅ always granted |
 | `kv` | `prx:host/kv` | tool, middleware, hook, cron | ❌ must declare |
