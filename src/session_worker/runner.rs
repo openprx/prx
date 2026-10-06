@@ -1116,7 +1116,7 @@ async fn run_authenticated_manifest(
     let parent = crate::runtime::turn_cleanup::current_tracker();
     let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(parent.as_ref(), CancellationToken::new())?;
     let prepared = cleanup
-        .run(run_owned_manifest(manifest, steer_rx, explicit_config_dir, transport))
+        .run(owned_worker_future(manifest, steer_rx, explicit_config_dir, transport))
         .await?;
     if let Some(completion) = prepared.completion {
         super::completion::persist(
@@ -1341,6 +1341,15 @@ fn verify_worker_parent_authority(
         scope: Arc::new(VerifiedChildScope::new(child, &parent)?),
         catalog,
     }))
+}
+
+fn owned_worker_future(
+    manifest: WorkerManifest,
+    steer_rx: Option<tokio::sync::mpsc::Receiver<String>>,
+    explicit_config_dir: Option<&str>,
+    transport: Option<AuthenticatedWorkerTransport>,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<PreparedWorkerResult>> + Send + '_>> {
+    Box::pin(run_owned_manifest(manifest, steer_rx, explicit_config_dir, transport))
 }
 
 async fn run_owned_manifest(
