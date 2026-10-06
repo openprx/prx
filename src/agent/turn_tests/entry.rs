@@ -254,6 +254,44 @@ fn cli_agent_probe_config(
     config.auth.codex_auth_json_auto_import = false;
     config.auth.codex_auth_json_path = root.join("no-codex-auth.json");
     config.memory.backend = "sqlite".to_string();
+    // Price the actual custom endpoint/model; an unqualified model key cannot
+    // admit a paid custom-provider attempt through the production cost gate.
+    let provider = probe.custom_provider();
+    let model = crate::providers::credential_probe::PROBE_MODEL;
+    config.cost.prices.insert(
+        format!("{provider}/{model}"),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    assert!(matches!(
+        crate::llm::route_decision::usage_cost_resolution(
+            &provider, model, 64, 64, 0, 0, &config.cost,
+        ),
+        crate::llm::route_decision::UsagePrice::Priced(cost) if cost > 0.0
+    ));
+    // This declaration describes only the controlled compatible loopback model.
+    config.providers.models.push(
+        toml::from_str(&format!(
+            "provider = {provider:?}\nmodel = {model:?}\noperations = [\"chat\"]\nnative_tools = true\n"
+        ))
+        .expect("test: controlled model declaration"),
+    );
+    let verified = crate::providers::selection::check(
+        &config,
+        &provider,
+        model,
+        &crate::providers::catalog::Requirement::chat().with(crate::providers::catalog::Feature::NativeTools),
+        crate::providers::catalog::UnknownPolicy::Invocation,
+    )
+    .expect("test: real PMM admits the controlled model");
+    assert_eq!(
+        verified.verification(),
+        &crate::providers::catalog::Verification::Verified
+    );
     std::fs::create_dir_all(&config.workspace_dir).expect("test: create the workspace");
     config
 }
@@ -385,20 +423,34 @@ async fn cli_agent_persists_no_secret_from_a_reply() {
 
     let tmp = TempDir::new().expect("test: tempdir");
     let probe = CredentialProbe::start_replying(&format!("Here is the key {PROBE_SECRET} you asked for")).await;
-    let config = cli_agent_probe_config(tmp.path(), &probe);
+    let mut config = cli_agent_probe_config(tmp.path(), &probe);
+    config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+    // Real provider-persistence fixture: a controlled local decision selects
+    // the legal Answer candidate through actual compiler/validator/gates.
+    // No tool completion or invented grant is needed to test reply redaction.
+    let driver = crate::agent::agent::native_decision_fixture::Driver::start_answer()
+        .await
+        .expect("owned loopback decision driver");
+    crate::agent::agent::native_decision_fixture::configure(&mut config, driver.endpoint())
+        .expect("actual compatible decision model binding");
+    let workspace = config.workspace_dir.clone();
 
-    let reply = run_with_runtime_envelope(
-        config,
-        Some("show me the deployment key".to_string()),
-        None,
-        None,
-        0.0,
-        CancellationToken::new(),
-        None,
-        None,
-    )
-    .await
-    .expect("test: the single-shot agent turn completes");
+    let reply = driver
+        .run(
+            true,
+            run_with_runtime_envelope(
+                config,
+                Some("Return a short PRX project greeting.".to_string()),
+                None,
+                None,
+                0.0,
+                CancellationToken::new(),
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("test: the single-shot agent turn completes");
 
     assert!(
         reply.contains("Here is the key"),
@@ -408,6 +460,7 @@ async fn cli_agent_persists_no_secret_from_a_reply() {
         cli_agent_probe_saw_a_chat_request(&probe),
         "test: the turn reached the provider"
     );
+    assert_cli_redaction_answer_receipts(&workspace, "completed");
     assert_nothing_under_persists_the_probe_secret(tmp.path());
 }
 
@@ -422,26 +475,102 @@ async fn cli_agent_persists_no_secret_from_a_provider_error() {
 
     let tmp = TempDir::new().expect("test: tempdir");
     let probe = CredentialProbe::start_failing(400, &format!("upstream rejected key {PROBE_SECRET}")).await;
-    let config = cli_agent_probe_config(tmp.path(), &probe);
+    let mut config = cli_agent_probe_config(tmp.path(), &probe);
+    config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+    // Real provider-persistence fixture: a controlled local decision selects
+    // the legal Answer candidate through actual compiler/validator/gates.
+    // No tool completion or invented grant is needed to test reply redaction.
+    let driver = crate::agent::agent::native_decision_fixture::Driver::start_answer()
+        .await
+        .expect("owned loopback decision driver");
+    crate::agent::agent::native_decision_fixture::configure(&mut config, driver.endpoint())
+        .expect("actual compatible decision model binding");
+    let workspace = config.workspace_dir.clone();
 
-    let result = run_with_runtime_envelope(
-        config,
-        Some("show me the deployment key".to_string()),
-        None,
-        None,
-        0.0,
-        CancellationToken::new(),
-        None,
-        None,
-    )
-    .await;
+    let result = driver
+        .run(
+            true,
+            run_with_runtime_envelope(
+                config,
+                Some("Return a short PRX project greeting.".to_string()),
+                None,
+                None,
+                0.0,
+                CancellationToken::new(),
+                None,
+                None,
+            ),
+        )
+        .await;
 
     assert!(result.is_err(), "test: a failing provider fails the single-shot turn");
     assert!(
         cli_agent_probe_saw_a_chat_request(&probe),
         "test: the turn reached the provider"
     );
+    assert_cli_redaction_answer_receipts(&workspace, "failed");
     assert_nothing_under_persists_the_probe_secret(tmp.path());
+}
+
+// Read actual post-cleanup receipts; a policy refusal or empty persistence
+// cannot count as a provider-redaction positive.
+fn assert_cli_redaction_answer_receipts(workspace: &std::path::Path, status: &str) {
+    let terminals = crate::memory::sqlite::fixture_readback::terminal_rows(workspace).unwrap();
+    assert_eq!(terminals.len(), 1, "one actual CLI whole-turn terminal");
+    let terminal: serde_json::Value = serde_json::from_str(&terminals.first().unwrap().raw_payload).unwrap();
+    assert_eq!(terminal.get("status").and_then(serde_json::Value::as_str), Some(status));
+    let decision_id = terminal
+        .get("decision_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("actual CLI decision identity");
+    let tool_events = crate::memory::sqlite::fixture_readback::tool_event_count(workspace).unwrap();
+    assert_eq!(tool_events, 0, "Answer redaction fixture must execute no tools");
+    let store = crate::causal_tree::store::CausalDecisionStore::open_unshared_read_only(workspace);
+    let scope = crate::causal_tree::store::DecisionScope::Owner {
+        workspace_id: store.workspace_id().unwrap(),
+        owner_id: std::sync::Arc::from(terminals[0].owner_id.as_deref().expect("actual terminal owner")),
+    };
+    let decision = store
+        .reader()
+        .get(
+            &scope,
+            &crate::causal_tree::ids::DecisionId::parse(decision_id).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    let (directive, backend) = (decision.directive_kind, decision.backend_kind);
+    assert_eq!(directive, "answer", "the actual service must select Answer");
+    assert_eq!(
+        backend, "compatible_http",
+        "builtin fallback is not controlled-answer acceptance"
+    );
+}
+
+#[test]
+fn cli_entry_future_fits_default_stack_and_unpolled_drop_is_lazy() {
+    let workspace = TempDir::new().expect("test workspace");
+    let mut config = Config::default();
+    config.workspace_dir = workspace.path().to_path_buf();
+    config.config_path = workspace.path().join("config.toml");
+    let shutdown = CancellationToken::new();
+    let future = run_with_runtime_envelope(
+        config,
+        Some("prx stack layout input".to_owned()),
+        None,
+        None,
+        0.0,
+        shutdown.clone(),
+        None,
+        None,
+    );
+    assert!(std::mem::size_of_val(&future) <= 64 * 1024);
+    drop(future);
+    assert!(!shutdown.is_cancelled());
+    assert!(crate::runtime::turn_cleanup::current_tracker().is_none());
+    assert_eq!(
+        std::fs::read_dir(workspace.path()).expect("fixture directory").count(),
+        0
+    );
 }
 
 /// Every file under `root` with its size, for a before/after comparison.

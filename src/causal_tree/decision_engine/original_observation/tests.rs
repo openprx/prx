@@ -72,6 +72,7 @@ enum RunMode {
     Once,
     Duplicate,
     Missing,
+    MismatchedModel,
 }
 
 async fn run(mode: RunMode, event_limit: usize) -> anyhow::Result<(Vec<EngineDecision>, Observation, usize)> {
@@ -83,6 +84,11 @@ async fn run(mode: RunMode, event_limit: usize) -> anyhow::Result<(Vec<EngineDec
     trusted.workspace_id = Arc::from("prx_workspace");
     trusted.catalog_generation = *catalog.generation();
     trusted.budgets.latency_ms = 500;
+    // Keep this component's trusted main-model fact coherent with its G7 input.
+    // The paired negative retains the old mismatch and must refuse prediction.
+    if !matches!(mode, RunMode::MismatchedModel) {
+        trusted.resolved_model = Arc::from("ollama:prx_observation_model");
+    }
     state.trusted = TrustedState::from_runtime(trusted);
     let view = catalog.view(&CatalogScope::default());
     let cost = CapabilityCostModel {
@@ -311,6 +317,22 @@ async fn original_request_score_and_source_mutations_are_rejected() -> anyhow::R
     assert_eq!(
         captured.checked_sidecar(&decisions).err(),
         Some(ObservationError::Source)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn mismatched_model_cannot_create_original_observation() -> anyhow::Result<()> {
+    let (outcomes, captured, matched) = run(RunMode::MismatchedModel, MAX_EVENTS).await?;
+    assert_eq!(matched, 0);
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| !outcome.request_compiled && outcome.scored_count == 0)
+    );
+    assert_eq!(
+        captured.checked_sidecar(&outcomes.iter().collect::<Vec<_>>()).err(),
+        Some(ObservationError::Missing)
     );
     Ok(())
 }

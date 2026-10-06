@@ -20,11 +20,11 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     "src/runtime/turn_decision/routing/tests/paid_embedding.rs::embedding::let database = Connection::open_with_flags(",
     "src/runtime/turn_decision/routing/tests/paid_embedding.rs::run::let db = Connection::open(workspace.path().join(\"memory/brain.db\")).unwrap();",
     "src/runtime/turn_decision/routing/tests/paid_embedding.rs::run::let decisions = Connection::open(workspace.path().join(\"self/causal_tree/decisions.db\")).unwrap();",
-    "src/agent/agent/automix_integration_tests.rs::verify_result::let database = rusqlite::Connection::open_with_flags(",
-    "src/agent/agent/automix_integration_tests.rs::run_dropped_premium::let database = rusqlite::Connection::open_with_flags(workspace.path().join(\"memory/brain.db\"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;",
+    "src/agent/agent/automix_integration_tests.rs::verify_result_work::let database = rusqlite::Connection::open_with_flags(",
+    "src/agent/agent/automix_integration_tests.rs::run_dropped_premium_work::let database = rusqlite::Connection::open_with_flags(workspace.path().join(\"memory/brain.db\"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;",
     // Isolated child-process AUT: consistent snapshot and one copied completion tamper.
-    "src/runtime/turn_decision/tests/child_process.rs::actual_parent_grant_process_builtin_close_has_signed_completion_and_join::let logical_db = rusqlite::Connection::open(workspace.join(\"memory/brain.db\"))?;",
-    "src/runtime/turn_decision/tests/child_process.rs::actual_parent_grant_process_builtin_close_has_signed_completion_and_join::let copy = rusqlite::Connection::open(&copied_db)?;",
+    "src/runtime/turn_decision/tests/child_process.rs::actual_parent_process_case::let logical_db = rusqlite::Connection::open(workspace.join(\"memory/brain.db\"))?;",
+    "src/runtime/turn_decision/tests/child_process.rs::actual_parent_process_case::let copy = rusqlite::Connection::open(&copied_db)?;",
     // Fresh-process fixture: bounded, read-only enumeration before owned repository readback.
     "src/runtime/ingress_recovery/tests.rs::report::let conn = rusqlite::Connection::open_with_flags(",
     // Failure-only, read-only decision diagnostics in the actual Router fixture.

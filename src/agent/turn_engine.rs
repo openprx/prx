@@ -336,7 +336,7 @@ async fn run_turn_unguarded(
                 && !candidate.is_empty()
                 && candidate.iter().all(|message| !message.role.trim().is_empty())
             {
-                proposal_messages = candidate;
+                proposal_messages = neutralize_middleware_user_messages(&proposal_messages, candidate);
             }
             if let Some(tools) = transformed.get("tools")
                 && let Ok(candidate) = serde_json::from_value::<Vec<crate::tools::ToolSpec>>(tools.clone())

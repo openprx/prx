@@ -591,6 +591,16 @@ unattributable and therefore reaches no owner-isolated caller either. Nothing is
 migrated or rewritten to make that true, so a rollback restores the previous
 visibility immediately.
 
+An embedded agent's legacy `MemoryLoader` callback runs only after a Memory
+retrieval is selected and validated. It receives a bounded read view tied to
+the authenticated source workspace and owner. Non-public rows must match that
+owner; public rows remain shared under the existing visibility rules.
+This read scope is separate from the semantic write context and does not change
+that context. A conflicting workspace or owner is rejected before the callback;
+ownerless historical rows are not attributed to the caller. Read counts, result
+bounds and the original decision deadline still apply. Reverting this read-scope
+repair restores the earlier failure for embedded write contexts without an owner.
+
 The shared SQL predicate is the owner contract on both backends. On PostgreSQL
 the row-level-security policy over `memories`, `document_chunks` and
 `embedding_cache` is a floor under it. For an owner-isolated caller the policy

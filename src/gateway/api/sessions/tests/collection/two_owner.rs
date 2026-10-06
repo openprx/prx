@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Real authenticated API routing for two independent owner-approved writes.
 use super::*;
 use tower::ServiceExt;
@@ -536,3 +537,5 @@ async fn run_two_owner_case() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+mod browser_fixture;

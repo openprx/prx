@@ -17,7 +17,7 @@ fn auxiliary_early_pass_preserves_actual_proxy_and_heuristic_admission() -> anyh
         "a",
         "abcd",
         "abcde",
-        "\u{03bb}\u{4e2d}\u{1f600}",
+        "\u{03bb}\u{20ac}\u{1f600}",
         "<|endoftext|>",
         r#"{"input":"project text","image":"AAAA=="}"#,
         &repeated,

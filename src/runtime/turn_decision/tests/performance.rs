@@ -199,6 +199,14 @@ async fn actual_builtin_fixture_characterization() {
     drain_required(&service).await;
     let cancellation = CancellationToken::new();
     let process_pilot = std::env::var("PRX_CDP_PROCESS_PILOT").is_ok_and(|v| v == "1");
+    // Observer-on diagnostics are a separate run: never enter the allocation
+    // gate with capture copies, and never label reconstructed values original.
+    let observe_original = std::env::var("PRX_CDP_ORIGINAL_OBSERVATION").is_ok_and(|v| v == "1");
+    assert!(
+        !(observe_original && process_pilot),
+        "original observation must remain outside measured allocation windows"
+    );
+    let mut original_capture = None;
     let (mut context, process_measurement) = if process_pilot {
         let ((context, return_us, drained_us), allocations) =
             crate::decision::builtin::allocation_counter::count_process_future(async {
@@ -218,6 +226,17 @@ async fn actual_builtin_fixture_characterization() {
             "required drains cannot finish before decision return"
         );
         (context, Some((allocations, return_us, drained_us)))
+    } else if observe_original {
+        let (result, captured) = crate::causal_tree::decision_engine::original_observation::capture(
+            "actual-neutral-service-characterization",
+            service.decide_agent_initial(&proof, AgentTurnKind::Repl, &cancellation),
+        )
+        .await
+        .expect("bounded original-object observation");
+        let context = result.expect("actual observed builtin decision");
+        drain_required(&service).await;
+        original_capture = Some(captured);
+        (context, None)
     } else {
         let context = service
             .decide_agent_initial(&proof, AgentTurnKind::Repl, &cancellation)
@@ -226,6 +245,31 @@ async fn actual_builtin_fixture_characterization() {
         drain_required(&service).await;
         (context, None)
     };
+    if let Some(captured) = original_capture {
+        let actual_hops = context.audit_hops().collect::<Vec<_>>();
+        let sidecar = captured
+            .checked_sidecar(&actual_hops)
+            .expect("exact original service-hop inventory and scores");
+        assert!(
+            captured.checked_sidecar(&[]).is_err(),
+            "empty service inventory must fail closed"
+        );
+        let mut duplicated = actual_hops.clone();
+        duplicated.push(*actual_hops.first().expect("actual original hop"));
+        assert!(
+            captured.checked_sidecar(&duplicated).is_err(),
+            "duplicated service inventory must fail closed"
+        );
+        println!(
+            "PRX_CDP_ORIGINAL_OBSERVATION {}",
+            json!({
+                "scope":"observer-on actual service original objects only; no physical HTTP wire or performance acceptance",
+                "class":class,"recording_profile":profile,"extra_inventory":extra,"reverse_registry":reverse,
+                "workspace_id":proof.workspace_id(),"owner_id":proof.owner_id(),"session_key":proof.session_key(),
+                "run_id":proof.run_id(),"source_event_id":proof.source_event_id(),"observation":sidecar
+            })
+        );
+    }
     let semantics = semantic_context(&service, &proof, &context);
     if std::env::var("PRX_CDP_WITNESS_RED").is_ok_and(|v| v == "blocked-abstain") {
         use crate::causal_tree::gates::GateOutcome;

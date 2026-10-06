@@ -284,6 +284,25 @@ async fn actual_parent_process_case(non_root_route: bool) -> anyhow::Result<()> 
         ))
     });
     let scratch = tempfile::tempdir()?;
+    // This ignored fresh-process AUT bypasses CLI ingress in its parent. Publish
+    // the same owned config directory that the actual child CLI receives before
+    // either side resolves its lazy session-worker signing key. Keep it through
+    // the common cleanup tail, and restore even after a panic.
+    struct ParentConfigScope {
+        previous: Option<std::path::PathBuf>,
+        _lock: parking_lot::MutexGuard<'static, ()>,
+    }
+    impl Drop for ParentConfigScope {
+        fn drop(&mut self) {
+            // Restore while the existing global test lock is still held.
+            crate::config::schema::swap_process_config_dir_for_tests(self.previous.take());
+        }
+    }
+    let config_lock = crate::config::schema::process_config_dir_test_lock();
+    let _parent_config_scope = ParentConfigScope {
+        previous: crate::config::schema::swap_process_config_dir_for_tests(Some(scratch.path().join("config"))),
+        _lock: config_lock,
+    };
     let owned_runs = Arc::new(tokio::sync::RwLock::new(Vec::<SubAgentRun>::new()));
     // Catch every assertion panic and Result error after launch. The common
     // tail always waits for the actual process owner before returning.

@@ -25,6 +25,7 @@ struct ListenerOwner {
     requests: Arc<parking_lot::Mutex<Vec<Value>>>,
     address: std::net::SocketAddr,
     premium_seen: Arc<tokio::sync::Notify>,
+    response_statuses: Arc<parking_lot::Mutex<Vec<u16>>>,
 }
 impl ListenerOwner {
     async fn start(replies: Vec<(u16, Value)>, block_premium: bool) -> anyhow::Result<Self> {
@@ -34,6 +35,8 @@ impl ListenerOwner {
         let stop = cancel.clone();
         let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let captured = Arc::clone(&requests);
+        let response_statuses = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let captured_statuses = Arc::clone(&response_statuses);
         let premium_seen = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let seen = Arc::clone(&premium_seen);
@@ -102,6 +105,7 @@ impl ListenerOwner {
                     socket.write_all(head.as_bytes()).await?;
                     socket.write_all(&body).await?;
                     socket.shutdown().await?;
+                    captured_statuses.lock().push(status);
                     Ok::<_, anyhow::Error>(())
                 };
                 tokio::select! {
@@ -117,6 +121,7 @@ impl ListenerOwner {
             requests,
             address,
             premium_seen,
+            response_statuses,
         })
     }
     async fn finish(&mut self) -> anyhow::Result<()> {
@@ -368,6 +373,23 @@ async fn verify_result_work(
         2,
         "cheap aggregate is deduplicated after early settlement; premium is separate"
     );
+    let mut unique_settlements = std::collections::HashSet::new();
+    for row in &costs {
+        assert!(
+            unique_settlements.insert(
+                required_fixture_field(row, "/settlement_id")?
+                    .as_str()
+                    .context("actual settlement ID")?
+            )
+        );
+        assert!(
+            required_fixture_field(row, "/usage/cost_usd")?
+                .as_f64()
+                .context("priced cost")?
+                > 0.0
+        );
+    }
+    assert_eq!(unique_settlements.len(), 2);
     assert_eq!(
         costs
             .iter()
@@ -488,7 +510,7 @@ async fn verify_result_work(
 }
 
 // Synchronous construction returns before the fixture future is polled.
-fn run_case(recording: bool) -> std::pin::Pin<Box<impl std::future::Future<Output = anyhow::Result<()>>>> {
+pub(super) fn run_case(recording: bool) -> std::pin::Pin<Box<impl std::future::Future<Output = anyhow::Result<()>>>> {
     Box::pin(run_case_work(recording))
 }
 
@@ -620,6 +642,265 @@ async fn run_dropped_premium_work() -> anyhow::Result<()> {
     }
     if !matches!(&result, Ok(Ok(()))) {
         let _retained_workspace = workspace.keep();
+    }
+    drop(agent);
+    match result {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+fn required_fixture_field<'a>(value: &'a Value, pointer: &str) -> anyhow::Result<&'a Value> {
+    value
+        .pointer(pointer)
+        .with_context(|| format!("required fixture field missing: {pointer}"))
+}
+
+// Canonical replacements for the former unaccounted provider fixture. The
+// listener observes physical calls; SQLite and cost files observe production
+// settlement/learning. No advertised accounting capability is fabricated.
+pub(super) fn run_cheap_outcome_case(
+    fail_premium: bool,
+    turns: usize,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = anyhow::Result<()>>>> {
+    Box::pin(run_cheap_outcome_case_work(fail_premium, turns))
+}
+
+async fn run_cheap_outcome_case_work(fail_premium: bool, turns: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(turns > 0 && (!fail_premium || turns == 1), "invalid fixture scenario");
+    const CONFIDENT_REPLY: &str = "```rust\nfn main() {}\n```\nThis compiles cleanly.";
+    let cheap_reply = if fail_premium { CHEAP_REPLY } else { CONFIDENT_REPLY };
+    let mut replies = Vec::new();
+    for _ in 0..turns {
+        replies.push((200, response(cheap_reply)));
+        if fail_premium {
+            replies.push((500, json!({"error":{"message":"fixture premium failure"}})));
+        }
+    }
+    let workspace = tempfile::tempdir()?;
+    let mut listener = ListenerOwner::start(replies, false).await?;
+    let mut agent = None;
+    let result = AssertUnwindSafe(async {
+        agent = Some(build_agent(workspace.path(), &listener, true).await?);
+        let agent = agent.as_mut().context("built Agent")?;
+        for _ in 0..turns {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), turn(agent)).await??,
+                cheap_reply
+            );
+            agent.cleanup_state.confirm().await?;
+        }
+        let requests = listener.requests.lock().clone();
+        assert_eq!(
+            *listener.response_statuses.lock(),
+            if fail_premium { vec![200, 500] } else { vec![200; turns] }
+        );
+        assert_eq!(requests.len(), turns + usize::from(fail_premium));
+        for request in requests.iter().take(turns) {
+            assert_eq!(request.get("model").context("cheap wire model")?, CHEAP);
+        }
+        if fail_premium {
+            let premium = requests.last().context("premium request")?;
+            assert_eq!(premium.get("model").context("premium wire model")?, PREMIUM);
+            assert!(premium.get("tools").is_none(), "premium has no tool authority");
+        }
+        let terminals: Vec<_> = crate::memory::sqlite::fixture_readback::terminal_rows(workspace.path())?
+            .into_iter()
+            .map(|row| (row.run_id, row.raw_payload))
+            .collect();
+        assert_eq!(terminals.len(), turns);
+        let run_ids: std::collections::HashSet<_> = terminals.iter().map(|(run, _)| run.as_str()).collect();
+        assert_eq!(run_ids.len(), turns);
+        for (_, raw) in &terminals {
+            let terminal: Value = serde_json::from_str(raw)?;
+            assert_eq!(
+                required_fixture_field(&terminal, "/provider_outcome/final_model")?,
+                CHEAP
+            );
+            assert_eq!(
+                required_fixture_field(&terminal, "/provider_outcome/final_provider")?.as_str(),
+                Some(format!("custom:http://{}", listener.address).as_str())
+            );
+            assert!(terminal.get("served_auxiliary").is_none());
+        }
+        let costs = std::fs::read_to_string(workspace.path().join("state/costs.jsonl"))?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            costs.len(),
+            turns,
+            "one known cheap debit per actual turn; no fake zero premium debit"
+        );
+        let mut settlement_ids = std::collections::HashSet::new();
+        for cost in &costs {
+            let settlement_id = required_fixture_field(cost, "/settlement_id")?
+                .as_str()
+                .context("settlement ID")?;
+            assert!(settlement_ids.insert(settlement_id));
+            assert!(run_ids.contains(settlement_id));
+            assert!(
+                required_fixture_field(cost, "/usage/model")?
+                    .as_str()
+                    .context("cost model")?
+                    .ends_with(CHEAP)
+            );
+            assert!(
+                required_fixture_field(cost, "/usage/cost_usd")?
+                    .as_f64()
+                    .context("known cheap cost")?
+                    > 0.0
+            );
+        }
+        let database = crate::memory::sqlite::fixture_readback::AutomixReadback::open(workspace.path())?;
+        let auxiliary_count = database.auxiliary_count()?;
+        assert_eq!(auxiliary_count, i64::from(fail_premium));
+        let reservation_path = workspace.path().join("state/costs.reservations.jsonl");
+        if fail_premium {
+            let auxiliary = database.auxiliary_payload()?;
+            let auxiliary: Value = serde_json::from_str(&auxiliary)?;
+            assert_eq!(required_fixture_field(&auxiliary, "/purpose")?, "automix_premium");
+            assert!(
+                required_fixture_field(&auxiliary, "/provider_outcome")?.is_null(),
+                "HTTP error returns before a ChatTrace; do not invent failed-attempt attribution"
+            );
+            let linked = database.auxiliary_terminal_count(
+                &terminals.first().context("actual terminal")?.0,
+                workspace.path().to_string_lossy().as_ref(),
+            )?;
+            assert_eq!(
+                linked, 1,
+                "actual auxiliary receipt binds the same owner/session/run before terminal"
+            );
+            assert_eq!(required_fixture_field(&auxiliary, "/usage_uncertain")?, true);
+            assert!(required_fixture_field(&auxiliary, "/served_reply_sha256")?.is_null());
+            let journal = std::fs::read_to_string(reservation_path)?
+                .lines()
+                .map(serde_json::from_str::<Value>)
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(
+                journal
+                    .iter()
+                    .filter(|row| row.get("event").and_then(Value::as_str) == Some("dispatched"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                journal
+                    .iter()
+                    .filter(|row| row.get("event").and_then(Value::as_str) == Some("estimated_settled_v1"))
+                    .count(),
+                0
+            );
+            let hold = journal
+                .iter()
+                .find(|row| row.get("event").and_then(Value::as_str) == Some("estimated_reserved_v1"))
+                .context("premium hold")?;
+            assert!(
+                required_fixture_field(hold, "/request/reservation/maximum_micro_usd")?
+                    .as_u64()
+                    .context("held amount")?
+                    > 0
+            );
+            let reservation = required_fixture_field(hold, "/request/reservation")?;
+            let attempt_id = required_fixture_field(reservation, "/attempt_id")?
+                .as_str()
+                .context("held attempt")?;
+            let scope_id = required_fixture_field(&auxiliary, "/accounting_scope_id")?
+                .as_str()
+                .context("auxiliary scope")?;
+            assert!(attempt_id.starts_with("automix_premium:"));
+            assert_eq!(
+                required_fixture_field(reservation, "/turn_id")?.as_str(),
+                Some(scope_id),
+                "physical attempt must bind the actual auxiliary scope"
+            );
+            assert_eq!(journal.len(), 2, "one unresolved reservation and its dispatch only");
+            assert_eq!(
+                required_fixture_field(journal.first().context("reservation row")?, "/event")?.as_str(),
+                Some("estimated_reserved_v1")
+            );
+            assert_eq!(
+                required_fixture_field(journal.get(1).context("dispatch row")?, "/event")?.as_str(),
+                Some("dispatched")
+            );
+            assert_eq!(
+                required_fixture_field(journal.get(1).context("dispatch row")?, "/attempt_id")?.as_str(),
+                Some(attempt_id)
+            );
+            assert!(
+                journal.iter().all(|row| !matches!(
+                    row.get("event").and_then(Value::as_str),
+                    Some("released" | "settled" | "estimated_settled_v1")
+                )),
+                "unknown attempt must retain its liability"
+            );
+        } else if reservation_path.exists() {
+            let journal = std::fs::read_to_string(reservation_path)?
+                .lines()
+                .map(serde_json::from_str::<Value>)
+                .collect::<Result<Vec<_>, _>>()?;
+            assert!(
+                journal.is_empty(),
+                "high confidence must not reserve or dispatch premium"
+            );
+        }
+        let (domain, snapshot) = database.learning_state()?;
+        assert_eq!(domain.len(), 64);
+        assert!(domain.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let snapshot: crate::memory::traits::RouterLearningSnapshot = serde_json::from_str(&snapshot)?;
+        assert_eq!(snapshot.version, i64::try_from(turns)?);
+        let cheap = snapshot
+            .models
+            .iter()
+            .find(|model| model.model == CHEAP)
+            .context("cheap metrics")?;
+        let premium = snapshot
+            .models
+            .iter()
+            .find(|model| model.model == PREMIUM)
+            .context("premium priors")?;
+        assert_eq!(cheap.provider, format!("custom:http://{}", listener.address));
+        assert_eq!(premium.provider, cheap.provider);
+        assert!(
+            cheap.elo > 2_000.0,
+            "actual cheap success improves its configured prior"
+        );
+        assert_eq!(cheap.successes.iter().copied().collect::<Vec<_>>(), vec![true; turns]);
+        assert_eq!(premium.elo, 1_000.0);
+        assert!(
+            premium.successes.is_empty(),
+            "failed or uncalled premium receives no successful attribution"
+        );
+        let receipts = database.learning_receipt_count()?;
+        assert_eq!(receipts, i64::try_from(turns)?);
+        for (run, _) in &terminals {
+            let matched =
+                database.learning_terminal_count(run, &domain, workspace.path().to_string_lossy().as_ref())?;
+            assert_eq!(
+                matched, 1,
+                "one exact owner/workspace/domain/source-bound learning receipt per terminal"
+            );
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .catch_unwind()
+    .await;
+    let confirmed = if let Some(agent) = agent.as_mut() {
+        matches!(
+            tokio::time::timeout(Duration::from_secs(5), agent.cleanup_state.confirm()).await,
+            Ok(Ok(()))
+        )
+    } else {
+        true
+    };
+    let listener_cleanup = listener.finish().await;
+    if !confirmed || listener_cleanup.is_err() {
+        let retained = workspace.keep();
+        anyhow::bail!("Automix fixture cleanup unconfirmed; retained {}", retained.display());
+    }
+    if !matches!(&result, Ok(Ok(()))) {
+        let _retained = workspace.keep();
     }
     drop(agent);
     match result {

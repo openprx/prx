@@ -78,30 +78,35 @@ impl ScheduledAgentOrigin {
         self.retry_boundary.clone()
     }
 
-    pub(crate) async fn scope<T, F: Future<Output = Result<T>>>(self, work: F) -> Result<T> {
-        let boundary = self.retry_boundary.clone();
-        let parent = crate::runtime::turn_cleanup::current_tracker();
-        let cleanup = match crate::runtime::turn_cleanup::CleanupScope::new(
-            parent.as_ref(),
-            tokio_util::sync::CancellationToken::new(),
-        ) {
-            Ok(cleanup) => cleanup,
-            Err(error) => {
-                boundary.0.store(true, Ordering::Release);
-                return Err(error);
-            }
-        };
-        cleanup
-            .run(SCHEDULED_ORIGIN.scope(self, work))
-            .await
-            .inspect_err(|error| {
-                if error
-                    .downcast_ref::<crate::runtime::turn_cleanup::CleanupIncomplete>()
-                    .is_some()
-                {
+    pub(crate) fn scope<T, F: Future<Output = Result<T>>>(self, work: F) -> impl Future<Output = Result<T>> {
+        // Box before constructing the scheduled and cleanup wrapper futures.
+        // The full agent entry state must not be copied into each owner frame.
+        let work = Box::pin(work);
+        async move {
+            let boundary = self.retry_boundary.clone();
+            let parent = crate::runtime::turn_cleanup::current_tracker();
+            let cleanup = match crate::runtime::turn_cleanup::CleanupScope::new(
+                parent.as_ref(),
+                tokio_util::sync::CancellationToken::new(),
+            ) {
+                Ok(cleanup) => cleanup,
+                Err(error) => {
                     boundary.0.store(true, Ordering::Release);
+                    return Err(error);
                 }
-            })
+            };
+            cleanup
+                .run(SCHEDULED_ORIGIN.scope(self, work))
+                .await
+                .inspect_err(|error| {
+                    if error
+                        .downcast_ref::<crate::runtime::turn_cleanup::CleanupIncomplete>()
+                        .is_some()
+                    {
+                        boundary.0.store(true, Ordering::Release);
+                    }
+                })
+        }
     }
 
     fn validate(&self, envelope: &RuntimeEnvelope, scheduled: Option<&ScheduledToolScope>) -> Result<()> {

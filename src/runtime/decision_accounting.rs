@@ -225,24 +225,58 @@ impl AccountingScope {
             let mut ticket = Some(ticket);
             let mut confirmed = true;
             let mut restore_tokens = true;
+            #[cfg(test)]
+            let mut diagnostic_stage = "decode";
             let result = (|| -> anyhow::Result<OwnedReceipt> {
                 let text = std::str::from_utf8(&request_body)?;
+                #[cfg(test)]
+                {
+                    diagnostic_stage = "input_fit";
+                }
                 let input_fits = input_token_preflight(text, tokens, auxiliary, || {
                     let measured = crate::agent::context_budget::count_tokens_with_source(text);
-                    crate::agent::context_budget::estimate_request_tokens(
+                    let estimate = crate::agent::context_budget::estimate_request_tokens(
                         measured,
                         crate::agent::context_budget::TokenMeasurement::NONE,
-                    )
+                    );
+                    #[cfg(test)]
+                    if u64::try_from(estimate).is_ok_and(|estimate| estimate >= tokens) {
+                        let source = match measured.source {
+                            crate::agent::context_budget::TokenMeasurementSource::Cl100kProxy => "cl100k_proxy",
+                            crate::agent::context_budget::TokenMeasurementSource::Heuristic => "heuristic",
+                        };
+                        let _ = std::io::Write::write_fmt(
+                            &mut std::io::stderr().lock(),
+                            format_args!(
+                                "prx_accounting_input_rejected source={source} measured_tokens={} body_bytes={} estimate_tokens={estimate} allowance_tokens={tokens}\n",
+                                measured.tokens,
+                                text.len(),
+                            ),
+                        );
+                    }
+                    estimate
                 })?;
                 anyhow::ensure!(
                     input_fits,
                     "physical request exceeds estimated decision token allowance"
                 );
+                #[cfg(test)]
+                {
+                    diagnostic_stage = "deadline_after_estimation";
+                }
                 anyhow::ensure!(
                     !cancel.is_cancelled() && Instant::now() < deadline,
                     "physical accounting deadline elapsed during estimation"
                 );
+                #[cfg(test)]
+                {
+                    diagnostic_stage = "tracker_open";
+                }
                 let tracker = CostTracker::new(config.cost.clone(), &config.workspace_dir)?;
+                #[cfg(test)]
+                {
+                    diagnostic_stage = "reserve";
+                }
                 let receipt = match tracker.reserve_estimated_attempt(request) {
                     Ok(receipt) => receipt,
                     Err(error) => {
@@ -256,6 +290,10 @@ impl AccountingScope {
                 // From this point a durable liability exists. Only a confirmed
                 // unsent release can restore the prospective token allowance.
                 restore_tokens = false;
+                #[cfg(test)]
+                {
+                    diagnostic_stage = "deadline_before_dispatch";
+                }
                 if cancel.is_cancelled() || Instant::now() >= deadline {
                     if let Err(error) = tracker.release_unsent_attempt(&receipt) {
                         confirmed = false;
@@ -263,6 +301,10 @@ impl AccountingScope {
                     }
                     restore_tokens = true;
                     anyhow::bail!("decision accounting deadline elapsed before dispatch");
+                }
+                #[cfg(test)]
+                {
+                    diagnostic_stage = "mark_dispatched";
                 }
                 if let Err(error) = tracker.mark_attempt_dispatched(&receipt) {
                     if error.is::<crate::cost::reservation::ReservationWriteUnconfirmed>() {
@@ -294,12 +336,27 @@ impl AccountingScope {
             if let Some(ticket) = ticket {
                 ticket.finish(confirmed);
             }
+            #[cfg(test)]
+            if result.is_err() {
+                let _ = std::io::Write::write_fmt(
+                    &mut std::io::stderr().lock(),
+                    format_args!("prx_accounting_failure stage={diagnostic_stage} allowance_tokens={tokens}\n"),
+                );
+            }
             result.map_err(|_| DecisionError::BudgetExceeded)
         });
         let receipt = tokio::time::timeout_at(deadline.into(), work)
             .await
-            .map_err(|_| DecisionError::BudgetExceeded)?
-            .map_err(|_| DecisionError::BudgetExceeded)??;
+            .map_err(|_| {
+                #[cfg(test)]
+                accounting_diagnostic_failure("blocking_timeout");
+                DecisionError::BudgetExceeded
+            })?
+            .map_err(|_| {
+                #[cfg(test)]
+                accounting_diagnostic_failure("blocking_join");
+                DecisionError::BudgetExceeded
+            })??;
         Ok(receipt)
     }
 }
@@ -454,3 +511,11 @@ fn input_token_preflight(
 
 #[cfg(test)]
 mod token_preflight_tests;
+
+#[cfg(test)]
+fn accounting_diagnostic_failure(stage: &'static str) {
+    let _ = std::io::Write::write_fmt(
+        &mut std::io::stderr().lock(),
+        format_args!("prx_accounting_failure stage={stage}\n"),
+    );
+}

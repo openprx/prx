@@ -196,3 +196,6 @@ async fn actual_compiler_binds_decision_model_before_real_http() {
     );
     assert_eq!(dispatches.load(Ordering::SeqCst), 0);
 }
+
+#[path = "model_binding/original_service_wire.rs"]
+mod original_service_wire;

@@ -2208,6 +2208,11 @@ mod tests {
         config.default_provider.get_or_insert_with(|| "ollama".to_owned());
         config.default_model.get_or_insert_with(|| "test-model".to_owned());
         config.causal_tree.enabled = false;
+        test_app_state_with_config(config, provider)
+    }
+
+    fn test_app_state_with_config(config: Config, provider: Arc<dyn Provider>) -> AppState {
+        let model = config.default_model.clone().expect("fixture config model");
         static PARTICIPANT: std::sync::OnceLock<Arc<dyn crate::config::ConfigGenerationParticipant>> =
             std::sync::OnceLock::new();
         let config = crate::config::new_shared(config);
@@ -2215,7 +2220,7 @@ mod tests {
         AppState {
             config,
             provider,
-            model: "test-model".into(),
+            model,
             temperature: 0.0,
             mem: Arc::new(TestMemory),
             auto_save: false,
@@ -2243,6 +2248,49 @@ mod tests {
             #[cfg(feature = "wasm-plugins")]
             plugin_runtime: None,
         }
+    }
+
+    fn console_provider_fixture_config(config: &mut Config, workspace: &std::path::Path, model: &str, endpoint: &str) {
+        config.workspace_dir = workspace.to_owned();
+        config.config_path = workspace.join("config.toml");
+        config.default_provider = Some("ollama".to_owned());
+        config.default_model = Some(model.to_owned());
+        config.cost.prices.insert(
+            format!("ollama/{model}"),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+        assert!(matches!(crate::llm::route_decision::usage_cost_resolution(
+            "ollama", model, 1, 0, 0, 0, &config.cost,
+        ), crate::llm::route_decision::UsagePrice::Priced(value) if value > 0.0));
+        let native_tools = model == CONSOLE_WINDOW_MODEL;
+        config.providers.models.push(
+            toml::from_str(&format!(
+                "provider = \"ollama\"\nmodel = {model:?}\noperations = [\"chat\"]\nnative_tools = {native_tools}\n"
+            ))
+            .unwrap(),
+        );
+        let selected = crate::providers::selection::check(
+            config,
+            "ollama",
+            model,
+            &if native_tools {
+                crate::providers::catalog::Requirement::chat().with(crate::providers::catalog::Feature::NativeTools)
+            } else {
+                crate::providers::catalog::Requirement::chat()
+            },
+            crate::providers::catalog::UnknownPolicy::Invocation,
+        )
+        .unwrap();
+        assert_eq!(
+            selected.verification(),
+            &crate::providers::catalog::Verification::Verified
+        );
+        crate::agent::agent::native_decision_fixture::configure(config, endpoint).unwrap();
     }
 
     async fn console_test_source(
@@ -2305,83 +2353,103 @@ mod tests {
 
     #[tokio::test]
     async fn console_runtime_turn_uses_shared_tool_loop_history() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        config.workspace_dir = tmp.path().to_path_buf();
-        let provider_impl = Arc::new(CapturingProvider::default());
-        let mut state = test_app_state(config, provider_impl.clone());
-        let envelope = console_runtime_envelope_for_workspace(
-            tmp.path().to_string_lossy().to_string(),
-            "console-session",
-            "console",
-            "prx_user",
-        );
-        let previous_turns = vec![ConversationTurn {
-            id: 1,
-            session_key: "console-session".to_string(),
-            role: "assistant".to_string(),
-            content: "previous answer".to_string(),
-            timestamp: "2026-05-27T00:00:00Z".to_string(),
-            message_id: Some("previous-event".to_string()),
-        }];
-
-        let (runtime, _, _, proof) = console_test_source(&mut state, envelope, "current question").await;
-        let service = runtime.decision_slot.publish(&runtime, &state).await.unwrap().clone();
-        let cancellation = tokio_util::sync::CancellationToken::new();
-        let context = service
-            .decide_agent_initial(
-                &proof,
-                crate::runtime::turn_decision::AgentTurnKind::SingleShot,
-                &cancellation,
-            )
+        let driver = crate::agent::agent::native_decision_fixture::Driver::start_answer()
             .await
             .unwrap();
-        let decision = ConsoleDecisionTurn {
-            service: service.clone(),
-            context,
-            proof: &proof,
-            cancellation,
-            provider_trace: None,
-        };
-        assert!(
-            run_console_runtime_turn(
-                runtime.clone(),
-                &state,
-                "different unadmitted input",
-                Vec::new(),
-                &decision,
-            )
-            .await
-            .is_err()
-        );
-        assert!(
-            provider_impl.requests.lock().is_empty(),
-            "source mismatch must fail before provider transport"
-        );
-        let turn = run_console_runtime_turn(runtime, &state, "current question", previous_turns, &decision)
-            .await
-            .unwrap();
+        let endpoint = driver.endpoint().to_owned();
+        driver
+            .run(true, async move {
+                let tmp = tempfile::tempdir().unwrap();
+                let cleanup =
+                    crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+                        .unwrap();
+                cleanup
+                    .run(Box::pin(async {
+                        let mut config = Config::default();
+                        console_provider_fixture_config(&mut config, tmp.path(), "test-model", &endpoint);
+                        let provider_impl = Arc::new(CapturingProvider::default());
+                        let mut state = test_app_state_with_config(config, provider_impl.clone());
+                        let envelope = console_runtime_envelope_for_workspace(
+                            tmp.path().to_string_lossy().to_string(),
+                            "console-session",
+                            "console",
+                            "prx_user",
+                        );
+                        let previous_turns = vec![ConversationTurn {
+                            id: 1,
+                            session_key: "console-session".to_string(),
+                            role: "assistant".to_string(),
+                            content: "previous answer".to_string(),
+                            timestamp: "2026-05-27T00:00:00Z".to_string(),
+                            message_id: Some("previous-event".to_string()),
+                        }];
 
-        service
-            .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+                        let (runtime, _, _, proof) =
+                            console_test_source(&mut state, envelope, "current question").await;
+                        let service = runtime.decision_slot.publish(&runtime, &state).await.unwrap().clone();
+                        let cancellation = tokio_util::sync::CancellationToken::new();
+                        let context = service
+                            .decide_agent_initial(
+                                &proof,
+                                crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+                                &cancellation,
+                            )
+                            .await
+                            .unwrap();
+                        let decision = ConsoleDecisionTurn {
+                            service: service.clone(),
+                            context,
+                            proof: &proof,
+                            cancellation,
+                            provider_trace: None,
+                        };
+                        assert!(
+                            run_console_runtime_turn(
+                                runtime.clone(),
+                                &state,
+                                "different unadmitted input",
+                                Vec::new(),
+                                &decision,
+                            )
+                            .await
+                            .is_err()
+                        );
+                        assert!(
+                            provider_impl.requests.lock().is_empty(),
+                            "source mismatch must fail before provider transport"
+                        );
+                        let turn =
+                            run_console_runtime_turn(runtime, &state, "current question", previous_turns, &decision)
+                                .await
+                                .unwrap();
+
+                        service
+                            .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+                            .await;
+                        assert_eq!(turn.reply, "console-runtime-ok");
+                        let requests = provider_impl.requests.lock();
+                        assert_eq!(requests.len(), 1);
+                        let history = requests.first().expect("request should be recorded");
+                        assert_eq!(history.first().map(|m| m.role.as_str()), Some("system"));
+                        assert!(
+                            history
+                                .iter()
+                                .any(|m| m.role == "assistant" && m.content == "previous answer")
+                        );
+                        assert_eq!(history.last().map(|m| m.role.as_str()), Some("user"));
+                        assert!(history.last().is_some_and(|m| m.content.contains("current question")));
+                        Ok::<(), anyhow::Error>(())
+                    }))
+                    .await
+                    .expect("actual fixture decision transport and cleanup ownership");
+            })
             .await;
-        assert_eq!(turn.reply, "console-runtime-ok");
-        let requests = provider_impl.requests.lock();
-        assert_eq!(requests.len(), 1);
-        let history = requests.first().expect("request should be recorded");
-        assert_eq!(history.first().map(|m| m.role.as_str()), Some("system"));
-        assert!(
-            history
-                .iter()
-                .any(|m| m.role == "assistant" && m.content == "previous answer")
-        );
-        assert_eq!(history.last().map(|m| m.role.as_str()), Some("user"));
-        assert!(history.last().is_some_and(|m| m.content.contains("current question")));
     }
 
     // ── R5 / OQ-23: the Console turn budgets on the model's effective window ──
 
-    const CONSOLE_BULKY_TOOL: &str = "console_bulky_probe";
+    const CONSOLE_BULKY_TOOL: &str = "file_read";
+    const CONSOLE_BULKY_FILE: &str = "prx-console-window.txt";
     const CONSOLE_BULKY_MARKER: &str = "CONSOLE-BULKY";
     const CONSOLE_WINDOW_MODEL: &str = "narrow-window-model";
     const CONSOLE_WINDOW_PROVIDER: &str = "ollama";
@@ -2389,35 +2457,48 @@ mod tests {
 
     /// A read-only tool whose output overruns a 6,000-token window but fits the
     /// 128,000-token base window and the unbudgeted inline cap.
-    struct ConsoleBulkyTool;
+    struct ConsoleBulkyTool {
+        inner: crate::tools::file_read::FileReadTool,
+        executions: Arc<std::sync::atomic::AtomicUsize>,
+        expected: String,
+    }
 
     #[async_trait]
     impl crate::tools::Tool for ConsoleBulkyTool {
         fn name(&self) -> &str {
-            CONSOLE_BULKY_TOOL
+            self.inner.name()
         }
-
         fn description(&self) -> &str {
-            "Return a large diagnostic payload."
+            self.inner.description()
         }
-
         fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object", "properties": {}})
+            self.inner.parameters_schema()
         }
-
-        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
-            use std::fmt::Write as _;
-            let mut output = String::with_capacity(40_000);
-            let mut index = 0usize;
-            while output.len() < 40_000 {
-                let _ = write!(output, "{CONSOLE_BULKY_MARKER}-{index} ");
-                index += 1;
-            }
-            Ok(crate::tools::ToolResult {
-                success: true,
-                output,
-                error: None,
-            })
+        fn tier(&self) -> crate::tools::traits::ToolTier {
+            self.inner.tier()
+        }
+        fn categories(&self) -> &'static [crate::tools::traits::ToolCategory] {
+            self.inner.categories()
+        }
+        fn supports_owner_filesystem(&self) -> bool {
+            self.inner.supports_owner_filesystem()
+        }
+        async fn execute_with_cancellation(
+            &self,
+            args: serde_json::Value,
+            cancellation: Option<tokio_util::sync::CancellationToken>,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.executions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let result = self.inner.execute_with_cancellation(args, cancellation).await?;
+            assert!(result.success, "actual private FileRead must succeed");
+            assert_eq!(
+                result.output, self.expected,
+                "the full physical file must reach budgeting"
+            );
+            Ok(result)
+        }
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+            self.execute_with_cancellation(args, None).await
         }
     }
 
@@ -2462,7 +2543,7 @@ mod tests {
                 vec![crate::providers::ToolCall {
                     id: "call-console-bulky-1".into(),
                     name: CONSOLE_BULKY_TOOL.into(),
-                    arguments: "{}".into(),
+                    arguments: serde_json::json!({"path": CONSOLE_BULKY_FILE}).to_string(),
                 }]
             } else {
                 Vec::new()
@@ -2513,75 +2594,146 @@ mod tests {
     /// loop again and the follow-up request carries the whole payload.
     #[tokio::test]
     async fn console_turn_budgets_on_the_served_models_effective_window() {
-        let tmp = tempfile::tempdir().expect("test: tempdir");
-        let config = narrow_router_window_config(tmp.path());
-        let provider_impl = Arc::new(ToolRoundSpyProvider::default());
-        let mut state = test_app_state(config, provider_impl.clone());
-        state.model = CONSOLE_WINDOW_MODEL.into();
-        state.tools_registry = Arc::new(vec![Box::new(ConsoleBulkyTool)]);
-        let envelope = console_runtime_envelope_for_workspace(
-            tmp.path().to_string_lossy().to_string(),
-            "console-window-session",
-            "console",
-            "prx_user",
-        );
-
-        let (runtime, _, _, proof) =
-            console_test_source(&mut state, envelope, "summarise the console bulky probe").await;
-        let service = runtime.decision_slot.publish(&runtime, &state).await.unwrap().clone();
-        let cancellation = tokio_util::sync::CancellationToken::new();
-        let context = service
-            .decide_agent_initial(
-                &proof,
-                crate::runtime::turn_decision::AgentTurnKind::SingleShot,
-                &cancellation,
-            )
+        let driver = crate::agent::agent::native_decision_fixture::Driver::start("filesystem")
             .await
             .unwrap();
-        let decision = ConsoleDecisionTurn {
-            service: service.clone(),
-            context,
-            proof: &proof,
-            cancellation,
-            provider_trace: None,
-        };
-        let turn = run_console_runtime_turn(
-            runtime,
-            &state,
-            "summarise the console bulky probe",
-            Vec::new(),
-            &decision,
-        )
-        .await
-        .expect("test: console turn completes");
-        service
-            .shutdown(std::time::Instant::now() + Duration::from_secs(2))
-            .await;
-        assert_eq!(turn.reply, "done");
+        let endpoint = driver.endpoint().to_owned();
+        driver
+            .run(true, async move {
+                let tmp = tempfile::tempdir().expect("test: tempdir");
+                let cleanup =
+                    crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+                        .unwrap();
+                cleanup.run(Box::pin(async {
+                let workspace = tmp.path().join("workspace");
+                let private = tmp.path().join("private");
+                std::fs::create_dir_all(&workspace).unwrap();
+                std::fs::create_dir_all(&private).unwrap();
+                let mut config = narrow_router_window_config(&workspace);
+                console_provider_fixture_config(&mut config, &workspace, CONSOLE_WINDOW_MODEL, &endpoint);
+                config.config_path = private.join("config.toml");
+                let provider_impl = Arc::new(ToolRoundSpyProvider::default());
+                // Keep the fixture's existing autonomy; owner isolation still gates
+                // the actual registered private-filesystem backend independently.
+                config.autonomy.level = crate::security::AutonomyLevel::Full;
+                let mut state = test_app_state_with_config(config, provider_impl.clone());
+                state.model = CONSOLE_WINDOW_MODEL.into();
+                let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let mut payload = String::with_capacity(40_000);
+                let mut index = 0usize;
+                while payload.len() < 40_000 {
+                    use std::fmt::Write as _;
+                    let _ = write!(payload, "{CONSOLE_BULKY_MARKER}-{index} ");
+                    index += 1;
+                }
+                let principal = super::super::ApiPrincipal::of_token("prx-test-token");
+                let filesystem = crate::tools::owner_filesystem::OwnerFilesystem::open(
+                    &private, workspace.to_string_lossy().as_ref(), &principal.owner_id, &workspace,
+                ).unwrap();
+                let target = filesystem.resolve(CONSOLE_BULKY_FILE).unwrap();
+                let physical = std::path::PathBuf::from(target.operation_target());
+                std::fs::create_dir_all(physical.parent().unwrap()).unwrap();
+                std::fs::write(&physical, &payload).unwrap();
+                let security = Arc::new(crate::security::SecurityPolicy::from_config(
+                    &state.config.pin().effective.autonomy, &workspace,
+                ));
+                state.tools_registry = Arc::new(vec![Box::new(ConsoleBulkyTool {
+                    inner: crate::tools::file_read::FileReadTool::new(security, false),
+                    executions: Arc::clone(&executions), expected: payload,
+                })]);
+                let envelope = console_runtime_envelope_for_workspace(
+                    workspace.to_string_lossy().to_string(),
+                    "console-window-session",
+                    "console",
+                    "prx_user",
+                );
 
-        let requests = provider_impl.requests.lock().clone();
-        assert_eq!(requests.len(), 2, "one tool round, then the answer");
-        let follow_up = requests.get(1).expect("test: the follow-up request was recorded");
-        let payload_occurrences: usize = follow_up
-            .iter()
-            .map(|message| message.content.matches(CONSOLE_BULKY_MARKER).count())
-            .sum();
-        assert!(
-            payload_occurrences < 500,
-            "the follow-up request must be budgeted on the model's {CONSOLE_ROUTER_WINDOW}-token window, \
+                // Tool publication is not selection authority. Name the actual
+                // fixture capability in the raw source admitted by the service.
+                const INPUT: &str = "file_read prx-console-window.txt: summarise the console bulky probe";
+                let (runtime, _, _, proof) =
+                    console_test_source(&mut state, envelope, INPUT).await;
+                let service = runtime.decision_slot.publish(&runtime, &state).await.unwrap().clone();
+                let cancellation = tokio_util::sync::CancellationToken::new();
+                let (context, observed) = crate::causal_tree::decision_engine::original_observation::capture(
+                    "console-owned-file-window-diagnostic",
+                    service.decide_agent_initial(
+                        &proof,
+                        crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+                        &cancellation,
+                    ),
+                ).await.expect("bounded actual Console decision observation");
+                let context = context.unwrap();
+                let hops = context.audit_hops().collect::<Vec<_>>();
+                let diagnostic = hops.iter().map(|hop| serde_json::json!({
+                    "decision_id":hop.decision_id.to_string(),
+                    "selection":format!("{:?}", hop.selection),
+                    "fallback_cause":format!("{:?}", hop.fallback_cause),
+                    "factory_prediction":format!("{:?}", hop.prediction),
+                    "factory_attempts":hop.prediction.as_ref().map(|prediction| format!("{:?}", prediction.attempts)),
+                    "request_compiled":hop.request_compiled,
+                    "scored_count":hop.scored_count,
+                    "candidates":format!("{:?}", hop.candidates),
+                    "post_rehearsal":format!("{:?}", hop.post_rehearsal),
+                    "pre_commit":format!("{:?}", hop.pre_commit),
+                    "audit":format!("{:?}", hop.audit_trace),
+                })).collect::<Vec<_>>();
+                eprintln!("actual_console_window_hops={}", serde_json::to_string(&diagnostic).unwrap());
+                let sidecar = observed.checked_sidecar(&hops);
+                eprintln!("actual_console_window_original={sidecar:?}");
+                sidecar.expect("original objects must match the actual returned hop inventory");
+                let decision = ConsoleDecisionTurn {
+                    service: service.clone(),
+                    context,
+                    proof: &proof,
+                    cancellation,
+                    provider_trace: None,
+                };
+                let turn = run_console_runtime_turn(
+                    runtime,
+                    &state,
+                    INPUT,
+                    Vec::new(),
+                    &decision,
+                )
+                .await
+                .expect("test: console turn completes");
+                service
+                    .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+                    .await;
+                assert_eq!(turn.reply, "done");
+                assert_eq!(
+                    executions.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "the full bulky payload must be physically produced once"
+                );
+
+                let requests = provider_impl.requests.lock().clone();
+                assert_eq!(requests.len(), 2, "one tool round, then the answer");
+                let follow_up = requests.get(1).expect("test: the follow-up request was recorded");
+                let payload_occurrences: usize = follow_up
+                    .iter()
+                    .map(|message| message.content.matches(CONSOLE_BULKY_MARKER).count())
+                    .sum();
+                assert!(
+                    payload_occurrences < 500,
+                    "the follow-up request must be budgeted on the model's {CONSOLE_ROUTER_WINDOW}-token window, \
              not the 128,000-token base window; found {payload_occurrences} payload segments"
-        );
-        let follow_up_chars: usize = follow_up.iter().map(|message| message.content.chars().count()).sum();
-        assert!(
-            follow_up_chars < CONSOLE_ROUTER_WINDOW * 4,
-            "the follow-up request must fit the effective window; it has {follow_up_chars} characters"
-        );
-        assert!(
-            follow_up
-                .iter()
-                .any(|message| message.role == "user" && message.content.contains("summarise the console bulky probe")),
-            "the turn's own request must survive the budget (D-011)"
-        );
+                );
+                let follow_up_chars: usize = follow_up.iter().map(|message| message.content.chars().count()).sum();
+                assert!(
+                    follow_up_chars < CONSOLE_ROUTER_WINDOW * 4,
+                    "the follow-up request must fit the effective window; it has {follow_up_chars} characters"
+                );
+                assert!(
+                    follow_up.iter().any(|message| message.role == "user"
+                        && message.content.contains("summarise the console bulky probe")),
+                    "the turn's own request must survive the budget (D-011)"
+                );
+                    Ok::<(), anyhow::Error>(())
+                })).await.expect("actual fixture decision transport and cleanup ownership");
+            })
+            .await;
     }
 
     /// C2b-2: the console session API returns a tool-schema refusal as a
@@ -2589,52 +2741,62 @@ mod tests {
     /// aggregate clipped to 200 characters, which cut the tool list.
     #[tokio::test]
     async fn a_console_tool_schema_refusal_returns_a_stable_code_and_the_tools() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        config.workspace_dir = tmp.path().to_path_buf();
-        let mut state = test_app_state(
-            config,
-            Arc::new(crate::providers::tool_schema_refusal_tests::RefusingProvider),
-        );
-        let envelope = console_runtime_envelope_for_workspace(
-            tmp.path().to_string_lossy().to_string(),
-            "console-session",
-            "console",
-            "prx_user",
-        );
+        let driver = crate::agent::agent::native_decision_fixture::Driver::start_answer()
+            .await
+            .unwrap();
+        let endpoint = driver.endpoint().to_owned();
+        driver
+            .run(true, async move {
+                let tmp = tempfile::tempdir().unwrap();
+                let mut config = Config::default();
+                console_provider_fixture_config(&mut config, tmp.path(), "test-model", &endpoint);
+                let mut state = test_app_state_with_config(
+                    config,
+                    Arc::new(crate::providers::tool_schema_refusal_tests::RefusingProvider),
+                );
+                let envelope = console_runtime_envelope_for_workspace(
+                    tmp.path().to_string_lossy().to_string(),
+                    "console-session",
+                    "console",
+                    "prx_user",
+                );
 
-        let (runtime, _, _, proof) = console_test_source(&mut state, envelope, "hello").await;
-        let output = match run_console_message_job(
-            runtime,
-            state,
-            "hello".to_string(),
-            Vec::new(),
-            ConsoleTurnSource::Message(proof),
-        )
-        .await
-        {
-            Ok(output) => output,
-            Err(message) => panic!("the refusal must be answered with a stable code, not a failed job: {message}"),
-        };
-        assert_eq!(output.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(
-            output.body.get("error"),
-            Some(&serde_json::json!("tool_schema_refused")),
-            "{}",
-            output.body
-        );
-        assert_eq!(
-            output.body.get("tools"),
-            Some(&serde_json::json!(["fixture_conditional", "fixture_alternatives"])),
-            "{}",
-            output.body
-        );
+                let (runtime, _, _, proof) = console_test_source(&mut state, envelope, "hello").await;
+                let output = match run_console_message_job(
+                    runtime,
+                    state,
+                    "hello".to_string(),
+                    Vec::new(),
+                    ConsoleTurnSource::Message(proof),
+                )
+                .await
+                {
+                    Ok(output) => output,
+                    Err(message) => {
+                        panic!("the refusal must be answered with a stable code, not a failed job: {message}")
+                    }
+                };
+                assert_eq!(output.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+                assert_eq!(
+                    output.body.get("error"),
+                    Some(&serde_json::json!("tool_schema_refused")),
+                    "{}",
+                    output.body
+                );
+                assert_eq!(
+                    output.body.get("tools"),
+                    Some(&serde_json::json!(["fixture_conditional", "fixture_alternatives"])),
+                    "{}",
+                    output.body
+                );
+            })
+            .await;
     }
 
     // ── D-053 / REDACT-TURN: console turns persist no provider secret ──
 
     /// Answers every structured chat with a reply that echoes a secret.
-    struct SecretReplyProvider;
+    struct SecretReplyProvider(Arc<std::sync::atomic::AtomicUsize>);
 
     #[async_trait]
     impl Provider for SecretReplyProvider {
@@ -2654,6 +2816,7 @@ mod tests {
             _model: &str,
             _temperature: f64,
         ) -> anyhow::Result<ChatResponse> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let secret = crate::agent::terminal::persistence_probe::PROBE_SECRET;
             Ok(ChatResponse {
                 text: Some(format!("Here is the key {secret} you asked for")),
@@ -2664,7 +2827,7 @@ mod tests {
     }
 
     /// Fails every structured chat with an error that echoes a secret.
-    struct SecretErrorProvider;
+    struct SecretErrorProvider(Arc<std::sync::atomic::AtomicUsize>);
 
     #[async_trait]
     impl Provider for SecretErrorProvider {
@@ -2684,6 +2847,7 @@ mod tests {
             _model: &str,
             _temperature: f64,
         ) -> anyhow::Result<ChatResponse> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let secret = crate::agent::terminal::persistence_probe::PROBE_SECRET;
             anyhow::bail!("upstream rejected key {secret}");
         }
@@ -2697,6 +2861,7 @@ mod tests {
         tmp: &tempfile::TempDir,
         provider: Arc<dyn Provider>,
         session_id: &str,
+        endpoint: &str,
     ) -> (
         AppState,
         Arc<crate::gateway::TurnRuntimeGeneration>,
@@ -2705,8 +2870,8 @@ mod tests {
         crate::gateway::decision_source::GatewayTurnProof,
     ) {
         let mut config = Config::default();
-        config.workspace_dir = tmp.path().to_path_buf();
-        let mut state = test_app_state(config, provider);
+        console_provider_fixture_config(&mut config, tmp.path(), "test-model", endpoint);
+        let mut state = test_app_state_with_config(config, provider);
         state.mem = Arc::new(crate::memory::SqliteMemory::new(tmp.path()).expect("test: sqlite memory"));
         let envelope = console_runtime_envelope_for_workspace(
             tmp.path().to_string_lossy().to_string(),
@@ -2723,36 +2888,75 @@ mod tests {
     /// with a reply that echoes a secret; it must fail before the REDACT-TURN commits.
     #[tokio::test]
     async fn console_persists_no_secret_from_a_reply() {
-        let tmp = tempfile::tempdir().expect("test: tempdir");
-        let session_id = "console-probe-reply";
-        let (state, runtime, envelope, _, proof) =
-            console_probe_state(&tmp, Arc::new(SecretReplyProvider), session_id).await;
-        let mem = Arc::clone(&state.mem);
-        let principal = envelope.memory_principal();
-
-        let output = run_console_message_job(
-            runtime,
-            state,
-            "what is my key?".to_string(),
-            Vec::new(),
-            ConsoleTurnSource::Message(proof),
-        )
-        .await
-        .expect("test: the console turn completes");
-        assert_eq!(output.status, axum::http::StatusCode::OK, "{}", output.body);
-
-        let turns = mem
-            .list_conversation_turns(&principal, session_id, 50, 0)
+        let driver = crate::agent::agent::native_decision_fixture::Driver::start_answer()
             .await
-            .expect("test: list the console turns");
-        assert!(
-            turns
-                .iter()
-                .any(|turn| turn.role == "assistant" && turn.content.contains("[REDACTED]")),
-            "the reply must be persisted as a redacted assistant turn: {turns:?}"
-        );
+            .unwrap();
+        let endpoint = driver.endpoint().to_owned();
+        driver
+            .run(true, async move {
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let tmp = tempfile::tempdir().expect("test: tempdir");
+                let session_id = "console-probe-reply";
+                let (state, runtime, envelope, _, proof) = console_probe_state(
+                    &tmp,
+                    Arc::new(SecretReplyProvider(Arc::clone(&calls))),
+                    session_id,
+                    &endpoint,
+                )
+                .await;
+                let mem = Arc::clone(&state.mem);
+                let principal = envelope.memory_principal();
 
-        crate::agent::terminal::persistence_probe::assert_nothing_under_persists_the_probe_secret(tmp.path());
+                // Keep the actual writer/runtime alive through the full file scan.
+                let retained_runtime = Arc::clone(&runtime);
+                let service = runtime.decision_slot.publish(&runtime, &state).await.unwrap().clone();
+                let output = run_console_message_job(
+                    runtime,
+                    state,
+                    "what is my key?".to_string(),
+                    Vec::new(),
+                    ConsoleTurnSource::Message(proof),
+                )
+                .await
+                .expect("test: the console turn completes");
+                assert_eq!(output.status, axum::http::StatusCode::OK, "{}", output.body);
+
+                let turns = mem
+                    .list_conversation_turns(&principal, session_id, 50, 0)
+                    .await
+                    .expect("test: list the console turns");
+                assert!(
+                    turns
+                        .iter()
+                        .any(|turn| turn.role == "assistant" && turn.content.contains("[REDACTED]")),
+                    "the reply must be persisted as a redacted assistant turn: {turns:?}"
+                );
+
+                assert_eq!(
+                    calls.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "the controlled provider must actually run once"
+                );
+                retained_runtime
+                    .decision_slot
+                    .cleanup
+                    .drain(tokio::time::Instant::now() + Duration::from_secs(5))
+                    .await
+                    .expect("Console cleanup must drain before persisted-file inspection");
+                assert!(
+                    service.drain_writes(Instant::now() + Duration::from_secs(5)).await,
+                    "actual decision writes must drain before persisted-file inspection"
+                );
+                crate::agent::terminal::persistence_probe::assert_nothing_under_persists_the_probe_secret(tmp.path());
+                service.shutdown(Instant::now() + Duration::from_secs(2)).await;
+                let retirement = Arc::clone(&retained_runtime.decision_slot.cleanup);
+                drop(retained_runtime);
+                retirement
+                    .drain(tokio::time::Instant::now() + Duration::from_secs(5))
+                    .await
+                    .expect("Console runtime retirement must drain before scratch removal");
+            })
+            .await;
     }
 
     /// D-053 / REDACT-TURN probe: drives `run_console_message_job` into the
@@ -2760,24 +2964,63 @@ mod tests {
     /// error that echoes a secret; it must fail before the REDACT-TURN commits.
     #[tokio::test]
     async fn console_persists_no_secret_from_a_provider_error() {
-        let tmp = tempfile::tempdir().expect("test: tempdir");
-        let (state, runtime, _, _, proof) =
-            console_probe_state(&tmp, Arc::new(SecretErrorProvider), "console-probe-error").await;
+        let driver = crate::agent::agent::native_decision_fixture::Driver::start_answer()
+            .await
+            .unwrap();
+        let endpoint = driver.endpoint().to_owned();
+        driver
+            .run(true, async move {
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let tmp = tempfile::tempdir().expect("test: tempdir");
+                let (state, runtime, _, _, proof) = console_probe_state(
+                    &tmp,
+                    Arc::new(SecretErrorProvider(Arc::clone(&calls))),
+                    "console-probe-error",
+                    &endpoint,
+                )
+                .await;
 
-        let result = run_console_message_job(
-            runtime,
-            state,
-            "what is my key?".to_string(),
-            Vec::new(),
-            ConsoleTurnSource::Message(proof),
-        )
-        .await;
-        assert!(
-            result.is_err(),
-            "the provider failure must fail the console job, not answer it"
-        );
+                // Keep the actual writer/runtime alive through the full file scan.
+                let retained_runtime = Arc::clone(&runtime);
+                let service = runtime.decision_slot.publish(&runtime, &state).await.unwrap().clone();
+                let result = run_console_message_job(
+                    runtime,
+                    state,
+                    "what is my key?".to_string(),
+                    Vec::new(),
+                    ConsoleTurnSource::Message(proof),
+                )
+                .await;
+                assert!(
+                    result.is_err(),
+                    "the provider failure must fail the console job, not answer it"
+                );
 
-        crate::agent::terminal::persistence_probe::assert_nothing_under_persists_the_probe_secret(tmp.path());
+                assert_eq!(
+                    calls.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "the controlled provider must actually run once"
+                );
+                retained_runtime
+                    .decision_slot
+                    .cleanup
+                    .drain(tokio::time::Instant::now() + Duration::from_secs(5))
+                    .await
+                    .expect("Console cleanup must drain before persisted-file inspection");
+                assert!(
+                    service.drain_writes(Instant::now() + Duration::from_secs(5)).await,
+                    "actual decision writes must drain before persisted-file inspection"
+                );
+                crate::agent::terminal::persistence_probe::assert_nothing_under_persists_the_probe_secret(tmp.path());
+                service.shutdown(Instant::now() + Duration::from_secs(2)).await;
+                let retirement = Arc::clone(&retained_runtime.decision_slot.cleanup);
+                drop(retained_runtime);
+                retirement
+                    .drain(tokio::time::Instant::now() + Duration::from_secs(5))
+                    .await
+                    .expect("Console runtime retirement must drain before scratch removal");
+            })
+            .await;
     }
 
     /// Gateway authorization reads the active ConfigGeneration, so a config

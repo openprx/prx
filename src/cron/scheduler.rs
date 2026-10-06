@@ -230,6 +230,15 @@ enum JobCycleOutcome {
     Killed,
 }
 
+// Keep the scheduled job future out of CleanupScope's task-local/select state.
+// This changes representation only; the same work remains inside its cleanup owner.
+#[inline(never)]
+fn boxed_scheduled_job_work(
+    work: impl std::future::Future<Output = anyhow::Result<(String, JobCycleOutcome)>> + Send + 'static,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(String, JobCycleOutcome)>> + Send>> {
+    Box::pin(work)
+}
+
 /// Start every due job on a task of its own and hand back the join handles.
 ///
 /// Nothing here rations how many jobs run at once, and nothing here waits for
@@ -313,13 +322,13 @@ fn spawn_due_jobs(
             }
         };
         let task = tokio::spawn(crate::runtime::registry::scoped(guard, async move {
-            let work = async move {
+            let work = boxed_scheduled_job_work(async move {
                 Ok(if let Some(manager) = manager {
                     CONFIG_MANAGER.scope(manager, configured).await
                 } else {
                     configured.await
                 })
-            };
+            });
             match cleanup.run(work).await {
                 Ok(outcome) => outcome,
                 Err(error) => {

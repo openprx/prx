@@ -137,6 +137,23 @@ async fn context_budget_counts_native_tool_schemas_before_provider_call() {
 /// counted.
 #[tokio::test]
 async fn small_native_tool_schemas_leave_the_turn_on_the_unchanged_provider_path() {
+    small_native_schema_fixture(false).await;
+}
+
+#[tokio::test]
+async fn excluded_native_tool_schema_does_not_admit_provider_work() {
+    small_native_schema_fixture(true).await;
+}
+
+// Keep this owned fixture's concrete work out of CleanupScope's select state.
+#[inline(never)]
+fn boxed_native_schema_work<'a>(
+    work: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'a,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+    Box::pin(work)
+}
+
+async fn small_native_schema_fixture(excluded: bool) {
     let wide_registry = crate::agent::turn_tests::admission::registry_with_search(vec![Box::new(
         WideSchemaTool::with_fields("file_read", 1),
     )]);
@@ -164,89 +181,158 @@ async fn small_native_tool_schemas_leave_the_turn_on_the_unchanged_provider_path
     );
 
     let tmp = TempDir::new().unwrap();
-    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
-    let mut admission_config = crate::config::Config::default();
-    admission_config.workspace_dir = tmp.path().to_path_buf();
-    admission_config.agent.compaction = config.clone();
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
-        admission_config,
-        &history.last().expect("current fixture input").content,
-        Arc::clone(&tools_registry),
-        Arc::clone(&memory),
-    )
-    .await;
-    admission.assert_core_specs(&tool_specs);
-    let runtime = admission.memory_runtime();
+    let cleanup =
+        crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new()).unwrap();
+    cleanup
+        .run(boxed_native_schema_work(async {
+            let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+            let mut admission_config = crate::config::Config::default();
+            admission_config.workspace_dir = tmp.path().to_path_buf();
+            admission_config.agent.compaction = config.clone();
+            admission_config.causal_tree.enabled = false;
+            admission_config.tool_tiering.always_include = vec!["file_read".to_owned()];
+            if excluded {
+                admission_config
+                    .tool_tiering
+                    .always_exclude
+                    .push("file_read".to_owned());
+            }
+            admission_config.cost.prices.insert(
+                "ollama/prx-local-model".to_owned(),
+                crate::config::schema::ModelPricing {
+                    input: 1.0,
+                    output: 1.0,
+                    cache_write: 1.0,
+                    cache_read: 1.0,
+                },
+            );
+            assert!(matches!(
+                crate::llm::route_decision::usage_cost_resolution(
+                    "ollama", "prx-local-model", 1, 0, 0, 0, &admission_config.cost
+                ),
+                crate::llm::route_decision::UsagePrice::Priced(value) if value > 0.0
+            ));
+            let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
+                admission_config,
+                &history.last().expect("current fixture input").content,
+                Arc::clone(&tools_registry),
+                Arc::clone(&memory),
+            )
+            .await;
+            let decision = admission.decision();
+            if excluded {
+                assert!(
+                    decision
+                        .service
+                        .agent_execution_specs(decision.proof, decision.context)
+                        .is_err()
+                );
+                assert!(matches!(
+                    decision.context.disposition().unwrap(),
+                    crate::runtime::turn_decision::TurnDisposition::Close { .. }
+                ));
+            } else {
+                let diagnostic = decision.context.audit_hops().map(|hop| serde_json::json!({
+                    "selection":format!("{:?}", hop.selection),
+                    "factory_prediction":format!("{:?}", hop.prediction),
+                    "factory_attempts":hop.prediction.as_ref().map(|prediction| format!("{:?}", prediction.attempts)),
+                    "request_compiled":hop.request_compiled,
+                    "candidates":format!("{:?}", hop.candidates),
+                    "post_rehearsal":format!("{:?}", hop.post_rehearsal),
+                    "pre_commit":format!("{:?}", hop.pre_commit),
+                    "audit":format!("{:?}", hop.audit_trace),
+                })).collect::<Vec<_>>();
+                eprintln!(
+                    "actual_small_native_admission={}",
+                    serde_json::to_string(&diagnostic).unwrap()
+                );
+                admission.assert_core_specs(&tool_specs);
+            }
+            let runtime = admission.memory_runtime();
 
-    let calls = Arc::new(AtomicUsize::new(0));
-    let max_request_tokens = Arc::new(AtomicUsize::new(0));
-    let provider = NativeToolProvider::recording("done", &calls, &max_request_tokens);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let max_request_tokens = Arc::new(AtomicUsize::new(0));
+            let provider = NativeToolProvider::recording("done", &calls, &max_request_tokens);
 
-    let result = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "terminal",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
-            },
-            compaction: Some(admission.compaction()),
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry,
-            observer: &NoopObserver,
-            hooks: &HookManager::new(tmp.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: runtime,
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .map(|(outcome, _trace)| outcome.into_text())
-    .expect("a request that fits must reach the provider untouched");
+            let result = run_turn(
+                &mut history,
+                crate::agent::turn_request::TurnRequest {
+                    channel_name: "terminal",
+                    scope: None,
+                    mode: ChatMode::default(),
+                    silent: true,
+                    expose_stay_silent: false,
+                    multimodal: &crate::config::MultimodalConfig::default(),
+                    schedule: crate::agent::turn_request::TurnSchedule {
+                        read_only_tool_concurrency_window: 2,
+                        priority_scheduling_enabled: false,
+                        low_priority_tool_names: Vec::new(),
+                    },
+                    compaction: Some(admission.compaction()),
+                    decision: admission.decision(),
+                },
+                crate::agent::turn_request::TurnServices {
+                    provider: &provider,
+                    provider_name: "ollama",
+                    model: "prx-local-model",
+                    temperature: 0.0,
+                    tools_registry,
+                    observer: &NoopObserver,
+                    hooks: &HookManager::new(tmp.path().to_path_buf()),
+                    approval: None,
+                    approval_resolver: None,
+                    runtime_adapter: Some(admission.adapter()),
+                    memory: runtime,
+                },
+                crate::agent::turn_request::TurnDelivery {
+                    cancellation: None,
+                    on_delta: None,
+                    on_tool_call: None,
+                },
+            )
+            .await
+            .map(|(outcome, _trace)| outcome.into_text());
 
-    assert_eq!(result, "done");
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        history.len(),
-        original_len.saturating_add(1),
-        "nothing may be compacted away; only the answer is appended"
-    );
+            if excluded {
+                assert_eq!(calls.load(Ordering::SeqCst), 0, "excluded tool admits no provider work");
+                let error = result.expect_err("the low-level engine must reject a closed admission");
+                assert!(
+                    error.to_string().contains("decision has no executable selection"),
+                    "{error:#}"
+                );
+                return Ok(());
+            }
+            let result = result.expect("a request that fits must reach the provider untouched");
 
-    // The durable event and the request that left for the provider must
-    // report the same total, because both are produced by one estimator.
-    let principal = admission.principal();
-    let events = memory.list_message_events_since(&principal, 0, 10).await.unwrap();
-    let payload: serde_json::Value = serde_json::from_str(
-        events
-            .iter()
-            .find(|event| event.event_type == "llm.request.context.compiled")
-            .and_then(|event| event.raw_payload_json.as_deref())
-            .expect("compiled request context payload"),
-    )
-    .unwrap();
-    assert_eq!(
-        payload["request_estimate"]["total_tokens"].as_u64(),
-        u64::try_from(max_request_tokens.load(Ordering::SeqCst)).ok(),
-        "the reported total must be the total that was sent"
-    );
+            assert_eq!(result, "done");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                history.len(),
+                original_len.saturating_add(1),
+                "nothing may be compacted away; only the answer is appended"
+            );
+
+            // The durable event and the request that left for the provider must
+            // report the same total, because both are produced by one estimator.
+            let principal = admission.principal();
+            let events = memory.list_message_events_since(&principal, 0, 10).await.unwrap();
+            let payload: serde_json::Value = serde_json::from_str(
+                events
+                    .iter()
+                    .find(|event| event.event_type == "llm.request.context.compiled")
+                    .and_then(|event| event.raw_payload_json.as_deref())
+                    .expect("compiled request context payload"),
+            )
+            .unwrap();
+            assert_eq!(
+                payload["request_estimate"]["total_tokens"].as_u64(),
+                u64::try_from(max_request_tokens.load(Ordering::SeqCst)).ok(),
+                "the reported total must be the total that was sent"
+            );
+            Ok(())
+        }))
+        .await
+        .unwrap();
 }
 
 /// One estimator, two inputs: the preflight measures `history`, the event

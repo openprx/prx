@@ -427,6 +427,9 @@ fn owner_identity(workspace_id: &str, owner_id: &str) -> [u8; 32] {
 }
 
 #[cfg(all(test, unix))]
+mod fifo_fixture;
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
@@ -549,15 +552,7 @@ mod tests {
         assert!(scope.read(&target, 100).is_err());
         assert!(scope.write_authorized(&target, b"changed").is_err());
         std::fs::remove_dir(target.operation_target()).unwrap();
-        assert!(
-            std::process::Command::new("mkfifo")
-                .arg("-m")
-                .arg("600")
-                .arg(target.operation_target())
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(fifo_fixture::create_fifo(target.operation_target()).unwrap().success());
         assert!(scope.resolve("file").is_err());
         assert!(scope.read(&target, 100).is_err());
         assert!(scope.write_authorized(&target, b"changed").is_err());

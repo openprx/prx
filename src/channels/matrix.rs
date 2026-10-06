@@ -784,6 +784,219 @@ mod tests {
         assert_eq!(delivered, vec!["hello from the room".to_string()]);
     }
 
+    /// Exercise the native anymap3 context path through public SDK sync dispatch.
+    /// All session material and transport belong to this loopback fixture.
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn sdk_owned_context_clones_per_event_and_stops_after_handler_removal() -> anyhow::Result<()> {
+        use futures_util::FutureExt as _;
+        use matrix_sdk::event_handler::Ctx;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        struct OwnedContext {
+            value: String,
+            clones: Arc<AtomicUsize>,
+        }
+        impl Clone for OwnedContext {
+            fn clone(&self) -> Self {
+                self.clones.fetch_add(1, Ordering::SeqCst);
+                Self {
+                    value: self.value.clone(),
+                    clones: Arc::clone(&self.clones),
+                }
+            }
+        }
+        #[derive(Clone)]
+        struct OtherContext(Vec<u8>);
+        fn assert_native_send_sync<T: Send + Sync>() {}
+        assert_native_send_sync::<OwnedContext>();
+        assert_native_send_sync::<OtherContext>();
+        assert_native_send_sync::<MatrixSdkClient>();
+
+        #[derive(Clone)]
+        struct HttpProbe {
+            syncs: Arc<AtomicUsize>,
+            // Retain only method/path/body length, never tokens or body contents.
+            requests: Arc<parking_lot::Mutex<Vec<(String, String, usize)>>>,
+        }
+        async fn answer(
+            axum::extract::State(probe): axum::extract::State<HttpProbe>,
+            method: axum::http::Method,
+            uri: axum::http::Uri,
+            body: axum::body::Bytes,
+        ) -> axum::Json<serde_json::Value> {
+            let path = uri.path();
+            probe
+                .requests
+                .lock()
+                .push((method.to_string(), path.to_owned(), body.len()));
+            axum::Json(if path.ends_with("/versions") {
+                serde_json::json!({"versions":["v1.1","v1.11"],"unstable_features":{}})
+            } else if path.ends_with("/sync") {
+                let sequence = probe.syncs.fetch_add(1, Ordering::SeqCst) + 1;
+                serde_json::json!({
+                    "next_batch":format!("prx-batch-{sequence}"),
+                    "rooms":{"join":{"!prx_room:localhost":{"timeline":{
+                        "limited":false,"events":[{
+                            "type":"m.room.message","event_id":format!("$prx-event-{sequence}"),
+                            "sender":"@prx_sender:localhost","origin_server_ts":sequence,
+                            "content":{"msgtype":"m.text","body":format!("prx context event {sequence}")}
+                        }]
+                    }}}}
+                })
+            } else if path.ends_with("/keys/upload") {
+                serde_json::json!({"one_time_key_counts":{"signed_curve25519":50}})
+            } else if path.ends_with("/keys/query") {
+                serde_json::json!({"device_keys":{},"failures":{}})
+            } else {
+                serde_json::json!({})
+            })
+        }
+        let syncs = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+        let homeserver = format!("http://{}", listener.local_addr()?);
+        let stop = tokio_util::sync::CancellationToken::new();
+        let server_stop = stop.clone();
+        let app = axum::Router::new().fallback(answer).with_state(HttpProbe {
+            syncs: Arc::clone(&syncs),
+            requests: Arc::clone(&requests),
+        });
+        let mut server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(server_stop.cancelled_owned())
+                .await
+        });
+        let result = std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_mins(2), async {
+            let client = MatrixSdkClient::builder().homeserver_url(&homeserver).build().await?;
+            client
+                .restore_session(MatrixSession {
+                    meta: SessionMeta {
+                        user_id: "@prx_user:localhost".parse()?,
+                        device_id: "PRXCONTEXTTEST".into(),
+                    },
+                    tokens: SessionTokens {
+                        access_token: "prx-loopback-context-token".into(),
+                        refresh_token: None,
+                    },
+                })
+                .await?;
+            let clones = Arc::new(AtomicUsize::new(0));
+            client.add_event_handler_context(OwnedContext {
+                value: "prx owned context".into(),
+                clones: Arc::clone(&clones),
+            });
+            client.add_event_handler_context(OtherContext(vec![3, 7, 11]));
+            assert_eq!(clones.load(Ordering::SeqCst), 0, "registration moves the owned context");
+            let (tx, mut rx) = mpsc::channel(4);
+            let handler_calls = Arc::new(AtomicUsize::new(0));
+            let observed_calls = Arc::clone(&handler_calls);
+            let handle = client.add_event_handler(
+                move |event: OriginalSyncRoomMessageEvent,
+                      room: Room,
+                      Ctx(mut context): Ctx<OwnedContext>,
+                      Ctx(mut other): Ctx<OtherContext>| {
+                    let tx = tx.clone();
+                    let observed_calls = Arc::clone(&observed_calls);
+                    async move {
+                        observed_calls.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(room.room_id().as_str(), "!prx_room:localhost");
+                        assert_eq!(
+                            context.value, "prx owned context",
+                            "prior handler copy must not mutate stored context"
+                        );
+                        assert_eq!(
+                            other.0,
+                            vec![3, 7, 11],
+                            "different context type must retain its own value"
+                        );
+                        other.0.push(13);
+                        assert_eq!(other.0, vec![3, 7, 11, 13]);
+                        context.value.push_str(" modified in handler");
+                        let MessageType::Text(text) = event.content.msgtype else {
+                            panic!("fixture text event");
+                        };
+                        tx.send((event.event_id.to_string(), text.body, context.value))
+                            .await
+                            .expect("fixture receiver alive");
+                    }
+                },
+            );
+            for sequence in 1..=2 {
+                tokio::time::timeout(Duration::from_secs(20), client.sync_once(SyncSettings::new())).await??;
+                let delivered = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("actual SDK handler did not deliver"))?;
+                assert_eq!(
+                    delivered,
+                    (
+                        format!("$prx-event-{sequence}"),
+                        format!("prx context event {sequence}"),
+                        "prx owned context modified in handler".to_owned(),
+                    )
+                );
+                assert_eq!(
+                    handler_calls.load(Ordering::SeqCst),
+                    sequence,
+                    "actual completed handler invocations"
+                );
+                assert_eq!(
+                    clones.load(Ordering::SeqCst),
+                    sequence,
+                    "Ctx extraction clones once per actual handler invocation"
+                );
+                assert!(rx.try_recv().is_err(), "a sync event must not be delivered twice");
+            }
+            client.remove_event_handler(handle);
+            tokio::time::timeout(Duration::from_secs(20), client.sync_once(SyncSettings::new())).await??;
+            assert_eq!(
+                syncs.load(Ordering::SeqCst),
+                3,
+                "three actual sync requests reached loopback"
+            );
+            {
+                let requests = requests.lock();
+                let sync_requests = requests
+                    .iter()
+                    .filter(|(_, path, _)| path.ends_with("/sync"))
+                    .collect::<Vec<_>>();
+                assert_eq!(sync_requests.len(), 3, "actual HTTP request ledger: {requests:?}");
+                assert!(
+                    sync_requests
+                        .iter()
+                        .all(|(method, _, bytes)| method == "GET" && *bytes == 0),
+                    "SDK sync must be actual GET with no request body: {requests:?}"
+                );
+            }
+            assert_eq!(handler_calls.load(Ordering::SeqCst), 2, "removed handler must not run");
+            assert_eq!(
+                clones.load(Ordering::SeqCst),
+                2,
+                "removed handler must not extract/clone context"
+            );
+            assert!(rx.try_recv().is_err(), "removed handler must not deliver another event");
+            drop(client);
+            Ok::<(), anyhow::Error>(())
+        }))
+        .catch_unwind()
+        .await;
+        stop.cancel();
+        let joined = match tokio::time::timeout(Duration::from_secs(5), &mut server).await {
+            Ok(result) => result.is_ok_and(|served| served.is_ok()),
+            Err(_) => {
+                server.abort();
+                let _ = tokio::time::timeout(Duration::from_secs(5), &mut server).await;
+                false
+            }
+        };
+        assert!(joined, "owned loopback listener must terminate and join");
+        match result {
+            Ok(result) => result?,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
     fn make_channel() -> MatrixChannel {
         MatrixChannel::new(
             "https://matrix.org".to_string(),

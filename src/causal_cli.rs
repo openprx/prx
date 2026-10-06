@@ -603,6 +603,17 @@ struct HttpPlane {
     events: Arc<dyn CausalEventSink>,
 }
 
+fn admin_prediction(result: crate::decision::factory::PredictionResult) -> crate::causal_tree::admin::AdminPrediction {
+    crate::causal_tree::admin::AdminPrediction::from_validated_parts(
+        result.served,
+        result.served_by,
+        result
+            .attempts
+            .into_iter()
+            .map(|attempt| (attempt.identity.kind, attempt.outcome, attempt.latency)),
+    )
+}
+
 impl DecisionPlaneBuilder for HttpPlane {
     fn check_health<'a>(
         &'a self,
@@ -646,12 +657,13 @@ impl DecisionPlaneBuilder for HttpPlane {
         key: Arc<crate::decision::DecisionKey>,
         request: &'a crate::decision::DecisionRequest,
         lineage: &'a crate::decision::telemetry::CausalLineage,
-    ) -> crate::causal_tree::admin::AdminPlaneFuture<'a, crate::decision::factory::PredictionResult> {
+    ) -> crate::causal_tree::admin::AdminPlaneFuture<'a, crate::causal_tree::admin::AdminPrediction> {
         Box::pin(async move {
             if factory.status().order.is_empty() {
                 return factory
                     .decide(request, lineage)
                     .await
+                    .map(admin_prediction)
                     .map_err(|failure| admin_accounting_error(failure.0.class()));
             }
             let parent = crate::runtime::turn_cleanup::current_tracker();
@@ -673,6 +685,7 @@ impl DecisionPlaneBuilder for HttpPlane {
                         .map_err(|failure| anyhow::anyhow!("{}", failure.0.class()))
                 })
                 .await
+                .map(admin_prediction)
                 .map_err(|_| admin_accounting_error("test accounting or cleanup was not confirmed"))
         })
     }

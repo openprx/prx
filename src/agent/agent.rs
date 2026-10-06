@@ -23,8 +23,6 @@ use crate::providers::{ConversationMessage, Provider};
 #[cfg(feature = "llm-router")]
 use crate::router::RouterEngine;
 use crate::runtime::control_ladder::ControlLadderSnapshot;
-#[cfg(test)]
-use crate::runtime::control_ladder::ControlLadderTrace;
 #[cfg(all(test, feature = "llm-router"))]
 use crate::self_system::SELF_SYSTEM_SESSION_ID;
 use crate::tools::Tool;
@@ -726,12 +724,9 @@ mod tests {
     )]
     use super::*;
     use crate::agent::dispatcher::{NativeToolDispatcher, XmlToolDispatcher};
-    use crate::config::Config;
     use crate::tools::{ToolCategory, ToolTier};
     use async_trait::async_trait;
     use parking_lot::Mutex;
-    #[cfg(feature = "llm-router")]
-    use std::collections::HashMap;
     #[cfg(feature = "llm-router")]
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -767,31 +762,6 @@ mod tests {
                 });
             }
             Ok(guard.remove(0))
-        }
-    }
-
-    struct MockTool;
-
-    #[async_trait]
-    impl Tool for MockTool {
-        fn name(&self) -> &str {
-            "echo"
-        }
-
-        fn description(&self) -> &str {
-            "echo"
-        }
-
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object", "properties": {}})
-        }
-
-        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
-            Ok(crate::tools::ToolResult {
-                success: true,
-                output: "tool-out".into(),
-                error: None,
-            })
         }
     }
 
@@ -1010,7 +980,7 @@ mod tests {
         assert_eq!(event.channel.as_deref(), Some("agent_api"));
     }
 
-    struct ModelSpy(Arc<std::sync::Mutex<Vec<String>>>);
+    struct ModelSpy(Arc<std::sync::Mutex<Vec<String>>>, &'static str);
     #[async_trait]
     impl Provider for ModelSpy {
         async fn chat_with_system(&self, _: Option<&str>, _: &str, model: &str, _: f64) -> Result<String> {
@@ -1025,6 +995,37 @@ mod tests {
                 reasoning_content: None,
             })
         }
+        async fn chat_traced(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: f64,
+        ) -> Result<crate::providers::traits::ChatTrace> {
+            use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, TokenUsage};
+            let started_at = chrono::Utc::now();
+            let response = self.chat(request, model, temperature).await?;
+            let finished_at = chrono::Utc::now();
+            // This controlled provider reports the actual instance used and
+            // model received; it does not claim a physical external send or
+            // invent reported usage, price, credits or permission.
+            Ok(crate::providers::traits::ChatTrace {
+                response,
+                attempts: vec![ProviderAttempt {
+                    seq: 1,
+                    provider: self.1.to_owned(),
+                    model: model.to_owned(),
+                    started_at,
+                    finished_at,
+                    status: AttemptStatus::Success,
+                    error_class: None,
+                    error_message: None,
+                }],
+                final_provider: self.1.to_owned(),
+                final_model: model.to_owned(),
+                served_member: None,
+                tokens_used: TokenUsage::default(),
+            })
+        }
     }
 
     #[tokio::test]
@@ -1032,7 +1033,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let models = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut builder = embedded_provider_builder(workspace.path())
-            .provider(Box::new(ModelSpy(Arc::clone(&models))))
+            .provider(Box::new(ModelSpy(Arc::clone(&models), "ollama")))
             .classification_config(crate::config::QueryClassificationConfig {
                 rules: vec![crate::config::schema::ClassificationRule {
                     hint: "prx-selected-model".to_owned(),
@@ -1069,12 +1070,12 @@ mod tests {
             let primary_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
             let routed_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
             let endpoint = "custom:http://127.0.0.1:19999/v1";
-            let mut builder = embedded_builder(workspace.path())
-                .provider(Box::new(ModelSpy(Arc::clone(&primary_calls))))
+            let mut builder = embedded_provider_builder(workspace.path())
+                .provider(Box::new(ModelSpy(Arc::clone(&primary_calls), "ollama")))
                 .route_provider(
                     endpoint.to_owned(),
                     "hint:other".to_owned(),
-                    Box::new(ModelSpy(Arc::clone(&routed_calls))),
+                    Box::new(ModelSpy(Arc::clone(&routed_calls), endpoint)),
                 )
                 .classification_config(crate::config::QueryClassificationConfig {
                     rules: vec![crate::config::schema::ClassificationRule {
@@ -1092,7 +1093,7 @@ mod tests {
                 credential_ref: None,
             });
             config.cost.prices.insert(
-                "prx-other-model".to_owned(),
+                format!("{endpoint}/prx-other-model"),
                 crate::config::schema::ModelPricing {
                     input: 1.0,
                     output: 1.0,
@@ -1100,11 +1101,53 @@ mod tests {
                     cache_read: 1.0,
                 },
             );
+            config.providers.models.push(
+                toml::from_str(&format!(
+                    "provider = \"{endpoint}\"\nmodel = \"prx-other-model\"\noperations = [\"chat\"]\nnative_tools = true\n"
+                ))
+                .unwrap(),
+            );
+            let verified = crate::providers::selection::check(
+                config,
+                endpoint,
+                "prx-other-model",
+                &crate::providers::catalog::Requirement::chat().with(crate::providers::catalog::Feature::NativeTools),
+                crate::providers::catalog::UnknownPolicy::Invocation,
+            )
+            .expect("controlled routed fixture must satisfy actual PMM tool requirements");
+            assert_eq!(
+                verified.verification(),
+                &crate::providers::catalog::Verification::Verified
+            );
+            assert!(
+                matches!(
+                    crate::llm::route_decision::usage_cost_resolution(
+                        endpoint, "prx-other-model", 64, 64, 0, 0, &config.cost,
+                    ),
+                    crate::llm::route_decision::UsagePrice::Priced(cost) if cost > 0.0
+                ),
+                "the actual routed provider/model must be priced before admission"
+            );
             let mut agent = builder.build().unwrap();
-            assert_eq!(agent.turn("switch model").await.unwrap(), "done");
+            agent.seed_scoped_query_memory_for_test(
+                "memory_search: switch model to explain `2 + 2`. memory_search: ordinary input explaining `3 + 3`. The expressions add integers."
+            ).await;
+            assert_eq!(
+                agent
+                    .turn("memory_search: switch model to explain `2 + 2`.")
+                    .await
+                    .unwrap(),
+                "done"
+            );
             assert!(primary_calls.lock().unwrap().is_empty());
             assert_eq!(*routed_calls.lock().unwrap(), ["prx-other-model"]);
-            assert_eq!(agent.turn("ordinary input").await.unwrap(), "done");
+            assert_eq!(
+                agent
+                    .turn("memory_search: ordinary input explaining `3 + 3`.")
+                    .await
+                    .unwrap(),
+                "done"
+            );
             assert_eq!(*primary_calls.lock().unwrap(), ["prx-local-model"]);
             assert_eq!(*routed_calls.lock().unwrap(), ["prx-other-model"]);
             let conn = rusqlite::Connection::open_with_flags(
@@ -1150,7 +1193,7 @@ mod tests {
             .route_provider(
                 "ollama".to_owned(),
                 "prx-other-model".to_owned(),
-                Box::new(ModelSpy(Arc::new(std::sync::Mutex::new(Vec::new())))),
+                Box::new(ModelSpy(Arc::new(std::sync::Mutex::new(Vec::new())), "ollama")),
             )
             .build();
         assert!(matches!(result, Err(error) if error.to_string().contains("connection is already bound")));
@@ -1164,12 +1207,22 @@ mod tests {
                 anyhow::bail!("formatter must not run without admitted memory")
             }
         }
-        let workspace = tempfile::tempdir().unwrap();
-        let mut agent = embedded_builder(workspace.path())
-            .selected_memory_formatter(Box::new(UnexpectedFormatter))
-            .build()
-            .unwrap();
-        assert_eq!(agent.turn("hello").await.unwrap(), "done");
+        let driver = super::native_decision_fixture::Driver::start_answer().await.unwrap();
+        let endpoint = driver.endpoint().to_owned();
+        driver
+            .run(true, async move {
+                let workspace = tempfile::tempdir().unwrap();
+                let models = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let mut builder = embedded_provider_builder(workspace.path())
+                    .provider(Box::new(ModelSpy(Arc::clone(&models), "ollama")))
+                    .selected_memory_formatter(Box::new(UnexpectedFormatter));
+                super::native_decision_fixture::configure(&mut builder.runtime_config.as_mut().unwrap().0, &endpoint)
+                    .unwrap();
+                let mut agent = builder.build().unwrap();
+                assert_eq!(agent.turn("hello").await.unwrap(), "done");
+                assert_eq!(*models.lock().unwrap(), ["prx-local-model"]);
+            })
+            .await;
     }
 
     #[test]
@@ -1191,41 +1244,187 @@ mod tests {
         assert!(embedded_builder(workspace.path()).skills(Vec::new()).build().is_ok());
     }
 
-    #[test]
-    fn embedded_builder_rejects_ignored_custom_memory_loader() {
+    #[tokio::test]
+    async fn embedded_custom_memory_loader_runs_only_for_selected_retrieval() {
+        custom_memory_loader_fixture(false).await;
+    }
+
+    #[tokio::test]
+    async fn embedded_custom_memory_loader_with_durable_builtin_diagnostics() {
+        custom_memory_loader_fixture(true).await;
+    }
+
+    async fn custom_memory_loader_fixture(record_decisions: bool) {
+        struct CountingLoader(Arc<AtomicUsize>);
+        #[async_trait]
+        impl MemoryLoader for CountingLoader {
+            async fn load_context(&self, memory: &dyn Memory, input: &str) -> Result<String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(
+                    input, "memory_search: Explain `2 + 2`.",
+                    "selected loader receives original input"
+                );
+                let hits = memory
+                    .recall(input, 5, None)
+                    .await
+                    .expect("actual selected owner-scoped Memory recall must succeed");
+                assert!(
+                    !hits.is_empty(),
+                    "selected loader must obtain actual bounded Memory hits"
+                );
+                Ok(hits
+                    .iter()
+                    .map(|hit| hit.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            }
+        }
         let workspace = tempfile::tempdir().unwrap();
-        let result = embedded_builder(workspace.path())
-            .memory_loader(Box::new(RecalledBrowserContextLoader))
-            .build();
-        assert!(
-            matches!(result, Err(error) if error.to_string().contains("custom MemoryLoader requires selected-retrieval integration"))
+        let calls = Arc::new(AtomicUsize::new(0));
+        let models = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut builder = embedded_provider_builder(workspace.path())
+            .provider(Box::new(ModelSpy(Arc::clone(&models), "ollama")))
+            .memory_loader(Box::new(CountingLoader(Arc::clone(&calls))));
+        if record_decisions {
+            let config = &mut builder.runtime_config.as_mut().unwrap().0;
+            config.causal_tree.enabled = true;
+            config.causal_tree.backend.kind =
+                crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+            config.causal_tree.backend.remote_enabled = false;
+            config.causal_tree.store.record_redacted_projection = true;
+            config.cost.prices.insert(
+                "ollama/prx-local-model".to_owned(),
+                config.cost.prices["prx-local-model"].clone(),
+            );
+        }
+        let mut agent = builder.build().unwrap();
+        assert_eq!(
+            agent.turn("hello").await.unwrap(),
+            "What specific information should I use to answer your request?"
         );
-        // Reject before even resolving required fields in the legacy builder.
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(models.lock().unwrap().is_empty());
+        // Establish retrieval evidence only after the empty-memory negative case.
+        agent.seed_scoped_query_memory_for_test(PROVIDER_QUERY_NOTE).await;
+        let reply = agent.turn("memory_search: Explain `2 + 2`.").await.unwrap();
+        if record_decisions {
+            use crate::runtime::turn_source::TurnSourceProof;
+            let anchor = agent
+                .embedded_binding
+                .as_ref()
+                .unwrap()
+                .record("diagnostic inspection anchor")
+                .await
+                .unwrap();
+            let principal = anchor.envelope().memory_principal();
+            let events = agent
+                .memory
+                .list_message_events_since(&principal, 0, 100)
+                .await
+                .unwrap();
+            let source = events
+                .iter()
+                .find(|event| event.role == "user" && event.content == "memory_search: Explain `2 + 2`.")
+                .unwrap();
+            let store = crate::causal_tree::store::CausalDecisionStore::open_unshared_read_only(workspace.path());
+            let reader = store.reader();
+            let scope = crate::causal_tree::store::DecisionScope::Owner {
+                workspace_id: store.workspace_id().unwrap(),
+                owner_id: Arc::from(anchor.owner_id()),
+            };
+            let decisions = reader
+                .list(
+                    &scope,
+                    crate::causal_tree::store::TimeWindow {
+                        from_ms: 0,
+                        to_ms: i64::MAX,
+                    },
+                    100,
+                )
+                .unwrap();
+            let mut diagnostics = Vec::new();
+            for decision in decisions {
+                let replay = reader.replay_record(&scope, &decision.decision_id).unwrap().unwrap();
+                if replay.source_event_id.as_deref() != Some(source.event_id.as_str()) {
+                    continue;
+                }
+                assert_eq!(decision.session_key, source.session_key);
+                assert_eq!(decision.run_id, source.run_id);
+                diagnostics.push(serde_json::json!({
+                    "decision_id":decision.decision_id.to_string(), "source_event_id":replay.source_event_id,
+                    "directive":decision.directive_kind, "abstention":decision.abstention_reason,
+                    "backend":decision.backend_kind, "selected":decision.selected_candidate_id,
+                    "gates":reader.inspection_gates(&scope, &decision.decision_id).unwrap(),
+                    "projection":reader.inspection_projection(&scope, &decision.decision_id).unwrap(),
+                }));
+            }
+            eprintln!(
+                "actual_custom_loader_decisions={}",
+                serde_json::to_string(&diagnostics).unwrap()
+            );
+            assert!(
+                !diagnostics.is_empty(),
+                "enabled diagnostic needs actual owned decision receipts"
+            );
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "selected callback count; actual reply: {reply}"
+        );
+        assert_eq!(
+            reply, "done",
+            "callback ran but selected retrieval did not admit provider"
+        );
+        assert_eq!(*models.lock().unwrap(), ["prx-local-model"]);
+    }
+
+    #[test]
+    fn embedded_custom_memory_loader_requires_runtime_authority() {
         let result = Agent::builder()
             .memory_loader(Box::new(RecalledBrowserContextLoader))
             .build();
-        assert!(
-            matches!(result, Err(error) if error.to_string().contains("custom MemoryLoader requires selected-retrieval integration"))
-        );
+        assert!(matches!(result, Err(error) if error.to_string().contains(
+            "embedded Agent custom MemoryLoader requires runtime_config for selected retrieval"
+        )));
     }
 
     #[cfg(feature = "llm-router")]
     #[tokio::test]
-    async fn embedded_builder_rejects_ignored_injected_router() {
+    async fn embedded_injected_router_requires_the_actual_bound_memory() {
         let workspace = tempfile::tempdir().unwrap();
-        let router = RouterEngine::new(
-            automix_router_config(true),
-            "openai".to_owned(),
-            Vec::new(),
-            Arc::new(TestMemory::default()),
-            None,
-        )
-        .await
-        .unwrap();
-        let result = embedded_builder(workspace.path()).router(router).build();
-        assert!(
-            matches!(result, Err(error) if error.to_string().contains("injected RouterEngine requires source-bound model routing integration"))
-        );
+        let other_workspace = tempfile::tempdir().unwrap();
+        for matching in [true, false] {
+            let mut builder = embedded_builder(workspace.path());
+            let router_config = automix_router_config(true);
+            builder.runtime_config.as_mut().unwrap().0.router = router_config.clone();
+            builder.runtime_config.as_mut().unwrap().1 = "openai".to_owned();
+            let memory: Arc<dyn Memory> = if matching {
+                Arc::clone(builder.memory.as_ref().unwrap())
+            } else {
+                Arc::new(crate::memory::SqliteMemory::new(other_workspace.path()).unwrap())
+            };
+            let router = RouterEngine::new(router_config, "openai".to_owned(), Vec::new(), memory, None)
+                .await
+                .unwrap();
+            let result = builder.router(router).build();
+            if matching {
+                let agent = result.expect("matching source-bound Router must be supported");
+                let binding = agent.embedded_binding.as_ref().unwrap();
+                binding
+                    .verify(
+                        agent.runtime_generation.as_ref().unwrap(),
+                        &agent.provider,
+                        &agent.model_name,
+                    )
+                    .unwrap();
+                binding.record("original router binding input").await.unwrap();
+            } else {
+                assert!(matches!(result, Err(error) if error.to_string().contains(
+                    "embedded Router memory differs from pinned source"
+                )));
+            }
+        }
     }
 
     #[test]
@@ -1475,11 +1674,20 @@ mod tests {
 
     #[tokio::test]
     async fn embedded_turn_promotes_only_original_user_input_when_enabled() {
-        let input = "The project uses a weekly release schedule with a separate review window.";
+        let input = "memory_search: Explain the project weekly release schedule and separate review window.";
         for enabled in [true, false] {
             let workspace = tempfile::tempdir().unwrap();
-            let mut agent = embedded_builder(workspace.path()).auto_save(enabled).build().unwrap();
+            let models = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut agent = embedded_provider_builder(workspace.path())
+                .provider(Box::new(ModelSpy(Arc::clone(&models), "ollama")))
+                .auto_save(enabled)
+                .build()
+                .unwrap();
+            agent.seed_scoped_query_memory_for_test(
+                "memory_search: Explain the project weekly release schedule and separate review window. The project has a weekly release schedule with a separate review window."
+            ).await;
             assert_eq!(agent.turn(input).await.unwrap(), "done");
+            assert_eq!(*models.lock().unwrap(), ["prx-local-model"]);
             let entries = agent
                 .memory
                 .list(Some(&MemoryCategory::Conversation), None)
@@ -1680,8 +1888,28 @@ mod tests {
         tracing::callsite::rebuild_interest_cache();
 
         let workspace = tempfile::TempDir::new().unwrap();
-        let mem: Arc<dyn Memory> =
-            Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: sqlite memory"));
+        let mut builder = embedded_provider_builder(workspace.path());
+        let (config, provider_name) = builder.runtime_config.as_mut().unwrap();
+        *provider_name = LABEL.to_owned();
+        config.default_provider = Some(LABEL.to_owned());
+        config.default_model = Some("model-a".to_owned());
+        config.causal_tree.enabled = true;
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+        config.causal_tree.backend.remote_enabled = false;
+        config.providers.models.clear();
+        config.providers.models.push(
+            toml::from_str(&format!(
+                "provider = {LABEL:?}\nmodel = \"model-a\"\noperations = [\"chat\"]\nnative_tools = true\n"
+            ))
+            .unwrap(),
+        );
+        config.cost.prices.insert(
+            format!("{LABEL}/model-a"),
+            config.cost.prices["prx-local-model"].clone(),
+        );
+        let price = crate::llm::route_decision::usage_cost_resolution(LABEL, "model-a", 1, 0, 0, 0, &config.cost);
+        assert!(matches!(price, crate::llm::route_decision::UsagePrice::Priced(value) if value > 0.0));
         let router_config = crate::config::RouterConfig {
             models: vec![crate::config::RouterModelConfig {
                 model_id: "model-a".into(),
@@ -1695,38 +1923,93 @@ mod tests {
             }],
             ..crate::config::RouterConfig::default()
         };
-        let router = crate::router::RouterEngine::new(router_config, LABEL.into(), Vec::new(), Arc::clone(&mem), None)
-            .await
-            .expect("test: router");
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut config = Config::default();
-        config.workspace_dir = workspace.path().to_path_buf();
-        let mut agent = Agent::builder()
-            .provider(Box::new(MockProvider {
-                responses: Mutex::new(vec![]),
-            }))
-            .tools(vec![Box::new(MockTool)])
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(XmlToolDispatcher))
-            .workspace_dir(workspace.path().to_path_buf())
-            .control_ladder(ControlLadderSnapshot::from_config(&config))
+        config.router = router_config.clone();
+        let memory = Arc::clone(builder.memory.as_ref().unwrap());
+        let router =
+            crate::router::RouterEngine::new(router_config, LABEL.into(), Vec::new(), Arc::clone(&memory), None)
+                .await
+                .expect("test: router");
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = builder
+            .provider(Box::new(ModelSpy(Arc::clone(&calls), LABEL)))
             .router(router)
             .build()
-            .expect("agent builder should succeed with valid config");
-
-        let _ = agent.turn("hello, please analyse this").await;
-
-        // The trace proves the router branch ran (deterministic); the log
-        // capture can miss events another test's subscriber shaped, so the
-        // log is checked for absence only.
-        let traces: String = std::fs::read_dir(workspace.path().join("runtime"))
-            .expect("test: runtime trace dir")
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .map(|path| std::fs::read_to_string(path).unwrap_or_default())
+            .expect("actual runtime-bound custom provider fixture");
+        agent.seed_scoped_query_memory_for_test(PROVIDER_QUERY_NOTE).await;
+        const INPUT: &str = "memory_search: Explain `2 + 2`.";
+        assert_eq!(agent.turn(INPUT).await.unwrap(), "done");
+        assert_eq!(calls.lock().unwrap().as_slice(), ["model-a"]);
+        let anchor = agent
+            .embedded_binding
+            .as_ref()
+            .unwrap()
+            .record("receipt inspection anchor")
+            .await
+            .unwrap();
+        let principal = anchor.envelope().memory_principal();
+        let events = agent
+            .memory
+            .list_message_events_since(&principal, 0, 100)
+            .await
+            .unwrap();
+        let inputs: Vec<_> = events
+            .iter()
+            .filter(|event| event.role == "user" && event.content == INPUT)
             .collect();
-        assert!(traces.contains("model_selected"), "the router branch ran: {traces}");
-        assert!(!traces.contains("AGENT-ROUTER-SECRET-pw"), "{traces}");
+        assert_eq!(inputs.len(), 1);
+        let terminals: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "turn.finalized")
+            .collect();
+        assert_eq!(terminals.len(), 1);
+        let terminal = terminals[0];
+        assert_eq!(terminal.workspace_id, inputs[0].workspace_id);
+        assert_eq!(terminal.owner_id, inputs[0].owner_id);
+        assert_eq!(terminal.session_key, inputs[0].session_key);
+        assert_eq!(terminal.run_id, inputs[0].run_id);
+        assert!(terminal.id > inputs[0].id);
+        let payload: serde_json::Value = serde_json::from_str(terminal.raw_payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["status"], "completed");
+        let outcome: crate::llm::route_decision::ProviderExecutionOutcome =
+            serde_json::from_value(payload["provider_outcome"].clone()).unwrap();
+        let expected_provider = crate::providers::redact_endpoint_userinfo(LABEL);
+        assert_eq!(outcome.final_provider, expected_provider);
+        assert_eq!(outcome.attempts[0].provider, expected_provider);
+        assert_eq!(outcome.final_model, "model-a");
+        assert_eq!(outcome.status, crate::llm::route_decision::ExecutionStatus::Success);
+        assert_eq!(outcome.attempts.len(), 1);
+        assert_eq!(outcome.attempts[0].model, "model-a");
+        assert_eq!(
+            outcome.attempts[0].status,
+            crate::llm::route_decision::AttemptStatus::Success
+        );
+        let store = crate::causal_tree::store::CausalDecisionStore::open_unshared_read_only(workspace.path());
+        let key = crate::decision::key::DecisionKey::load_existing(workspace.path()).unwrap();
+        let store_id = store.workspace_id().unwrap();
+        let replay = crate::agent::terminal::verify_terminal_replay(
+            agent.memory.as_ref(),
+            &store.reader(),
+            &key,
+            &store_id,
+            &terminal.workspace_id,
+            terminal.owner_id.as_deref().unwrap(),
+            terminal.run_id.as_deref().unwrap(),
+            terminal,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.source().event_id, inputs[0].event_id);
+        assert_eq!(replay.assistant().unwrap().content, "done");
+        // Causal Router consumption is evidenced by its durable terminal receipt.
+        let consumed = crate::memory::sqlite::fixture_readback::router_consumption_count(
+            workspace.path(),
+            terminal.run_id.as_deref().unwrap(),
+            &terminal.workspace_id,
+            terminal.owner_id.as_deref().unwrap(),
+            &inputs[0].event_id,
+        )
+        .unwrap();
+        assert_eq!(consumed, 1, "actual Router terminal consumption");
         let logs = String::from_utf8_lossy(&sink.0.lock()).to_string();
         assert!(!logs.contains("AGENT-ROUTER-SECRET-pw"), "{logs}");
         // Nothing the turn stored (memory, router metrics, cost events)
@@ -1770,117 +2053,281 @@ mod tests {
 
     #[tokio::test]
     async fn turn_without_tools_returns_text() {
+        // Bound only to this fixture's actual ollama instance. Other generic
+        // MockProvider fixtures retain their existing trace contract.
+        struct BoundHelloProvider {
+            inner: MockProvider,
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Provider for BoundHelloProvider {
+            async fn chat_with_system(
+                &self,
+                system: Option<&str>,
+                input: &str,
+                model: &str,
+                temperature: f64,
+            ) -> Result<String> {
+                self.inner.chat_with_system(system, input, model, temperature).await
+            }
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                model: &str,
+                temperature: f64,
+            ) -> Result<crate::providers::ChatResponse> {
+                assert_eq!(model, "prx-local-model");
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.chat(request, model, temperature).await
+            }
+            async fn chat_traced(
+                &self,
+                request: ChatRequest<'_>,
+                model: &str,
+                temperature: f64,
+            ) -> Result<crate::providers::traits::ChatTrace> {
+                use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, TokenUsage};
+                let started_at = chrono::Utc::now();
+                let response = self.chat(request, model, temperature).await?;
+                let finished_at = chrono::Utc::now();
+                // This controlled provider reports the actual instance used and
+                // model received; it does not claim a physical external send or
+                // invent reported usage, price, credits or permission.
+                Ok(crate::providers::traits::ChatTrace {
+                    response,
+                    attempts: vec![ProviderAttempt {
+                        seq: 1,
+                        provider: "ollama".to_owned(),
+                        model: model.to_owned(),
+                        started_at,
+                        finished_at,
+                        status: AttemptStatus::Success,
+                        error_class: None,
+                        error_message: None,
+                    }],
+                    final_provider: "ollama".to_owned(),
+                    final_model: model.to_owned(),
+                    served_member: None,
+                    tokens_used: TokenUsage::default(),
+                })
+            }
+        }
         let workspace = tempfile::TempDir::new().unwrap();
-        let provider = Box::new(MockProvider {
-            responses: Mutex::new(vec![crate::providers::ChatResponse {
-                text: Some("hello".into()),
-                tool_calls: vec![],
-                reasoning_content: None,
-            }]),
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Box::new(BoundHelloProvider {
+            inner: MockProvider {
+                responses: Mutex::new(vec![crate::providers::ChatResponse {
+                    text: Some("hello".into()),
+                    tool_calls: vec![],
+                    reasoning_content: None,
+                }]),
+            },
+            calls: Arc::clone(&calls),
         });
 
-        let memory_cfg = crate::config::MemoryConfig {
-            backend: "none".into(),
-            ..crate::config::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
-                .expect("memory creation should succeed with valid config"),
+        let mut builder = embedded_provider_builder(workspace.path());
+        let config = &mut builder.runtime_config.as_mut().unwrap().0;
+        config.causal_tree.enabled = true;
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+        config.causal_tree.backend.remote_enabled = false;
+        config.cost.prices.insert(
+            "ollama/prx-local-model".to_owned(),
+            config.cost.prices["prx-local-model"].clone(),
         );
-
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut config = Config::default();
-        config.workspace_dir = workspace.path().to_path_buf();
-        let mut agent = Agent::builder()
-            .provider(provider)
-            .tools(vec![Box::new(MockTool)])
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(XmlToolDispatcher))
-            .workspace_dir(workspace.path().to_path_buf())
-            .control_ladder(ControlLadderSnapshot::from_config(&config))
-            .build()
-            .expect("agent builder should succeed with valid config");
-
-        let response = agent.turn("hi").await.unwrap();
+        let price =
+            crate::llm::route_decision::usage_cost_resolution("ollama", "prx-local-model", 1, 0, 0, 0, &config.cost);
+        assert!(matches!(price, crate::llm::route_decision::UsagePrice::Priced(value) if value > 0.0));
+        let mut agent = builder.provider(provider).build().unwrap();
+        agent.seed_scoped_query_memory_for_test(PROVIDER_QUERY_NOTE).await;
+        const INPUT: &str = "memory_search: Explain `2 + 2`.";
+        let response = agent.turn(INPUT).await.unwrap();
         assert_eq!(response, "hello");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one actual bound fixture provider call"
+        );
+        let anchor = agent
+            .embedded_binding
+            .as_ref()
+            .unwrap()
+            .record("receipt inspection anchor")
+            .await
+            .unwrap();
+        let principal = anchor.envelope().memory_principal();
+        let events = agent
+            .memory
+            .list_message_events_since(&principal, 0, 100)
+            .await
+            .unwrap();
+        let inputs: Vec<_> = events
+            .iter()
+            .filter(|event| event.role == "user" && event.content == INPUT)
+            .collect();
+        assert_eq!(inputs.len(), 1);
+        let terminals: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "turn.finalized")
+            .collect();
+        assert_eq!(terminals.len(), 1);
+        let terminal = terminals[0];
+        assert_eq!(terminal.workspace_id, inputs[0].workspace_id);
+        assert_eq!(terminal.owner_id, inputs[0].owner_id);
+        assert_eq!(terminal.session_key, inputs[0].session_key);
+        assert_eq!(terminal.run_id, inputs[0].run_id);
+        assert!(terminal.id > inputs[0].id);
+        let payload: serde_json::Value = serde_json::from_str(terminal.raw_payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["status"], "completed");
+        let outcome: crate::llm::route_decision::ProviderExecutionOutcome =
+            serde_json::from_value(payload["provider_outcome"].clone()).unwrap();
+        assert_eq!(outcome.final_provider, "ollama");
+        assert_eq!(outcome.attempts[0].provider, "ollama");
+        assert_eq!(outcome.final_model, "prx-local-model");
+        assert_eq!(outcome.status, crate::llm::route_decision::ExecutionStatus::Success);
+        assert_eq!(outcome.attempts.len(), 1);
+        assert_eq!(outcome.attempts[0].model, "prx-local-model");
+        assert_eq!(
+            outcome.attempts[0].status,
+            crate::llm::route_decision::AttemptStatus::Success
+        );
+        let store = crate::causal_tree::store::CausalDecisionStore::open_unshared_read_only(workspace.path());
+        let key = crate::decision::key::DecisionKey::load_existing(workspace.path()).unwrap();
+        let store_id = store.workspace_id().unwrap();
+        let replay = crate::agent::terminal::verify_terminal_replay(
+            agent.memory.as_ref(),
+            &store.reader(),
+            &key,
+            &store_id,
+            &terminal.workspace_id,
+            terminal.owner_id.as_deref().unwrap(),
+            terminal.run_id.as_deref().unwrap(),
+            terminal,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.source().event_id, inputs[0].event_id);
+        assert_eq!(replay.assistant().unwrap().content, "hello");
+    }
 
-        // Traces are written to a date-rotated file
-        // (`runtime/control_ladder_traces.YYYY-MM-DD.jsonl`); locate the single
-        // rotated file produced under the workspace runtime dir.
-        let trace_dir = workspace.path().join("runtime");
-        let trace_path = std::fs::read_dir(&trace_dir)
-            .expect("test: runtime trace dir should exist")
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("control_ladder_traces.") && name.ends_with(".jsonl"))
-            })
-            .expect("test: a rotated control ladder trace file should exist");
-        let trace_content = std::fs::read_to_string(trace_path).unwrap();
-        let trace: ControlLadderTrace = serde_json::from_str(trace_content.lines().next().unwrap()).unwrap();
-        assert_eq!(trace.source, "agent.turn");
-        assert!(trace.layers.iter().any(|layer| {
-            layer.name == "runtime" && layer.status == "active" && layer.reason.as_deref() == Some("l0_turn_execution")
-        }));
+    // Fixture-only authority is pinned into an owned runtime configuration.
+    // Full is used only for the explicitly acting bounded_probe; the paired
+    // denied cases preserve production Supervised and ReadOnly behavior.
+    fn embedded_native_fixture_builder(
+        workspace: &std::path::Path,
+        autonomy: crate::security::AutonomyLevel,
+    ) -> AgentBuilder {
+        let mut builder = embedded_builder(workspace);
+        let config = &mut builder.runtime_config.as_mut().unwrap().0;
+        config.autonomy.level = autonomy;
+        // These dispatcher fixtures exercise execution of their registered tools,
+        // not catalog discovery. Publish the actual fixture tools as Direct;
+        // exact mentions alone do not change Searchable exposure.
+        config.tool_tiering.always_include = vec!["file_read".to_owned(), "bounded_probe".to_owned()];
+        for model in ["prx-local-model", "prx-native-gemini"] {
+            config.providers.models.push(
+                toml::from_str(&format!(
+                    "provider = \"ollama\"\nmodel = \"{model}\"\noperations = [\"chat\"]\nnative_tools = true\n"
+                ))
+                .unwrap(),
+            );
+            config.cost.prices.insert(
+                format!("ollama/{model}"),
+                crate::config::schema::ModelPricing {
+                    input: 1.0,
+                    output: 1.0,
+                    cache_write: 1.0,
+                    cache_read: 1.0,
+                },
+            );
+            let checked = crate::providers::selection::check(
+                config,
+                "ollama",
+                model,
+                &crate::providers::catalog::Requirement::chat().with(crate::providers::catalog::Feature::NativeTools),
+                crate::providers::catalog::UnknownPolicy::Invocation,
+            )
+            .expect("controlled model must pass the production PMM contract");
+            assert_eq!(
+                checked.verification(),
+                &crate::providers::catalog::Verification::Verified
+            );
+        }
+        builder.tool_dispatcher(Box::new(NativeToolDispatcher))
     }
 
     #[tokio::test]
     async fn turn_with_native_dispatcher_handles_tool_results_variant() {
-        let provider = Box::new(MockProvider {
-            responses: Mutex::new(vec![
-                crate::providers::ChatResponse {
-                    text: Some(String::new()),
-                    tool_calls: vec![crate::providers::ToolCall {
-                        id: "tc1".into(),
-                        name: "echo".into(),
-                        arguments: "{}".into(),
-                    }],
-                    reasoning_content: None,
-                },
-                crate::providers::ChatResponse {
-                    text: Some("done".into()),
-                    tool_calls: vec![],
-                    reasoning_content: None,
-                },
-            ]),
-        });
-
-        let memory_cfg = crate::config::MemoryConfig {
-            backend: "none".into(),
-            ..crate::config::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
-                .expect("memory creation should succeed with valid config"),
-        );
-
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = Agent::builder()
-            .provider(provider)
-            .tools(vec![Box::new(MockTool)])
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .build()
-            .expect("agent builder should succeed with valid config");
-
-        let response = agent.turn("hi").await.unwrap();
-        assert_eq!(response, "done");
-        assert!(
-            agent
-                .history()
-                .iter()
-                .any(|msg| matches!(msg, ConversationMessage::ToolResults(_)))
-        );
+        let driver = super::native_decision_fixture::Driver::start("filesystem")
+            .await
+            .unwrap();
+        let endpoint = driver.endpoint().to_owned();
+        driver
+            .run(true, async move {
+                let workspace = tempfile::tempdir().unwrap();
+                std::fs::write(workspace.path().join("prx-native.txt"), "tool-out").unwrap();
+                let observed = Arc::new(Mutex::new(Vec::new()));
+                let provider = Box::new(PerModelDialectMock {
+                    observed: Arc::clone(&observed),
+                    responses: Mutex::new(vec![
+                        crate::providers::ChatResponse {
+                            text: Some(String::new()),
+                            tool_calls: vec![crate::providers::ToolCall {
+                                id: "tc1".into(),
+                                name: "file_read".into(),
+                                arguments: r#"{"path":"prx-native.txt"}"#.into(),
+                            }],
+                            reasoning_content: None,
+                        },
+                        crate::providers::ChatResponse {
+                            text: Some("done".into()),
+                            tool_calls: vec![],
+                            reasoning_content: None,
+                        },
+                    ]),
+                });
+                let mut builder =
+                    embedded_native_fixture_builder(workspace.path(), crate::security::AutonomyLevel::ReadOnly);
+                super::native_decision_fixture::configure(&mut builder.runtime_config.as_mut().unwrap().0, &endpoint)
+                    .unwrap();
+                let config = &builder.runtime_config.as_ref().unwrap().0;
+                let policy = Arc::new(crate::security::SecurityPolicy::from_config(
+                    &config.autonomy,
+                    workspace.path(),
+                ));
+                let mut agent = builder
+                    .provider(provider)
+                    .tools(vec![Box::new(crate::tools::file_read::FileReadTool::new(
+                        policy, false,
+                    ))])
+                    .build()
+                    .unwrap();
+                let response = agent
+                    .turn("file_read prx-native.txt and report its contents")
+                    .await
+                    .unwrap();
+                assert_eq!(response, "done");
+                assert!(
+                    agent.history().iter().any(|message| match message {
+                        ConversationMessage::ToolResults(results) => results
+                            .iter()
+                            .any(|result| result.tool_call_id == "tc1" && result.content.contains("tool-out")),
+                        _ => false,
+                    }),
+                    "the actual file result must survive as a native ToolResults message"
+                );
+                let calls = observed.lock();
+                assert_eq!(calls.len(), 2);
+                assert!(calls.iter().all(|(model, _)| model == "prx-local-model"));
+                assert!(calls.first().unwrap().1.iter().any(|spec| spec.name == "file_read"));
+            })
+            .await;
     }
 
-    /// A native-tool mock whose wire document is Gemini's (no `minimum`) for
-    /// the classified model `hint:fast` and raw otherwise.
+    /// Controlled provider with model-specific schema dialect and observed requests.
     struct PerModelDialectMock {
         responses: Mutex<Vec<crate::providers::ChatResponse>>,
+        observed: Arc<Mutex<Vec<(String, Vec<crate::tools::ToolSpec>)>>>,
     }
 
     #[async_trait]
@@ -1893,7 +2340,7 @@ mod tests {
         }
 
         fn tool_schema_dialect_for(&self, model: &str) -> crate::tools::ToolSchemaDialect {
-            if model == "hint:fast" {
+            if model == "prx-native-gemini" {
                 crate::tools::ToolSchemaDialect::Gemini
             } else {
                 crate::tools::ToolSchemaDialect::Raw
@@ -1912,10 +2359,13 @@ mod tests {
 
         async fn chat(
             &self,
-            _request: ChatRequest<'_>,
-            _model: &str,
+            request: ChatRequest<'_>,
+            model: &str,
             _temperature: f64,
         ) -> Result<crate::providers::ChatResponse> {
+            self.observed
+                .lock()
+                .push((model.to_owned(), request.tools.unwrap_or_default().to_vec()));
             let mut guard = self.responses.lock();
             if guard.is_empty() {
                 return Ok(crate::providers::ChatResponse {
@@ -1960,67 +2410,127 @@ mod tests {
         }
     }
 
-    /// D-065 L-1: the shell validates a tool call in the dialect of the model
-    /// it actually sent the turn to (here the classified `hint:fast`), not
-    /// the configured `model_name`. That model was shown the Gemini document
-    /// (no `minimum`), so `{"limit": 0}` is a valid call and runs.
+    // The controlled acting tool keeps its published raw minimum. Only the
+    // actual served model's existing Gemini projection omits that keyword.
+    async fn run_bounded_native_fixture(
+        autonomy: crate::security::AutonomyLevel,
+        classify: bool,
+    ) -> (
+        Result<String>,
+        usize,
+        Vec<(String, Vec<crate::tools::ToolSpec>)>,
+        Vec<ConversationMessage>,
+    ) {
+        let driver = super::native_decision_fixture::Driver::start("native_tool")
+            .await
+            .unwrap();
+        let endpoint = driver.endpoint().to_owned();
+        driver
+            .run(autonomy == crate::security::AutonomyLevel::Full, async move {
+                let workspace = tempfile::tempdir().unwrap();
+                let executions = Arc::new(AtomicUsize::new(0));
+                let observed = Arc::new(Mutex::new(Vec::new()));
+                let provider = Box::new(PerModelDialectMock {
+                    observed: Arc::clone(&observed),
+                    responses: Mutex::new(vec![
+                        crate::providers::ChatResponse {
+                            text: Some(String::new()),
+                            tool_calls: vec![crate::providers::ToolCall {
+                                id: "tc1".into(),
+                                name: "bounded_probe".into(),
+                                arguments: r#"{"limit":0}"#.into(),
+                            }],
+                            reasoning_content: None,
+                        },
+                        crate::providers::ChatResponse {
+                            text: Some("done".into()),
+                            tool_calls: vec![],
+                            reasoning_content: None,
+                        },
+                    ]),
+                });
+                let mut builder = embedded_native_fixture_builder(workspace.path(), autonomy)
+                    .provider(provider)
+                    .tools(vec![Box::new(BoundedTool {
+                        executions: Arc::clone(&executions),
+                    })]);
+                if classify {
+                    // Direct classified model is checked by PMM on the same registered
+                    // provider; no fictitious hint-to-wire substitution is asserted.
+                    builder = builder.classification_config(crate::config::QueryClassificationConfig {
+                        rules: vec![crate::config::schema::ClassificationRule {
+                            hint: "prx-native-gemini".to_owned(),
+                            keywords: vec!["bounded_probe".to_owned()],
+                            ..Default::default()
+                        }],
+                    });
+                }
+                super::native_decision_fixture::configure(&mut builder.runtime_config.as_mut().unwrap().0, &endpoint)
+                    .unwrap();
+                let mut agent = builder.build().unwrap();
+                let result = agent.turn("bounded_probe with limit 0").await;
+                agent.cleanup_state.confirm().await.unwrap();
+                let calls = observed.lock().clone();
+                let history = agent.history().to_vec();
+                (result, executions.load(Ordering::SeqCst), calls, history)
+            })
+            .await
+    }
+
     #[tokio::test]
     async fn turn_validates_tool_calls_in_the_dialect_of_the_model_it_sent_to() {
-        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let provider = Box::new(PerModelDialectMock {
-            responses: Mutex::new(vec![
-                crate::providers::ChatResponse {
-                    text: Some(String::new()),
-                    tool_calls: vec![crate::providers::ToolCall {
-                        id: "tc1".into(),
-                        name: "bounded_probe".into(),
-                        arguments: "{\"limit\": 0}".into(),
-                    }],
-                    reasoning_content: None,
-                },
-                crate::providers::ChatResponse {
-                    text: Some("done".into()),
-                    tool_calls: vec![],
-                    reasoning_content: None,
-                },
-            ]),
-        });
-        let memory_cfg = crate::config::MemoryConfig {
-            backend: "none".into(),
-            ..crate::config::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
-                .expect("memory creation should succeed with valid config"),
-        );
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = Agent::builder()
-            .provider(provider)
-            .tools(vec![Box::new(BoundedTool {
-                executions: Arc::clone(&executions),
-            })])
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .model_name("base-model".to_string())
-            .classification_config(crate::config::QueryClassificationConfig {
-                rules: vec![crate::config::schema::ClassificationRule {
-                    hint: "fast".to_string(),
-                    keywords: vec!["probe".to_string()],
-                    ..crate::config::schema::ClassificationRule::default()
-                }],
-            })
-            .available_hints(vec!["fast".to_string()])
-            .build()
-            .expect("agent builder should succeed with valid config");
-
-        let response = agent.turn("run the probe").await.unwrap();
-        assert_eq!(response, "done");
+        let (result, executions, calls, history) =
+            run_bounded_native_fixture(crate::security::AutonomyLevel::Full, true).await;
+        assert_eq!(result.unwrap(), "done");
         assert_eq!(
-            executions.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "a call valid against the document the served model was shown was refused"
+            executions, 1,
+            "the served Gemini dialect must admit limit 0 exactly once"
+        );
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|(model, _)| model == "prx-native-gemini"));
+        assert!(calls.first().unwrap().1.iter().any(|spec| spec.name == "bounded_probe"));
+        assert!(history.iter().any(|message| {
+            match message {
+                ConversationMessage::ToolResults(results) => results
+                    .iter()
+                    .any(|result| result.tool_call_id == "tc1" && result.content.contains("ok")),
+                _ => false,
+            }
+        }));
+    }
+
+    #[tokio::test]
+    async fn bounded_native_fixture_preserves_supervised_and_readonly_denials() {
+        for autonomy in [
+            crate::security::AutonomyLevel::Supervised,
+            crate::security::AutonomyLevel::ReadOnly,
+        ] {
+            let (result, executions, _, _) = run_bounded_native_fixture(autonomy, true).await;
+            assert_eq!(executions, 0, "unapproved acting tool must never execute");
+            assert!(!matches!(result, Ok(ref reply) if reply == "done"));
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_native_fixture_preserves_raw_schema_minimum() {
+        let (_, executions, calls, history) =
+            run_bounded_native_fixture(crate::security::AutonomyLevel::Full, false).await;
+        assert_eq!(executions, 0, "raw schema must still reject limit 0");
+        assert!(
+            !calls.is_empty(),
+            "raw model must actually receive the admitted tool surface"
+        );
+        assert!(calls.iter().all(|(model, _)| model == "prx-local-model"));
+        assert!(
+            history.iter().any(|message| match message {
+                ConversationMessage::ToolResults(results) =>
+                    results
+                        .iter()
+                        .any(|result| result.tool_call_id == "tc1"
+                            && result.content.contains("$.limit must be at least 1")),
+                _ => false,
+            }),
+            "raw schema denial must be observed, not inferred from an unentered provider"
         );
     }
 
@@ -2086,11 +2596,53 @@ mod tests {
     async fn embedded_selected_memory_preserves_original_source_input() {
         use crate::runtime::turn_source::TurnSourceProof;
 
-        struct SourceContextProvider;
+        struct SourceContextProvider(Arc<AtomicUsize>);
+        struct ObservedMemoryFormatter(Arc<AtomicUsize>);
+        impl SelectedMemoryFormatter for ObservedMemoryFormatter {
+            fn format_context(&self, summaries: &[&str]) -> Result<String> {
+                assert_eq!(summaries.len(), 1);
+                assert!(summaries[0].contains("PRX_RECALLED_BROWSER_INSTRUCTION"));
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(summaries.join("\n"))
+            }
+        }
         #[async_trait]
         impl Provider for SourceContextProvider {
             fn supports_native_tools(&self) -> bool {
                 true
+            }
+
+            async fn chat_traced(
+                &self,
+                request: ChatRequest<'_>,
+                model: &str,
+                temperature: f64,
+            ) -> Result<crate::providers::traits::ChatTrace> {
+                // This fixture is the bound ollama instance. Record only the
+                // actual call below; its assertions and invocation counter run.
+                assert_eq!(model, "prx-local-model");
+                let started_at = chrono::Utc::now();
+                let response = self.chat(request, model, temperature).await?;
+                let finished_at = chrono::Utc::now();
+                Ok(crate::providers::traits::ChatTrace {
+                    response,
+                    attempts: vec![crate::llm::route_decision::ProviderAttempt {
+                        seq: 1,
+                        provider: "ollama".to_owned(),
+                        model: model.to_owned(),
+                        started_at,
+                        finished_at,
+                        status: crate::llm::route_decision::AttemptStatus::Success,
+                        error_class: None,
+                        error_message: None,
+                    }],
+                    final_provider: "ollama".to_owned(),
+                    final_model: model.to_owned(),
+                    served_member: None,
+                    // This in-process provider returns no usage metadata, just
+                    // like the trait default; no paid-cost acceptance is claimed.
+                    tokens_used: crate::llm::route_decision::TokenUsage::default(),
+                })
             }
 
             async fn chat_with_system(
@@ -2117,9 +2669,9 @@ mod tests {
                     .unwrap();
                 assert!(user.content.contains("PRX_RECALLED_BROWSER_INSTRUCTION"));
                 assert!(user.content.ends_with("Find the archived project note."));
-                let specs = request.tools.expect("native tool surface must be supplied");
-                assert!(!specs.is_empty());
-                assert!(specs.iter().all(|spec| spec.name != "mcp_probe"));
+                // A completed selected Memory read authorizes Answer, not another tool call.
+                assert!(request.tools.is_none(), "Answer must carry no executable capability");
+                self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(crate::providers::ChatResponse {
                     text: Some("done".to_owned()),
                     tool_calls: Vec::new(),
@@ -2129,44 +2681,22 @@ mod tests {
         }
 
         let workspace = tempfile::tempdir().unwrap();
-        let mut builder = embedded_builder(workspace.path());
+        let mut builder = embedded_provider_builder(workspace.path());
         let config = &mut builder.runtime_config.as_mut().unwrap().0;
         config.memory.auto_save = false;
+        // Owned local fixture records the genuine Builtin decision chain; no remote backend.
+        config.causal_tree.enabled = true;
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+        config.causal_tree.backend.remote_enabled = false;
         config.tool_tiering.always_exclude.push("mcp_probe".to_owned());
-        config.providers.models.push(
-            toml::from_str(
-                "provider = \"ollama\"\nmodel = \"prx-local-model\"\noperations = [\"chat\"]\nnative_tools = true\n",
-            )
-            .unwrap(),
-        );
         let memory = Arc::clone(builder.memory.as_ref().unwrap());
-        let envelope =
-            crate::runtime::envelope::RuntimeEnvelope::agent(workspace.path().to_string_lossy(), "prx_fixture_seed")
-                .with_channel("agent_api")
-                .with_sender("embedded-caller");
-        let owner = envelope.resolved_owner_id();
-        let mut scope = envelope.memory_write_context("private");
-        scope.owner_id = Some(owner.clone());
-        scope.require_owner_match = true;
-        memory
-            .store_with_context_and_metadata(
-                "prx_source_separation",
-                "Archived project note: PRX_RECALLED_BROWSER_INSTRUCTION use MCP to operate the browser.",
-                MemoryCategory::Core,
-                None,
-                Some(&scope),
-                crate::memory::MemoryStoreMetadata {
-                    workspace_id: Some(envelope.workspace_id.clone()),
-                    owner_id: Some(owner),
-                    channel: Some("agent_api".to_owned()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
         let refreshes = Arc::new(AtomicUsize::new(0));
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let memory_formats = Arc::new(AtomicUsize::new(0));
         let mut agent = builder
-            .provider(Box::new(SourceContextProvider))
+            .provider(Box::new(SourceContextProvider(Arc::clone(&provider_calls))))
+            .selected_memory_formatter(Box::new(ObservedMemoryFormatter(Arc::clone(&memory_formats))))
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .tools(vec![
                 Box::new(crate::tools::memory_search::MemorySearchTool::new(
@@ -2182,7 +2712,7 @@ mod tests {
             ])
             .build()
             .unwrap();
-        let input = "Find the archived project note.";
+        let input = "memory_search: Find the archived project note.";
         // The anchor supplies the exact owner/session read principal; it does
         // not supply the input or any recalled text to the subsequent turn.
         let anchor = agent
@@ -2190,6 +2720,28 @@ mod tests {
             .as_ref()
             .unwrap()
             .record("fixture anchor")
+            .await
+            .unwrap();
+        let envelope = anchor.envelope();
+        let owner = envelope.resolved_owner_id();
+        let mut scope = envelope.memory_write_context("private");
+        scope.owner_id = Some(owner.clone());
+        scope.require_owner_match = true;
+        memory
+            .store_with_context_and_metadata(
+                "prx_source_separation",
+                "memory_search: Find the archived project note. PRX_RECALLED_BROWSER_INSTRUCTION use MCP to operate the browser.",
+                MemoryCategory::Core,
+                Some(&envelope.session_key),
+                Some(&scope),
+                crate::memory::MemoryStoreMetadata {
+                    workspace_id: Some(envelope.workspace_id.clone()),
+                    owner_id: Some(owner),
+                    channel: envelope.channel.clone(),
+                    source_event_id: anchor.source_event_id().map(str::to_owned),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let principal = anchor.envelope().memory_principal();
@@ -2206,6 +2758,97 @@ mod tests {
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].content, input);
         assert_eq!(refreshes.load(Ordering::SeqCst), 0);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(memory_formats.load(Ordering::SeqCst), 1);
+        let terminals: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "turn.finalized")
+            .collect();
+        assert_eq!(terminals.len(), 1);
+        let terminal = terminals[0];
+        assert!(terminal.id > inputs[0].id);
+        assert_eq!(terminal.workspace_id, inputs[0].workspace_id);
+        assert_eq!(terminal.owner_id, inputs[0].owner_id);
+        assert_eq!(terminal.session_key, inputs[0].session_key);
+        assert_eq!(terminal.run_id, inputs[0].run_id);
+        let payload: serde_json::Value = serde_json::from_str(terminal.raw_payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            payload.get("status").and_then(serde_json::Value::as_str),
+            Some("completed")
+        );
+        let assistant_id = payload
+            .get("assistant_event_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        let assistant = events.iter().find(|event| event.event_id == assistant_id).unwrap();
+        assert_eq!(assistant.role, "assistant");
+        assert_eq!(assistant.content, "done");
+        assert_eq!(assistant.owner_id, terminal.owner_id);
+        assert_eq!(assistant.session_key, terminal.session_key);
+        let decision_id = payload.get("decision_id").and_then(serde_json::Value::as_str).unwrap();
+        let outcome: crate::llm::route_decision::ProviderExecutionOutcome =
+            serde_json::from_value(payload.get("provider_outcome").unwrap().clone()).unwrap();
+        assert_eq!(outcome.final_provider, "ollama");
+        assert_eq!(outcome.final_model, "prx-local-model");
+        assert_eq!(outcome.status, crate::llm::route_decision::ExecutionStatus::Success);
+        assert_eq!(outcome.attempts.len(), 1);
+        assert_eq!(outcome.attempts[0].provider, "ollama");
+        assert_eq!(outcome.attempts[0].model, "prx-local-model");
+        assert_eq!(
+            outcome.attempts[0].status,
+            crate::llm::route_decision::AttemptStatus::Success
+        );
+        let store = crate::causal_tree::store::CausalDecisionStore::open_unshared_read_only(workspace.path());
+        let reader = store.reader();
+        let scope = crate::causal_tree::store::DecisionScope::Owner {
+            workspace_id: store.workspace_id().unwrap(),
+            owner_id: Arc::from(terminal.owner_id.as_deref().unwrap()),
+        };
+        let answer = reader
+            .replay_record(
+                &scope,
+                &crate::causal_tree::ids::DecisionId::parse(decision_id).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        let retrieval = reader
+            .replay_record(&scope, &answer.decision.prior_decision_id.unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer.decision.directive_kind, "answer");
+        assert!(answer.decision.enabled_snapshot && retrieval.decision.enabled_snapshot);
+        assert_eq!(retrieval.decision.directive_kind, "retrieve");
+        let selected = retrieval.decision.selected().unwrap();
+        assert_eq!(selected.action, "retrieve");
+        assert_eq!(selected.target, "memory");
+        assert_eq!(
+            answer.decision.session_key.as_deref(),
+            Some(terminal.session_key.as_deref().unwrap())
+        );
+        assert_eq!(
+            retrieval
+                .decision
+                .candidates
+                .iter()
+                .filter(|candidate| Some(candidate.id.as_str()) == retrieval.decision.selected_candidate_id.as_deref())
+                .count(),
+            1
+        );
+        assert_eq!(answer.source_event_id.as_deref(), Some(inputs[0].event_id.as_str()));
+        assert_eq!(answer.decision.run_id, terminal.run_id);
+        assert_eq!(retrieval.decision.session_key, answer.decision.session_key);
+        assert_eq!(retrieval.source_event_id, answer.source_event_id);
+        assert_eq!(retrieval.decision.run_id, answer.decision.run_id);
+        // Replay records deliberately exclude appended outcomes; read those
+        // through the same canonical owner scope and actual decision identity.
+        let settled = reader.get(&scope, &answer.decision.decision_id).unwrap().unwrap();
+        assert_eq!(settled.decision_id, answer.decision.decision_id);
+        let matched = settled
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome.executed_action.as_deref() == Some("answer"))
+            .count();
+        assert_eq!(matched, 1);
     }
 
     #[tokio::test]
@@ -2268,127 +2911,6 @@ mod tests {
     }
 
     #[cfg(feature = "llm-router")]
-    #[derive(Default)]
-    struct TestMemory {
-        entries: Mutex<HashMap<String, crate::memory::MemoryEntry>>,
-    }
-
-    #[cfg(feature = "llm-router")]
-    #[async_trait]
-    impl Memory for TestMemory {
-        fn name(&self) -> &str {
-            "test"
-        }
-
-        async fn store(
-            &self,
-            key: &str,
-            content: &str,
-            category: MemoryCategory,
-            session_id: Option<&str>,
-        ) -> Result<()> {
-            self.entries.lock().insert(
-                key.to_string(),
-                crate::memory::MemoryEntry {
-                    id: key.to_string(),
-                    key: key.to_string(),
-                    content: content.to_string(),
-                    category,
-                    timestamp: "2026-03-10T00:00:00Z".into(),
-                    session_id: session_id.map(str::to_string),
-                    score: None,
-                    tags: None,
-                    access_count: None,
-                    useful_count: None,
-                    source: None,
-                    source_confidence: None,
-                    verification_status: None,
-                    lifecycle_state: None,
-                    compressed_from: None,
-                },
-            );
-            Ok(())
-        }
-
-        async fn recall(
-            &self,
-            _query: &str,
-            _limit: usize,
-            _session_id: Option<&str>,
-        ) -> Result<Vec<crate::memory::MemoryEntry>> {
-            Ok(Vec::new())
-        }
-
-        async fn get(&self, key: &str) -> Result<Option<crate::memory::MemoryEntry>> {
-            Ok(self.entries.lock().get(key).cloned())
-        }
-
-        async fn list(
-            &self,
-            _category: Option<&MemoryCategory>,
-            _session_id: Option<&str>,
-        ) -> Result<Vec<crate::memory::MemoryEntry>> {
-            Ok(self.entries.lock().values().cloned().collect())
-        }
-
-        async fn forget(&self, key: &str) -> Result<bool> {
-            Ok(self.entries.lock().remove(key).is_some())
-        }
-
-        async fn count(&self) -> Result<usize> {
-            Ok(self.entries.lock().len())
-        }
-
-        async fn health_check(&self) -> bool {
-            true
-        }
-    }
-
-    #[cfg(feature = "llm-router")]
-    struct RecordingProvider {
-        models: Arc<Mutex<Vec<String>>>,
-        cheap_response: String,
-        premium_response: String,
-        fail_premium: bool,
-    }
-
-    #[cfg(feature = "llm-router")]
-    #[async_trait]
-    impl Provider for RecordingProvider {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: f64,
-        ) -> Result<String> {
-            Ok("ok".into())
-        }
-
-        async fn chat(
-            &self,
-            _request: ChatRequest<'_>,
-            model: &str,
-            _temperature: f64,
-        ) -> Result<crate::providers::ChatResponse> {
-            self.models.lock().push(model.to_string());
-            if self.fail_premium && model.contains("premium") {
-                anyhow::bail!("premium failure");
-            }
-            let text = if model.contains("premium") {
-                self.premium_response.clone()
-            } else {
-                self.cheap_response.clone()
-            };
-            Ok(crate::providers::ChatResponse {
-                text: Some(text),
-                tool_calls: vec![],
-                reasoning_content: None,
-            })
-        }
-    }
-
-    #[cfg(feature = "llm-router")]
     fn automix_router_config(_enabled: bool) -> crate::config::RouterConfig {
         crate::config::RouterConfig {
             alpha: 0.0,
@@ -2429,296 +2951,64 @@ mod tests {
     }
 
     #[cfg(feature = "llm-router")]
-    async fn build_automix_agent(
-        cheap_response: &str,
-        premium_response: &str,
-        automix_enabled: bool,
-        fail_premium: bool,
-    ) -> (Agent, Arc<TestMemory>, Arc<Mutex<Vec<String>>>) {
-        let memory = Arc::new(TestMemory::default());
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let models = Arc::new(Mutex::new(Vec::new()));
-        let provider = Box::new(RecordingProvider {
-            models: Arc::clone(&models),
-            cheap_response: cheap_response.into(),
-            premium_response: premium_response.into(),
-            fail_premium,
-        });
-        let router = RouterEngine::new(
-            automix_router_config(automix_enabled),
-            "openai".into(),
-            Vec::new(),
-            memory.clone(),
-            None,
-        )
-        .await
-        .unwrap();
-
-        let agent = Agent::builder()
-            .provider(provider)
-            .tools(vec![Box::new(MockTool)])
-            .memory(memory.clone())
-            .observer(observer)
-            .tool_dispatcher(Box::new(XmlToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .model_name("openai/model-mini".into())
-            .model_routes(Vec::new())
-            .router(router)
-            .build()
-            .unwrap();
-
-        (agent, memory, models)
-    }
-
-    #[cfg(feature = "llm-router")]
-    async fn build_named_automix_agent(
-        cheap_response: &str,
-        premium_response: &str,
-        fail_premium: bool,
-    ) -> (Agent, Arc<TestMemory>, Arc<Mutex<Vec<String>>>) {
-        let memory = Arc::new(TestMemory::default());
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let models = Arc::new(Mutex::new(Vec::new()));
-        let provider = Box::new(RecordingProvider {
-            models: Arc::clone(&models),
-            cheap_response: cheap_response.into(),
-            premium_response: premium_response.into(),
-            fail_premium,
-        });
-        let router = RouterEngine::new(
-            crate::config::RouterConfig {
-                alpha: 0.0,
-                beta: 0.5,
-                gamma: 0.3,
-                delta: 1.0,
-                epsilon: 0.3,
-                knn_min_records: 10,
-                knn_k: 7,
-                automix: crate::config::AutomixConfig {
-                    confidence_threshold: 0.7,
-                    cheap_model_tiers: vec!["cheap".into()],
-                    premium_model_id: "openai/model-premium".into(),
-                },
-                models: vec![
-                    crate::config::RouterModelConfig {
-                        model_id: "model-cheap".into(),
-                        provider: "openai".into(),
-                        cost_per_million_tokens: 0.1,
-                        max_context: 128_000,
-                        reserved_output_tokens: None,
-                        latency_ms: 500,
-                        categories: vec!["conversation".into()],
-                        elo_rating: 1_000.0,
-                    },
-                    crate::config::RouterModelConfig {
-                        model_id: "model-premium".into(),
-                        provider: "openai".into(),
-                        cost_per_million_tokens: 10.0,
-                        max_context: 128_000,
-                        reserved_output_tokens: None,
-                        latency_ms: 2_000,
-                        categories: vec!["conversation".into()],
-                        elo_rating: 1_000.0,
-                    },
-                ],
-            },
-            "openai".into(),
-            Vec::new(),
-            memory.clone(),
-            None,
-        )
-        .await
-        .unwrap();
-
-        let agent = Agent::builder()
-            .provider(provider)
-            .tools(vec![Box::new(MockTool)])
-            .memory(memory.clone())
-            .observer(observer)
-            .tool_dispatcher(Box::new(XmlToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .model_name("openai/model-cheap".into())
-            .model_routes(Vec::new())
-            .router(router)
-            .build()
-            .unwrap();
-
-        (agent, memory, models)
-    }
-
-    #[cfg(feature = "llm-router")]
     #[tokio::test]
     async fn test_automix_escalates_on_low_confidence() {
-        let (mut agent, _memory, models) = build_automix_agent(
-            "I'm not sure, maybe this is the answer.",
-            "This is the premium answer.",
-            true,
-            false,
-        )
-        .await;
-
-        let response = agent.turn("hello").await.unwrap();
-
-        assert_eq!(response, "This is the premium answer.");
-        assert_eq!(
-            models.lock().clone(),
-            vec!["openai/model-mini".to_string(), "openai/model-premium".to_string()]
-        );
+        super::automix_integration_tests::run_case(true).await.unwrap();
     }
 
     #[cfg(feature = "llm-router")]
     #[tokio::test]
     async fn test_automix_skips_escalation_on_high_confidence() {
-        let (mut agent, _memory, models) = build_automix_agent(
-            "```rust\nfn main() {}\n```\nThis compiles cleanly.",
-            "This should not be used.",
-            true,
-            false,
-        )
-        .await;
-
-        let response = agent.turn("fix this rust code").await.unwrap();
-
-        assert!(response.contains("compiles cleanly"));
-        assert_eq!(models.lock().clone(), vec!["openai/model-mini".to_string()]);
+        super::automix_integration_tests::run_cheap_outcome_case(false, 1)
+            .await
+            .unwrap();
     }
 
     #[cfg(feature = "llm-router")]
     #[tokio::test]
     async fn test_automix_legacy_disabled_flag_is_ignored() {
-        let (mut agent, _memory, models) = build_automix_agent(
-            "I'm not sure, maybe this is the answer.",
-            "This should not be used.",
-            false,
-            false,
-        )
-        .await;
-
-        let response = agent.turn("hello").await.unwrap();
-
-        assert!(response.contains("should not be used"));
-        assert_eq!(
-            models.lock().clone(),
-            vec!["openai/model-mini".to_string(), "openai/model-premium".to_string()]
-        );
+        // No legacy enable flag exists in RouterConfig: configured Automix remains active.
+        super::automix_integration_tests::run_case(false).await.unwrap();
     }
 
     #[cfg(feature = "llm-router")]
     #[tokio::test]
     async fn test_cost_tracking() {
-        let (mut agent, memory, _models) = build_automix_agent(
-            "I'm not sure, maybe this is the answer.",
-            "This is the premium answer.",
-            true,
-            false,
-        )
-        .await;
-
-        let _ = agent.turn("hello").await.unwrap();
-
-        let prefix = format!("router/cost/{}/", chrono::Utc::now().format("%Y-%m-%d"));
-        let entries: Vec<_> = memory
-            .list(
-                Some(&MemoryCategory::Custom("router".into())),
-                Some(crate::self_system::SELF_SYSTEM_SESSION_ID),
-            )
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|entry| entry.key.starts_with(&prefix))
-            .collect();
-
-        assert_eq!(entries.len(), 1);
-        let event: RouterCostEvent = serde_json::from_str(&entries[0].content).unwrap();
-        assert_eq!(
-            entries[0].session_id.as_deref(),
-            Some(crate::self_system::SELF_SYSTEM_SESSION_ID)
-        );
-        assert!(event.escalated);
-        assert!(event.total_cost_usd > 0.0);
+        super::automix_integration_tests::run_case(true).await.unwrap();
     }
 
     #[cfg(feature = "llm-router")]
     #[tokio::test]
     async fn test_automix_escalation_failure_keeps_cheap_attribution() {
-        let (mut agent, memory, models) = build_automix_agent(
-            "I'm not sure, maybe this is the answer.",
-            "This should fail.",
-            true,
-            true,
-        )
-        .await;
-
-        let response = agent.turn("hello").await.unwrap();
-        assert_eq!(response, "I'm not sure, maybe this is the answer.");
-        assert_eq!(
-            models.lock().clone(),
-            vec!["openai/model-mini".to_string(), "openai/model-premium".to_string()]
-        );
-
-        let prefix = format!("router/cost/{}/", chrono::Utc::now().format("%Y-%m-%d"));
-        let entry = memory
-            .list(
-                Some(&MemoryCategory::Custom("router".into())),
-                Some(crate::self_system::SELF_SYSTEM_SESSION_ID),
-            )
+        super::automix_integration_tests::run_cheap_outcome_case(true, 1)
             .await
-            .unwrap()
-            .into_iter()
-            .find(|entry| entry.key.starts_with(&prefix))
-            .expect("cost entry");
-        let event: RouterCostEvent = serde_json::from_str(&entry.content).unwrap();
-        assert_eq!(event.primary_model, "openai/model-mini");
-        assert!(!event.escalated);
-        assert!(event.escalation_failed);
+            .unwrap();
     }
 
     #[cfg(feature = "llm-router")]
     #[tokio::test]
     async fn test_automix_failure_records_elo_on_cheap_model() {
-        let (mut agent, memory, models) =
-            build_named_automix_agent("I'm not sure, maybe this is the answer.", "This should fail.", true).await;
-
-        let response = agent.turn("hello").await.unwrap();
-        assert_eq!(response, "I'm not sure, maybe this is the answer.");
-        assert_eq!(
-            models.lock().clone(),
-            vec!["openai/model-cheap".to_string(), "openai/model-premium".to_string()]
-        );
-
-        let cheap_elo = memory
-            .get("router/elo/model-cheap")
-            .await
-            .unwrap()
-            .expect("cheap elo persisted");
-        let cheap_snapshot: serde_json::Value = serde_json::from_str(&cheap_elo.content).unwrap();
-        assert!(cheap_snapshot["dynamic_elo"].as_f64().unwrap() > 1_000.0);
-
-        assert!(memory.get("router/elo/model-premium").await.unwrap().is_none());
-
-        let router_entries = memory
-            .list(
-                Some(&MemoryCategory::Custom("router".into())),
-                Some(crate::self_system::SELF_SYSTEM_SESSION_ID),
-            )
+        super::automix_integration_tests::run_cheap_outcome_case(true, 1)
             .await
             .unwrap();
-        assert!(
-            router_entries
-                .iter()
-                .any(|entry| entry.key.starts_with("router/success/model-cheap/"))
-        );
-        assert!(
-            router_entries
-                .iter()
-                .all(|entry| !entry.key.starts_with("router/success/model-premium/"))
-        );
+    }
+
+    #[cfg(feature = "llm-router")]
+    #[tokio::test]
+    async fn repeated_actual_turns_have_unique_cost_and_learning_receipts() {
+        super::automix_integration_tests::run_cheap_outcome_case(false, 5)
+            .await
+            .unwrap();
     }
 
     #[cfg(feature = "llm-router")]
     #[tokio::test]
     async fn test_multiple_cost_events_no_overwrite() {
-        let (agent, memory, _models) = build_named_automix_agent("cheap", "premium", false).await;
+        // Direct helper coverage stays distinct from canonical runtime settlement.
+        let workspace = tempfile::tempdir().unwrap();
+        let builder = embedded_builder(workspace.path());
+        let memory = Arc::clone(builder.memory.as_ref().unwrap());
+        let agent = builder.build().unwrap();
 
         for index in 0..5 {
             let mut event = RouterCostEvent::new("openai/model-cheap");
@@ -2746,3 +3036,6 @@ mod tests {
 
 #[cfg(all(test, feature = "llm-router"))]
 mod automix_integration_tests;
+
+#[cfg(test)]
+pub(crate) mod native_decision_fixture;

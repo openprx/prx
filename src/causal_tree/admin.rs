@@ -79,13 +79,65 @@ pub(crate) trait DecisionPlaneBuilder: Send + Sync {
         _key: Arc<DecisionKey>,
         request: &'a DecisionRequest,
         lineage: &'a CausalLineage,
-    ) -> AdminPlaneFuture<'a, crate::decision::factory::PredictionResult> {
+    ) -> AdminPlaneFuture<'a, AdminPrediction> {
         Box::pin(async move {
             factory
                 .decide(request, lineage)
                 .await
+                .map(|result| {
+                    AdminPrediction::from_validated_parts(
+                        result.served,
+                        result.served_by,
+                        result
+                            .attempts
+                            .into_iter()
+                            .map(|attempt| (attempt.identity.kind, attempt.outcome, attempt.latency)),
+                    )
+                })
                 .map_err(|failure| AdminError::Fixture(failure.0.class().to_owned()))
         })
+    }
+}
+
+/// The validated facts consumed by the administration test view.
+/// Factory-local routing evidence remains owned by the prediction producer.
+pub(crate) struct AdminPrediction {
+    served: crate::decision::ValidatedDecision,
+    served_by: ServedBy,
+    sent: bool,
+    attempts: Vec<AttemptView>,
+}
+
+impl AdminPrediction {
+    pub(crate) fn from_validated_parts(
+        served: crate::decision::ValidatedDecision,
+        served_by: ServedBy,
+        attempts: impl Iterator<Item = (BackendKind, AttemptOutcome, Duration)>,
+    ) -> Self {
+        let mut sent = false;
+        let attempts = attempts
+            .map(|(backend, outcome, latency)| {
+                sent |= matches!(outcome, AttemptOutcome::Served | AttemptOutcome::Failed(_));
+                let (outcome, error_class) = match outcome {
+                    AttemptOutcome::Served => ("served", None),
+                    AttemptOutcome::Cached => ("cached", None),
+                    AttemptOutcome::Failed(error) => ("failed", Some(error.class())),
+                    AttemptOutcome::Skipped(error) => ("skipped", Some(error.class())),
+                };
+                AttemptView {
+                    backend: backend.as_str(),
+                    outcome,
+                    error_class,
+                    latency_ms: u64::try_from(latency.as_millis()).unwrap_or(u64::MAX),
+                }
+            })
+            .collect();
+        Self {
+            served,
+            served_by,
+            sent,
+            attempts,
+        }
     }
 }
 
@@ -899,10 +951,7 @@ impl DecisionAdmin {
             .plane
             .decide(&factory, &self.config, key, &fixture, &lineage)
             .await?;
-        let sent = result
-            .attempts
-            .iter()
-            .any(|attempt| matches!(attempt.outcome, AttemptOutcome::Served | AttemptOutcome::Failed(_)));
+        let sent = result.sent;
         let served_by = match result.served_by {
             ServedBy::Primary => "primary",
             ServedBy::Fallback => "fallback",
@@ -917,24 +966,7 @@ impl DecisionAdmin {
             },
             sent,
             served_by: Some(served_by),
-            attempts: result
-                .attempts
-                .iter()
-                .map(|attempt| {
-                    let (outcome, error_class) = match &attempt.outcome {
-                        AttemptOutcome::Served => ("served", None),
-                        AttemptOutcome::Cached => ("cached", None),
-                        AttemptOutcome::Failed(error) => ("failed", Some(error.class())),
-                        AttemptOutcome::Skipped(error) => ("skipped", Some(error.class())),
-                    };
-                    AttemptView {
-                        backend: attempt.identity.kind.as_str(),
-                        outcome,
-                        error_class,
-                        latency_ms: u64::try_from(attempt.latency.as_millis()).unwrap_or(u64::MAX),
-                    }
-                })
-                .collect(),
+            attempts: result.attempts,
             answered: FIXTURE
                 .iter()
                 .filter(|(question, _)| result.served.answer(&QuestionId::global(*question)).is_some())

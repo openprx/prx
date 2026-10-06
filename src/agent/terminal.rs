@@ -478,7 +478,7 @@ where
     C::Error: Into<anyhow::Error>,
 {
     let commit = commit.try_into().map_err(Into::into)?;
-    finalize_turn_impl(fabric, commit, cost_config, workspace_dir, false).await
+    boxed_terminal_work(fabric, commit, cost_config, workspace_dir, false).await
 }
 
 #[cfg(test)]
@@ -493,7 +493,26 @@ where
     C::Error: Into<anyhow::Error>,
 {
     let commit = commit.try_into().map_err(Into::into)?;
-    finalize_turn_impl(fabric, commit, cost_config, workspace_dir, true).await
+    boxed_terminal_work(fabric, commit, cost_config, workspace_dir, true).await
+}
+
+// Construct terminal work before polling it. A single owned box keeps the
+// finalizer state out of the nested entry, cleanup and terminal-guard futures.
+// Conversion and rejection of an invalid draft remain in the lazy wrappers.
+fn boxed_terminal_work<'a>(
+    fabric: &'a MemoryFabric,
+    commit: TurnTerminalCommit,
+    cost_config: &'a CostConfig,
+    workspace_dir: &'a Path,
+    stop_after_marker: bool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<TurnTerminalReceipt>> + Send + 'a>> {
+    Box::pin(finalize_turn_impl(
+        fabric,
+        commit,
+        cost_config,
+        workspace_dir,
+        stop_after_marker,
+    ))
 }
 
 async fn finalize_turn_impl(
@@ -896,7 +915,8 @@ pub(crate) mod persistence_probe {
         let needle = PROBE_SECRET.to_ascii_lowercase();
         let mut redacted_somewhere = false;
         for file in &files {
-            let bytes = std::fs::read(file).expect("test: read a probed file");
+            let bytes = std::fs::read(file)
+                .unwrap_or_else(|error| panic!("test: read probed file {}: {error}", file.display()));
             let text = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
             assert!(!text.contains(&needle), "{} persisted the probe secret", file.display());
             redacted_somewhere |= String::from_utf8_lossy(&bytes).contains(REDACTION_MARKER);
