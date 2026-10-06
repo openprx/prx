@@ -30,6 +30,7 @@ async fn reply(
 
 pub(crate) struct Driver {
     endpoint: String,
+    diagnostics_dir: Option<std::path::PathBuf>,
     state: Arc<State>,
     stop: CancellationToken,
     task: tokio::task::JoinHandle<std::io::Result<()>>,
@@ -63,10 +64,15 @@ impl Driver {
         });
         Ok(Self {
             endpoint,
+            diagnostics_dir: None,
             state,
             stop,
             task,
         })
+    }
+    pub(crate) fn retain_evidence_at(mut self, directory: std::path::PathBuf) -> Self {
+        self.diagnostics_dir = Some(directory);
+        self
     }
     pub(crate) fn endpoint(&self) -> &str {
         &self.endpoint
@@ -86,8 +92,11 @@ impl Driver {
         let requests = self.state.requests.lock().clone();
         let replies = self.state.replies.lock().clone();
         let diagnostic = json!({"fixture_action":self.state.action,"fixture_target":self.state.target,"requests":requests,"replies":replies});
-        if let Some(directory) = std::env::var_os("PRX_NATIVE_DECISION_DIAGNOSTICS") {
-            let directory = std::path::PathBuf::from(directory);
+        if let Some(directory) = self
+            .diagnostics_dir
+            .take()
+            .or_else(|| std::env::var_os("PRX_NATIVE_DECISION_DIAGNOSTICS").map(std::path::PathBuf::from))
+        {
             assert!(
                 directory.is_absolute() && directory.is_dir(),
                 "explicit existing fixture diagnostic directory required"

@@ -1349,6 +1349,17 @@ Built-in HTTP webhook endpoint for receiving external events:
 - Memory-backed event storage
 - Route external events (GitHub, CI/CD, monitoring) into agent context
 
+The local webhook lifecycle candidate keeps decision prediction and subsequent
+turn execution under the same cleanup owner. If decision admission fails, it
+drains owned accounting work before acknowledging the input's failed terminal
+state. Cancellation retains the cleanup acknowledgement; an unconfirmed drain
+remains an error rather than a completed turn. Runtime verification of this
+candidate remains pending.
+
+This change adds no configuration and does not relax authorization, approval or
+budget checks. Rollback is a source change; no SQLite migration or stored-data
+rewrite is required.
+
 Chat supports `/approve --decision <uuid>` and `/deny --decision <uuid>` for a pending causal decision owned by the current chat. These commands record review through the signed decision-approval service; approval alone does not execute or resume the operation. Existing `/approve <seq>` and `/deny <seq>` still address child sessions. Use the canonical lowercase hyphenated decision UUID. Unknown, foreign, expired and failed reviews produce the same unconfirmed result and are not automatically retried.
 
 Use `/approval --decision <uuid>` to inspect the pending call before review. It displays the existing owner-authorized DTO, including redacted arguments and original-call availability; large output is truncated with a marker. `/revoke --decision <uuid>` records revocation of reviewed grants and does not undo any effect already executed. Neither command invokes a provider or resumes a tool. Unknown or foreign decisions do not reveal their existence.

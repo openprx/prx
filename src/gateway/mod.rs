@@ -2421,21 +2421,57 @@ async fn run_gateway_chat_with_multimodal(
         .await?;
     let runtime_envelope = source_receipt.envelope().clone();
     let gateway_proof = source_receipt.bind(&turn_runtime, fabric_ctx)?;
-    let admission = async {
-        let service = turn_runtime.decision_slot.publish(&turn_runtime, state).await?;
-        let context = service
-            .decide_agent_initial(
-                &gateway_proof,
-                crate::runtime::turn_decision::AgentTurnKind::SingleShot,
-                &cancellation,
-            )
-            .await?;
-        Ok::<_, anyhow::Error>((service, context))
-    }
-    .await;
+    // A spawned webhook job cannot inherit the caller's cleanup task-local.
+    // Prediction and later work must retain the same concrete cleanup owner.
+    let child_cleanup = match crate::runtime::turn_cleanup::CleanupScope::new(
+        Some(&turn_runtime.decision_slot.cleanup),
+        cancellation.clone(),
+    ) {
+        Ok(scope) => scope.with_acknowledgement(jobs::register_terminal_cleanup()),
+        Err(error) => {
+            if let Err(record_error) = admission_guard
+                .finish_failure(
+                    cancellation.is_cancelled(),
+                    &format!("decision cleanup admission failed: {error}"),
+                )
+                .await
+            {
+                return Err(error.context(format!(
+                    "Gateway admission failure persistence is unconfirmed: {record_error}"
+                )));
+            }
+            return Err(error);
+        }
+    };
+    let admission = child_cleanup
+        .scope_admission(Box::pin(async {
+            let service = turn_runtime.decision_slot.publish(&turn_runtime, state).await?;
+            let context = service
+                .decide_agent_initial(
+                    &gateway_proof,
+                    crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+                    &cancellation,
+                )
+                .await?;
+            Ok::<_, anyhow::Error>((service, context))
+        }))
+        .await;
     let (service, context) = match admission {
         Ok(admitted) => admitted,
         Err(error) => {
+            // Admission is no longer polled. Settle its owned accounting work
+            // before acknowledging the persisted input's failure.
+            let admission_error = format!("{error:#}");
+            let error = match child_cleanup.run(Box::pin(async { Err::<(), _>(error) })).await {
+                Err(error) if error.is::<crate::runtime::turn_cleanup::CleanupIncomplete>() => {
+                    let context = format!(
+                        "decision admission failed: {admission_error}; Gateway admission cleanup is unconfirmed: {error:#}"
+                    );
+                    error.context(context)
+                }
+                Err(error) => error,
+                Ok(()) => anyhow::anyhow!(admission_error),
+            };
             if let Err(record_error) = admission_guard
                 .finish_failure(
                     cancellation.is_cancelled(),
@@ -2461,11 +2497,6 @@ async fn run_gateway_chat_with_multimodal(
         runtime_envelope.clone(),
         admission_acknowledgement,
     )?;
-    let child_cleanup = crate::runtime::turn_cleanup::CleanupScope::new(
-        Some(&turn_runtime.decision_slot.cleanup),
-        cancellation.clone(),
-    )?
-    .with_acknowledgement(jobs::register_terminal_cleanup());
     let turn_result: anyhow::Result<String> = child_cleanup
         .run(async {
             anyhow::ensure!(
@@ -5916,27 +5947,168 @@ for line in sys.stdin:
     /// "LLM request failed" that told the caller nothing it could act on.
     #[tokio::test]
     async fn a_webhook_tool_schema_refusal_returns_a_stable_code_and_the_tools() {
-        let provider: Arc<dyn Provider> = Arc::new(crate::providers::tool_schema_refusal_tests::RefusingProvider);
-        let state = webhook_test_state(provider);
+        use futures_util::FutureExt as _;
 
-        let response = handle_webhook(
-            State(state),
-            test_connect_info(),
-            test_uri(),
-            HeaderMap::new(),
-            Bytes::from_static(br#"{"message":"hello"}"#),
-        )
-        .await
-        .into_response();
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let payload = response.into_body().collect().await.unwrap().to_bytes();
-        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(parsed["error"], "tool_schema_refused", "{parsed}");
-        assert_eq!(
-            parsed["tools"],
-            serde_json::json!(["fixture_conditional", "fixture_alternatives"]),
-            "{parsed}"
-        );
+        struct CountingRefusal {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Provider for CountingRefusal {
+            async fn chat_with_system(
+                &self,
+                system_prompt: Option<&str>,
+                message: &str,
+                model: &str,
+                temperature: f64,
+            ) -> anyhow::Result<String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                crate::providers::tool_schema_refusal_tests::RefusingProvider
+                    .chat_with_system(system_prompt, message, model, temperature)
+                    .await
+            }
+        }
+
+        // Retain this owned fixture's SQLite and key evidence on success and panic.
+        let scratch = tempfile::tempdir().expect("schema fixture directory").keep();
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(path = %scratch.display(), "retained schema fixture workspace");
+        });
+        let driver = crate::agent::agent::native_decision_fixture::Driver::start_answer()
+            .await
+            .expect("owned schema decision listener")
+            .retain_evidence_at(scratch.clone());
+        let endpoint = driver.endpoint().to_owned();
+        driver
+            .run(true, async move {
+                let mut config = Config::default();
+                config.workspace_dir = scratch.join("workspace");
+                config.config_path = scratch.join("config.toml");
+                config.default_provider = Some("ollama".to_string());
+                config.default_model = Some("prx-schema-fixture".to_string());
+                config.memory.backend = "sqlite".to_string();
+                config.providers.models.push(
+                    toml::from_str("provider = \"ollama\"\nmodel = \"prx-schema-fixture\"\noperations = [\"chat\"]\n")
+                        .expect("schema fixture chat declaration"),
+                );
+                config.cost.prices.insert(
+                    "ollama/prx-schema-fixture".to_string(),
+                    crate::config::schema::ModelPricing {
+                        input: 1.0,
+                        output: 1.0,
+                        cache_write: 1.0,
+                        cache_read: 1.0,
+                    },
+                );
+                assert!(matches!(
+                    crate::llm::route_decision::usage_cost_resolution(
+                        "ollama", "prx-schema-fixture", 1, 0, 0, 0, &config.cost,
+                    ),
+                    crate::llm::route_decision::UsagePrice::Priced(cost) if cost > 0.0
+                ));
+                crate::agent::agent::native_decision_fixture::configure(&mut config, &endpoint)
+                    .expect("schema fixture physical decision endpoint");
+                let resolved =
+                    providers::selection::check_default(&config, providers::catalog::UnknownPolicy::Invocation)
+                        .expect("schema fixture PMM chat selection");
+                let model = resolved.model().to_owned();
+                let security = Arc::new(crate::security::SecurityPolicy::from_config(
+                    &config.autonomy,
+                    &config.workspace_dir,
+                ));
+                let memory: Arc<dyn Memory> = Arc::new(
+                    crate::memory::SqliteMemory::new(&config.workspace_dir).expect("schema fixture durable SQLite"),
+                );
+                let calls = Arc::new(AtomicUsize::new(0));
+                let provider: Arc<dyn Provider> = Arc::new(CountingRefusal {
+                    calls: Arc::clone(&calls),
+                });
+                let mut state = webhook_test_state(Arc::clone(&provider));
+                state.config = crate::config::new_shared(config);
+                state.model = model.clone();
+                state.mem = Arc::clone(&memory);
+                state.hooks = Arc::new(HookManager::new(scratch.clone()));
+                // Controlled trait injection: PMM selection and pointer identity are real;
+                // this does not claim the production provider factory created the fixture.
+                let runtime = TurnRuntimeGeneration {
+                    provider_binding: Some(Arc::new(decision_source::GatewayProviderBinding::new(
+                        Arc::clone(&provider),
+                        resolved,
+                    ))),
+                    decision_slot: Arc::new(decision_runtime::GatewayDecisionSlot::new(security, 0)),
+                    config_generation: state.config.pin(),
+                    provider,
+                    model,
+                    temperature: state.temperature,
+                    tools_registry: Arc::clone(&state.tools_registry),
+                    mcp_tool: None,
+                };
+                let cleanup = Arc::clone(&runtime.decision_slot.cleanup);
+                let owner = Arc::new(GatewayTurnRuntimeOwner::new(
+                    runtime,
+                    Arc::clone(&state.config),
+                    memory,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Arc::clone(&state.hooks),
+                    #[cfg(feature = "wasm-plugins")]
+                    None,
+                ));
+                state.turn_runtime = Some(Arc::clone(&owner));
+                let work = Box::pin(async move {
+                    let response = handle_webhook(
+                        State(state),
+                        test_connect_info(),
+                        test_uri(),
+                        HeaderMap::new(),
+                        Bytes::from_static(br#"{"message":"hello"}"#),
+                    )
+                    .await
+                    .into_response();
+                    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                    let payload = response.into_body().collect().await.unwrap().to_bytes();
+                    let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                    assert_eq!(parsed["error"], "tool_schema_refused", "{parsed}");
+                    assert_eq!(
+                        parsed["tools"],
+                        serde_json::json!(["fixture_conditional", "fixture_alternatives"]),
+                        "{parsed}"
+                    );
+                    assert_eq!(calls.load(Ordering::SeqCst), 1, "actual refusal provider entered once");
+                });
+                let outcome = cleanup.scope(std::panic::AssertUnwindSafe(work).catch_unwind()).await;
+                // All request futures and state references are gone before owner retirement.
+                drop(owner);
+                let drained = cleanup
+                    .drain(tokio::time::Instant::now() + Duration::from_secs(15))
+                    .await;
+                if let Err(error) = drained {
+                    let subscriber = tracing_subscriber::fmt()
+                        .with_test_writer()
+                        .with_ansi(false)
+                        .without_time()
+                        .with_max_level(tracing::Level::ERROR)
+                        .finish();
+                    tracing::subscriber::with_default(subscriber, || {
+                        tracing::error!("schema fixture cleanup failed: {error}");
+                    });
+                    if let Err(panic) = outcome {
+                        std::panic::resume_unwind(panic);
+                    }
+                    panic!("schema fixture cleanup failed: {error}");
+                }
+                if let Err(panic) = outcome {
+                    std::panic::resume_unwind(panic);
+                }
+            })
+            .await;
     }
 
     #[tokio::test]
