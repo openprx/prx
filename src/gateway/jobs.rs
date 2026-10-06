@@ -400,6 +400,9 @@ where
         phase_tx,
     });
 
+    #[cfg(test)]
+    test_observation::observe_submission(&phase_rx);
+
     let terminal_cleanups = Arc::new(Mutex::new(initial_cleanup.into_iter().collect()));
     let work_cleanups = Arc::clone(&terminal_cleanups);
     let inner = tokio::spawn(registry::scoped(guard, async move {
@@ -626,3 +629,6 @@ mod tests {
         assert_eq!(records.len(), before, "running jobs must not be evicted");
     }
 }
+
+#[cfg(test)]
+pub(super) mod test_observation;

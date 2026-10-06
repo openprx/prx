@@ -1637,6 +1637,17 @@ async fn run_owned_manifest(
         None
     };
 
+    // Logical completion belongs to the authenticated original spawn input.
+    // Worker model segments and worker-result events keep their own scope.
+    let logical_task_scope = if child_grant.is_some() {
+        source_receipt
+            .as_deref()
+            .context("worker logical input missing")?
+            .logical_task_scope()
+    } else {
+        worker_event_scope.clone()
+    };
+
     // Capture completion-only authority before the driver can be cancelled.
     // Model segment authority remains independently checked per segment.
     let logical_terminal = match (
@@ -1647,7 +1658,7 @@ async fn run_owned_manifest(
         (Some(grant), None, None) => crate::agent::terminal::logical::LogicalTaskTerminalRef::granted(
             grant,
             source_receipt.as_deref().context("worker logical input missing")?,
-            &worker_event_scope,
+            &logical_task_scope,
         )?,
         (None, Some(authority), None) => {
             crate::agent::terminal::logical::LogicalTaskTerminalRef::ordinary_process(authority)?
@@ -2308,7 +2319,7 @@ async fn run_owned_manifest(
             crate::agent::terminal::TurnTerminalDraft {
                 decision: None,
                 terminal_id: manifest.run_id.clone(),
-                scope: worker_event_scope.clone(),
+                scope: logical_task_scope.clone(),
                 status: terminal_status,
                 history: worker_result
                     .success
@@ -2348,15 +2359,15 @@ async fn run_owned_manifest(
             }) && terminal_receipt.terminal_id == manifest.run_id
                 && terminal_receipt.usage_settlement.is_none()
                 && event.workspace_id == terminal_fabric.workspace_id()
-                && event.owner_id == worker_event_scope.owner_id
-                && event.run_id == worker_event_scope.run_id
-                && event.session_key == worker_event_scope.session_key
-                && event.source == worker_event_scope.source
+                && event.owner_id == logical_task_scope.owner_id
+                && event.run_id == logical_task_scope.run_id
+                && event.session_key == logical_task_scope.session_key
+                && event.source == logical_task_scope.source
                 && event.event_type == "turn.finalized"
                 && event.idempotency_key.as_deref() == Some(expected_key.as_str()),
             "worker logical terminal differs from admitted scope"
         );
-        let owner = worker_event_scope
+        let owner = logical_task_scope
             .owner_id
             .as_deref()
             .context("worker terminal owner missing")?;

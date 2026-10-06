@@ -25,6 +25,8 @@ pub struct WhatsAppChannel {
     endpoint_id: String,
     verify_token: String,
     allowed_numbers: Vec<String>,
+    #[cfg(test)]
+    test_transport: Option<(String, reqwest::Client)>,
 }
 
 impl WhatsAppChannel {
@@ -39,10 +41,34 @@ impl WhatsAppChannel {
             endpoint_id,
             verify_token,
             allowed_numbers,
+            #[cfg(test)]
+            test_transport: None,
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_transport(mut self, endpoint: &str, client: reqwest::Client) -> anyhow::Result<Self> {
+        let parsed = reqwest::Url::parse(endpoint)?;
+        anyhow::ensure!(
+            parsed.scheme() == "https"
+                && parsed.host_str() == Some("127.0.0.1")
+                && parsed.port().is_some()
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.query().is_none()
+                && parsed.fragment().is_none()
+                && parsed.path() == "/",
+            "fixture transport requires an explicit HTTPS IPv4-loopback root"
+        );
+        self.test_transport = Some((endpoint.trim_end_matches('/').to_owned(), client));
+        Ok(self)
+    }
+
     fn http_client(&self) -> reqwest::Client {
+        #[cfg(test)]
+        if let Some((_, client)) = &self.test_transport {
+            return client.clone();
+        }
         crate::config::build_runtime_proxy_client("channel.whatsapp")
             .map_err(|e| {
                 tracing::error!("proxy build failed for channel.whatsapp, using direct: {e}");
@@ -166,6 +192,11 @@ impl Channel for WhatsAppChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         // WhatsApp Cloud API: POST to /v18.0/{phone_number_id}/messages
         let url = format!("https://graph.facebook.com/v18.0/{}/messages", self.endpoint_id);
+        #[cfg(test)]
+        let url = self
+            .test_transport
+            .as_ref()
+            .map_or(url, |(base, _)| format!("{base}/v18.0/{}/messages", self.endpoint_id));
 
         // Normalize recipient (remove leading + if present for API)
         let to = message.recipient.strip_prefix('+').unwrap_or(&message.recipient);
@@ -220,6 +251,11 @@ impl Channel for WhatsAppChannel {
     async fn health_check(&self) -> bool {
         // Check if we can reach the WhatsApp API
         let url = format!("https://graph.facebook.com/v18.0/{}", self.endpoint_id);
+        #[cfg(test)]
+        let url = self
+            .test_transport
+            .as_ref()
+            .map_or(url, |(base, _)| format!("{base}/v18.0/{}", self.endpoint_id));
 
         if ensure_https(&url).is_err() {
             return false;

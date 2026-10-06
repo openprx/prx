@@ -214,6 +214,17 @@ terminal and confirmed segment event references and digests, including segments
 without metered usage. The signature binds the original spawn input, parent
 decision and returned result. The parent must still verify the inventory and
 read the durable events before treating any usage as confirmed.
+
+For granted process workers, the reviewed local scope repair binds logical-task
+completion to the original authenticated spawn input, preserving its source,
+owner, visibility and complete lineage. Worker model segments and worker-result
+events retain their separate worker scope. Logical terminal issuance and the
+final draft use the same original task identity; receipt, backend, signature and
+scope checks remain mandatory. This does not create a new grant or accept an
+unsigned completion. Runtime validation remains pending. No configuration or
+stored-data migration is required; reverting the scope repair restores the prior
+refusal when the worker projection differs from the original task identity.
+
 The signed inventory includes the number of recorded segment inputs. A successful
 result must cover every index exactly once; duplicate event references and
 noncanonical or out-of-range segment identities are refused. Failed results may

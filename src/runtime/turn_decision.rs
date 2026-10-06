@@ -7,6 +7,9 @@
 #[cfg(test)]
 use crate::causal_tree::state::ConstraintCode;
 
+#[cfg(test)]
+pub(crate) mod progress_diagnostic;
+
 mod accounting;
 mod auxiliary;
 
@@ -2700,10 +2703,32 @@ impl TurnDecisionService {
             // refs. A terminal-only preparation would hide them and falsely
             // classify successful discovery as no progress. The current
             // unproven-budget factory admits only the local builtin.
-            if hop >= max_hops
-                || Instant::now() >= deadline
-                || discovery_change.as_ref().is_some_and(|(_, added)| !added)
-                || retrieval_progress == Some(false)
+            // The test-only observation returns each original operand unchanged.
+            // Short-circuit order and each clock/fingerprint evaluation are preserved.
+            macro_rules! progress_operand {
+                ($label:literal, $value:expr) => {{
+                    let value = $value;
+                    #[cfg(test)]
+                    progress_diagnostic::record($label, u64::from(value));
+                    value
+                }};
+            }
+            #[cfg(test)]
+            progress_diagnostic::with_active(|trace| {
+                trace.push("hop", u64::from(hop));
+                trace.push("max_hops", u64::from(max_hops));
+                if let Some((previous, _)) = &discovery_change {
+                    trace.push("previous_refs", previous.iter().count() as u64);
+                    trace.push("current_refs", discovered_refs.iter().count() as u64);
+                }
+            });
+            if progress_operand!("hop_limit", hop >= max_hops)
+                || progress_operand!("deadline_expired", Instant::now() >= deadline)
+                || progress_operand!(
+                    "no_added_discovery_refs",
+                    discovery_change.as_ref().is_some_and(|(_, added)| !added)
+                )
+                || progress_operand!("retrieval_no_progress", retrieval_progress == Some(false))
             {
                 stop_hops = true;
             } else if retrieval_progress == Some(true) {
@@ -2771,9 +2796,16 @@ impl TurnDecisionService {
                 if cancellation.is_cancelled() {
                     return Err(AgentDecisionError::Cancelled);
                 }
-                stop_hops = next_prepared.evidence_fingerprint() == previous_prepared.evidence_fingerprint()
-                    && !next_prepared.candidate_bodies_changed_from_prepared(&previous_prepared);
+                stop_hops = progress_operand!(
+                    "same_evidence",
+                    next_prepared.evidence_fingerprint() == previous_prepared.evidence_fingerprint()
+                ) && progress_operand!(
+                    "same_candidate_bodies",
+                    !next_prepared.candidate_bodies_changed_from_prepared(&previous_prepared)
+                );
             }
+            #[cfg(test)]
+            progress_diagnostic::record("stop_hops", u64::from(stop_hops));
             // Keep every completed hop's actual gates, prediction and
             // candidates. IDs alone cannot reconstruct a durable audit row.
             prior_hops.push(decision);

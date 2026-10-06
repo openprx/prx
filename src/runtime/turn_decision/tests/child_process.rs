@@ -307,8 +307,9 @@ async fn actual_parent_process_case(non_root_route: bool) -> anyhow::Result<()> 
     // Catch every assertion panic and Result error after launch. The common
     // tail always waits for the actual process owner before returning.
     let scenario = std::panic::AssertUnwindSafe(async {
-        let workspace = scratch.path().join("logical");
         let config_dir = scratch.path().join("config");
+        // Match the production --config-dir loader; workspace_dir is not serialized.
+        let workspace = config_dir.join("workspace");
         let private_home = scratch.path().join("worker-home");
         let workers = scratch.path().join("workers");
         for path in [&workspace, &config_dir, &private_home, &workers] {

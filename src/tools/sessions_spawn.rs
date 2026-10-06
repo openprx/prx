@@ -8530,6 +8530,36 @@ async fn run_sub_agent_process(
     let stdout_raw = String::from_utf8_lossy(&stdout).trim().to_string();
     let stderr_raw = String::from_utf8_lossy(&stderr).trim().to_string();
     let outcome = classify_worker_output(status, &stdout_raw, &stderr_raw);
+    #[cfg(all(test, unix))]
+    if let (Some(artifact), Ok(ProcessWorkerOutcome::Finished(result))) = (test_worker_executable, &outcome) {
+        if !result.success && result.completion_evidence.is_none() {
+            if let Some(error) = result.error.as_deref() {
+                // Diagnostic only for the explicitly attested local AUT. Keep
+                // unsigned failure evidence private; it grants no authority.
+                let retained = (|| -> anyhow::Result<()> {
+                    use std::io::Write as _;
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    anyhow::ensure!(
+                        std::fs::symlink_metadata(&artifact.private_home)?.file_type().is_dir(),
+                        "worker diagnostic home is not an owned directory"
+                    );
+                    let redacted = crate::agent::terminal::redact_persisted_text(error);
+                    let bounded: String = redacted.chars().take(4096).collect();
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(artifact.private_home.join("unsigned-worker-error.txt"))?;
+                    file.write_all(bounded.as_bytes())?;
+                    file.sync_all()?;
+                    Ok(())
+                })();
+                if retained.is_err() {
+                    tracing::warn!("owned worker unsigned-error diagnostic could not be retained");
+                }
+            }
+        }
+    }
     let outcome = async {
         // A cleanup-confirmed worker can exit after journaling but before its
         // stdout result reaches the parent. Reuse its exact launch authority.

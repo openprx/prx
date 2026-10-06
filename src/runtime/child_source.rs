@@ -148,6 +148,36 @@ impl ChildInputReceipt {
         &self.event
     }
 
+    /// Project the original durable task identity, not a worker segment envelope.
+    /// This is metadata only; logical terminal issuance still verifies the grant,
+    /// backend identity and every semantic field against this receipt.
+    pub(crate) fn logical_task_scope(&self) -> MessageEventScope {
+        let event = self.event();
+        MessageEventScope {
+            source: event.source.clone(),
+            owner_id: event.owner_id.clone(),
+            channel: event.channel.clone(),
+            session_key: event.session_key.clone(),
+            parent_session_key: event.parent_session_key.clone(),
+            run_id: event.run_id.clone(),
+            parent_run_id: event.parent_run_id.clone(),
+            agent_id: event.agent_id.clone(),
+            persona_id: event.persona_id.clone(),
+            sender: event.sender.clone(),
+            recipient: event.recipient.clone(),
+            subject: event.subject.clone(),
+            goal_id: event.goal_id.clone(),
+            causation_event_id: event.causation_event_id.clone(),
+            correlation_id: event.correlation_id.clone(),
+            attempt_id: event.attempt_id.clone(),
+            lease_epoch: event.lease_epoch,
+            config_generation_id: event.config_generation_id,
+            config_source_revision: event.config_source_revision.clone(),
+            authority_guard: self.authority_guard.clone(),
+            visibility: event.visibility.clone(),
+        }
+    }
+
     pub(crate) fn verify_backend(&self, memory: &Arc<dyn crate::memory::Memory>) -> anyhow::Result<()> {
         anyhow::ensure!(
             Arc::ptr_eq(&self.memory, memory),

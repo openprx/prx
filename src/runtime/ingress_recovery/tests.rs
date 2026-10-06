@@ -307,8 +307,9 @@ fn final_for<'a>(report: &'a Report, event: &MessageEvent) -> Option<&'a Message
 }
 
 fn verify_recovery(completed: bool) {
-    let workspace = tempfile::tempdir().unwrap();
-    let mut first = OwnedChild::start(workspace.path(), if completed { "completed" } else { "pending" });
+    let workspace = tempfile::tempdir().unwrap().keep();
+    println!("retained ingress recovery fixture: {}", workspace.display());
+    let mut first = OwnedChild::start(workspace.as_path(), if completed { "completed" } else { "pending" });
     let before = first.acknowledgement();
     assert_eq!(before.pid, first.child.id());
     assert_eq!(before.calls, 1);
@@ -316,7 +317,7 @@ fn verify_recovery(completed: bool) {
     let before_final = final_for(&before, original);
     assert_eq!(before_final.is_some(), completed);
     first.finish(!completed);
-    let mut next = OwnedChild::start(workspace.path(), "probe");
+    let mut next = OwnedChild::start(workspace.as_path(), "probe");
     let after = next.acknowledgement();
     assert_eq!(after.pid, next.child.id());
     next.finish(false);

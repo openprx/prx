@@ -366,6 +366,25 @@ async fn read_terminal(
     digest: &str,
     run_id: &str,
 ) -> anyhow::Result<MessageEvent> {
+    read_terminal_with_source(
+        fabric,
+        owner,
+        event_id,
+        digest,
+        run_id,
+        &MessageEventSource::SessionWorker,
+    )
+    .await
+}
+
+async fn read_terminal_with_source(
+    fabric: &MemoryFabric,
+    owner: &str,
+    event_id: &str,
+    digest: &str,
+    run_id: &str,
+    expected_source: &MessageEventSource,
+) -> anyhow::Result<MessageEvent> {
     let event = fabric
         .memory()
         .find_owned_message_event(fabric.workspace_id(), owner, event_id)
@@ -377,7 +396,7 @@ async fn read_terminal(
             && event.workspace_id == fabric.workspace_id()
             && event.owner_id.as_deref() == Some(owner)
             && event.run_id.as_deref() == Some(run_id)
-            && event.source == MessageEventSource::SessionWorker
+            && &event.source == expected_source
             && event.role == "event"
             && event.event_type == "turn.finalized"
             && event.idempotency_key.as_deref() == Some(format!("turn:{run_id}:final").as_str())
@@ -454,12 +473,13 @@ async fn verify_bound(
             && source.event_id == evidence.input_event_id,
         "worker completion lookup differs from issued source"
     );
-    let logical = read_terminal(
+    let logical = read_terminal_with_source(
         fabric,
         provenance.owner,
         &evidence.terminal_event_id,
         &evidence.terminal_event_digest,
         &evidence.run_id,
+        &source.source,
     )
     .await?;
     anyhow::ensure!(

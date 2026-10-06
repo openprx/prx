@@ -13,6 +13,8 @@ pub struct LinqChannel {
     from_phone: String,
     allowed_senders: Vec<String>,
     client: reqwest::Client,
+    #[cfg(test)]
+    test_api_base: Option<String>,
 }
 
 const LINQ_API_BASE: &str = "https://api.linqapp.com/api/partner/v3";
@@ -24,7 +26,28 @@ impl LinqChannel {
             from_phone,
             allowed_senders,
             client: reqwest::Client::new(),
+            #[cfg(test)]
+            test_api_base: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_transport(mut self, endpoint: &str, client: reqwest::Client) -> anyhow::Result<Self> {
+        let parsed = reqwest::Url::parse(endpoint)?;
+        anyhow::ensure!(
+            parsed.scheme() == "https"
+                && parsed.host_str() == Some("127.0.0.1")
+                && parsed.port().is_some()
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.query().is_none()
+                && parsed.fragment().is_none()
+                && parsed.path() == "/",
+            "fixture transport requires an explicit HTTPS IPv4-loopback root"
+        );
+        self.test_api_base = Some(format!("{}/api/partner/v3", endpoint.trim_end_matches('/')));
+        self.client = client;
+        Ok(self)
     }
 
     /// Check if a sender phone number is allowed (E.164 format: +1234567890)
@@ -235,7 +258,10 @@ impl Channel for LinqChannel {
         });
 
         // Try sending to existing chat (recipient is chat_id)
-        let url = format!("{LINQ_API_BASE}/chats/{recipient}/messages");
+        let api_base = LINQ_API_BASE;
+        #[cfg(test)]
+        let api_base = self.test_api_base.as_deref().unwrap_or(api_base);
+        let url = format!("{api_base}/chats/{recipient}/messages");
 
         let resp = self
             .client
@@ -265,7 +291,7 @@ impl Channel for LinqChannel {
 
             let create_resp = self
                 .client
-                .post(format!("{LINQ_API_BASE}/chats"))
+                .post(format!("{api_base}/chats"))
                 .bearer_auth(&self.api_token)
                 .header("Content-Type", "application/json")
                 .json(&new_chat_body)

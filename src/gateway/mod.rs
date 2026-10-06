@@ -3364,7 +3364,27 @@ fn accept_channel_webhook_delivery(
 /// Owns the delivery claim for the whole run, so the claim is resolved by code
 /// that knows whether the turn reached a side effect — never by the request
 /// future going away.
-async fn run_channel_webhook_job(
+fn run_channel_webhook_job(
+    state: AppState,
+    channel: Arc<dyn Channel>,
+    channel_key: &'static str,
+    messages: Vec<crate::channels::traits::ChannelMessage>,
+    memory_key: fn(&crate::channels::traits::ChannelMessage) -> String,
+    claim: webhook_dedup::DeliveryClaim,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<jobs::JobOutput, String>> + Send>> {
+    // Keep owned channel work out of the generic job submitter's future.
+    // Construction does not poll it; the same delivery claim moves with it.
+    Box::pin(run_channel_webhook_job_work(
+        state,
+        channel,
+        channel_key,
+        messages,
+        memory_key,
+        claim,
+    ))
+}
+
+async fn run_channel_webhook_job_work(
     state: AppState,
     channel: Arc<dyn Channel>,
     channel_key: &'static str,
@@ -3729,6 +3749,9 @@ async fn handle_nextcloud_talk_webhook(
         nextcloud_talk_memory_key,
     )
 }
+
+#[cfg(test)]
+mod platform_test_transport;
 
 #[cfg(test)]
 mod tests {
@@ -5746,6 +5769,255 @@ for line in sys.stdin:
         }
     }
 
+    struct BoundBlockingProvider(Arc<BlockFirstProvider>);
+    #[async_trait]
+    impl Provider for BoundBlockingProvider {
+        async fn chat_with_system(
+            &self,
+            system_prompt: Option<&str>,
+            message: &str,
+            model: &str,
+            temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.0
+                .chat_with_system(system_prompt, message, model, temperature)
+                .await
+        }
+        async fn chat_traced(
+            &self,
+            request: crate::providers::ChatRequest<'_>,
+            model: &str,
+            temperature: f64,
+        ) -> anyhow::Result<crate::providers::traits::ChatTrace> {
+            assert_eq!(model, "prx-blocking-fixture");
+            let started_at = chrono::Utc::now();
+            let response = self.chat(request, model, temperature).await?;
+            let finished_at = chrono::Utc::now();
+            Ok(crate::providers::traits::ChatTrace {
+                response,
+                attempts: vec![crate::llm::route_decision::ProviderAttempt {
+                    seq: 1,
+                    provider: "ollama".into(),
+                    model: model.into(),
+                    started_at,
+                    finished_at,
+                    status: crate::llm::route_decision::AttemptStatus::Success,
+                    error_class: None,
+                    error_message: None,
+                }],
+                final_provider: "ollama".into(),
+                final_model: model.into(),
+                served_member: None,
+                tokens_used: crate::llm::route_decision::TokenUsage::default(),
+            })
+        }
+    }
+
+    type FixtureCallerHandle = Arc<Mutex<Option<tokio::task::JoinHandle<axum::response::Response>>>>;
+
+    struct OwnedWebhookCaller(FixtureCallerHandle);
+    impl OwnedWebhookCaller {
+        fn abort(&self) {
+            if let Some(handle) = self.0.lock().as_ref() {
+                handle.abort();
+            }
+        }
+    }
+    impl std::future::Future for OwnedWebhookCaller {
+        type Output = Result<axum::response::Response, tokio::task::JoinError>;
+        fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+            let mut slot = self.0.lock();
+            let result = std::pin::Pin::new(slot.as_mut().expect("owned caller polled once")).poll(cx);
+            if result.is_ready() {
+                slot.take();
+            }
+            result
+        }
+    }
+
+    #[derive(Default)]
+    struct WebhookFixtureCallers {
+        jobs: Arc<jobs::test_observation::SubmittedJobs>,
+        callers: Mutex<Vec<FixtureCallerHandle>>,
+    }
+    impl WebhookFixtureCallers {
+        fn spawn(
+            &self,
+            work: impl std::future::Future<Output = axum::response::Response> + Send + 'static,
+        ) -> OwnedWebhookCaller {
+            let jobs = Arc::clone(&self.jobs);
+            let handle = tokio::spawn(async move { jobs.scope(work).await });
+            let slot = Arc::new(Mutex::new(Some(handle)));
+            self.callers.lock().push(Arc::clone(&slot));
+            OwnedWebhookCaller(slot)
+        }
+
+        async fn join_callers(&self) {
+            let callers = std::mem::take(&mut *self.callers.lock());
+            for caller in callers {
+                let handle = caller.lock().take();
+                if let Some(handle) = handle {
+                    handle.abort();
+                    let _ = handle.await;
+                }
+            }
+        }
+    }
+
+    async fn owned_blocking_webhook_fixture<F, Fut>(business: F)
+    where
+        F: FnOnce(AppState, Arc<BlockFirstProvider>, Arc<WebhookFixtureCallers>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use futures_util::FutureExt as _;
+        let scratch = tempfile::tempdir().expect("owned webhook fixture").keep();
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(path = %scratch.display(), "retained blocking webhook fixture");
+        });
+        let driver = crate::agent::agent::native_decision_fixture::Driver::start_answer()
+            .await
+            .expect("owned webhook prediction listener")
+            .retain_evidence_at(scratch.clone());
+        let endpoint = driver.endpoint().to_owned();
+        driver
+            .run(true, async move {
+                let mut config = Config::default();
+                config.workspace_dir = scratch.join("workspace");
+                config.config_path = scratch.join("config.toml");
+                config.default_provider = Some("ollama".to_string());
+                config.default_model = Some("prx-blocking-fixture".to_string());
+                config.memory.backend = "sqlite".to_string();
+                config.providers.models.push(
+                    toml::from_str(
+                        "provider = \"ollama\"\nmodel = \"prx-blocking-fixture\"\noperations = [\"chat\"]\n",
+                    )
+                    .expect("blocking webhook fixture chat declaration"),
+                );
+                config.cost.prices.insert(
+                    "ollama/prx-blocking-fixture".to_string(),
+                    crate::config::schema::ModelPricing {
+                        input: 1.0,
+                        output: 1.0,
+                        cache_write: 1.0,
+                        cache_read: 1.0,
+                    },
+                );
+                assert!(matches!(
+                    crate::llm::route_decision::usage_cost_resolution(
+                        "ollama", "prx-blocking-fixture", 1, 0, 0, 0, &config.cost,
+                    ),
+                    crate::llm::route_decision::UsagePrice::Priced(cost) if cost > 0.0
+                ));
+                crate::agent::agent::native_decision_fixture::configure(&mut config, &endpoint)
+                    .expect("blocking webhook fixture physical decision endpoint");
+                let resolved =
+                    providers::selection::check_default(&config, providers::catalog::UnknownPolicy::Invocation)
+                        .expect("blocking webhook fixture PMM chat selection");
+                let model = resolved.model().to_owned();
+                let security = Arc::new(crate::security::SecurityPolicy::from_config(
+                    &config.autonomy,
+                    &config.workspace_dir,
+                ));
+                let memory: Arc<dyn Memory> = Arc::new(
+                    crate::memory::SqliteMemory::new(&config.workspace_dir)
+                        .expect("blocking webhook fixture durable SQLite"),
+                );
+                let provider_impl = Arc::new(BlockFirstProvider::default());
+                let provider: Arc<dyn Provider> = Arc::new(BoundBlockingProvider(Arc::clone(&provider_impl)));
+                let mut state = webhook_test_state(Arc::clone(&provider));
+                state.config = crate::config::new_shared(config);
+                state.model = model.clone();
+                state.mem = Arc::clone(&memory);
+                state.hooks = Arc::new(HookManager::new(scratch.clone()));
+                // Controlled trait injection: PMM selection and pointer identity are real;
+                // this does not claim the production provider factory created the fixture.
+                let runtime = TurnRuntimeGeneration {
+                    provider_binding: Some(Arc::new(decision_source::GatewayProviderBinding::new(
+                        Arc::clone(&provider),
+                        resolved,
+                    ))),
+                    decision_slot: Arc::new(decision_runtime::GatewayDecisionSlot::new(security, 0)),
+                    config_generation: state.config.pin(),
+                    provider,
+                    model,
+                    temperature: state.temperature,
+                    tools_registry: Arc::clone(&state.tools_registry),
+                    mcp_tool: None,
+                };
+                let cleanup = Arc::clone(&runtime.decision_slot.cleanup);
+                let owner = Arc::new(GatewayTurnRuntimeOwner::new(
+                    runtime,
+                    Arc::clone(&state.config),
+                    memory,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Arc::clone(&state.hooks),
+                    #[cfg(feature = "wasm-plugins")]
+                    None,
+                ));
+                state.turn_runtime = Some(Arc::clone(&owner));
+
+                let callers = Arc::new(WebhookFixtureCallers::default());
+                let cleanup_callers = Arc::clone(&callers);
+                let release = Arc::clone(&provider_impl);
+                let work = Box::pin(async move { business(state, provider_impl, callers).await });
+                let outcome = cleanup
+                    .scope(
+                        cleanup_callers
+                            .jobs
+                            .scope(std::panic::AssertUnwindSafe(work).catch_unwind()),
+                    )
+                    .await;
+                // The real provider is unblocked only after business success/failure is captured.
+                release.release_first.notify_one();
+                cleanup_callers.join_callers().await;
+                let monitor = cleanup_callers
+                    .jobs
+                    .wait_terminal(1, tokio::time::Instant::now() + Duration::from_secs(15))
+                    .await;
+                // Monitor terminal can itself represent failed cleanup; independently drain ownership.
+                let drained = cleanup
+                    .drain(tokio::time::Instant::now() + Duration::from_secs(15))
+                    .await;
+                drop(owner);
+                let retired = cleanup
+                    .drain(tokio::time::Instant::now() + Duration::from_secs(15))
+                    .await;
+                if monitor.is_err() || drained.is_err() || retired.is_err() {
+                    let subscriber = tracing_subscriber::fmt()
+                        .with_test_writer()
+                        .with_ansi(false)
+                        .without_time()
+                        .with_max_level(tracing::Level::ERROR)
+                        .finish();
+                    tracing::subscriber::with_default(subscriber, || {
+                        tracing::error!(
+                            ?monitor,
+                            ?drained,
+                            ?retired,
+                            "owned webhook fixture cleanup unconfirmed"
+                        );
+                    });
+                    if let Err(panic) = outcome {
+                        std::panic::resume_unwind(panic);
+                    }
+                    panic!("owned webhook fixture cleanup unconfirmed");
+                }
+                if let Err(panic) = outcome {
+                    std::panic::resume_unwind(panic);
+                }
+            })
+            .await;
+    }
+
     #[derive(Default)]
     struct OversizeResponseProvider {
         calls: AtomicUsize,
@@ -6247,52 +6519,30 @@ for line in sys.stdin:
     /// committing side effects.
     #[tokio::test]
     async fn webhook_idempotency_cancelled_attempt_does_not_reexecute() {
-        let provider_impl = Arc::new(BlockFirstProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
-        let state = webhook_test_state(provider);
-        let mut headers = HeaderMap::new();
-        headers.insert("X-Idempotency-Key", HeaderValue::from_static("retry-after-cancel"));
+        owned_blocking_webhook_fixture(|state, provider_impl, callers| async move {
+            let mut headers = HeaderMap::new();
+            headers.insert("X-Idempotency-Key", HeaderValue::from_static("retry-after-cancel"));
 
-        let started = provider_impl.first_started.notified();
-        let first_state = state.clone();
-        let first_headers = headers.clone();
-        let first = tokio::spawn(async move {
-            handle_webhook(
-                State(first_state),
-                test_connect_info(),
-                test_uri(),
-                first_headers,
-                Bytes::from_static(br#"{"message":"hello"}"#),
-            )
-            .await
-            .into_response()
-        });
-        started.await;
-        first.abort();
-        assert!(first.await.unwrap_err().is_cancelled());
+            let started = provider_impl.first_started.notified();
+            let first_state = state.clone();
+            let first_headers = headers.clone();
+            let first = callers.spawn(async move {
+                handle_webhook(
+                    State(first_state),
+                    test_connect_info(),
+                    test_uri(),
+                    first_headers,
+                    Bytes::from_static(br#"{"message":"hello"}"#),
+                )
+                .await
+                .into_response()
+            });
+            started.await;
+            first.abort();
+            assert!(first.await.unwrap_err().is_cancelled());
 
-        // The abandoned caller must not have handed the key back for re-execution.
-        let retry = handle_webhook(
-            State(state.clone()),
-            test_connect_info(),
-            test_uri(),
-            headers.clone(),
-            Bytes::from_static(br#"{"message":"hello"}"#),
-        )
-        .await
-        .into_response();
-        assert_eq!(retry.status(), StatusCode::CONFLICT);
-        let payload = retry.into_body().collect().await.unwrap().to_bytes();
-        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(parsed["status"], "processing");
-        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
-
-        // Once the detached run finishes, the redelivery is answered from the
-        // stored result instead of by running the request a second time.
-        provider_impl.release_first.notify_one();
-        let mut duplicate = None;
-        for _ in 0..200_u32 {
-            let response = handle_webhook(
+            // The abandoned caller must not have handed the key back for re-execution.
+            let retry = handle_webhook(
                 State(state.clone()),
                 test_connect_info(),
                 test_uri(),
@@ -6301,109 +6551,131 @@ for line in sys.stdin:
             )
             .await
             .into_response();
-            if response.status() == StatusCode::OK {
-                duplicate = Some(response);
-                break;
+            assert_eq!(retry.status(), StatusCode::CONFLICT);
+            let payload = retry.into_body().collect().await.unwrap().to_bytes();
+            let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(parsed["status"], "processing");
+            assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+
+            // Once the detached run finishes, the redelivery is answered from the
+            // stored result instead of by running the request a second time.
+            provider_impl.release_first.notify_one();
+            let mut duplicate = None;
+            for _ in 0..200_u32 {
+                let response = handle_webhook(
+                    State(state.clone()),
+                    test_connect_info(),
+                    test_uri(),
+                    headers.clone(),
+                    Bytes::from_static(br#"{"message":"hello"}"#),
+                )
+                .await
+                .into_response();
+                if response.status() == StatusCode::OK {
+                    duplicate = Some(response);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let duplicate = duplicate.expect("detached run should commit its idempotent result");
-        let payload = duplicate.into_body().collect().await.unwrap().to_bytes();
-        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(parsed["status"], "duplicate");
-        assert_eq!(parsed["response"], "released");
-        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+            let duplicate = duplicate.expect("detached run should commit its idempotent result");
+            let payload = duplicate.into_body().collect().await.unwrap().to_bytes();
+            let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(parsed["status"], "duplicate");
+            assert_eq!(parsed["response"], "released");
+            assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn webhook_idempotency_concurrent_attempt_reports_processing() {
-        let provider_impl = Arc::new(BlockFirstProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
-        let state = webhook_test_state(provider);
-        let mut headers = HeaderMap::new();
-        headers.insert("X-Idempotency-Key", HeaderValue::from_static("concurrent-key"));
+        owned_blocking_webhook_fixture(|state, provider_impl, callers| async move {
+            let mut headers = HeaderMap::new();
+            headers.insert("X-Idempotency-Key", HeaderValue::from_static("concurrent-key"));
 
-        let started = provider_impl.first_started.notified();
-        let first_state = state.clone();
-        let first_headers = headers.clone();
-        let first = tokio::spawn(async move {
-            handle_webhook(
-                State(first_state),
+            let started = provider_impl.first_started.notified();
+            let first_state = state.clone();
+            let first_headers = headers.clone();
+            let first = callers.spawn(async move {
+                handle_webhook(
+                    State(first_state),
+                    test_connect_info(),
+                    test_uri(),
+                    first_headers,
+                    Bytes::from_static(br#"{"message":"hello"}"#),
+                )
+                .await
+                .into_response()
+            });
+            started.await;
+
+            let concurrent = handle_webhook(
+                State(state.clone()),
                 test_connect_info(),
                 test_uri(),
-                first_headers,
+                headers.clone(),
                 Bytes::from_static(br#"{"message":"hello"}"#),
             )
             .await
-            .into_response()
-        });
-        started.await;
+            .into_response();
+            let concurrent_status = concurrent.status();
+            let payload = concurrent.into_body().collect().await.unwrap().to_bytes();
+            let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
 
-        let concurrent = handle_webhook(
-            State(state.clone()),
-            test_connect_info(),
-            test_uri(),
-            headers.clone(),
-            Bytes::from_static(br#"{"message":"hello"}"#),
-        )
-        .await
-        .into_response();
-        let concurrent_status = concurrent.status();
-        let payload = concurrent.into_body().collect().await.unwrap().to_bytes();
-        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-
-        provider_impl.release_first.notify_one();
-        let first_response = first.await.unwrap();
-        assert_eq!(first_response.status(), StatusCode::OK);
-        assert_eq!(concurrent_status, StatusCode::CONFLICT);
-        assert_eq!(parsed["status"], "processing");
-        assert_eq!(parsed["idempotent"], true);
-        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+            provider_impl.release_first.notify_one();
+            let first_response = first.await.unwrap();
+            assert_eq!(first_response.status(), StatusCode::OK);
+            assert_eq!(concurrent_status, StatusCode::CONFLICT);
+            assert_eq!(parsed["status"], "processing");
+            assert_eq!(parsed["idempotent"], true);
+            assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn webhook_idempotency_full_capacity_returns_service_unavailable() {
-        let provider_impl = Arc::new(BlockFirstProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
-        let mut state = webhook_test_state(provider);
-        state.idempotency_store = Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1));
+        owned_blocking_webhook_fixture(|mut state, provider_impl, callers| async move {
+            state.idempotency_store = Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1));
 
-        let mut first_headers = HeaderMap::new();
-        first_headers.insert("X-Idempotency-Key", HeaderValue::from_static("first-key"));
-        let started = provider_impl.first_started.notified();
-        let first_state = state.clone();
-        let first = tokio::spawn(async move {
-            handle_webhook(
-                State(first_state),
+            let mut first_headers = HeaderMap::new();
+            first_headers.insert("X-Idempotency-Key", HeaderValue::from_static("first-key"));
+            let started = provider_impl.first_started.notified();
+            let first_state = state.clone();
+            let first = callers.spawn(async move {
+                handle_webhook(
+                    State(first_state),
+                    test_connect_info(),
+                    test_uri(),
+                    first_headers,
+                    Bytes::from_static(br#"{"message":"first"}"#),
+                )
+                .await
+                .into_response()
+            });
+            started.await;
+
+            let mut second_headers = HeaderMap::new();
+            second_headers.insert("X-Idempotency-Key", HeaderValue::from_static("second-key"));
+            let at_capacity = handle_webhook(
+                State(state),
                 test_connect_info(),
                 test_uri(),
-                first_headers,
-                Bytes::from_static(br#"{"message":"first"}"#),
+                second_headers,
+                Bytes::from_static(br#"{"message":"second"}"#),
             )
             .await
-            .into_response()
-        });
-        started.await;
+            .into_response();
+            assert_eq!(at_capacity.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let payload = at_capacity.into_body().collect().await.unwrap().to_bytes();
+            let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(parsed["retryable"], true);
 
-        let mut second_headers = HeaderMap::new();
-        second_headers.insert("X-Idempotency-Key", HeaderValue::from_static("second-key"));
-        let at_capacity = handle_webhook(
-            State(state),
-            test_connect_info(),
-            test_uri(),
-            second_headers,
-            Bytes::from_static(br#"{"message":"second"}"#),
-        )
-        .await
-        .into_response();
-        assert_eq!(at_capacity.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let payload = at_capacity.into_body().collect().await.unwrap().to_bytes();
-        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(parsed["retryable"], true);
-
-        provider_impl.release_first.notify_one();
-        assert_eq!(first.await.unwrap().status(), StatusCode::OK);
-        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+            provider_impl.release_first.notify_one();
+            assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+            assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -7201,6 +7473,148 @@ for line in sys.stdin:
     const PLATFORM_LINQ_SECRET: &str = "linq-signing-secret";
     const PLATFORM_NC_SECRET: &str = "nextcloud-webhook-secret";
 
+    async fn local_platform_fixture<F, Fut>(business: F)
+    where
+        F: FnOnce(AppState, Arc<BlockFirstProvider>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use futures_util::FutureExt as _;
+        let transport = platform_test_transport::LocalTransport::start()
+            .await
+            .expect("owned platform TLS endpoint");
+        let endpoint = transport.endpoint.clone();
+        let client = transport.client.clone();
+        let outcome = std::panic::AssertUnwindSafe(owned_blocking_webhook_fixture(
+            |mut state, provider, _callers| async move {
+                state.whatsapp = Some(Arc::new(
+                    WhatsAppChannel::new(
+                        "wa-token".into(),
+                        "endpoint-id".into(),
+                        "verify-token".into(),
+                        vec!["*".into()],
+                    )
+                    .with_test_transport(&endpoint, client.clone())
+                    .expect("WhatsApp loopback only"),
+                ));
+                state.whatsapp_app_secret = Some(Arc::from(PLATFORM_WA_SECRET));
+                state.linq = Some(Arc::new(
+                    LinqChannel::new("linq-token".into(), "+15550000000".into(), vec!["*".into()])
+                        .with_test_transport(&endpoint, client.clone())
+                        .expect("Linq loopback only"),
+                ));
+                state.linq_signing_secret = Some(Arc::from(PLATFORM_LINQ_SECRET));
+                state.nextcloud_talk = Some(Arc::new(
+                    NextcloudTalkChannel::new(endpoint.clone(), "app-token".into(), vec!["*".into()])
+                        .with_test_transport(&endpoint, client)
+                        .expect("Nextcloud loopback only"),
+                ));
+                state.nextcloud_talk_webhook_secret = Some(Arc::from(PLATFORM_NC_SECRET));
+                business(state, provider).await;
+            },
+        ))
+        .catch_unwind()
+        .await;
+        let drained = transport.finish().await;
+        if let Err(error) = &drained {
+            let subscriber = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_ansi(false)
+                .without_time()
+                .with_max_level(tracing::Level::ERROR)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::error!(%error, "owned platform transport cleanup failed");
+            });
+        }
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+        drained.expect("owned platform TLS listener joined");
+    }
+
+    #[tokio::test]
+    async fn platform_real_adapters_send_only_to_owned_tls_endpoint() {
+        use futures_util::FutureExt as _;
+        let transport = platform_test_transport::LocalTransport::start()
+            .await
+            .expect("owned sender endpoint");
+        let work = Box::pin(async {
+            let channels: Vec<Box<dyn Channel>> = vec![
+                Box::new(
+                    WhatsAppChannel::new(
+                        "fixture-token".into(),
+                        "fixture-endpoint".into(),
+                        "fixture-verify".into(),
+                        vec![],
+                    )
+                    .with_test_transport(&transport.endpoint, transport.client.clone())
+                    .expect("local WhatsApp"),
+                ),
+                Box::new(
+                    LinqChannel::new("fixture-token".into(), "fixture-sender".into(), vec![])
+                        .with_test_transport(&transport.endpoint, transport.client.clone())
+                        .expect("local Linq"),
+                ),
+                Box::new(
+                    NextcloudTalkChannel::new(transport.endpoint.clone(), "fixture-token".into(), vec![])
+                        .with_test_transport(&transport.endpoint, transport.client.clone())
+                        .expect("local Nextcloud"),
+                ),
+            ];
+            for channel in channels {
+                channel
+                    .send(&SendMessage::new("PRX delivery probe", "fixture-recipient"))
+                    .await
+                    .expect("actual local send");
+            }
+            let records = transport.records();
+            assert_eq!(records.len(), 3);
+            assert!(records[0].0.starts_with("POST /v18.0/fixture-endpoint/messages "));
+            assert_eq!(
+                records[0].1.pointer("/text/body").and_then(serde_json::Value::as_str),
+                Some("PRX delivery probe")
+            );
+            assert!(
+                records[1]
+                    .0
+                    .starts_with("POST /api/partner/v3/chats/fixture-recipient/messages ")
+            );
+            assert_eq!(
+                records[1]
+                    .1
+                    .pointer("/message/parts/0/value")
+                    .and_then(serde_json::Value::as_str),
+                Some("PRX delivery probe")
+            );
+            assert!(
+                records[2]
+                    .0
+                    .starts_with("POST /ocs/v2.php/apps/spreed/api/v1/chat/fixture-recipient?format=json ")
+            );
+            assert_eq!(
+                records[2].1.get("message").and_then(serde_json::Value::as_str),
+                Some("PRX delivery probe")
+            );
+        });
+        let outcome = std::panic::AssertUnwindSafe(work).catch_unwind().await;
+        let drained = transport.finish().await;
+        if let Err(error) = &drained {
+            let subscriber = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_ansi(false)
+                .without_time()
+                .with_max_level(tracing::Level::ERROR)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::error!(%error, "owned platform transport cleanup failed");
+            });
+        }
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+        drained.expect("sender endpoint joined");
+    }
+
     fn platform_webhook_state(provider: Arc<dyn Provider>) -> AppState {
         AppState {
             whatsapp: Some(Arc::new(WhatsAppChannel::new(
@@ -7373,59 +7787,59 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn whatsapp_webhook_acks_before_the_turn_finishes() {
-        let provider_impl = Arc::new(BlockFirstProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
-        let state = platform_webhook_state(provider);
-        let body = whatsapp_payload("ack-evidence");
-        let headers = whatsapp_headers(&body);
+        local_platform_fixture(|state, provider_impl| async move {
+            let body = whatsapp_payload("ack-evidence");
+            let headers = whatsapp_headers(&body);
 
-        let response = tokio::time::timeout(
-            PLATFORM_ACK_TEST_BUDGET,
-            handle_whatsapp_message(State(state), headers, Bytes::from(body)),
-        )
-        .await
-        .expect("test: the webhook must answer while the turn is still running")
-        .into_response();
+            let response = tokio::time::timeout(
+                PLATFORM_ACK_TEST_BUDGET,
+                handle_whatsapp_message(State(state), headers, Bytes::from(body)),
+            )
+            .await
+            .expect("test: the webhook must answer while the turn is still running")
+            .into_response();
 
-        assert_acks_before_the_turn_finishes(provider_impl, "gateway:whatsapp:", response).await;
+            assert_acks_before_the_turn_finishes(provider_impl, "gateway:whatsapp:", response).await;
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn linq_webhook_acks_before_the_turn_finishes() {
-        let provider_impl = Arc::new(BlockFirstProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
-        let state = platform_webhook_state(provider);
-        let body = linq_payload("ack-evidence");
-        let headers = linq_headers(&body);
+        local_platform_fixture(|state, provider_impl| async move {
+            let body = linq_payload("ack-evidence");
+            let headers = linq_headers(&body);
 
-        let response = tokio::time::timeout(
-            PLATFORM_ACK_TEST_BUDGET,
-            handle_linq_webhook(State(state), headers, Bytes::from(body)),
-        )
-        .await
-        .expect("test: the webhook must answer while the turn is still running")
-        .into_response();
+            let response = tokio::time::timeout(
+                PLATFORM_ACK_TEST_BUDGET,
+                handle_linq_webhook(State(state), headers, Bytes::from(body)),
+            )
+            .await
+            .expect("test: the webhook must answer while the turn is still running")
+            .into_response();
 
-        assert_acks_before_the_turn_finishes(provider_impl, "gateway:linq:", response).await;
+            assert_acks_before_the_turn_finishes(provider_impl, "gateway:linq:", response).await;
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn nextcloud_talk_webhook_acks_before_the_turn_finishes() {
-        let provider_impl = Arc::new(BlockFirstProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
-        let state = platform_webhook_state(provider);
-        let body = nextcloud_payload("ack-evidence");
-        let headers = nextcloud_headers(&body);
+        local_platform_fixture(|state, provider_impl| async move {
+            let body = nextcloud_payload("ack-evidence");
+            let headers = nextcloud_headers(&body);
 
-        let response = tokio::time::timeout(
-            PLATFORM_ACK_TEST_BUDGET,
-            handle_nextcloud_talk_webhook(State(state), headers, Bytes::from(body)),
-        )
-        .await
-        .expect("test: the webhook must answer while the turn is still running")
-        .into_response();
+            let response = tokio::time::timeout(
+                PLATFORM_ACK_TEST_BUDGET,
+                handle_nextcloud_talk_webhook(State(state), headers, Bytes::from(body)),
+            )
+            .await
+            .expect("test: the webhook must answer while the turn is still running")
+            .into_response();
 
-        assert_acks_before_the_turn_finishes(provider_impl, "gateway:nextcloud_talk:", response).await;
+            assert_acks_before_the_turn_finishes(provider_impl, "gateway:nextcloud_talk:", response).await;
+        })
+        .await;
     }
 
     /// A platform retry of a delivery already accepted must not start a second
@@ -7460,83 +7874,83 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn whatsapp_redelivery_does_not_run_the_turn_twice() {
-        let provider_impl = Arc::new(BlockFirstProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
-        let state = platform_webhook_state(provider);
-        let body = whatsapp_payload("dedup-evidence");
-        let headers = whatsapp_headers(&body);
+        local_platform_fixture(|state, provider_impl| async move {
+            let body = whatsapp_payload("dedup-evidence");
+            let headers = whatsapp_headers(&body);
 
-        // Bounded so the inline-await shape fails here instead of hanging.
-        let first = tokio::time::timeout(
-            PLATFORM_ACK_TEST_BUDGET,
-            handle_whatsapp_message(State(state.clone()), headers.clone(), Bytes::from(body.clone())),
-        )
-        .await
-        .expect("test: the first delivery must be acked while its turn runs")
-        .into_response();
-        let second = tokio::time::timeout(
-            PLATFORM_ACK_TEST_BUDGET,
-            handle_whatsapp_message(State(state), headers, Bytes::from(body)),
-        )
-        .await
-        .expect("test: the redelivery must be acked without waiting on the first turn")
-        .into_response();
+            // Bounded so the inline-await shape fails here instead of hanging.
+            let first = tokio::time::timeout(
+                PLATFORM_ACK_TEST_BUDGET,
+                handle_whatsapp_message(State(state.clone()), headers.clone(), Bytes::from(body.clone())),
+            )
+            .await
+            .expect("test: the first delivery must be acked while its turn runs")
+            .into_response();
+            let second = tokio::time::timeout(
+                PLATFORM_ACK_TEST_BUDGET,
+                handle_whatsapp_message(State(state), headers, Bytes::from(body)),
+            )
+            .await
+            .expect("test: the redelivery must be acked without waiting on the first turn")
+            .into_response();
 
-        assert_redelivery_runs_once(provider_impl, first, second).await;
+            assert_redelivery_runs_once(provider_impl, first, second).await;
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn linq_redelivery_does_not_run_the_turn_twice() {
-        let provider_impl = Arc::new(BlockFirstProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
-        let state = platform_webhook_state(provider);
-        let body = linq_payload("dedup-evidence");
-        let headers = linq_headers(&body);
+        local_platform_fixture(|state, provider_impl| async move {
+            let body = linq_payload("dedup-evidence");
+            let headers = linq_headers(&body);
 
-        // Bounded so the inline-await shape fails here instead of hanging.
-        let first = tokio::time::timeout(
-            PLATFORM_ACK_TEST_BUDGET,
-            handle_linq_webhook(State(state.clone()), headers.clone(), Bytes::from(body.clone())),
-        )
-        .await
-        .expect("test: the first delivery must be acked while its turn runs")
-        .into_response();
-        let second = tokio::time::timeout(
-            PLATFORM_ACK_TEST_BUDGET,
-            handle_linq_webhook(State(state), headers, Bytes::from(body)),
-        )
-        .await
-        .expect("test: the redelivery must be acked without waiting on the first turn")
-        .into_response();
+            // Bounded so the inline-await shape fails here instead of hanging.
+            let first = tokio::time::timeout(
+                PLATFORM_ACK_TEST_BUDGET,
+                handle_linq_webhook(State(state.clone()), headers.clone(), Bytes::from(body.clone())),
+            )
+            .await
+            .expect("test: the first delivery must be acked while its turn runs")
+            .into_response();
+            let second = tokio::time::timeout(
+                PLATFORM_ACK_TEST_BUDGET,
+                handle_linq_webhook(State(state), headers, Bytes::from(body)),
+            )
+            .await
+            .expect("test: the redelivery must be acked without waiting on the first turn")
+            .into_response();
 
-        assert_redelivery_runs_once(provider_impl, first, second).await;
+            assert_redelivery_runs_once(provider_impl, first, second).await;
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn nextcloud_talk_redelivery_does_not_run_the_turn_twice() {
-        let provider_impl = Arc::new(BlockFirstProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
-        let state = platform_webhook_state(provider);
-        let body = nextcloud_payload("dedup-evidence");
-        let headers = nextcloud_headers(&body);
+        local_platform_fixture(|state, provider_impl| async move {
+            let body = nextcloud_payload("dedup-evidence");
+            let headers = nextcloud_headers(&body);
 
-        // Bounded so the inline-await shape fails here instead of hanging.
-        let first = tokio::time::timeout(
-            PLATFORM_ACK_TEST_BUDGET,
-            handle_nextcloud_talk_webhook(State(state.clone()), headers.clone(), Bytes::from(body.clone())),
-        )
-        .await
-        .expect("test: the first delivery must be acked while its turn runs")
-        .into_response();
-        let second = tokio::time::timeout(
-            PLATFORM_ACK_TEST_BUDGET,
-            handle_nextcloud_talk_webhook(State(state), headers, Bytes::from(body)),
-        )
-        .await
-        .expect("test: the redelivery must be acked without waiting on the first turn")
-        .into_response();
+            // Bounded so the inline-await shape fails here instead of hanging.
+            let first = tokio::time::timeout(
+                PLATFORM_ACK_TEST_BUDGET,
+                handle_nextcloud_talk_webhook(State(state.clone()), headers.clone(), Bytes::from(body.clone())),
+            )
+            .await
+            .expect("test: the first delivery must be acked while its turn runs")
+            .into_response();
+            let second = tokio::time::timeout(
+                PLATFORM_ACK_TEST_BUDGET,
+                handle_nextcloud_talk_webhook(State(state), headers, Bytes::from(body)),
+            )
+            .await
+            .expect("test: the redelivery must be acked without waiting on the first turn")
+            .into_response();
 
-        assert_redelivery_runs_once(provider_impl, first, second).await;
+            assert_redelivery_runs_once(provider_impl, first, second).await;
+        })
+        .await;
     }
 
     #[tokio::test]

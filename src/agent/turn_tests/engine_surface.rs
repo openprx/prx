@@ -52,12 +52,36 @@ async fn run_tool_call_loop_executes_read_only_tools_with_bounded_parallelism() 
     let input = "Use file_read and memory_get.";
     let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user(input)];
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
-        workspace.path(),
-        input,
-        Arc::clone(&tools_registry),
+    let (admission, progress_trace) = crate::runtime::turn_decision::progress_diagnostic::capture(
+        crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
+            workspace.path(),
+            input,
+            Arc::clone(&tools_registry),
+        ),
     )
     .await;
+    assert!(!progress_trace.overflowed(), "complete bounded stop-operand diagnostic");
+    eprintln!("actual_parallel_progress={progress_trace:?}");
+    // Observe the actual admitted fixture before the original engine assertions.
+    let decision = admission.decision();
+    let diagnostic = decision
+        .context
+        .audit_hops()
+        .map(|hop| {
+            serde_json::json!({
+                "selection": format!("{:?}", hop.selection),
+                "prediction": format!("{:?}", hop.prediction),
+                "candidates": format!("{:?}", hop.candidates),
+                "post_rehearsal": format!("{:?}", hop.post_rehearsal),
+                "pre_commit": format!("{:?}", hop.pre_commit),
+                "audit": format!("{:?}", hop.audit_trace),
+            })
+        })
+        .collect::<Vec<_>>();
+    eprintln!(
+        "actual_parallel_admission={}",
+        serde_json::to_string(&diagnostic).unwrap()
+    );
     let observer = NoopObserver;
 
     let started = std::time::Instant::now();

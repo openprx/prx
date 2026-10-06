@@ -25,6 +25,25 @@ impl NextcloudTalkChannel {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_transport(mut self, endpoint: &str, client: reqwest::Client) -> anyhow::Result<Self> {
+        let parsed = reqwest::Url::parse(endpoint)?;
+        anyhow::ensure!(
+            parsed.scheme() == "https"
+                && parsed.host_str() == Some("127.0.0.1")
+                && parsed.port().is_some()
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.query().is_none()
+                && parsed.fragment().is_none()
+                && parsed.path() == "/",
+            "fixture transport requires an explicit HTTPS IPv4-loopback root"
+        );
+        self.base_url = endpoint.trim_end_matches('/').to_owned();
+        self.client = client;
+        Ok(self)
+    }
+
     fn is_user_allowed(&self, actor_id: &str) -> bool {
         self.allowed_users.iter().any(|u| u == "*" || u == actor_id)
     }
